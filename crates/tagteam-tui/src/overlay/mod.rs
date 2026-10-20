@@ -78,58 +78,59 @@ fn question_rows(question: &str, width: usize, height: u16) -> Vec<String> {
     wrap_rows(question, width, usize::from(height / 3))
 }
 
-/// A key while an overlay is open. `Esc` declines a dialog and closes a panel (spec §5.5).
-pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
-    let Some(overlay) = state.overlay.take() else {
-        return vec![];
-    };
-    let (kept, cmds) = overlay_key(state, overlay, key, now_ms);
-    state.overlay = kept;
-    cmds
+/// What a key did to the overlay it went to.
+pub(crate) enum KeyOutcome {
+    /// Nothing more than what it changed in place: the overlay stays open.
+    Keep,
+    /// The overlay stays open and the key started `Cmd`s.
+    KeepWith(Vec<Cmd>),
+    /// The overlay is closed.
+    Close,
+    /// The overlay is closed and the key started `Cmd`s.
+    CloseWith(Vec<Cmd>),
 }
 
-/// The overlay after `key`, or `None` once it is closed, and what it started.
-fn overlay_key(
-    state: &mut State,
-    overlay: Overlay,
-    key: KeyEvent,
-    now_ms: i64,
-) -> (Option<Overlay>, Vec<Cmd>) {
-    match overlay {
+/// A key while an overlay is open. `Esc` declines a dialog and closes a panel (spec §5.5).
+pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
+    // Out of `state`: the handlers start actions, which take `state` whole.
+    let Some(mut overlay) = state.overlay.take() else {
+        return vec![];
+    };
+    let outcome = match &mut overlay {
         Overlay::Help => help::key(key),
-        Overlay::Confirm {
-            question,
-            default_yes,
-            choice,
-            then,
-        } => confirm::key(state, question, default_yes, choice, then, key, now_ms),
+        Overlay::Confirm { choice, then, .. } => confirm::key(state, choice, then, key, now_ms),
         Overlay::Choose {
-            question,
             options,
             selected,
             reply,
-        } => choose::key(question, options, selected, reply, key),
-        Overlay::Text {
-            prompt,
-            input,
-            then,
-        } => text::key(state, prompt, input, then, key, now_ms),
-        Overlay::Result {
-            title,
-            text,
-            scroll,
-        } => panel::result_key(state, title, text, scroll, key),
-        Overlay::Doctor {
-            text,
-            scroll,
-            online,
-        } => panel::doctor_key(state, text, scroll, online, key, now_ms),
+            ..
+        } => choose::key(options, selected, *reply, key),
+        Overlay::Text { input, then, .. } => text::key(state, input, then, key, now_ms),
+        Overlay::Result { text, scroll, .. } => panel::result_key(state, text, scroll, key),
+        Overlay::Doctor { text, scroll, .. } => panel::doctor_key(state, text, scroll, key, now_ms),
         Overlay::Filter(dialog) => filter::handle_key(state, dialog, key, now_ms),
+    };
+    match outcome {
+        KeyOutcome::Keep => {
+            state.overlay = Some(overlay);
+            vec![]
+        }
+        KeyOutcome::KeepWith(cmds) => {
+            state.overlay = Some(overlay);
+            cmds
+        }
+        KeyOutcome::Close => {
+            state.overlay = None;
+            vec![]
+        }
+        KeyOutcome::CloseWith(cmds) => {
+            state.overlay = None;
+            cmds
+        }
     }
 }
 
-pub fn render(state: &State, frame: &mut Frame, now_ms: i64) {
-    let _ = now_ms;
+pub fn render(state: &State, frame: &mut Frame) {
     let Some(overlay) = &state.overlay else {
         return;
     };
@@ -175,4 +176,34 @@ pub(crate) fn boxed(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<
         ),
         rect,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyCode;
+
+    use super::*;
+    use crate::state::Screen;
+    use crate::testutil::*;
+
+    #[test]
+    fn a_kept_overlay_is_the_one_its_key_changed() {
+        let mut state = fresh(Screen::Accounts);
+        state.overlay = Some(Overlay::Text {
+            prompt: "Alias".to_owned(),
+            input: "ab".to_owned(),
+            then: TextThen::Alias(AccountRef {
+                id: id(1),
+                provider: cc(),
+                position: 1,
+            }),
+        });
+        assert!(handle_key(&mut state, press(KeyCode::Char('c')), NOW_MS).is_empty());
+        assert!(matches!(
+            &state.overlay,
+            Some(Overlay::Text { input, .. }) if input == "abc"
+        ));
+        assert!(handle_key(&mut state, press(KeyCode::Esc), NOW_MS).is_empty());
+        assert!(state.overlay.is_none());
+    }
 }

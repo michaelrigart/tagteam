@@ -4,70 +4,42 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph};
 
-use super::Overlay;
+use super::KeyOutcome;
 use crate::actions::start;
 use crate::host::Action;
-use crate::msg::Cmd;
 use crate::state::State;
 use crate::view::wrap;
 
-pub(super) fn result_key(
-    state: &State,
-    title: String,
-    text: String,
-    scroll: u16,
-    key: KeyEvent,
-) -> (Option<Overlay>, Vec<Cmd>) {
+pub(super) fn result_key(state: &State, text: &str, scroll: &mut u16, key: KeyEvent) -> KeyOutcome {
     match key.code {
-        KeyCode::Esc | KeyCode::Enter => (None, vec![]),
+        KeyCode::Esc | KeyCode::Enter => KeyOutcome::Close,
         code => {
-            let scroll = scrolled(scroll, code, &text, state.size);
-            (
-                Some(Overlay::Result {
-                    title,
-                    text,
-                    scroll,
-                }),
-                vec![],
-            )
+            *scroll = scrolled(*scroll, code, text, state.size);
+            KeyOutcome::Keep
         }
     }
 }
 
 pub(super) fn doctor_key(
     state: &mut State,
-    text: String,
-    scroll: u16,
-    online: bool,
+    text: &str,
+    scroll: &mut u16,
     key: KeyEvent,
     now_ms: i64,
-) -> (Option<Overlay>, Vec<Cmd>) {
+) -> KeyOutcome {
     match key.code {
-        KeyCode::Esc | KeyCode::Enter => (None, vec![]),
+        KeyCode::Esc | KeyCode::Enter => KeyOutcome::Close,
         KeyCode::Char('o') => {
             let provider = state.provider.clone();
             let action = Action::Doctor {
                 provider,
                 online: true,
             };
-            let cmds = start(state, action, now_ms);
-            let kept = Overlay::Doctor {
-                text,
-                scroll,
-                online,
-            };
-            (Some(kept), cmds)
+            KeyOutcome::KeepWith(start(state, action, now_ms))
         }
         code => {
-            let scroll = scrolled(scroll, code, &text, state.size);
-            (
-                Some(Overlay::Doctor {
-                    text,
-                    scroll,
-                    online,
-                }),
-                vec![],
-            )
+            *scroll = scrolled(*scroll, code, text, state.size);
+            KeyOutcome::Keep
         }
     }
 }

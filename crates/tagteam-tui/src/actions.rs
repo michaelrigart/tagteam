@@ -1,4 +1,4 @@
-//! Actions in the TUI (spec §5.5, §7): the action keys, the dialogs and panels, the CLI's
+//! Actions in the TUI (spec §5.5, §7): the action keys, the CLI's
 //! prompts, and what an action's outcome shows.
 
 use crossterm::event::{KeyCode, KeyEvent};

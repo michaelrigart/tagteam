@@ -3,10 +3,9 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
-use super::{Overlay, TextThen, boxed, question_rows};
+use super::{KeyOutcome, TextThen, boxed, question_rows};
 use crate::actions::start;
 use crate::host::Action;
-use crate::msg::Cmd;
 use crate::state::State;
 use crate::view::width_of;
 
@@ -16,35 +15,20 @@ const POSITION_MAX: usize = 9;
 
 pub(super) fn key(
     state: &mut State,
-    prompt: String,
-    mut input: String,
-    then: TextThen,
+    input: &mut String,
+    then: &TextThen,
     key: KeyEvent,
     now_ms: i64,
-) -> (Option<Overlay>, Vec<Cmd>) {
+) -> KeyOutcome {
     match key.code {
-        KeyCode::Esc => (None, vec![]),
-        KeyCode::Enter => match submitted(&then, &input) {
-            Some(action) => (None, start(state, action, now_ms)),
-            None => (
-                Some(Overlay::Text {
-                    prompt,
-                    input,
-                    then,
-                }),
-                vec![],
-            ),
+        KeyCode::Esc => KeyOutcome::Close,
+        KeyCode::Enter => match submitted(then, input) {
+            Some(action) => KeyOutcome::CloseWith(start(state, action, now_ms)),
+            None => KeyOutcome::Keep,
         },
         KeyCode::Backspace => {
             input.pop();
-            (
-                Some(Overlay::Text {
-                    prompt,
-                    input,
-                    then,
-                }),
-                vec![],
-            )
+            KeyOutcome::Keep
         }
         KeyCode::Char(c) if !c.is_control() => {
             let fits = match then {
@@ -54,23 +38,9 @@ pub(super) fn key(
             if fits {
                 input.push(c);
             }
-            (
-                Some(Overlay::Text {
-                    prompt,
-                    input,
-                    then,
-                }),
-                vec![],
-            )
+            KeyOutcome::Keep
         }
-        _ => (
-            Some(Overlay::Text {
-                prompt,
-                input,
-                then,
-            }),
-            vec![],
-        ),
+        _ => KeyOutcome::Keep,
     }
 }
 
