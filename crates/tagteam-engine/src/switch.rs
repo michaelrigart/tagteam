@@ -1477,9 +1477,8 @@ impl Engine {
             GateOutcome::Unpersisted => return Err(needs_relogin(p, target)),
             // A journal row names it. The gate cannot tell a switch still in progress from an
             // interrupted one, so this does not refuse: with `--force` the switch supersedes
-            // the row, and without it `guard` decides under the mutation lock (it
-            // waits for a live holder, and recovers or refuses a dead one with the right
-            // message).
+            // the row, and without it `guard` decides under the mutation lock (it waits for a
+            // live holder, and recovers or refuses a dead one with the right message).
             GateOutcome::Owned(OwnedBy::Journal) => Freshened::Go(vec![cannot_refresh(
                 p.display_name(),
                 label,

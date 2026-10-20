@@ -369,6 +369,10 @@ impl Engine {
     /// test without a pause hook between acquiring the guard and running the check, which does
     /// not exist yet; it is verified by reading `guard` instead.
     pub(crate) fn settle_or_refuse(&self, r: &GuardRequest) -> Result<(), EngineError> {
+        debug_assert!(
+            r.refuse_interrupted,
+            "settle_or_refuse takes a refusing request"
+        );
         for provider in r.providers {
             if self.interrupted(provider)? {
                 drop(self.guard(r)?);
@@ -851,7 +855,7 @@ mod tests {
             .unwrap()
             .insert_journal(&unresolved_journal(&provider, &to_id))
             .unwrap();
-        rusqlite::Connection::open(engine.env().data_dir().join("tagteam.db"))
+        rusqlite::Connection::open(engine.store_file())
             .unwrap()
             .execute("UPDATE switch_journal SET prior = 'not json'", [])
             .unwrap();
