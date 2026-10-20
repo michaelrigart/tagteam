@@ -1,6 +1,7 @@
 //! D5.4: the daemon's status, as a snapshot its jobs keep current (Decision 12). The
 //! scheduler's jobs write it after each run; the socket server reads it and fills in
-//! `subscribers` and `socket`. Reading it never touches the store and never waits for a job.
+//! `subscribers`, and binding the socket fills in `socket`. Reading it never touches the store
+//! and never waits for a job.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
