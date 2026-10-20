@@ -15,6 +15,10 @@ pub use age::secrecy::SecretString;
 use serde_json::{Map, Value, json};
 use tagteam_core::time::{format_iso8601, parse_iso8601};
 use tagteam_core::{CLAUDE_CODE, Fingerprint, ProviderId};
+pub use tagteam_provider::import::ImportRecord;
+use tagteam_provider::import::{
+    FormatError, accounts, disabled, field_error, optional_string, position,
+};
 
 /// The envelope's `format` and `version` (§13.3).
 pub const FORMAT: &str = "tagteam-export";
@@ -80,6 +84,12 @@ impl TransferError {
             TransferError::Decrypt(_) => "decrypt-failed",
             TransferError::Encrypt(_) => "encrypt-failed",
         }
+    }
+}
+
+impl From<FormatError> for TransferError {
+    fn from(e: FormatError) -> Self {
+        TransferError::Format(e.0)
     }
 }
 
@@ -150,101 +160,12 @@ pub fn envelope(
     out
 }
 
-/// One account an import file holds: read and type-checked, not yet validated by its provider
-/// (§13.3 pass 1). An account ID is never read from a file (§6.1, B.65). It holds a
-/// credential, so `Debug` shows neither payload.
-#[derive(Clone)]
-pub struct ImportRecord {
-    pub provider: ProviderId,
-    pub position: u32,
-    /// The file's kind, held against the provider's classification of the credential. `None`
-    /// for a cswap account whose kind cswap leaves to the credential's shape.
-    pub kind: Option<String>,
-    /// For information: the stored label comes from the identity the provider validates.
-    pub label: Option<String>,
-    pub alias: Option<String>,
-    pub disabled: bool,
-    /// Epoch ms.
-    pub added_at: Option<i64>,
-    pub identity: Value,
-    pub credential: Value,
-}
-
-impl fmt::Debug for ImportRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ImportRecord")
-            .field("provider", &self.provider)
-            .field("position", &self.position)
-            .field("kind", &self.kind)
-            .field("alias", &self.alias)
-            .field("disabled", &self.disabled)
-            .field("added_at", &self.added_at)
-            .finish_non_exhaustive()
-    }
-}
-
-/// What one account of a file failed, naming the field and the type it must have.
-fn field_error(account: usize, field: &str, must_be: &str) -> TransferError {
-    format_error(format!("account {account}: {field} must be {must_be}"))
-}
-
-/// A string, or nothing when absent or null; any other type is refused.
-fn optional_string(
-    o: &Map<String, Value>,
-    account: usize,
-    field: &str,
-) -> Result<Option<String>, TransferError> {
-    match o.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => Ok(Some(s.clone())),
-        Some(_) => Err(field_error(account, field, "a string or null")),
-    }
-}
-
-/// An integer position ≥ 1 (§13.3 pass 1: a path-traversal defence, B.34).
-fn position(o: &Map<String, Value>, account: usize, field: &str) -> Result<u32, TransferError> {
-    o.get(field)
-        .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok())
-        .filter(|n| *n >= 1)
-        .ok_or_else(|| field_error(account, field, "an integer of at least 1"))
-}
-
-fn disabled(o: &Map<String, Value>, account: usize) -> Result<bool, TransferError> {
-    match o.get("disabled") {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::Bool(b)) => Ok(*b),
-        Some(_) => Err(field_error(account, "disabled", "true or false")),
-    }
-}
-
 /// A payload the provider validates (§13.3): present and not null.
 fn payload(o: &Map<String, Value>, account: usize, field: &str) -> Result<Value, TransferError> {
     match o.get(field) {
-        None | Some(Value::Null) => Err(field_error(account, field, "present")),
+        None | Some(Value::Null) => Err(field_error(account, field, "present").into()),
         Some(v) => Ok(v.clone()),
     }
-}
-
-/// A file's accounts, each numbered from 1 as the errors name them.
-type Numbered = Vec<(usize, Map<String, Value>)>;
-
-/// The `accounts` array, each entry an object.
-fn accounts(v: &Value, what: &str) -> Result<Numbered, TransferError> {
-    let list = v
-        .get("accounts")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format_error(format!("{what} has no accounts list")))?;
-    list.iter()
-        .enumerate()
-        .map(|(i, a)| match a {
-            Value::Object(o) => Ok((i + 1, o.clone())),
-            _ => Err(format_error(format!(
-                "account {}: it is not a JSON object",
-                i + 1
-            ))),
-        })
-        .collect()
 }
 
 /// §13.3's envelope, read back: `format` and `version` first, then every account's fields,
@@ -264,14 +185,14 @@ pub fn read_envelope(v: &Value) -> Result<Vec<ImportRecord>, TransferError> {
     }
     accounts(v, "the export")?
         .into_iter()
-        .map(|(i, o)| {
+        .map(|(i, o)| -> Result<ImportRecord, TransferError> {
             let provider = match o.get("provider") {
                 Some(Value::String(p)) if !p.is_empty() => ProviderId::new(p.as_str()),
-                _ => return Err(field_error(i, "provider", "a provider's name")),
+                _ => return Err(field_error(i, "provider", "a provider's name").into()),
             };
             let kind = match o.get("kind") {
                 Some(Value::String(k)) if !k.is_empty() => k.clone(),
-                _ => return Err(field_error(i, "kind", "a credential kind")),
+                _ => return Err(field_error(i, "kind", "a credential kind").into()),
             };
             let added_at = match optional_string(&o, i, "addedAt")? {
                 Some(s) => Some(
@@ -306,19 +227,23 @@ pub fn read_envelope(v: &Value) -> Result<Vec<ImportRecord>, TransferError> {
 /// `sk-ant-api…` string for an API-key account. cswap marks only API-key accounts
 /// (`kind: "api_key"`); its OAuth logins and setup tokens carry no kind, which Claude Code
 /// tells apart from the credential (§7.1). An `added` time tagteam cannot read is dropped.
-pub fn read_cswap_v1(v: &Value) -> Result<Vec<ImportRecord>, TransferError> {
+pub fn read_cswap_v1(v: &Value) -> Result<Vec<ImportRecord>, FormatError> {
     match v.get("version").and_then(Value::as_u64) {
         Some(1) => {}
         Some(n) => {
-            return Err(format_error(format!(
+            return Err(FormatError(format!(
                 "the cswap export's version is {n}; tagteam reads version 1"
             )));
         }
-        None => return Err(format_error("the cswap export's version is not a number")),
+        None => {
+            return Err(FormatError(
+                "the cswap export's version is not a number".into(),
+            ));
+        }
     }
     if v.get("encrypted").and_then(Value::as_bool) == Some(true) {
-        return Err(format_error(
-            "the cswap export is encrypted (encrypted: true), which tagteam cannot read",
+        return Err(FormatError(
+            "the cswap export is encrypted (encrypted: true), which tagteam cannot read".into(),
         ));
     }
     accounts(v, "the cswap export")?
