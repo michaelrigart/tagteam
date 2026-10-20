@@ -17,7 +17,7 @@ use tagteam_provider::profile::{
     has_own_file, read_own_bytes, refuse_linked_credential, refuse_linked_file, remove_own_file,
     write_own_json_with,
 };
-use tagteam_provider::provider::{DeadReason, RefreshResult, TransientKind};
+use tagteam_provider::provider::{DeadReason, RefreshResult, TransientKind, ValidateRequest};
 use tagteam_provider::splice::{self, render_nested};
 use tagteam_provider::{
     BeforeFallback, Cancel, Capabilities, CredLocks, Credential, DoomedEntry, EntryKind, Env,
@@ -1010,14 +1010,16 @@ impl Provider for FakeAgent {
     ///   (`interrupted`, which the caller maps by reading the token).
     fn validate_profile(
         &self,
-        env: &Env,
-        spelling: &str,
-        _cwd: &Path,
-        _program: &Path,
-        expect: &Identity,
+        req: &ValidateRequest<'_>,
         _spawner: &dyn ProcessSpawner,
         cancel: &Cancel,
     ) -> Validity {
+        let ValidateRequest {
+            env,
+            spelling,
+            expect,
+            ..
+        } = *req;
         if cancel.requested().is_some() {
             return Validity::Unknown("interrupted".into());
         }

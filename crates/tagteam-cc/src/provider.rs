@@ -17,7 +17,8 @@ use tagteam_provider::{
     FreshCredential, Identity, IdentitySurface, Keychain, KindTraits, LineError, LiveAuth,
     LiveChange, LiveLockSet, LiveLocks, LockError, LockState, MergeReport, MustShare,
     MutationGuard, Pace, PollBudget, Provider, ProviderError, ProviderVars, ProviderWords, Read,
-    SessionEnv, SharePolicy, StoredLogin, Undo, UsageLine, UsageResult, Validity, Window, Written,
+    SessionEnv, SharePolicy, StoredLogin, Undo, UsageLine, UsageResult, ValidateRequest, Validity,
+    Window, Written,
 };
 
 use crate::config;
@@ -822,14 +823,17 @@ impl Provider for ClaudeCode {
     /// runs the binary the session will (Decision 20). A token already set spawns nothing.
     fn validate_profile(
         &self,
-        _env: &Env,
-        spelling: &str,
-        cwd: &Path,
-        program: &Path,
-        expect: &Identity,
+        req: &ValidateRequest<'_>,
         spawner: &dyn ProcessSpawner,
         cancel: &Cancel,
     ) -> Validity {
+        let ValidateRequest {
+            spelling,
+            cwd,
+            program,
+            expect,
+            ..
+        } = *req;
         if cancel.requested().is_some() {
             return Validity::Unknown(session::INTERRUPTED.into());
         }

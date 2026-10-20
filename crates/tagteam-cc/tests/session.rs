@@ -15,8 +15,8 @@ use tagteam_cc::{CcPaths, ClaudeCode, keychain_account};
 use tagteam_core::AccountId;
 use tagteam_provider::{
     EntryKind, Env, FakeKeychain, Keychain, KeychainError, LockError, LockState, MustShare,
-    MutationGuard, Provenance, Provider, ProviderError, Read, canonical_profile_path,
-    entry_matches, profile_path,
+    MutationGuard, Provenance, Provider, ProviderError, Read, ValidateRequest,
+    canonical_profile_path, entry_matches, profile_path,
 };
 
 struct Fx {
@@ -1939,11 +1939,13 @@ mod validation {
         let spawner = ScriptedSpawner::new();
         spawner.push(reply);
         f.cc.validate_profile(
-            &f.env,
-            spelling,
-            Path::new("/work/app"),
-            Path::new(CLAUDE),
-            &account(f),
+            &ValidateRequest {
+                env: &f.env,
+                spelling,
+                cwd: Path::new("/work/app"),
+                program: Path::new(CLAUDE),
+                expect: &account(f),
+            },
             &spawner,
             &Cancel::new(),
         )
@@ -1984,11 +1986,13 @@ mod validation {
         let cwd = f.env.home.join("work/app");
 
         let got = f.cc.validate_profile(
-            &f.env,
-            &spelling,
-            &cwd,
-            Path::new(CLAUDE),
-            &account(&f),
+            &ValidateRequest {
+                env: &f.env,
+                spelling: &spelling,
+                cwd: &cwd,
+                program: Path::new(CLAUDE),
+                expect: &account(&f),
+            },
             &spawner,
             &Cancel::new(),
         );
@@ -2027,11 +2031,13 @@ mod validation {
         let timed = Timed::default();
 
         let got = f.cc.validate_profile(
-            &f.env,
-            &spelling,
-            Path::new("/"),
-            Path::new(CLAUDE),
-            &account(&f),
+            &ValidateRequest {
+                env: &f.env,
+                spelling: &spelling,
+                cwd: Path::new("/"),
+                program: Path::new(CLAUDE),
+                expect: &account(&f),
+            },
             &timed,
             &Cancel::new(),
         );
@@ -2063,11 +2069,13 @@ mod validation {
         spawner.push(exited(0, &reply));
         assert_eq!(
             f.cc.validate_profile(
-                &f.env,
-                &spelling,
-                Path::new("/"),
-                Path::new(CLAUDE),
-                &personal,
+                &ValidateRequest {
+                    env: &f.env,
+                    spelling: &spelling,
+                    cwd: Path::new("/"),
+                    program: Path::new(CLAUDE),
+                    expect: &personal
+                },
                 &spawner,
                 &Cancel::new()
             ),
@@ -2279,11 +2287,13 @@ mod validation {
         cancel.request(15);
         assert_eq!(
             f.cc.validate_profile(
-                &f.env,
-                &spelling,
-                Path::new("/"),
-                Path::new(CLAUDE),
-                &account(&f),
+                &ValidateRequest {
+                    env: &f.env,
+                    spelling: &spelling,
+                    cwd: Path::new("/"),
+                    program: Path::new(CLAUDE),
+                    expect: &account(&f)
+                },
                 &spawner,
                 &cancel
             ),

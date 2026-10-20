@@ -182,6 +182,16 @@ pub struct SessionEnv {
     pub remove: Vec<OsString>,
 }
 
+/// What `validate_profile` checks: the profile `spelling`, run from `cwd` as `program`, against
+/// the identity `expect`, in the outer environment `env`.
+pub struct ValidateRequest<'a> {
+    pub env: &'a Env,
+    pub spelling: &'a str,
+    pub cwd: &'a Path,
+    pub program: &'a Path,
+    pub expect: &'a Identity,
+}
+
 /// §12.3 step 8's outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Validity {
@@ -848,14 +858,9 @@ pub trait Provider: Send + Sync {
     /// §12.3 step 8 / "Every launch is checked", run with `spawner` in the session's exact
     /// environment and `cwd`, 10 s timeout, cancellable. It spawns `program`, the launch
     /// command `plan_run` resolved, never the launch command by name (Decision 20).
-    #[allow(clippy::too_many_arguments)]
     fn validate_profile(
         &self,
-        env: &Env,
-        spelling: &str,
-        cwd: &Path,
-        program: &Path,
-        expect: &Identity,
+        req: &ValidateRequest<'_>,
         spawner: &dyn ProcessSpawner,
         cancel: &Cancel,
     ) -> Validity;
