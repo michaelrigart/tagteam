@@ -32,7 +32,9 @@ Claude Code deletes transcripts after 30 days by default; this machine's span 20
    counted twice. Under §7.4's three assumptions, none is attributed to an account it cannot
    have used (§7).
 3. A cold index of this machine's 3.42 GB takes ≤ 10 s; a refresh with nothing new takes
-   ≤ 100 ms; a 30-day report query takes ≤ 200 ms (release build, Apple silicon).
+   ≤ 100 ms; a 30-day report query takes ≤ 200 ms, and the default 12-month range takes
+   ≤ 1 s for the query and grouping on a store holding about 1.5M responses in that range
+   (release build, Apple silicon).
 4. `statusline` stays within core §1.1's 10 ms p95 with its session sighting (§6.3).
 5. No Claude Code file is ever written (core §3, pinned by core §15.3's byte-identity test).
 6. The TUI renders the engine view of §10 with no shape of its own; the CLI's `--json` is the
@@ -507,7 +509,7 @@ impl Engine {
   finds the profile no longer in use closes the launch, at that moment. A late close
   over-covers, which can only leave a response unattributed, never misplace it.
 - **Poll.** While its child runs, `run` checks the child's record,
-  `<profile>/sessions/<child pid>.json`, on every 50 ms tick of a scoped thread: a `stat`, and
+  `<profile>/sessions/<child pid>.json`, on every 250 ms tick of a scoped thread: a `stat`, and
   a read only when its mtime moved since the read that named the current session.
   - A read of this child's record (its pid, started no earlier than the launch, its process
     live) that names a session begins a **tenure** at the read. An unchanged mtime, or a read
@@ -672,9 +674,11 @@ assumptions:
   another, the session stayed in that execution. A session that left an execution and came
   back between two such reads, unseen, is credited to that home for the time it was away, unless
   another home sighted it then. `run` and the scan read the record's `sessionId`: `run` every
-  50 ms, the scan far less often. The statusline reads only the execution from the record and
+  250 ms, the scan far less often. The statusline reads only the execution from the record and
   takes the session from its environment (§6.3), so its reads are only as good as that
-  environment.
+  environment. A tenure ends at its last confirmation, so at most the responses of the last
+  250 ms before it ends go unsighted; with `run`'s launch open they have two candidates and
+  stay unattributed, never given to the wrong account.
 
 Known limits:
 
@@ -1142,7 +1146,8 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
   - The statusline p95 test runs with a fresh sighting (a lookup alone) and with one due an
     extension (the lookup, the ancestor walk and a write).
   - A benchmark generates a 500 MB synthetic tree and checks the refresh and query budgets
-    of §1.1, scaled.
+    of §1.1, scaled. A second case generates 12 months at the spec's rate (about 1.5M
+    responses) and checks the 12-month budget of §1.1 (release builds only).
 - **Compatibility** (core §15.4). The CC compat suite gains a check that a real session's
   transcript yields usage lines with every field §3.2 reads, and that its session record
   carries `sessionId`.
