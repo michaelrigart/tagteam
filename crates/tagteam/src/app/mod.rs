@@ -20,11 +20,11 @@ mod dispatch;
 mod early;
 mod failure;
 
-pub use context::{Context, Io};
 pub(crate) use context::{
-    build_engine, build_registry, color_enabled, command_settings, engine_for, fallback_provider,
-    locate, locate_run_shell, registry,
+    ColorEnv, build_engine, build_registry, color_enabled, command_settings, engine_for,
+    fallback_provider, locate, locate_run_shell, registry,
 };
+pub use context::{Context, Io};
 pub use failure::KIND_STALE_SELECTION;
 pub(crate) use failure::{EXIT_ERROR, EXIT_USAGE, KIND_ROOT, KIND_USAGE, error_json, fail_to};
 
@@ -48,12 +48,7 @@ fn display_name(engine: &Engine, provider: &ProviderId) -> String {
 struct App<'a, 'b> {
     engine: Engine,
     json: bool,
-    /// `Context::stdout_terminal`, `no_color_env` and `force_color_env`.
-    stdout_terminal: bool,
-    no_color_env: bool,
-    force_color_env: bool,
-    /// `--no-color`.
-    no_color: bool,
+    color: ColorEnv,
     provider_flag: Option<ProviderId>,
     /// `--expect-account`: the only account `resolve` may return (§10.4).
     expect_account: Option<AccountId>,
@@ -124,11 +119,15 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     }
     // §13.5: the status bar's fast path, before anything else is built.
     if let Some(Command::Statusline { print_config }) = &cli.command {
+        let color = ColorEnv {
+            stdout_terminal: true,
+            ..ColorEnv::of(&ctx, cli.no_color)
+        };
         return Ended::Code(run_statusline(
             ctx,
             io,
             json,
-            cli.no_color,
+            color,
             cli.provider,
             *print_config,
         ));
@@ -167,8 +166,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
         Platform::Linux => Vec::new(),
     };
     let platform = ctx.platform;
-    let (stdout_terminal, no_color_env, force_color_env) =
-        (ctx.stdout_terminal, ctx.no_color_env, ctx.force_color_env);
+    let color = ColorEnv::of(&ctx, cli.no_color);
     let provider_flag = cli.provider.map(ProviderId::new);
     // §12.8: under a marker that cannot be read the outer home is unknown, and nothing runs.
     let (engine, warnings) = match engine_for(ctx, provider_flag.as_ref()) {
@@ -181,10 +179,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     let mut app = App {
         engine,
         json,
-        stdout_terminal,
-        no_color_env,
-        force_color_env,
-        no_color: cli.no_color,
+        color,
         provider_flag,
         expect_account: cli.expect_account.map(AccountId::from_string),
         settings_warnings: warnings,
@@ -302,13 +297,7 @@ impl App<'_, '_> {
 
     /// Whether `list` and `status` colour their percentages (§13.1).
     fn color(&self) -> bool {
-        color_enabled(
-            self.no_color,
-            self.no_color_env,
-            self.force_color_env,
-            self.engine.settings().color,
-            self.stdout_terminal,
-        )
+        self.color.enabled(self.engine.settings().color)
     }
 
     /// Appendix A.3's check, for a command that will touch a Keychain item. With no store,

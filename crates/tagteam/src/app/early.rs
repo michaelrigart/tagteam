@@ -9,7 +9,7 @@ use crate::shell_init::Wrapped;
 use crate::{shell_init, statusline};
 
 use super::Ended;
-use super::context::{Context, Io, color_enabled};
+use super::context::{ColorEnv, Context, Io};
 use super::failure::{EXIT_USAGE, Failure, KIND_UNSUPPORTED, KIND_USAGE};
 
 const STATUSLINE_UNDER_JSON: &str = "statusline prints a line of text; run it without --json";
@@ -26,7 +26,7 @@ pub(super) fn run_statusline(
     ctx: Context,
     io: &mut Io<'_>,
     json: bool,
-    no_color: bool,
+    color: ColorEnv,
     provider: Option<String>,
     print_config: bool,
 ) -> i32 {
@@ -34,7 +34,6 @@ pub(super) fn run_statusline(
         io.fail(true, KIND_USAGE, STATUSLINE_UNDER_JSON);
         return EXIT_USAGE;
     }
-    let (no_color_env, force_color_env) = (ctx.no_color_env, ctx.force_color_env);
     let (engine, provider) = statusline::engine(ctx, provider.as_deref());
     let session_id = engine
         .provider(&provider)
@@ -61,13 +60,7 @@ pub(super) fn run_statusline(
         let settings = engine.settings();
         // The line goes to Claude Code, which renders ANSI colour but is never a terminal, so
         // `auto` colours it: the same rule as `list`, with the terminal test taken as met.
-        let colour = color_enabled(
-            no_color,
-            no_color_env,
-            force_color_env,
-            settings.color,
-            true,
-        );
+        let colour = color.enabled(settings.color);
         Ok(statusline::line(
             &view,
             &settings.statusline_format,

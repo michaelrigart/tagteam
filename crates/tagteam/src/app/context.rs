@@ -417,8 +417,42 @@ pub(crate) fn env_flag(name: &str) -> bool {
     is_set(std::env::var_os(name))
 }
 
-/// §13.1 and §6.4: `--no-color` and `NO_COLOR` always turn colour off, `FORCE_COLOR` turns it
-/// on, and otherwise `ui.color` decides, `auto` meaning "stdout is a terminal".
+/// The four inputs to the colour decision besides `ui.color`.
+#[derive(Clone, Copy)]
+pub(crate) struct ColorEnv {
+    pub(crate) no_color_flag: bool,
+    pub(crate) no_color_env: bool,
+    pub(crate) force_color_env: bool,
+    pub(crate) stdout_terminal: bool,
+}
+
+impl ColorEnv {
+    pub(crate) fn of(ctx: &Context, no_color_flag: bool) -> Self {
+        Self {
+            no_color_flag,
+            no_color_env: ctx.no_color_env,
+            force_color_env: ctx.force_color_env,
+            stdout_terminal: ctx.stdout_terminal,
+        }
+    }
+
+    /// §13.1 and §6.4: `--no-color` and `NO_COLOR` always turn colour off, `FORCE_COLOR` turns
+    /// it on, and otherwise `ui.color` decides, `auto` meaning "stdout is a terminal".
+    pub(crate) fn enabled(&self, setting: ColorMode) -> bool {
+        if self.no_color_flag || self.no_color_env {
+            return false;
+        }
+        if self.force_color_env {
+            return true;
+        }
+        match setting {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => self.stdout_terminal,
+        }
+    }
+}
+
 pub(crate) fn color_enabled(
     flag_off: bool,
     no_color: bool,
@@ -426,17 +460,13 @@ pub(crate) fn color_enabled(
     setting: ColorMode,
     stdout_terminal: bool,
 ) -> bool {
-    if flag_off || no_color {
-        return false;
+    ColorEnv {
+        no_color_flag: flag_off,
+        no_color_env: no_color,
+        force_color_env: force_color,
+        stdout_terminal,
     }
-    if force_color {
-        return true;
-    }
-    match setting {
-        ColorMode::Always => true,
-        ColorMode::Never => false,
-        ColorMode::Auto => stdout_terminal,
-    }
+    .enabled(setting)
 }
 
 #[cfg(test)]
