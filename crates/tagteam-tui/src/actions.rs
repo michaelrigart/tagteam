@@ -204,10 +204,7 @@ fn refresh(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     if busy(state, now_ms) {
         return vec![];
     }
-    let mut cmds = vec![state.load_accounts()];
-    if state.screen == Screen::History {
-        cmds.extend(screens::history::reload(state, now_ms));
-    }
+    let mut cmds = state.reload_views(now_ms);
     let shown = state.accounts.shown_ids();
     if !shown.is_empty() {
         cmds.push(state.collect_due(shown));
@@ -624,11 +621,7 @@ pub fn on_done(state: &mut State, action: Action, outcome: ActionOutcome, now_ms
             });
         }
     }
-    let mut cmds = vec![state.load_accounts()];
-    if state.screen == Screen::History {
-        cmds.extend(screens::history::reload(state, now_ms));
-    }
-    cmds
+    state.reload_views(now_ms)
 }
 
 pub fn render_overlay(state: &State, frame: &mut Frame, now_ms: i64) {

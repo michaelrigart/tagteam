@@ -439,10 +439,7 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
         cmds.extend(fetch(state, now_ms));
     }
     if views {
-        cmds.push(state.load_accounts());
-        if state.screen == Screen::History {
-            cmds.extend(screens::history::reload(state, now_ms));
-        }
+        cmds.extend(state.reload_views(now_ms));
         if all && state.screen == Screen::Tokens {
             cmds.extend(screens::tokens::requery(state, now_ms));
         }

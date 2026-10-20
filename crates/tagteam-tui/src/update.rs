@@ -77,11 +77,7 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                         return vec![];
                     }
                     // Spec §6.2: a collection that fetched is read back at once.
-                    let mut cmds = vec![state.load_accounts()];
-                    if state.screen == Screen::History {
-                        cmds.extend(screens::history::reload(state, now_ms));
-                    }
-                    cmds
+                    state.reload_views(now_ms)
                 }
                 Err(_) if stale => vec![],
                 Err(e) => {
@@ -254,10 +250,7 @@ fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     // only the accounts nothing else collects for (§6.3).
     state.refresh.next_ms = now_ms + REFRESH_MS;
     if !state.daemon.live() {
-        cmds.push(state.load_accounts());
-        if state.screen == Screen::History {
-            cmds.extend(screens::history::reload(state, now_ms));
-        }
+        cmds.extend(state.reload_views(now_ms));
     }
     let due = daemon::to_collect(state);
     if state.running.is_none() && !due.is_empty() {

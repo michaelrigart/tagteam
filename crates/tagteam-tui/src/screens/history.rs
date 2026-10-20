@@ -980,4 +980,37 @@ mod tests {
             "the read in flight is stale"
         );
     }
+
+    #[test]
+    fn reload_views_reads_the_accounts_and_on_history_the_account_shown() {
+        let mut state = fresh(Screen::Accounts);
+        let g = state.gens.accounts;
+        assert_eq!(
+            state.reload_views(NOW_MS),
+            [Cmd::LoadAccounts { r#gen: g + 1 }]
+        );
+
+        let mut state = on_history(many(2));
+        state.history.select(id(2));
+        let (g, h) = (state.gens.accounts, state.gens.history);
+        assert_eq!(
+            state.reload_views(NOW_MS),
+            [
+                Cmd::LoadAccounts { r#gen: g + 1 },
+                Cmd::LoadHistory {
+                    r#gen: h + 1,
+                    account: id(2),
+                    since_s: NOW_S - 7 * 86_400,
+                },
+            ]
+        );
+
+        let mut state = fresh(Screen::History);
+        let g = state.gens.accounts;
+        assert_eq!(
+            state.reload_views(NOW_MS),
+            [Cmd::LoadAccounts { r#gen: g + 1 }],
+            "no account shown yet"
+        );
+    }
 }
