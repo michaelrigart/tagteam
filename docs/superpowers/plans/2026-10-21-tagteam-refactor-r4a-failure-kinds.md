@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/30
 **Branch:** `refactor-r4a-failure-kinds`, based on `refactor-r3-cli-protocol` (`c7bfb84`)
 **Goal:** Type §8.6's two failure vocabularies, usage failure tokens as `FailureKind` and the gate's transient kinds as `GateFailure`, with every stored, wire, printed and logged string unchanged.
 **Architecture:** A leaf module, `crates/tagteam-engine/src/failure.rs`, holds both enums. Each lands with its consumers: `FailureKind` with its readers (Task 1), then its writers and `Collected::Errored` (Task 2); `GateFailure` with the gate and its readers (Task 3). Store, view and wire types stay `String`.
@@ -230,4 +230,4 @@ These are recorded under "Rulings" in the PR.
 8. **`NO_DATA` stays outside `FailureKind`:** it is the view's "never read" sentinel, not a token. `Collected::fetch_error` is the one place for the reported spellings.
 9. **The held `source.rs` gets a code-only edit.** Its stale doc comment (`Failed { kind: "error" }`) is left for the TUI redesign.
 10. **`refresh.rs` edits** beyond the writers are limited to the field type, its `Debug` arm, `transient` and `log_gate`.
-11. **§14's comment sweep of R4's files** goes in R4f (§8.9's slice), which sweeps every engine and daemon file that still carries a plan-local reference. R4a's new comments cite spec sections only.
+11. **§14's comment sweep of R4's files** goes in R4g (the slice that finishes §8.9), which sweeps every engine and daemon file that still carries a plan-local reference. R4a's new comments cite spec sections only.
