@@ -27,8 +27,9 @@ const KEYS_HELD: &str =
 
 /// ` tagteam   1 Accounts   2 Tokens   3 History` on the left: the brand bold, the tabs muted,
 /// the current one accent and bold. On the right, auto's state (`auto_state`), three spaces,
-/// and `? keys` one column in. The state is cut to the room the rest leaves; `? keys` is never
-/// dropped.
+/// and `? keys` one column in. The state keeps a column from the tabs: a long form too wide for
+/// the room the rest leaves gives way to the short one, and only what still does not fit is
+/// cut. `? keys` is never dropped.
 pub(crate) fn header(state: &State, width: u16) -> Line<'static> {
     let theme = state.theme;
     let mut spans = vec![Span::styled(" tagteam", theme.strong())];
@@ -47,13 +48,18 @@ pub(crate) fn header(state: &State, width: u16) -> Line<'static> {
         Span::raw(" "),
     ];
     let width = usize::from(width);
-    let pieces: Vec<Span<'static>> = auto_state(state, width >= usize::from(WIDE))
-        .into_iter()
-        .map(|(text, role)| Span::styled(text, theme.role(role)))
-        .collect();
+    let room = width.saturating_sub(spans_width(&spans) + 1 + 3 + spans_width(&keys));
+    let wide = width >= usize::from(WIDE);
+    let mut pieces = auto_state(state, wide);
+    if wide && pieces.iter().map(|(text, _)| width_of(text)).sum::<usize>() > room {
+        pieces = auto_state(state, false);
+    }
     let mut right = Vec::new();
     if !pieces.is_empty() {
-        let room = width.saturating_sub(spans_width(&spans) + 3 + spans_width(&keys));
+        let pieces = pieces
+            .into_iter()
+            .map(|(text, role)| Span::styled(text, theme.role(role)))
+            .collect();
         right = fit_spans(pieces, room);
         right.push(Span::raw("   "));
     }
@@ -317,7 +323,7 @@ mod tests {
                 "engine-lock, no pid",
                 live(job("waiting", Some("engine-lock"), None)),
                 "● auto runs in another terminal",
-                "● auto in another terminal",
+                "● auto runs elsewhere",
             ),
             (
                 "schema",
@@ -371,7 +377,10 @@ mod tests {
         for (case, state, wide, narrow) in cases {
             for (w, words) in [(120, wide), (80, narrow)] {
                 let row = &drawn(&state, w)[0];
-                assert!(row.starts_with(TABS_ROW), "{case} at {w}: {row}");
+                assert!(
+                    row.starts_with(&format!("{TABS_ROW} ")),
+                    "{case} at {w}: {row}"
+                );
                 assert!(
                     row.ends_with(&format!("{words}   ? keys")),
                     "{case} at {w}: {row}"
@@ -540,7 +549,8 @@ mod tests {
         let lines = draw(&state, 80, 24);
         assert_eq!(
             lines[0],
-            format!("{TABS_ROW}○ daemon a-mode-whose-nam…   ? keys")
+            format!("{TABS_ROW} ○ daemon a-mode-whose-na…   ? keys"),
+            "a column between the tabs and the state"
         );
         assert_eq!(width_of(&lines[0]) + 1, 80, "the keys one column in");
         assert!(
@@ -560,6 +570,40 @@ mod tests {
             "the table under it: {lines:?}"
         );
         assert!(draw(&state, 120, 40)[0].ends_with("keychain locked until 15:05   ? keys"));
+        // A wide state too long for the room at 120 columns takes its 80-column form, whole.
+        let consume_first = {
+            let mut snap = snapshot(many(1));
+            snap.providers[0].strategy = Strategy::ConsumeFirst;
+            snap
+        };
+        for (case, mode, autoswitch, pid, snap) in [
+            ("consume-first", "auto", true, None, consume_first),
+            ("idle collect", "collect", true, None, snapshot(many(1))),
+            (
+                "engine-lock",
+                "waiting",
+                true,
+                Some(4711),
+                snapshot(many(1)),
+            ),
+        ] {
+            let mut job = daemon_job("claude-code", mode, autoswitch);
+            job.waiting_for = (mode == "waiting").then(|| "engine-lock".to_owned());
+            job.holder_pid = pid;
+            job.backoff = Some(StatusBackoff {
+                reason: "keychain".into(),
+                until: "2026-09-21T15:05:00Z".into(),
+            });
+            let mut state = fresh(Screen::Accounts);
+            state.accounts.apply(snap);
+            go_live(&mut state, daemon_status(vec![job], vec![]));
+            let gap = " ".repeat(120 - 44 - 23 - 10);
+            assert_eq!(
+                draw(&state, 120, 40)[0],
+                format!("{TABS_ROW}{gap}! keychain locked 15:05   ? keys"),
+                "{case}"
+            );
+        }
     }
 
     #[test]

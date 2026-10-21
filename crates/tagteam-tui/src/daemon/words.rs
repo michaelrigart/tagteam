@@ -97,7 +97,7 @@ fn job_state(
                 (Some(pid), true) => format!("auto runs in another terminal (pid {pid})"),
                 (Some(pid), false) => format!("auto in pid {pid}"),
                 (None, true) => "auto runs in another terminal".to_owned(),
-                (None, false) => "auto in another terminal".to_owned(),
+                (None, false) => "auto runs elsewhere".to_owned(),
             };
             said("●", Role::Accent, &words, None)
         }
@@ -192,7 +192,7 @@ mod tests {
                 Some("engine-lock"),
                 None,
                 "● auto runs in another terminal",
-                "● auto in another terminal",
+                "● auto runs elsewhere",
             ),
             (
                 "waiting",
