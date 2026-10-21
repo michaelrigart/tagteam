@@ -502,6 +502,92 @@ fn each_provider_s_view_carries_its_models_and_live_login() {
     );
 }
 
+#[test]
+fn a_card_s_history_judges_trust_under_its_own_provider_s_models_as_its_list_row_does() {
+    // §12.1, per-provider models: FakeAgent's table names Fable; the default does not. Each
+    // account holds the same reading, taken 4000 s ago and refused since, so it is trusted only
+    // until its earliest relevant reset, and its Fable window has reset already.
+    use tagteam_core::{PollBudget, PollPlan, Window, WindowKind};
+    use tagteam_engine::store::{Eligibility, Reserve};
+
+    const T0: i64 = 1_790_000_000;
+    let ffx = FakeFx::new();
+    let config = tagteam_engine::settings::config_path(&ffx.fx.env);
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        "[provider.fake-agent.autoswitch]\nmodels = [\"Fable\"]\n",
+    )
+    .unwrap();
+    let cc = ffx.fx.add("a@b.co", "rt-a");
+    let alice = ffx.fake_add("alice", "tok-a", "renew-a");
+    let window = |key: &str, kind, resets_at| Window {
+        key: key.into(),
+        label: key.trim_start_matches("scoped:").into(),
+        kind,
+        pct: 10.0,
+        resets_at: Some(resets_at),
+        period_s: Some(86_400),
+        detail: None,
+    };
+    let reading = vec![
+        window("daily", WindowKind::Short, T0 + 9_630),
+        window("monthly", WindowKind::Long, T0 + 291_630),
+        window("scoped:Fable", WindowKind::Scoped, T0 - 100),
+    ];
+    let store = ffx.engine.store().unwrap();
+    let reserve = |id: &AccountId, at: i64| {
+        let row = store.account(id).unwrap().unwrap();
+        match store
+            .reserve_usage(
+                &row,
+                at * 1000,
+                Eligibility::Scheduled,
+                &PollBudget::STANDARD,
+            )
+            .unwrap()
+        {
+            Reserve::Reserved(r) => r,
+            other => panic!("not reserved at {at}: {other:?}"),
+        }
+    };
+    for id in [&cc, &alice] {
+        let plan = PollPlan {
+            interval_s: 500,
+            next_poll_at: T0 - 3_500,
+        };
+        let r = reserve(id, T0 - 4_000);
+        assert!(
+            store
+                .record_usage(&r, &reading, T0 - 4_000, &plan, 180)
+                .unwrap()
+        );
+        let r = reserve(id, T0 - 3_000);
+        assert!(
+            store
+                .record_usage_failure(&r, "http-429", T0 - 3_000, T0 + 600, Some(T0 + 600), None)
+                .unwrap()
+        );
+    }
+    let rows: Vec<_> = ffx
+        .engine
+        .accounts(None)
+        .unwrap()
+        .into_iter()
+        .flat_map(|l| l.accounts)
+        .collect();
+    for (id, trusted) in [(&cc, true), (&alice, false)] {
+        let row = rows.iter().find(|v| &v.row.id == id).unwrap();
+        let card = ffx.engine.history(id, None, 0).unwrap().account;
+        assert_eq!(
+            (row.usage.decision_grade, card.usage.decision_grade),
+            (trusted, trusted),
+            "{}",
+            row.row.label
+        );
+    }
+}
+
 #[cfg(feature = "test-hooks")]
 #[test]
 fn the_accounts_view_reads_each_provider_s_live_login_once() {

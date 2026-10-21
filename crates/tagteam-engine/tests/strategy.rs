@@ -16,7 +16,8 @@ use tagteam_engine::EngineError;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::{Eligibility, Reserve};
 use tagteam_engine::switch::{
-    BestForecast, NoPick, SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy,
+    BestForecast, LiveLogin, NoPick, SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget,
+    UsageStrategy,
 };
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::Keychain;
@@ -908,8 +909,9 @@ fn best_with_no_live_login_and_no_ranked_candidate_holding_a_login_is_usage_unav
 /// §12.1's parity: what `switch --strategy best` does with `forecast`, the accounts view's.
 /// `UsageUnknown` maps to `UsageUnavailable` only while `best`'s collection fails and the
 /// unknown reading is past §8.4's hour: one younger is trusted again once its refresh fails,
-/// and `best` then ranks it.
-fn assert_best_does(case: &str, forecast: &BestForecast, out: &SwitchOutcome) {
+/// and `best` then ranks it. Too few candidates is `only-one-account` with a managed live login
+/// and `no-valid-target` without one, as `live` (the view's) says.
+fn assert_best_does(case: &str, forecast: &BestForecast, live: &LiveLogin, out: &SwitchOutcome) {
     match forecast {
         BestForecast::Pick { order } => {
             assert!(out.switched, "{case}: {}", out.message);
@@ -926,14 +928,11 @@ fn assert_best_does(case: &str, forecast: &BestForecast, out: &SwitchOutcome) {
             assert_eq!(out.reason, SwitchReason::UnmanagedAccount, "{case}");
         }
         BestForecast::None(NoPick::TooFewCandidates) => {
-            assert!(
-                matches!(
-                    out.reason,
-                    SwitchReason::OnlyOneAccount | SwitchReason::NoValidTarget
-                ),
-                "{case}: {:?}",
-                out.reason
-            );
+            let reason = match live {
+                LiveLogin::Managed { .. } => SwitchReason::OnlyOneAccount,
+                LiveLogin::None | LiveLogin::Unmanaged { .. } => SwitchReason::NoValidTarget,
+            };
+            assert_eq!(out.reason, reason, "{case}: {live:?}");
         }
         BestForecast::None(NoPick::UsageUnknown) => {
             assert_eq!(out.reason, SwitchReason::UsageUnavailable, "{case}");
@@ -955,7 +954,7 @@ fn the_accounts_view_s_forecast_is_what_switch_best_picks() {
     let pick = |order: &[u32]| BestForecast::Pick {
         order: order.to_vec(),
     };
-    let cases: [(&str, Setup, BestForecast); 9] = [
+    let cases: [(&str, Setup, BestForecast); 10] = [
         (
             "the live account is itself disabled: fewer than two candidates",
             |fx| {
@@ -1047,17 +1046,46 @@ fn the_accounts_view_s_forecast_is_what_switch_best_picks() {
             },
             pick(&[1, 2]),
         ),
+        (
+            "the account in use quarantined, with the most headroom: it stays",
+            |fx| {
+                let (a, b, c) = three(fx); // c is live
+                read(fx, &a, &reading(10.0, 40.0, 0.0));
+                read(fx, &b, &reading(10.0, 20.0, 0.0));
+                read(fx, &c, &reading(10.0, 5.0, 0.0));
+                let bound = vault_fp(fx, &c);
+                fx.quarantine(&c, "invalid_grant", &bound);
+            },
+            BestForecast::AlreadyBest,
+        ),
     ];
     for (case, setup, expected) in cases {
         let fx = Fx::new();
         setup(&fx);
-        let forecast = fx.engine.accounts(Some(&fx.provider())).unwrap()[0]
-            .forecast
-            .clone();
-        assert_eq!(forecast, expected, "{case}");
+        let view = fx.engine.accounts(Some(&fx.provider())).unwrap().remove(0);
+        assert_eq!(view.forecast, expected, "{case}");
         let out = best(&fx).unwrap();
-        assert_best_does(case, &forecast, &out);
+        assert_best_does(case, &view.forecast, &view.live, &out);
     }
+}
+
+#[test]
+fn the_forecast_leaves_out_an_account_in_a_session_as_best_does() {
+    // §12.1, T3-4: a has the most headroom, but a live reservation holds it, so neither `best`
+    // nor the forecast picks it; b is next.
+    let fx = Fx::new();
+    let (a, b, c) = three(&fx); // c is live
+    read(&fx, &a, &reading(10.0, 10.0, 0.0));
+    read(&fx, &b, &reading(10.0, 40.0, 0.0));
+    read(&fx, &c, &reading(10.0, 90.0, 0.0));
+    let profile = fx.make_profile(&a);
+    let _launch = fx.hold_reservation(&profile);
+    let view = fx.engine.accounts(Some(&fx.provider())).unwrap().remove(0);
+    assert!(view.accounts[0].in_session, "a is in a session");
+    assert_eq!(view.forecast, BestForecast::Pick { order: vec![2] });
+    let out = best(&fx).unwrap();
+    assert_best_does("a candidate in a session", &view.forecast, &view.live, &out);
+    assert_eq!(out.to.map(|r| r.id), Some(b));
 }
 
 /// A 429 on `id`'s fetch at `at`, after its last good reading: backed off, and trusted after it
@@ -1104,11 +1132,14 @@ fn the_forecast_judges_trust_and_headroom_under_the_models_best_will_use() {
     read(&fx, &b, &reading(10.0, 20.0, 95.0));
     read(&fx, &c, &reading(10.0, 50.0, 0.0));
     fs::write(&config, "[autoswitch]\nmodels = [\"Fable\"]\n").unwrap();
-    let forecast = fx.engine.accounts(Some(&fx.provider())).unwrap()[0]
-        .forecast
-        .clone();
-    assert_eq!(forecast, BestForecast::AlreadyBest);
+    let view = fx.engine.accounts(Some(&fx.provider())).unwrap().remove(0);
+    assert_eq!(view.forecast, BestForecast::AlreadyBest);
     fx.engine.reload_settings(&fx.provider());
     let out = best(&fx).unwrap();
-    assert_best_does("models changed after start-up", &forecast, &out);
+    assert_best_does(
+        "models changed after start-up",
+        &view.forecast,
+        &view.live,
+        &out,
+    );
 }
