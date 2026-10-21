@@ -22,9 +22,10 @@ use crate::auto::{engine_lock_path, read_holder};
 use crate::displace::PurgeError;
 use crate::engine::Engine;
 use crate::error::{DeletionRefusal, EngineError, GuardScope, SessionOwner};
-use crate::fsutil::{FileId, absent, trace_path};
+use crate::fsutil::{FileId, absent};
 use crate::hooks;
 use crate::lifecycle::{PendingLaunches, UnlistedRescues};
+use crate::live_guard::{LiveGuardError, live_files, refuse_inside};
 use crate::rescue::RescueUnlisted;
 use crate::session::{SessionState, session_owned_error};
 use crate::store::{AccountRow, Store};
@@ -86,6 +87,15 @@ pub struct PurgeReport {
     pub warnings: Vec<String>,
     /// `(what, message)` for each thing it could not delete. Any makes the command exit 1.
     pub failures: Vec<(String, String)>,
+}
+
+/// What a purge leaves alone (§8.4), by filesystem identity.
+#[derive(Debug, Default)]
+struct Spared {
+    /// The profiles of the accounts it does not affect, unfollowed and followed.
+    profiles: Vec<FileId>,
+    /// The directories above each of them, which a path passes through to reach one.
+    on_the_way: Vec<FileId>,
 }
 
 /// The accounts a purge of `provider` (or of everything) affects, by provider, then position.
@@ -862,8 +872,14 @@ impl Engine {
     /// Every filesystem entry besides profiles and orphans that this purge would delete, by
     /// scope: a full purge's `displaced/`, rescue path, `vault/` (Linux), dead temp files and
     /// log; a `--provider` purge's displaced files and its accounts' rescue files. The store
-    /// file (emptied in place) and the lock files (kept) are not deleted, so not listed.
-    fn deletion_targets(&self, plan: &PurgePlan, rows: &[AccountRow]) -> Vec<PathBuf> {
+    /// file (emptied in place) and the lock files (kept) are not deleted, so not listed. A
+    /// listing that fails (§8.4 CC-E-20) fails this, so the pre-delete check refuses rather than
+    /// narrows: a rescue directory that cannot be listed is `RescueUnlistable`, as `remove` has it.
+    fn deletion_targets(
+        &self,
+        plan: &PurgePlan,
+        rows: &[AccountRow],
+    ) -> Result<Vec<PathBuf>, EngineError> {
         let data = self.env.data_dir();
         let mut targets = Vec::new();
         match &plan.provider {
@@ -884,15 +900,21 @@ impl Engine {
                 targets.extend(self.log_paths());
             }
             Some(provider) => {
-                for id in self.displaced_of(provider).unwrap_or_default() {
+                for id in self.displaced_of(provider)? {
                     targets.push(data.join("displaced").join(format!("{id}.json")));
                 }
                 for row in rows {
-                    targets.extend(self.rescue_paths_for(&row.id).unwrap_or_default());
+                    let rescues = self.rescue_paths_for(&row.id).map_err(
+                        |RescueUnlisted { path, detail }| EngineError::RescueUnlistable {
+                            path,
+                            detail,
+                        },
+                    )?;
+                    targets.extend(rescues);
                 }
             }
         }
-        targets
+        Ok(targets)
     }
 
     /// The deletion-time recheck for `--provider`'s displaced files (the preflight ran it).
@@ -918,37 +940,7 @@ impl Engine {
         rows: &[AccountRow],
         store: Option<&Store>,
     ) -> Result<(), EngineError> {
-        let unresolved = || EngineError::DeletionRefused {
-            why: DeletionRefusal::LiveLoginUnresolved(GuardScope::Purge),
-        };
-        let refused = || EngineError::DeletionRefused {
-            why: DeletionRefusal::LiveLoginInside(GuardScope::Purge),
-        };
-        // The roots are every directory purge deletes in, by what each RESOLVES to
-        // (`metadata` follows links): `vault/`, `displaced/` and `sessions/` may be links to
-        // somewhere else entirely, and the rescue path is whatever it is.
-        let mut walls: Vec<FileId> = Vec::new();
-        let data = self.env.data_dir();
-        let mut wall_dirs = vec![
-            data.clone(),
-            data.join("vault"),
-            data.join("displaced"),
-            data.join("sessions"),
-            self.rescue_dir(),
-        ];
-        if let Some(vault) = self.vault.dir() {
-            wall_dirs.push(vault.to_path_buf());
-        }
-        if plan.provider.is_none() {
-            wall_dirs.extend(self.env.log_file().parent().map(Path::to_path_buf));
-        }
-        for dir in &wall_dirs {
-            match fs::metadata(dir) {
-                Ok(meta) => walls.push(FileId::of(&meta)),
-                Err(e) if absent(&e) => {}
-                Err(_) => return Err(unresolved()),
-            }
-        }
+        let walls = self.envelope_walls(plan)?;
         if walls.is_empty() {
             return Ok(());
         }
@@ -957,68 +949,98 @@ impl Engine {
         for row in rows {
             self.refuse_live_vault_files(row)?;
         }
-        // What the purge leaves alone: the profiles of the accounts it does not affect, and the
-        // directories above each, which a path passes through to reach one.
-        let affected: BTreeSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
-        let mut spared: Vec<FileId> = Vec::new();
-        let mut on_the_way: Vec<FileId> = Vec::new();
-        if let Some(store) = store {
-            for row in store.all_accounts()? {
-                if affected.contains(row.id.as_str()) {
-                    continue;
-                }
-                let profile = profile_path(&self.env, &row.id);
-                match fs::symlink_metadata(&profile) {
-                    Ok(meta) => spared.push(FileId::of(&meta)),
-                    Err(e) if absent(&e) => continue,
-                    Err(_) => return Err(unresolved()),
-                }
-                if let Ok(meta) = fs::metadata(&profile) {
-                    spared.push(FileId::of(&meta));
-                }
-                for above in profile.ancestors().skip(1) {
-                    match fs::metadata(above) {
-                        Ok(meta) => on_the_way.push(FileId::of(&meta)),
-                        Err(e) if absent(&e) => break,
-                        Err(_) => return Err(unresolved()),
-                    }
-                }
-            }
-        }
+        let spared = self.spared_ids(store, rows)?;
         for p in self.registry.all() {
-            let surface = p.identity_surface(&self.env);
-            let files = surface
-                .credential_files
-                .into_iter()
-                .chain(surface.json_keys.into_iter().map(|(file, _)| file));
-            for file in files {
-                for touched in trace_path(&file).map_err(|_| unresolved())? {
-                    // Each ancestor as itself, and, for a link, as what it leads to: a link
-                    // to a root counts as the root.
-                    let mut chain = Vec::new();
-                    for ancestor in touched.ancestors() {
-                        match fs::symlink_metadata(ancestor) {
-                            Ok(meta) => chain.push(FileId::of(&meta)),
-                            Err(e) if absent(&e) => break,
-                            Err(_) => return Err(unresolved()),
-                        }
-                        if let Ok(meta) = fs::metadata(ancestor) {
-                            chain.push(FileId::of(&meta));
-                        }
-                    }
+            // Each path a live file touches is judged on its own chain (§8.4): it refuses when
+            // the chain meets a wall, unless it meets a spared profile, or its own first id is
+            // a directory on the way to one.
+            refuse_inside(
+                &live_files(p.as_ref(), &self.env),
+                GuardScope::Purge,
+                |chain| {
                     let inside = chain.iter().any(|id| walls.contains(id));
-                    let spared_path = chain.iter().any(|id| spared.contains(id))
-                        || chain.first().is_some_and(|id| on_the_way.contains(id));
-                    if inside && !spared_path {
-                        tracing::warn!(
-                            "the live login's files are inside what a purge would delete; nothing was deleted"
-                        );
-                        return Err(refused());
-                    }
+                    let spared_path = chain.iter().any(|id| spared.profiles.contains(id))
+                        || chain.first().is_some_and(|id| spared.on_the_way.contains(id));
+                    inside && !spared_path
+                },
+            )
+            .map_err(|e| {
+                if matches!(e, LiveGuardError::Inside(_)) {
+                    tracing::warn!(
+                        "the live login's files are inside what a purge would delete; nothing was deleted"
+                    );
                 }
-            }
+                EngineError::from(e)
+            })?;
         }
         Ok(())
+    }
+
+    /// The roots of what purge deletes: every directory it deletes in, by what each RESOLVES to
+    /// (`metadata` follows links): `vault/`, `displaced/` and `sessions/` may be links to
+    /// somewhere else entirely, and the rescue path is whatever it is. A directory that is not
+    /// there is no root; any other failure to resolve refuses.
+    fn envelope_walls(&self, plan: &PurgePlan) -> Result<Vec<FileId>, EngineError> {
+        let data = self.env.data_dir();
+        let mut dirs = vec![
+            data.clone(),
+            data.join("vault"),
+            data.join("displaced"),
+            data.join("sessions"),
+            self.rescue_dir(),
+        ];
+        if let Some(vault) = self.vault.dir() {
+            dirs.push(vault.to_path_buf());
+        }
+        if plan.provider.is_none() {
+            dirs.extend(self.env.log_file().parent().map(Path::to_path_buf));
+        }
+        let mut walls = Vec::new();
+        for dir in &dirs {
+            match fs::metadata(dir) {
+                Ok(meta) => walls.push(FileId::of(&meta)),
+                Err(e) if absent(&e) => {}
+                Err(_) => return Err(LiveGuardError::Unresolved(GuardScope::Purge).into()),
+            }
+        }
+        Ok(walls)
+    }
+
+    /// What the purge leaves alone: the profiles of the accounts it does not affect, and the
+    /// directories above each, which a path passes through to reach one.
+    fn spared_ids(
+        &self,
+        store: Option<&Store>,
+        rows: &[AccountRow],
+    ) -> Result<Spared, EngineError> {
+        let unresolved = || EngineError::from(LiveGuardError::Unresolved(GuardScope::Purge));
+        let affected: BTreeSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        let mut spared = Spared::default();
+        let Some(store) = store else {
+            return Ok(spared);
+        };
+        for row in store.all_accounts()? {
+            if affected.contains(row.id.as_str()) {
+                continue;
+            }
+            let profile = profile_path(&self.env, &row.id);
+            match fs::symlink_metadata(&profile) {
+                Ok(meta) => spared.profiles.push(FileId::of(&meta)),
+                Err(e) if absent(&e) => continue,
+                Err(_) => return Err(unresolved()),
+            }
+            if let Ok(meta) = fs::metadata(&profile) {
+                spared.profiles.push(FileId::of(&meta));
+            }
+            for above in profile.ancestors().skip(1) {
+                match fs::metadata(above) {
+                    Ok(meta) => spared.on_the_way.push(FileId::of(&meta)),
+                    Err(e) if absent(&e) => break,
+                    Err(_) => return Err(unresolved()),
+                }
+            }
+        }
+        Ok(spared)
     }
 
     /// Step 6: refuses the whole purge when any of `deletion_targets` holds a registered
@@ -1028,7 +1050,7 @@ impl Engine {
         plan: &PurgePlan,
         rows: &[AccountRow],
     ) -> Result<(), EngineError> {
-        for target in self.deletion_targets(plan, rows) {
+        for target in self.deletion_targets(plan, rows)? {
             self.refuse_live_at_all(&target)
                 .map_err(|e| e.at_path(&target))?;
         }

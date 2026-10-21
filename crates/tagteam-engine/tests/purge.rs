@@ -704,6 +704,36 @@ fn a_rescue_file_is_deleted_by_a_full_purge_and_refused_by_remove_and_a_provider
     assert!(fx.vault_bytes(&a).is_none());
 }
 
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_displaced_listing_that_fails_after_the_plan_refuses_the_provider_purge() {
+    // §8.4 CC-E-20, Review Focus 1: a listing that fails between `purge_plan` and `purge` must
+    // refuse before anything is deleted, not narrow the live-login check.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    plant_displaced(
+        &fx,
+        &fx.provider(),
+        "1790000000-aaaaaaaaaaaa-abc123",
+        "x@x.co",
+    );
+    let plan = fx.engine.purge_plan(Some(&fx.provider())).unwrap();
+    let displaced = fx.env.data_dir().join("displaced");
+    let shut = displaced.clone();
+    fx.engine.on_point(
+        "purge-guarded",
+        Box::new(move || {
+            fs::set_permissions(&shut, fs::Permissions::from_mode(0o000)).unwrap();
+        }),
+    );
+    let err = fx.engine.purge(&plan).unwrap_err();
+    fs::set_permissions(&displaced, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(err.kind(), "io", "{err:?}");
+    assert!(fx.vault_bytes(&a).is_some(), "refused before the vault");
+}
+
 #[test]
 fn an_undecidable_interrupted_switch_is_deleted_with_a_warning_and_the_live_login_kept() {
     // Decision 7: purge recovers what it can, and deletes what it cannot decide.
