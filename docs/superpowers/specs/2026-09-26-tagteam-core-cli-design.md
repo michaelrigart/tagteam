@@ -1209,8 +1209,9 @@ candidate that is not due keeps its reading and its trust (§8.4).
   - `projectedExhaustionAt = fetched_at + (100 − pct) / rate` (`fetched_at` when `pct ≥ 100`)
   - `willLastToReset = pct + rate · (reset − fetched_at) ≤ 100`
   - `aheadOfPace = pct − expected ≥ 15`, for the windows the fallback covers (never `Short`)
-- **Where they appear.** `list` marks a window that is ahead of pace (`▲ pace`, §13.1).
+- **Where they appear.** `list` marks a window that is ahead of pace (`▲ fast`, §13.1).
   `history` shows the ETA. JSON carries all fields plus the additive `projectionMethod: "regression" | "average"`.
+  *(Amended by the TUI redesign spec §11.1.)*
 
 ## 9. Switch
 
