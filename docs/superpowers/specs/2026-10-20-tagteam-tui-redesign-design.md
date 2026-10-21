@@ -1,6 +1,6 @@
 # tagteam — TUI redesign: one timeline, a quiet screen that gets loud, plain words
 
-**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/28
+**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/29
 **Date:** 2026-10-20
 **Scope:** Redesigns `tagteam tui` from the 2026-10-19 UI/UX review, on branch `tui-redesign`.
 Every VIS-n and UX-n finding of that review is assigned here (§17). So are the TUI items the

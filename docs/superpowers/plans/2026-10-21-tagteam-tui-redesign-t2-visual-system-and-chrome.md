@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/29
 **Goal:** Give the TUI its visual system (roles over three tiers, with the truecolor tier detected safely) and its new chrome: a header that says auto's state, an auto line, a footer and help from one key table, kinded toasts, framed overlays, key guards, empty states and plain words for auto's decisions, with no `--json`, protocol or store change.
 **Architecture:** The engine's accounts view gains each provider's threshold, strategy and names, and `words.rs` gains §11.3's sentences. The input thread asks the terminal its background before its first crossterm read and filters any colour reply it did not finish. `theme.rs` grows to seven roles over tiers 0, 1 and 2. New modules hold the chrome (`chrome.rs`, `autoline.rs`, `keys.rs`), detection (`detect.rs`, `replies.rs`) and the hand-over dialog (`overlay/proceed.rs`).
 **Tech Stack:** Rust 1.88 (edition 2024), ratatui 0.30.2, crossterm =0.29.0, `tagteam_provider::term`'s safe `poll(2)`/`read(2)` wrappers. No new dependency.
