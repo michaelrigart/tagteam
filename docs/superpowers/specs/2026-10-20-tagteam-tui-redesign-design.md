@@ -112,6 +112,7 @@ internal (`relogin required`, `pts/h (regression)`, `no-qualifying-candidate`).
 | M-5 | Store pauses and failed switches as events, outside the TUI's files? | "Do what is best": **yes**, after refactor R4 (§12.4) |
 | M-6 | (2026-10-21, T2 review) A late DA1 reply cut short is held whole by crossterm 0.29, Ctrl-C included. Fix it or accept it? | **Accept, and amend §4.2**: a known residual. No crossterm upgrade, no byte pre-reader |
 | M-7 | (2026-10-21, T2 review) Before T4, should timer mode say `no switches in the last 30 days` without reading the store? | **Show nothing until T4**: rank 4's place stays empty in timer mode (§5.3) |
+| M-8 | (2026-10-21, T3 review) Scheduled polls skip disabled accounts, so a disabled account's reading always goes stale. Should STATUS say `! old reading` or `○ disabled`? | **Disabled wins**: a disabled account's stale reading is not a problem, so STATUS says `○ disabled`. A real problem still wins (`✕ new login`), and UPDATED keeps the stale age in warn (§6.3) |
 
 **Inherited rulings:**
 - **D-2** (refactor §2): keep driving the CLI through argv, and fix its two string couplings with
@@ -535,6 +536,9 @@ account's card (§6.4). Content anchors to the top; spare rows go to the bottom 
   | in use | `in use` | accent |
   | best pick (§6.2) | `best` | text |
   | API key | `api key` | muted |
+
+  A disabled account's stale reading is not a problem (M-8): scheduled polls skip disabled
+  accounts, so such a row says `○ disabled`, its UPDATED still in warn.
 
   At 80 columns the phrase's glyph follows UPDATED.
 - **A row with no reading** shows its status words across the window columns:
