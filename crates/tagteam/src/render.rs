@@ -980,7 +980,7 @@ mod tests {
         // reading's age, and the status in words for a row with no reading.
         let mut live = view(
             1,
-            "michael@example.com",
+            "alex@example.com",
             OAUTH,
             read(120, 9.0, 77.0, true, vec![spend(0.0, 20.0), fable(0.0)]),
         );
@@ -993,7 +993,7 @@ mod tests {
         );
         let mut work = view(
             3,
-            "w@corp.com",
+            "sam@corp.example",
             OAUTH,
             unread(UsageStatus::ReloginRequired, None, None),
         );
@@ -1015,11 +1015,11 @@ mod tests {
                 false
             ),
             concat!(
-                "    #  ACCOUNT                5H           7D                   SPEND      FABLE        UPDATED\n",
-                " *  1  michael@example.com      9%  2h40m   77%  3d09h  ▲ fast  €0 of €20    0%  3d09h  2m\n",
-                "    2  spare@example.com       31%  2h40m   12%  3d09h          —             —         14m\n",
-                "    3  work (w@corp.com)      needs a new login\n",
-                "    4  api-key-4@token.local  api key\n",
+                "    #  ACCOUNT                  5H           7D                   SPEND      FABLE        UPDATED\n",
+                " *  1  alex@example.com           9%  2h40m   77%  3d09h  ▲ fast  €0 of €20    0%  3d09h  2m\n",
+                "    2  spare@example.com         31%  2h40m   12%  3d09h          —             —         14m\n",
+                "    3  work (sam@corp.example)  needs a new login\n",
+                "    4  api-key-4@token.local    api key\n",
             )
         );
     }
@@ -1406,7 +1406,7 @@ mod tests {
     fn pinned_rows() -> Vec<AccountView> {
         let mut live = view(
             1,
-            "michael@example.com",
+            "alex@example.com",
             OAUTH,
             read(120, 9.0, 77.0, true, vec![spend(0.0, 20.0), fable(0.0)]),
         );
@@ -1419,7 +1419,7 @@ mod tests {
         );
         let mut work = view(
             3,
-            "w@corp.com",
+            "sam@corp.example",
             OAUTH,
             unread(UsageStatus::ReloginRequired, None, None),
         );
@@ -1435,11 +1435,11 @@ mod tests {
     }
 
     const PINNED: &str = concat!(
-        "    #  ACCOUNT                5H           7D                   SPEND      FABLE        UPDATED\n",
-        " *  1  michael@example.com      9%  2h40m   77%  3d09h  ▲ fast  €0 of €20    0%  3d09h  2m\n",
-        "    2  spare@example.com       31%  2h40m   12%  3d09h          —             —         14m\n",
-        "    3  work (w@corp.com)      needs a new login\n",
-        "    4  api-key-4@token.local  api key\n",
+        "    #  ACCOUNT                  5H           7D                   SPEND      FABLE        UPDATED\n",
+        " *  1  alex@example.com           9%  2h40m   77%  3d09h  ▲ fast  €0 of €20    0%  3d09h  2m\n",
+        "    2  spare@example.com         31%  2h40m   12%  3d09h          —             —         14m\n",
+        "    3  work (sam@corp.example)  needs a new login\n",
+        "    4  api-key-4@token.local    api key\n",
     );
 
     #[test]
@@ -1472,22 +1472,22 @@ mod tests {
                 false
             ),
             concat!(
-                "    #    ACCOUNT                5H           7D                   SPEND      FABLE        UPDATED\n",
-                " *  1    michael@example.com      9%  2h40m   77%  3d09h  ▲ fast  €0 of €20    0%  3d09h  2m\n",
-                "    2 ▶  spare@example.com       31%  2h40m   12%  3d09h          —             —         14m      this\n",
-                "    3    work (w@corp.com)      needs a new login\n",
-                "    4    api-key-4@token.local  api key\n",
+                "    #    ACCOUNT                  5H           7D                   SPEND      FABLE        UPDATED\n",
+                " *  1    alex@example.com           9%  2h40m   77%  3d09h  ▲ fast  €0 of €20    0%  3d09h  2m\n",
+                "    2 ▶  spare@example.com         31%  2h40m   12%  3d09h          —             —         14m      this\n",
+                "    3    work (sam@corp.example)  needs a new login\n",
+                "    4    api-key-4@token.local    api key\n",
             )
         );
         // Outside a run shell the same session shows, without the note.
         assert_eq!(
             list_human(&one(rows), None, &names, "claude", NOW, false),
             concat!(
-                "    #    ACCOUNT                5H           7D                   SPEND      FABLE        UPDATED\n",
-                " *  1    michael@example.com      9%  2h40m   77%  3d09h  ▲ fast  €0 of €20    0%  3d09h  2m\n",
-                "    2 ▶  spare@example.com       31%  2h40m   12%  3d09h          —             —         14m\n",
-                "    3    work (w@corp.com)      needs a new login\n",
-                "    4    api-key-4@token.local  api key\n",
+                "    #    ACCOUNT                  5H           7D                   SPEND      FABLE        UPDATED\n",
+                " *  1    alex@example.com           9%  2h40m   77%  3d09h  ▲ fast  €0 of €20    0%  3d09h  2m\n",
+                "    2 ▶  spare@example.com         31%  2h40m   12%  3d09h          —             —         14m\n",
+                "    3    work (sam@corp.example)  needs a new login\n",
+                "    4    api-key-4@token.local    api key\n",
             )
         );
     }
@@ -1562,7 +1562,12 @@ mod tests {
 
     #[test]
     fn status_says_which_account_this_session_runs() {
-        let mut side = view(3, "w@corp.com", OAUTH, unread(UsageStatus::Ok, None, None));
+        let mut side = view(
+            3,
+            "sam@corp.example",
+            OAUTH,
+            unread(UsageStatus::Ok, None, None),
+        );
         side.row.alias = Some("work".into());
         let session = ShellAccount::Managed(side.row.clone());
         let failing = view(
@@ -1577,11 +1582,11 @@ mod tests {
         };
         assert_eq!(
             status_human(&managed, &session, None, NOW, false),
-            "Live: a@x.co (position 1 of 3)\n  usage check failed (pre-send, retry <1m)\nThis session: work (w@corp.com) (position 3)\n"
+            "Live: a@x.co (position 1 of 3)\n  usage check failed (pre-send, retry <1m)\nThis session: work (sam@corp.example) (position 3)\n"
         );
         assert_eq!(
             status_human(&StatusView::NoLogin, &session, None, NOW, false),
-            "No live login.\nThis session: work (w@corp.com) (position 3)\n"
+            "No live login.\nThis session: work (sam@corp.example) (position 3)\n"
         );
         let stranger = StatusView::Unmanaged {
             email: "u@x.co".into(),

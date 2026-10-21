@@ -1074,20 +1074,20 @@ mod tests {
                 AutoEvent::AccountQuarantined {
                     provider: cc(),
                     number: 3,
-                    email: "w@corp.com".into(),
+                    email: "sam@corp.example".into(),
                     reason: "invalid_grant".into(),
                 },
-                json!({"event": "account-quarantined", "number": 3, "email": "w@corp.com",
+                json!({"event": "account-quarantined", "number": 3, "email": "sam@corp.example",
                        "reason": "invalid_grant"}),
             ),
             (
                 AutoEvent::AccountUnquarantined {
                     provider: cc(),
                     number: 3,
-                    email: "w@corp.com".into(),
+                    email: "sam@corp.example".into(),
                     reason: "account-replaced".into(),
                 },
-                json!({"event": "account-unquarantined", "number": 3, "email": "w@corp.com",
+                json!({"event": "account-unquarantined", "number": 3, "email": "sam@corp.example",
                        "reason": "account-replaced"}),
             ),
             (
@@ -1188,19 +1188,19 @@ mod tests {
                 AutoEvent::AccountQuarantined {
                     provider: cc(),
                     number: 3,
-                    email: "w@corp.com".into(),
+                    email: "sam@corp.example".into(),
                     reason: "invalid_grant".into(),
                 },
-                r#"{"schemaVersion":1,"event":"account-quarantined","ts":"2026-09-21T14:13:20Z","provider":"claude-code","number":3,"email":"w@corp.com","reason":"invalid_grant"}"#,
+                r#"{"schemaVersion":1,"event":"account-quarantined","ts":"2026-09-21T14:13:20Z","provider":"claude-code","number":3,"email":"sam@corp.example","reason":"invalid_grant"}"#,
             ),
             (
                 AutoEvent::AccountUnquarantined {
                     provider: cc(),
                     number: 3,
-                    email: "w@corp.com".into(),
+                    email: "sam@corp.example".into(),
                     reason: "account-replaced".into(),
                 },
-                r#"{"schemaVersion":1,"event":"account-unquarantined","ts":"2026-09-21T14:13:20Z","provider":"claude-code","number":3,"email":"w@corp.com","reason":"account-replaced"}"#,
+                r#"{"schemaVersion":1,"event":"account-unquarantined","ts":"2026-09-21T14:13:20Z","provider":"claude-code","number":3,"email":"sam@corp.example","reason":"account-replaced"}"#,
             ),
             (
                 AutoEvent::AllExhausted {

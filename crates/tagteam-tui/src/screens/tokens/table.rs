@@ -1948,7 +1948,7 @@ mod tests {
         RowAccount::Account {
             id: id(1),
             position: 1,
-            label: "michael@example.com".into(),
+            label: "alex@example.com".into(),
             alias: None,
         }
     }
@@ -2028,7 +2028,7 @@ mod tests {
                 "{model} whole: {lines:?}"
             );
         }
-        assert!(lines[4].contains(" 1 mich…  "), "{lines:?}");
+        assert!(lines[4].contains(" 1 alex…  "), "{lines:?}");
     }
 
     #[test]
