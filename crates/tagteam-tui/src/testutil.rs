@@ -231,6 +231,15 @@ pub(crate) fn draw_at(state: &State, w: u16, h: u16, now_ms: i64) -> Vec<String>
     text_of(&draw_buffer(state, w, h, now_ms))
 }
 
+/// What `view` draws of `state` in the body's rows alone (`view::areas`), at `w`×`h` and
+/// `now_ms`, trailing spaces trimmed.
+pub(crate) fn body_of(state: &State, w: u16, h: u16, now_ms: i64) -> Vec<String> {
+    let body = crate::view::areas(state, ratatui::layout::Rect::new(0, 0, w, h)).body;
+    let mut rows = draw_at(state, w, h, now_ms);
+    rows.truncate(usize::from(body.y + body.height));
+    rows.split_off(usize::from(body.y))
+}
+
 /// Each row of `buf` as text, trailing spaces trimmed. A cell a wide character covers is
 /// skipped, as a terminal shows it.
 pub(crate) fn text_of(buf: &Buffer) -> Vec<String> {

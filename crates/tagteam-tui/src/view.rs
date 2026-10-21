@@ -936,7 +936,7 @@ mod tests {
         );
         assert_eq!(areas(&state, Rect::new(0, 0, 80, 24)).body.y, 2);
         assert!(
-            lines[2].contains("ACCOUNT"),
+            body_of(&state, 80, 24, NOW_MS)[0].contains("ACCOUNT"),
             "the table under it: {lines:?}"
         );
         assert!(draw(&state, 120, 40)[0].ends_with("keychain locked until 15:05   ? help"));
