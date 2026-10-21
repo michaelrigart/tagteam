@@ -1455,7 +1455,7 @@ mod tests {
     fn session(id: &str, account: RowAccount) -> TokenRow {
         let period = PeriodKey::Session {
             session_id: id.into(),
-            project: Some("/Users/michael/Code/tagteam".into()),
+            project: Some("/Users/alex/Code/tagteam".into()),
             first_ms: YESTERDAY + 9 * HOUR_MS + 12 * 60_000,
             last_ms: YESTERDAY + 11 * HOUR_MS + 40 * 60_000,
         };
@@ -1513,11 +1513,11 @@ mod tests {
                 " filter: all accounts · all models",
                 " UTC · refreshed 14:12",
                 " SESSION            PROJECT              ACCOUNT    INPUT  OUTPUT   TOTAL   COST",
-                "▌09-20 09:12–11:40  …chael/Code/tagteam  1 a1@x.co  20.0K    3.0K  923.0K  $1.23",
-                " 09-20 09:12–11:40  …chael/Code/tagteam  2 spare    20.0K    3.0K  923.0K  $1.23",
+                "▌09-20 09:12–11:40  …/alex/Code/tagteam  1 a1@x.co  20.0K    3.0K  923.0K  $1.23",
+                " 09-20 09:12–11:40  …/alex/Code/tagteam  2 spare    20.0K    3.0K  923.0K  $1.23",
                 " TOTAL                                              40.0K    6.0K    1.8M  $2.46",
                 " 1 response · cache write 0 (5m 0, 1h 0) · cache read 900.0K",
-                " session 3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c · /Users/michael/Code/tagteam",
+                " session 3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c · /Users/alex/Code/tagteam",
                 " 2026-09-20 09:12 – 2026-09-20 11:40 · 1 a1@x.co",
                 " API cost at list prices as of 2026-10-01.",
             ]
@@ -1956,7 +1956,7 @@ mod tests {
     fn work_session() -> PeriodKey {
         PeriodKey::Session {
             session_id: "3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c".into(),
-            project: Some("/Users/michael/Code/tagteam".into()),
+            project: Some("/Users/alex/Code/tagteam".into()),
             first_ms: YESTERDAY + 9 * HOUR_MS + 12 * 60_000,
             last_ms: YESTERDAY + 11 * HOUR_MS + 40 * 60_000,
         }
@@ -2277,7 +2277,7 @@ mod tests {
     fn widest() -> State {
         let long = PeriodKey::Session {
             session_id: "3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c".into(),
-            project: Some("/Users/michael/Code/ViuMore/VM.Portal-feature-user-manuals".into()),
+            project: Some("/Users/alex/Code/ExampleCorp/portal-feature-user-manuals".into()),
             first_ms: YESTERDAY - 365 * DAY_MS + 9 * HOUR_MS + 12 * 60_000,
             last_ms: YESTERDAY - 364 * DAY_MS + 11 * HOUR_MS + 40 * 60_000,
         };
@@ -2376,7 +2376,7 @@ mod tests {
     fn realistic() -> TokenRow {
         let period = PeriodKey::Session {
             session_id: "3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c".into(),
-            project: Some("/Users/michael/Code/ViuMore/VM.Portal-feature-user-manuals".into()),
+            project: Some("/Users/alex/Code/ExampleCorp/portal-feature-user-manuals".into()),
             first_ms: YESTERDAY + 9 * HOUR_MS + 12 * 60_000,
             last_ms: YESTERDAY + 11 * HOUR_MS + 40 * 60_000,
         };
@@ -2398,7 +2398,7 @@ mod tests {
     const DETAIL: [&str; 7] = [
         "412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M) · cache read 88.0M",
         "session 3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c",
-        "/Users/michael/Code/ViuMore/VM.Portal-feature-user-manuals",
+        "/Users/alex/Code/ExampleCorp/portal-feature-user-manuals",
         "2026-09-20 09:12 – 2026-09-20 11:40",
         "1 a1@x.co",
         "claude-opus-5-5, claude-sonnet-5-5",
@@ -2566,7 +2566,7 @@ mod tests {
         // half the body at most and never the table's last three. Below the total nothing is
         // cut: it scrolls, and J reaches every line of it.
         let long = format!("claude-{}", "x".repeat(1993));
-        let project = format!("/Users/michael/{}", "p".repeat(600));
+        let project = format!("/Users/alex/{}", "p".repeat(600));
         let mut big = realistic();
         if let PeriodKey::Session { project: p, .. } = &mut big.period {
             *p = Some(project.clone());

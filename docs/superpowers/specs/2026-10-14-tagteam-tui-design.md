@@ -286,9 +286,9 @@ selected account's card.
 ```
  [Day] Month Session Block    30 days    group: account    filter: all accounts · all models
  DAY         ACCOUNT    INPUT  OUTPUT  CACHE W  CACHE R   TOTAL     COST
- 2026-10-14  michael     1.2M    310k     4.1M    88.0M   93.6M   $41.20 ████████
+ 2026-10-14  alex        1.2M    310k     4.1M    88.0M   93.6M   $41.20 ████████
              spare       0.3M     80k     0.9M    20.1M   21.4M    $9.75 ██
- 2026-10-13  michael     …
+ 2026-10-13  alex        …
  Enter sessions  p period  g group  f filter  [ ] range  Esc back
 ```
 
