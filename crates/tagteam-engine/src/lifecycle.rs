@@ -10,7 +10,8 @@ use tagteam_provider::{Credential, Identity, Provenance, Provider, Read};
 use crate::account_lock::AccountLock;
 use crate::engine::{Engine, GuardRequest, Reconcile};
 use crate::error::{DeletionRefusal, EngineError, GuardScope};
-use crate::fsutil::{FileId, absent, trace_path};
+use crate::fsutil::{FileId, absent};
+use crate::live_guard::{LiveGuardError, live_files, refuse_inside};
 use crate::rescue::RescueUnlisted;
 use crate::store::{AccountRow, EventRow, LoginMeta, NewAccount, Store, StoreError};
 
@@ -447,35 +448,21 @@ impl Engine {
             Err(e) if absent(&e) => return Ok(()),
             Err(_) => return Err(unresolved()),
         }
-        let surface = p.identity_surface(&self.env);
-        let files = surface
-            .credential_files
-            .into_iter()
-            .chain(surface.json_keys.into_iter().map(|(file, _)| file));
-        for file in files {
-            let touched = trace_path(&file).map_err(|_| unresolved())?;
-            let mut inside = false;
-            for path in &touched {
-                // The path itself and each ancestor: one of them being the deleted entry puts
-                // the path at it or under it. A missing ancestor ends that walk.
-                for ancestor in path.ancestors() {
-                    match fs::symlink_metadata(ancestor) {
-                        Ok(meta) => inside |= doomed.contains(&FileId::of(&meta)),
-                        Err(e) if absent(&e) => break,
-                        Err(_) => return Err(unresolved()),
-                    }
-                }
-            }
-            if inside {
+        // The path itself and each ancestor: one of them being the deleted entry puts the path
+        // at it or under it. A missing ancestor ends that walk.
+        refuse_inside(
+            &live_files(p, &self.env),
+            GuardScope::ProfileEntry,
+            |chain| chain.iter().any(|id| doomed.contains(id)),
+        )
+        .map_err(|e| {
+            if matches!(e, LiveGuardError::Inside(_)) {
                 tracing::warn!(
                     "the live login's files are inside a profile directory; nothing was deleted"
                 );
-                return Err(EngineError::DeletionRefused {
-                    why: DeletionRefusal::LiveLoginInside(GuardScope::ProfileEntry),
-                });
             }
-        }
-        Ok(())
+            e.into()
+        })
     }
 
     /// Before anything of `row` is deleted: refuses when deleting its session profile would
