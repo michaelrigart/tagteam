@@ -6,12 +6,14 @@ use std::sync::Arc;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::Engine;
 use tagteam_engine::collect::{CollectMode, Collected};
+use tagteam_engine::daemon::{daemon_lock_path, read_daemon_record};
 use tagteam_engine::error::EngineError;
 use tagteam_engine::tokens::{
     IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport, Wait,
 };
 use tagteam_engine::views::{HistoryView, ProviderAccounts, ShellAccount, StatusView};
-use tagteam_provider::RunShell;
+use tagteam_provider::{Liveness, Read, RunShell};
+
 /// A read that failed, in the CLI's own words (`kind` is the JSON `error.type`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceError {
@@ -39,6 +41,9 @@ pub struct AccountsSnapshot {
     pub in_run_shell: bool,
     /// The engine clock, in seconds, when this was read.
     pub read_at_s: i64,
+    /// Each listed provider whose engine lock names a live process other than the daemon: its
+    /// pid (C-16, T2-11).
+    pub auto_holders: Vec<(ProviderId, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,12 +109,14 @@ impl Source for EngineSource {
                 Ok(StatusView::NoLogin | StatusView::Managed { .. }) | Err(_) => None,
             },
         };
+        let auto_holders = foreign_engine_holders(engine, &providers);
         Ok(AccountsSnapshot {
             providers,
             this,
             unmanaged_live,
             in_run_shell: matches!(engine.run_shell(), RunShell::Inside { .. }),
             read_at_s: engine.now_ms().div_euclid(1000),
+            auto_holders,
         })
     }
 
@@ -154,6 +161,31 @@ impl Source for EngineSource {
     fn token_index_state(&self, provider: &ProviderId) -> Result<IndexState, SourceError> {
         Ok(self.engine.token_index_state(provider)?)
     }
+}
+
+/// Each of `providers` whose engine lock record names a process that runs, judged by an exact pid
+/// and start-time match as `doctor` does (an undeterminable one counts as live), and that is not
+/// the daemon `daemon.lock` names: a `tagteam auto` in another terminal (C-16, T2-11).
+fn foreign_engine_holders(
+    engine: &Engine,
+    providers: &[ProviderAccounts],
+) -> Vec<(ProviderId, u32)> {
+    let daemon = match read_daemon_record(&daemon_lock_path(engine.env())) {
+        Read::Present(r) => Some((r.pid, r.start)),
+        Read::Absent | Read::Unreadable(_) => None,
+    };
+    providers
+        .iter()
+        .filter_map(|p| match engine.engine_holder(&p.provider) {
+            Read::Present(stamp)
+                if stamp.liveness() != Liveness::Dead
+                    && daemon != Some((stamp.pid, stamp.start)) =>
+            {
+                Some((p.provider.clone(), stamp.pid))
+            }
+            Read::Present(_) | Read::Absent | Read::Unreadable(_) => None,
+        })
+        .collect()
 }
 
 /// Whether one account's collection changed what the views show (`Collected`): a reading was

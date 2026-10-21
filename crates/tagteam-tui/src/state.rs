@@ -166,6 +166,16 @@ impl State {
             .find(|p| &p.provider == provider)
     }
 
+    /// The pid of a live `tagteam auto` other than the daemon, holding `provider`'s engine lock
+    /// in the last accounts view (C-16).
+    pub(crate) fn foreign_auto_pid(&self, provider: &ProviderId) -> Option<u32> {
+        self.accounts
+            .snapshot()?
+            .auto_holders
+            .iter()
+            .find_map(|(p, pid)| (p == provider).then_some(*pid))
+    }
+
     /// The first `Cmd`s: load `accounts` (gen 1), and on Tokens its report. History needs an
     /// account, which only the first `accounts` result names, so a TUI started on History loads
     /// it once that arrives.

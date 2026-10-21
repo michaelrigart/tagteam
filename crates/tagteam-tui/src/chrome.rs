@@ -181,6 +181,7 @@ fn fit_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
 mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::{Color, Modifier};
+    use tagteam_core::ProviderId;
     use tagteam_core::autoswitch::Strategy;
     use tagteam_daemon::protocol::{Event, Status, StatusBackoff, StatusSwitch};
 
@@ -633,6 +634,36 @@ mod tests {
             draw(&state, 80, 24)[0]
         );
         assert!(draw(&state, 120, 40)[0].ends_with("! daemon version unsupported   ? keys"));
+    }
+
+    #[test]
+    fn a_foreground_auto_shows_in_timer_mode_only() {
+        // C-16, T2-11: with no daemon, a live `tagteam auto` holding the engine lock is named.
+        let held = |provider: ProviderId| {
+            let mut snap = snapshot(many(1));
+            snap.auto_holders = vec![(provider, 4711)];
+            snap
+        };
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(held(cc()));
+        assert!(
+            draw(&state, 120, 40)[0]
+                .ends_with("● auto runs in another terminal (pid 4711)   ? keys")
+        );
+        assert!(draw(&state, 80, 24)[0].ends_with("● auto in pid 4711   ? keys"));
+
+        state.accounts.apply(held(ProviderId::new("fake-agent")));
+        assert!(
+            draw(&state, 80, 24)[0].ends_with("○ auto off · no daemon   ? keys"),
+            "another provider's holder is not the focus provider's"
+        );
+
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(held(cc()));
+        go_live(&mut state, one_job("auto", true));
+        let row = &draw(&state, 120, 40)[0];
+        assert!(row.contains("● auto on · "), "{row}");
+        assert!(!row.contains("another terminal"), "{row}");
     }
 
     #[test]

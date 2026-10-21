@@ -14,7 +14,8 @@ use crate::theme::Role;
 /// §5.2's state for the focus provider, long from 120 columns; each piece with its role.
 /// Nothing while the TUI waits for the daemon's first `status` (T2-11). In live mode, the
 /// provider's job in the last `status`; else why the daemon is not followed: a protocol this
-/// TUI does not speak, the daemon's `stopping`, or no daemon.
+/// TUI does not speak, the daemon's `stopping`, a `tagteam auto` in another terminal holding the
+/// provider's engine lock (C-16), or no daemon.
 pub(crate) fn auto_state(state: &State, wide: bool) -> Vec<(String, Role)> {
     let d = &state.daemon;
     if !d.settled() {
@@ -43,7 +44,16 @@ pub(crate) fn auto_state(state: &State, wide: bool) -> Vec<(String, Role)> {
         };
         return said("!", Role::Warn, &words, None);
     }
-    said("○", Role::Muted, "auto off", Some("no daemon"))
+    match state.foreign_auto_pid(&provider) {
+        Some(pid) if wide => said(
+            "●",
+            Role::Accent,
+            &format!("auto runs in another terminal (pid {pid})"),
+            None,
+        ),
+        Some(pid) => said("●", Role::Accent, &format!("auto in pid {pid}"), None),
+        None => said("○", Role::Muted, "auto off", Some("no daemon")),
+    }
 }
 
 /// `mark` in `role`, then `words` in text, then `· rest` muted.
