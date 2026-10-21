@@ -113,6 +113,8 @@ impl Replies {
             }
             State::Esc => self.after_esc(byte),
             State::Csi { private, first } => match byte {
+                // An ESC inside a CSI starts a new sequence: no reply byte may reach the keys.
+                ESC => self.state = State::Esc,
                 0x40..=0x7e => {
                     self.state = State::Ground;
                     let end = private && byte == b'c';
@@ -162,6 +164,9 @@ impl Replies {
                 private: false,
                 first: true,
             },
+            // A typed-ahead ESC, or a second one: it starts a new sequence (§4.2), so a reply
+            // that follows is still read whole.
+            ESC => State::Esc,
             _ => State::Ground,
         };
     }
@@ -511,8 +516,20 @@ mod tests {
         assert!(replies.push(b'c'));
     }
 
+    #[test]
+    fn a_typed_ahead_esc_does_not_hide_the_replies_that_follow() {
+        for typed in [&b"\x1b"[..], b"\x1b[", b"\x1b\x1b"] {
+            let bytes = [typed, b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b[?62;22c"].concat();
+            let (replies, took) = answered(&bytes);
+            assert!(replies.answered(), "{typed:?}");
+            assert_eq!(replies.background(), Some(Background::Light), "{typed:?}");
+            assert_eq!(replies.handoff(), Handoff::None, "{typed:?}");
+            assert!(took < Duration::from_millis(100), "{took:?}");
+        }
+    }
+
     /// Bytes a read can end after, and where the parser then stands.
-    const CUTS: [(&[u8], Handoff); 8] = [
+    const CUTS: [(&[u8], Handoff); 11] = [
         (b"", Handoff::None),
         (b"j\x1b]11;rgb:ffff/ffff/ffff\x07k", Handoff::None),
         (b"\x1b[1;1", Handoff::None),
@@ -521,6 +538,9 @@ mod tests {
         (b"\x1b[?62;2", Handoff::Da1),
         (b"\x1b]11;rgb:28", Handoff::Osc),
         (b"\x1b]11;rgb:28\x1b", Handoff::OscEsc),
+        (b"\x1b\x1b]11;rgb:28", Handoff::Osc),
+        (b"\x1b[\x1b]11;rgb:28", Handoff::Osc),
+        (b"\x1b\x1b[?62;2", Handoff::Da1),
     ];
 
     #[test]
