@@ -859,6 +859,11 @@ mod tests {
         snap.providers.push(ProviderAccounts {
             provider: fake,
             active_position: None,
+            forecast: tagteam_engine::views::forecast_of(
+                std::slice::from_ref(&third),
+                &tagteam_engine::switch::LiveLogin::None,
+                &[],
+            ),
             accounts: vec![third],
             threshold: 90.0,
             strategy: tagteam_core::autoswitch::AutoStrategy::Best,
@@ -866,6 +871,8 @@ mod tests {
                 display_name: "FakeAgent",
                 launch_command: "fakeagent",
             },
+            models: vec![],
+            live: tagteam_engine::switch::LiveLogin::None,
         });
         snap
     }

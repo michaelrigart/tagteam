@@ -821,7 +821,6 @@ mod tests {
             Ok(AccountsSnapshot {
                 providers: Vec::new(),
                 this: None,
-                unmanaged_live: None,
                 in_run_shell: false,
                 read_at_s: 0,
                 auto_holders: vec![],

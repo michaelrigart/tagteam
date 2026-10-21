@@ -707,6 +707,11 @@ mod tests {
             .push(tagteam_engine::views::ProviderAccounts {
                 provider: fake,
                 active_position: None,
+                forecast: tagteam_engine::views::forecast_of(
+                    std::slice::from_ref(&third),
+                    &tagteam_engine::switch::LiveLogin::None,
+                    &[],
+                ),
                 accounts: vec![third],
                 threshold: 75.0,
                 strategy: AutoStrategy::Best,
@@ -714,6 +719,8 @@ mod tests {
                     display_name: "FakeAgent",
                     launch_command: "fakeagent",
                 },
+                models: vec![],
+                live: tagteam_engine::switch::LiveLogin::None,
             });
         state.accounts.apply(snap);
         let mut waiting = daemon_job("fake-agent", "waiting", true);

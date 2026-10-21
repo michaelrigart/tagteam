@@ -738,8 +738,8 @@ mod tests {
     use std::path::PathBuf;
 
     use tagteam_cc::CLAUDE_CODE;
-    use tagteam_engine::switch::SwitchReason;
-    use tagteam_engine::views::NO_DATA;
+    use tagteam_engine::switch::{LiveLogin, SwitchReason};
+    use tagteam_engine::views::{NO_DATA, forecast_of};
 
     use super::testutil::*;
     use super::*;
@@ -854,6 +854,7 @@ mod tests {
     }
 
     fn accounts(provider: &str, active: Option<u32>) -> ProviderAccounts {
+        let live = active.map_or(LiveLogin::None, |position| LiveLogin::Managed { position });
         ProviderAccounts {
             provider: ProviderId::new(provider),
             active_position: active,
@@ -864,6 +865,9 @@ mod tests {
                 display_name: "Claude Code",
                 launch_command: "claude",
             },
+            models: vec![],
+            forecast: forecast_of(&[], &live, &[]),
+            live,
         }
     }
 
@@ -929,9 +933,16 @@ mod tests {
     }
 
     fn one(accounts: Vec<AccountView>) -> [ProviderAccounts; 1] {
+        let live = accounts
+            .iter()
+            .find(|v| v.active)
+            .map_or(LiveLogin::None, |v| LiveLogin::Managed {
+                position: v.row.position,
+            });
         [ProviderAccounts {
             provider: ProviderId::new(CLAUDE_CODE),
             active_position: None,
+            forecast: forecast_of(&accounts, &live, &[]),
             accounts,
             threshold: 90.0,
             strategy: tagteam_core::autoswitch::AutoStrategy::Best,
@@ -939,6 +950,8 @@ mod tests {
                 display_name: "Claude Code",
                 launch_command: "claude",
             },
+            models: vec![],
+            live,
         }]
     }
 

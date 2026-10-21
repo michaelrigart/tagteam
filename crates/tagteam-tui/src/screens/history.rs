@@ -930,6 +930,11 @@ mod tests {
             .push(tagteam_engine::views::ProviderAccounts {
                 provider: tagteam_core::ProviderId::new("fake-agent"),
                 active_position: None,
+                forecast: tagteam_engine::views::forecast_of(
+                    std::slice::from_ref(&other),
+                    &tagteam_engine::switch::LiveLogin::None,
+                    &[],
+                ),
                 accounts: vec![other],
                 threshold: 90.0,
                 strategy: tagteam_core::autoswitch::AutoStrategy::Best,
@@ -937,6 +942,8 @@ mod tests {
                     display_name: "FakeAgent",
                     launch_command: "fakeagent",
                 },
+                models: vec![],
+                live: tagteam_engine::switch::LiveLogin::None,
             });
         let mut state = fresh(Screen::History);
         state.accounts.apply(snap);

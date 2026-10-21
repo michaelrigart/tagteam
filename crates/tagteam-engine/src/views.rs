@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tagteam_core::pace::pace;
 use tagteam_core::trust::decision_grade;
-use tagteam_core::usage::{earliest_relevant_reset, is_relevant};
+use tagteam_core::usage::{earliest_relevant_reset, headroom, is_relevant};
 use tagteam_core::{AccountId, Pace, PollBudget, ProviderId, Sample, TrustInputs, Window};
 use tagteam_provider::{Identity, KindTraits, Provider, Read, RunShell};
 
@@ -15,6 +15,7 @@ use crate::settings::Settings;
 use crate::store::{
     AccountRow, LiveIdentityCacheRow, Store, UsageStateRow, backoff_is_skewed, plan_is_skewed,
 };
+use crate::switch::{BestForecast, LiveLogin, PickInput, PickRow, best_candidate};
 
 /// §8.7: pace and projections read the samples of the 48 h before a reading.
 const PACE_LOOKBACK_S: i64 = 48 * 3600;
@@ -148,6 +149,40 @@ pub struct ProviderAccounts {
     pub threshold: f64,
     pub strategy: tagteam_core::autoswitch::AutoStrategy,
     pub names: ProviderNames,
+    /// The effective `autoswitch.models` (§8.2's relevance), the provider's own table first.
+    pub models: Vec<String>,
+    /// The provider's live login as the view read it (T3-5).
+    pub live: LiveLogin,
+    /// `best_candidate` over this view (§12.1), computed with it.
+    pub forecast: BestForecast,
+}
+
+/// `best_candidate` over `accounts` as a view shows them (§12.1): each row a candidate when
+/// `is_poll_candidate` and not in a session (T3-4), its headroom from a decision-grade reading's
+/// relevant windows under `models`; no I/O. A headroom that is not finite is unknown.
+pub fn forecast_of(accounts: &[AccountView], live: &LiveLogin, models: &[String]) -> BestForecast {
+    let rows = accounts
+        .iter()
+        .map(|v| PickRow {
+            position: v.row.position,
+            candidate: v.row.is_poll_candidate() && !v.in_session,
+            headroom: v
+                .usage
+                .windows
+                .as_deref()
+                .filter(|_| v.usage.decision_grade)
+                .and_then(|read| {
+                    let windows: Vec<Window> = read.iter().map(|(w, _)| w.clone()).collect();
+                    headroom(&windows, models)
+                })
+                .filter(|h| h.is_finite()),
+        })
+        .collect();
+    best_candidate(&PickInput {
+        live: live.clone(),
+        force: false,
+        rows,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -281,7 +316,7 @@ pub enum StatuslineView {
 
 /// The live login as `statusline` needs it: its identity key and its label (the email when it
 /// has one).
-struct LiveLogin {
+struct CachedLogin {
     key: String,
     label: String,
     account_uuid: Option<String>,
@@ -305,9 +340,9 @@ impl Liveness {
     }
 }
 
-impl LiveLogin {
+impl CachedLogin {
     fn of(p: &dyn Provider, i: &Identity) -> Self {
-        LiveLogin {
+        CachedLogin {
             key: p.identity_key(i).as_str().to_owned(),
             label: i.email.clone().unwrap_or_else(|| i.label.clone()),
             account_uuid: i.account_uuid.clone(),
@@ -511,6 +546,15 @@ impl Engine {
         let active_position = accounts.iter().find(|v| v.active).map(|v| v.row.position);
         let live_label = live.identity.map(|i| i.email.unwrap_or(i.label));
         let (settings, _) = Settings::load(&self.env, provider);
+        // T3-5: the account the view marks active, the stored-active fallback included.
+        let live = match (active_position, &live_label) {
+            (Some(position), _) => LiveLogin::Managed { position },
+            (None, Read::Present(email)) => LiveLogin::Unmanaged {
+                email: email.clone(),
+            },
+            (None, Read::Absent | Read::Unreadable(_)) => LiveLogin::None,
+        };
+        let forecast = forecast_of(&accounts, &live, &settings.models);
         Ok((
             ProviderAccounts {
                 provider: provider.clone(),
@@ -519,6 +563,9 @@ impl Engine {
                 threshold: settings.threshold,
                 strategy: settings.strategy,
                 names: ProviderNames::of(p.as_ref()),
+                models: settings.models,
+                live,
+                forecast,
             },
             live_label,
         ))
@@ -532,6 +579,7 @@ impl Engine {
         store: Option<&Store>,
         provider: &ProviderId,
     ) -> Result<Liveness, EngineError> {
+        crate::hooks::point(self, "view-live-identity")?;
         let identity = p.live_identity(&self.env);
         let key = identity
             .as_ref()
@@ -880,9 +928,9 @@ impl Engine {
         &self,
         p: &dyn Provider,
         store: Option<&Store>,
-    ) -> Result<Option<LiveLogin>, EngineError> {
+    ) -> Result<Option<CachedLogin>, EngineError> {
         let parse = || match p.live_identity(&self.env) {
-            Read::Present(i) => Some(Some(LiveLogin::of(p, &i))),
+            Read::Present(i) => Some(Some(CachedLogin::of(p, &i))),
             Read::Absent => Some(None),
             Read::Unreadable(_) => None,
         };
@@ -908,7 +956,7 @@ impl Engine {
         };
         if let Some(c) = store.live_identity_cache(&stamp.provider)? {
             if c.path == stamp.path && c.mtime_ns == stamp.mtime_ns && c.size == stamp.size {
-                return Ok(c.identity_key.map(|key| LiveLogin {
+                return Ok(c.identity_key.map(|key| CachedLogin {
                     key,
                     label: c.label.unwrap_or_default(),
                     account_uuid: c.account_uuid,

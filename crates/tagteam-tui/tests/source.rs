@@ -17,6 +17,7 @@ use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::{Eligibility, NewAccount, Reserve, Store};
+use tagteam_engine::switch::LiveLogin;
 use tagteam_engine::tokens::{
     PeriodKey, RefreshOutcome, RowAccount, TokenGrouping, TokenPeriod, TokenQuery, tokens_lock_path,
 };
@@ -236,11 +237,11 @@ fn accounts_is_lists_view_read_at_the_engine_clock() {
     assert_eq!(
         (
             snap.this,
-            snap.unmanaged_live,
+            &snap.providers[0].live,
             snap.in_run_shell,
             snap.read_at_s
         ),
-        (None, None, false, NOW_S)
+        (None, &LiveLogin::Managed { position: 1 }, false, NOW_S)
     );
 }
 
@@ -250,7 +251,12 @@ fn a_live_login_tagteam_does_not_manage_is_named() {
     home.add(CLAUDE_CODE, 1, "a@x.co");
     home.login("s@x.co");
     let snap = home.source().accounts(None).unwrap();
-    assert_eq!(snap.unmanaged_live.as_deref(), Some("s@x.co"));
+    assert_eq!(
+        snap.providers[0].live,
+        LiveLogin::Unmanaged {
+            email: "s@x.co".into()
+        }
+    );
     assert_eq!(snap.providers[0].active_position, None);
 }
 

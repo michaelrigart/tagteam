@@ -106,7 +106,7 @@ pub struct PickInput {
 }
 
 /// An account as `best_candidate` ranks it: `candidate` is `switch_candidate`'s two layers
-/// (`is_candidate`, and not session-owned), and `headroom` comes from its decision-grade,
+/// (`is_poll_candidate`, and not session-owned), and `headroom` comes from its decision-grade,
 /// relevant windows only (`None`: unknown).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PickRow {
@@ -788,6 +788,15 @@ mod tests {
                     ],
                 ),
                 none(NoPick::CandidatesExhausted),
+            ),
+            (
+                "managed live known at its limit, a candidate less far past it",
+                input(
+                    managed(),
+                    false,
+                    &[row(1, true, Some(-10.0)), row(2, true, Some(-5.0))],
+                ),
+                pick(&[2]),
             ),
             (
                 "managed live known, no candidate known",
