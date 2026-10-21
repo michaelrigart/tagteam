@@ -276,15 +276,16 @@ fn row(buf: &Buffer, y: u16) -> (String, Vec<(usize, u16)>) {
 }
 
 /// The letters `roles` reads, in the order it tries them.
-const LETTERS: [(char, Role); 5] = [
+const LETTERS: [(char, Role); 6] = [
     ('c', Role::Crit),
     ('w', Role::Warn),
+    ('o', Role::Ok),
     ('a', Role::Accent),
     ('f', Role::Faint),
     ('m', Role::Muted),
 ];
 
-/// Row `y` of `buf` as role letters: `c w a f m` (crit, warn, accent, faint, muted), the first
+/// Row `y` of `buf` as role letters: `c w o a f m` (crit, warn, ok, accent, faint, muted), the first
 /// whose non-empty style the cell's contains (fg equal where the role sets one, its modifiers
 /// present), else `t`; a space cell is ` `. A cell a wide character covers is skipped, as
 /// `text_of` skips it.

@@ -151,6 +151,33 @@ impl Action {
         }
     }
 
+    /// The UI's words while the action runs (redesign §9.4, T2-17), without the `…`: the
+    /// spinner shows them, and the busy toast says `still <label>`. `named` gives an account's
+    /// short name (`words::short_name`) and `display` the provider's display name.
+    pub fn label(&self, named: &dyn Fn(&AccountRef) -> String, display: &str) -> String {
+        match self {
+            Action::Switch(a) => format!("switching to {}", named(a)),
+            Action::SwitchBy {
+                strategy: UsageStrategy::Best,
+                ..
+            } => "switching to the best account".into(),
+            Action::SwitchBy {
+                strategy: UsageStrategy::NextAvailable,
+                ..
+            } => "switching to the next account".into(),
+            Action::Enable(a) => format!("enabling {}", named(a)),
+            Action::Disable(a) => format!("disabling {}", named(a)),
+            Action::SetAlias { .. } | Action::ClearAlias(_) => "setting the alias".into(),
+            Action::Move { account, .. } => format!("moving {}", named(account)),
+            Action::Remove(a) => format!("removing {}", named(a)),
+            Action::AddLive { .. } => format!("adding {display}'s login"),
+            Action::Run(a) => format!("starting {display} as {}", named(a)),
+            Action::Doctor { .. } => "running doctor".into(),
+            Action::Autoswitch { on: false, .. } => "pausing auto".into(),
+            Action::Autoswitch { on: true, .. } => "resuming auto".into(),
+        }
+    }
+
     /// `Run` only: it always runs suspended (spec §7.3).
     pub fn needs_terminal(&self) -> bool {
         matches!(self, Action::Run(_))
@@ -363,6 +390,67 @@ mod tests {
             ),
         ] {
             assert_eq!(action.name(), name, "{action:?}");
+        }
+    }
+
+    #[test]
+    fn every_action_has_its_label() {
+        // Redesign §9.4's eleven, and T2-17's two (`R`, clearing an alias), and `enable`, which
+        // neither lists.
+        let a = || account(3);
+        let named = |r: &AccountRef| format!("{} spare", r.position);
+        let label = |action: Action| action.label(&named, "Claude Code");
+        let by = |strategy| Action::SwitchBy {
+            provider: provider(),
+            strategy,
+        };
+        let auto = |on| Action::Autoswitch {
+            provider: provider(),
+            on,
+        };
+        for (action, want) in [
+            (Action::Switch(a()), "switching to 3 spare"),
+            (by(UsageStrategy::Best), "switching to the best account"),
+            (
+                by(UsageStrategy::NextAvailable),
+                "switching to the next account",
+            ),
+            (Action::Disable(a()), "disabling 3 spare"),
+            (
+                Action::SetAlias {
+                    account: a(),
+                    alias: "work".into(),
+                },
+                "setting the alias",
+            ),
+            (
+                Action::Move {
+                    account: a(),
+                    position: 1,
+                },
+                "moving 3 spare",
+            ),
+            (Action::Remove(a()), "removing 3 spare"),
+            (
+                Action::AddLive {
+                    provider: provider(),
+                },
+                "adding Claude Code's login",
+            ),
+            (
+                Action::Doctor {
+                    provider: None,
+                    online: true,
+                },
+                "running doctor",
+            ),
+            (auto(false), "pausing auto"),
+            (auto(true), "resuming auto"),
+            (Action::Run(a()), "starting Claude Code as 3 spare"),
+            (Action::ClearAlias(a()), "setting the alias"),
+            (Action::Enable(a()), "enabling 3 spare"),
+        ] {
+            assert_eq!(label(action.clone()), want, "{action:?}");
         }
     }
 

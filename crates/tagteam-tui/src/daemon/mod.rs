@@ -18,7 +18,7 @@ use tagteam_engine::words::NO_SWITCH_REASONS;
 use crate::live::{Live, StatusError};
 use crate::msg::Cmd;
 use crate::screens;
-use crate::state::{Screen, State};
+use crate::state::{Screen, State, ToastKind};
 
 /// Spec §6.3: what an event asks for is read this long after it, and the events that come
 /// meanwhile share that read.
@@ -109,6 +109,9 @@ pub struct DaemonState {
     /// Each provider's last `poll` on this link, whose usage a `no-switch` of the same tick
     /// reads. A link can miss events before it, so a new one starts with none (C-R21).
     polls: BTreeMap<String, Value>,
+    /// A live link was lost in this session, and none has answered since (T2-10): the first
+    /// `status` after it says the daemon is back.
+    lost: bool,
 }
 
 impl DaemonState {
@@ -174,11 +177,11 @@ pub(crate) fn on_live(state: &mut State, live: Live, now_ms: i64) -> Vec<Cmd> {
     match live {
         Live::Up { link } => up(state, link, now_ms),
         Live::Down => {
-            down(state);
+            down(state, now_ms);
             vec![]
         }
         Live::Mismatch { server } => {
-            down(state);
+            down(state, now_ms);
             state.daemon.stopping = None;
             state.daemon.mismatch = Some(server);
             state.dirty = true;
@@ -215,8 +218,9 @@ fn up(state: &mut State, link: u64, now_ms: i64) -> Vec<Cmd> {
 }
 
 /// The link is down, or none came up: timer mode (spec §8), and the TUI knows who collects
-/// (C-R20). A mismatch seen before is gone too, since no daemon answered this time.
-fn down(state: &mut State) {
+/// (C-R20). A mismatch seen before is gone too, since no daemon answered this time. A live link
+/// lost toasts it, once (T2-10).
+fn down(state: &mut State, now_ms: i64) {
     screens::tokens::index::on_link_down(state);
     let d = &mut state.daemon;
     if d.mismatch.take().is_some() {
@@ -228,6 +232,7 @@ fn down(state: &mut State) {
     if d.link.take().is_none() {
         return;
     }
+    let was_live = d.status.is_some();
     d.status = None;
     d.status_due_ms = None;
     d.status_again = false;
@@ -237,6 +242,11 @@ fn down(state: &mut State) {
     d.reread_all = false;
     d.reread_status = false;
     state.dirty = true;
+    if was_live && state.quitting.is_none() {
+        state.daemon.lost = true;
+        let words = "lost the daemon; tagteam updates on its own every 30 s";
+        state.toast(ToastKind::Warn, words, now_ms);
+    }
 }
 
 /// Spec §7.4: `P`'s setting was written; `status` is fetched `RECHECK_MS` from now, whether or
@@ -262,8 +272,8 @@ fn fetch(state: &mut State, now_ms: i64) -> Option<Cmd> {
 
 /// C-R19: link `link` does not work. Timer mode, and the live thread is told to end that link,
 /// if it still holds it (C-R21), which it then connects again with backoff.
-fn broken(state: &mut State, link: u64) -> Vec<Cmd> {
-    down(state);
+fn broken(state: &mut State, link: u64, now_ms: i64) -> Vec<Cmd> {
+    down(state, now_ms);
     vec![Cmd::DropLink { link }]
 }
 
@@ -289,7 +299,7 @@ fn on_event(state: &mut State, event: Event, now_ms: i64) -> Vec<Cmd> {
         // C-R18: the link ends here, whether or not the daemon goes on to close it; the live
         // thread drops it and connects again with backoff.
         Event::Stopping { reason } => {
-            down(state);
+            down(state, now_ms);
             state.daemon.stopping = Some((reason, now_ms + STOPPING_MS));
             state.dirty = true;
         }
@@ -397,6 +407,9 @@ pub(crate) fn on_status(
             d.status = Some(status);
             d.unsettled_until = None;
             state.dirty = true;
+            if std::mem::take(&mut d.lost) {
+                state.toast(ToastKind::Done, "connected to the daemon", now_ms);
+            }
             if keeps_index(state) {
                 screens::tokens::index::on_daemon_index(state);
             }
@@ -405,7 +418,7 @@ pub(crate) fn on_status(
             }
             fetch(state, now_ms).into_iter().collect()
         }
-        Err(_) => broken(state, link),
+        Err(_) => broken(state, link, now_ms),
     }
 }
 
@@ -469,7 +482,7 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
         return vec![];
     };
     if d.status_due_ms.is_some_and(|due| now_ms >= due) {
-        return broken(state, link);
+        return broken(state, link, now_ms);
     }
     let (mut views, mut all, mut fetch_now) = (false, false, false);
     if d.reread_ms.is_some_and(|at| now_ms >= at) {
@@ -678,6 +691,51 @@ mod tests {
             state.daemon.job(&cc()).map(|j| j.mode.as_str()),
             Some("auto")
         );
+    }
+
+    #[test]
+    fn losing_the_daemon_toasts_once_and_connecting_again_toasts_once() {
+        // T2-10: the first link at start-up is no change the person noticed; a live link lost
+        // is, and so is the first `status` of the link after it.
+        let toast = |state: &State| state.toast.as_ref().map(|t| (t.kind, t.text.clone()));
+        let lost = (
+            ToastKind::Warn,
+            "lost the daemon; tagteam updates on its own every 30 s".to_owned(),
+        );
+        let mut state = fresh(Screen::Accounts);
+        let first = go_live(&mut state, auto_on());
+        assert_eq!(toast(&state), None, "the first link's status says nothing");
+        update(&mut state, Msg::Live(Live::Down), NOW_MS);
+        assert_eq!(toast(&state), Some(lost.clone()));
+        state.toast = None;
+        update(&mut state, Msg::Live(Live::Down), NOW_MS);
+        assert_eq!(toast(&state), None, "once: no link was left to lose");
+        // A link that comes up and fails before its `status` was never live.
+        update(&mut state, Msg::Live(Live::Up { link: 2 }), NOW_MS);
+        update(&mut state, Msg::Live(Live::Down), NOW_MS);
+        assert_eq!(toast(&state), None);
+        update(&mut state, Msg::Live(Live::Up { link: 3 }), NOW_MS);
+        assert_eq!(toast(&state), None, "a link up is not yet a daemon heard");
+        let reply = |link, result| Msg::DaemonStatus { link, result };
+        update(&mut state, reply(first, Ok(auto_on())), NOW_MS);
+        assert_eq!(toast(&state), None, "a reply for a link long gone");
+        update(&mut state, reply(3, Ok(auto_on())), NOW_MS);
+        assert_eq!(
+            toast(&state),
+            Some((ToastKind::Done, "connected to the daemon".to_owned()))
+        );
+        state.toast = None;
+        update(&mut state, reply(3, Ok(auto_on())), NOW_MS);
+        assert_eq!(toast(&state), None, "once: only the link's first status");
+        // The next loss and return say so again.
+        update(&mut state, Msg::Live(Live::Down), NOW_MS);
+        assert_eq!(toast(&state), Some(lost));
+        // No toast once the shutdown has begun.
+        let mut quitting = fresh(Screen::Accounts);
+        go_live(&mut quitting, auto_on());
+        quitting.quitting = Some(0);
+        update(&mut quitting, Msg::Live(Live::Down), NOW_MS);
+        assert_eq!(toast(&quitting), None);
     }
 
     #[test]

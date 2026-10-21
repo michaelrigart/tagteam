@@ -829,6 +829,8 @@ mod tests {
             Ok(CollectSummary {
                 fetched: 0,
                 warnings: Vec::new(),
+                updated: 0,
+                rate_limited: vec![],
             })
         }
 
@@ -900,6 +902,8 @@ mod tests {
             Ok(CollectSummary {
                 fetched: 0,
                 warnings: Vec::new(),
+                updated: 0,
+                rate_limited: vec![],
             })
         }
 
@@ -987,6 +991,8 @@ mod tests {
             Ok(CollectSummary {
                 fetched: 0,
                 warnings: Vec::new(),
+                updated: 0,
+                rate_limited: vec![],
             })
         }
         fn refresh_tokens(

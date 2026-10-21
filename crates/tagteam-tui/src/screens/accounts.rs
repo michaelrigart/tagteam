@@ -1139,7 +1139,11 @@ mod tests {
             BannerKind::Refusal,
             ["the store could not be read"; 12].join("; "),
         );
-        state.toast(["Switched to a@x.co (position 1)"; 8].join(" "), NOW_MS);
+        state.toast(
+            crate::state::ToastKind::Info,
+            ["Switched to a@x.co (position 1)"; 8].join(" "),
+            NOW_MS,
+        );
         for _ in 0..3 {
             update(&mut state, ch('J'), NOW_MS);
         }
@@ -1191,7 +1195,11 @@ mod tests {
             BannerKind::Refusal,
             ["the store could not be read"; 12].join("; "),
         );
-        state.toast(["Switched to a@x.co (position 1)"; 8].join(" "), NOW_MS);
+        state.toast(
+            crate::state::ToastKind::Info,
+            ["Switched to a@x.co (position 1)"; 8].join(" "),
+            NOW_MS,
+        );
         for _ in 0..3 {
             update(&mut state, ch('J'), NOW_MS);
         }
@@ -1280,7 +1288,11 @@ mod tests {
             BannerKind::Refusal,
             ["the store could not be read"; 12].join("; "),
         );
-        state.toast(["Switched to a@x.co (position 1)"; 8].join(" "), NOW_MS);
+        state.toast(
+            crate::state::ToastKind::Info,
+            ["Switched to a@x.co (position 1)"; 8].join(" "),
+            NOW_MS,
+        );
         for _ in 0..2 {
             update(&mut state, ch('J'), NOW_MS);
         }

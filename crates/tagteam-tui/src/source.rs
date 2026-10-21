@@ -50,6 +50,10 @@ pub struct AccountsSnapshot {
 pub struct CollectSummary {
     pub fetched: usize,
     pub warnings: Vec<String>,
+    /// The accounts whose reading was recorded (`Collected::Recorded`).
+    pub updated: usize,
+    /// The accounts the usage endpoint refused for rate limiting (`Failed { kind: "http-429" }`).
+    pub rate_limited: Vec<AccountId>,
 }
 
 pub trait Source {
@@ -126,12 +130,15 @@ impl Source for EngineSource {
     }
 
     /// `list`'s on-demand collection (core §8.3): the collector fetches only what is due.
-    /// `fetched` counts the accounts whose stored usage changed.
+    /// `fetched` counts the accounts whose stored usage changed, `updated` those with a new
+    /// reading, and `rate_limited` lists those the endpoint refused.
     fn collect_due(&self, accounts: &[AccountId]) -> Result<CollectSummary, SourceError> {
         if accounts.is_empty() {
             return Ok(CollectSummary {
                 fetched: 0,
                 warnings: vec![],
+                updated: 0,
+                rate_limited: vec![],
             });
         }
         let report = self.engine.collect_usage(CollectMode::OnDemand {
@@ -140,6 +147,17 @@ impl Source for EngineSource {
         Ok(CollectSummary {
             fetched: report.outcomes.iter().filter(|(_, c)| recorded(c)).count(),
             warnings: report.warnings,
+            updated: report
+                .outcomes
+                .iter()
+                .filter(|(_, c)| matches!(c, Collected::Recorded))
+                .count(),
+            rate_limited: report
+                .outcomes
+                .iter()
+                .filter(|(_, c)| matches!(c, Collected::Failed { kind } if kind == "http-429"))
+                .map(|(id, _)| id.clone())
+                .collect(),
         })
     }
 
@@ -243,6 +261,8 @@ mod tests {
             Ok(CollectSummary {
                 fetched: 0,
                 warnings: vec![self.0.into()],
+                updated: 0,
+                rate_limited: vec![],
             })
         }
         fn refresh_tokens(

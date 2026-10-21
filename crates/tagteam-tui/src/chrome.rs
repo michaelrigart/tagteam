@@ -7,9 +7,9 @@ use crate::autoline;
 use crate::daemon::words::auto_state;
 use crate::keys;
 use crate::screens;
-use crate::state::{BannerKind, Screen, State};
-use crate::theme::Role;
-use crate::view::{WRAP_ROWS, fit, width_of, wrap_rows};
+use crate::state::{BannerKind, Screen, State, Toast, ToastKind};
+use crate::theme::{Role, Theme};
+use crate::view::{WRAP_ROWS, fit, width_of, wrap, wrap_rows};
 
 /// From this many rows a faint rule sits under the chrome (§4.5).
 pub(crate) const RULE_FROM: u16 = 30;
@@ -102,36 +102,173 @@ pub(crate) fn rule(state: &State, width: u16) -> Line<'static> {
     ))
 }
 
-/// The footer's keys (§5.5): the screen's items from column 0 (`keys::footer_items`), each key
-/// in accent and its label muted, two spaces apart, and `? keys  q quit` on the right, one
-/// column in. The items give way from the end; the pinned ones stay.
-pub(crate) fn footer(state: &State, width: u16) -> Line<'static> {
-    let theme = state.theme;
-    let item = |key: &str, label: &str| {
-        [
-            Span::styled(key.to_owned(), theme.role(Role::Accent)),
-            Span::styled(format!(" {label}"), theme.role(Role::Muted)),
-        ]
-    };
-    let mut spans = Vec::new();
-    for (n, (key, label)) in keys::footer_items(state, width).into_iter().enumerate() {
-        if n > 0 {
-            spans.push(Span::raw("  "));
-        }
-        spans.extend(item(key, label));
-    }
+/// A toast wrapped beside the right part takes at least this many columns; with fewer it takes
+/// the full width and the right part is dropped (§5.5).
+const TOAST_MIN: usize = 40;
+
+/// A toast's rows, and whether the right part (the spinner and the pinned two) sits on the last.
+pub(crate) struct ToastRows {
+    pub(crate) rows: Vec<String>,
+    pub(crate) right: bool,
+}
+
+/// One footer item: its key in accent and its label muted.
+fn item(theme: Theme, key: &str, label: &str) -> [Span<'static>; 2] {
+    [
+        Span::styled(key.to_owned(), theme.role(Role::Accent)),
+        Span::styled(format!(" {label}"), theme.role(Role::Muted)),
+    ]
+}
+
+/// The pinned `? keys  q quit`.
+fn pinned_spans(theme: Theme) -> Vec<Span<'static>> {
     let mut pinned = Vec::new();
     for (n, (key, label)) in keys::PINNED.into_iter().enumerate() {
         if n > 0 {
             pinned.push(Span::raw("  "));
         }
-        pinned.extend(item(key, label));
+        pinned.extend(item(theme, key, label));
     }
-    let gap = usize::from(width)
-        .saturating_sub(spans_width(&spans) + spans_width(&pinned) + keys::RIGHT_INSET);
-    spans.push(Span::raw(" ".repeat(gap)));
-    spans.extend(pinned);
-    Line::from(spans)
+    pinned
+}
+
+/// The words the spinner shows, without the `…`: the running action's label (§9.4), else
+/// `checking usage` while a person's `r` waits for its collection (§9.7).
+pub(crate) fn busy_label(state: &State) -> Option<String> {
+    match &state.running {
+        Some(action) => Some(state.label_of(action)),
+        None => state.checking.map(|_| "checking usage".to_owned()),
+    }
+}
+
+/// The toast the footer shows: not once the shutdown has begun.
+fn shown_toast(state: &State) -> Option<&Toast> {
+    state.toast.as_ref().filter(|_| state.quitting.is_none())
+}
+
+/// `{mark} {text}` (§5.5), the mark being `✓` for `Done`, `!` for `Warn` and `✕` for `Failed`,
+/// in the role the mark is drawn in; none for `Info`.
+fn toast_mark(kind: ToastKind) -> Option<(&'static str, Role)> {
+    match kind {
+        ToastKind::Done => Some(("✓", Role::Ok)),
+        ToastKind::Info => None,
+        ToastKind::Warn => Some(("!", Role::Warn)),
+        ToastKind::Failed => Some(("✕", Role::Crit)),
+    }
+}
+
+/// The width a toast of `kind` wraps in at `width` columns, and whether the right part stays:
+/// the width less the right part and two columns, when that leaves `TOAST_MIN`; else all of it.
+fn toast_room(state: &State, width: usize) -> (usize, bool) {
+    let spinner = busy_label(state).map_or(0, |label| width_of(&label) + 3 + 2);
+    let right = spinner + keys::pinned_width() + keys::RIGHT_INSET;
+    let room = width.saturating_sub(right + 2);
+    if room >= TOAST_MIN {
+        (room, true)
+    } else {
+        (width, false)
+    }
+}
+
+fn toast_words(kind: ToastKind, text: &str) -> String {
+    match toast_mark(kind) {
+        Some((mark, _)) => format!("{mark} {text}"),
+        None => text.to_owned(),
+    }
+}
+
+/// A toast's rows at `width` columns: `{mark} {text}` wrapped onto `WRAP_ROWS` rows at most, from
+/// the body, with the right part on the last row when it fits (§5.5). An empty toast still takes
+/// the footer's one row.
+pub(crate) fn toast_rows(state: &State, kind: ToastKind, text: &str, width: u16) -> ToastRows {
+    let (room, right) = toast_room(state, usize::from(width));
+    let mut rows = wrap_rows(&toast_words(kind, text), room, WRAP_ROWS);
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    ToastRows { rows, right }
+}
+
+/// Whether a toast of `kind` fits `WRAP_ROWS` rows whole at the terminal's width, or would lose
+/// words to the last row's `…`.
+pub(crate) fn toast_fits(state: &State, kind: ToastKind, text: &str) -> bool {
+    let (room, _) = toast_room(state, usize::from(state.size.0));
+    wrap(&toast_words(kind, text), room).len() <= WRAP_ROWS
+}
+
+/// How many rows the footer takes for a toast, when it shows one.
+pub(crate) fn toast_height(state: &State, width: u16) -> Option<usize> {
+    let toast = shown_toast(state)?;
+    Some(toast_rows(state, toast.kind, &toast.text, width).rows.len())
+}
+
+/// The footer (§5.5) at `width`, `frame` being the spinner's frame now:
+/// - a toast, on as many rows as it needs, `WRAP_ROWS` at most, its mark in its role;
+/// - else the spinner (`{frame} {label}…`, in accent);
+/// - else the screen's keys (`keys::footer_items`) from column 0, each key in accent and its
+///   label muted, two spaces apart.
+///
+/// `? keys  q quit` sits on the right of the last row, one column in, wherever it fits. While an
+/// action runs, the spinner moves right of a toast, before the pinned two.
+pub(crate) fn footer(state: &State, width: u16, frame: &str) -> Vec<Line<'static>> {
+    let theme = state.theme;
+    let columns = usize::from(width);
+    let spinner = busy_label(state)
+        .map(|label| Span::styled(format!("{frame} {label}…"), theme.role(Role::Accent)));
+    let pinned = pinned_spans(theme);
+    // `left`, a gap, then `right` ending `RIGHT_INSET` columns from the edge.
+    let beside = |mut left: Vec<Span<'static>>, right: Vec<Span<'static>>| {
+        let used = spans_width(&left) + spans_width(&right) + keys::RIGHT_INSET;
+        left.push(Span::raw(" ".repeat(columns.saturating_sub(used))));
+        left.extend(right);
+        Line::from(left)
+    };
+    if let Some(toast) = shown_toast(state) {
+        let layout = toast_rows(state, toast.kind, &toast.text, width);
+        let mark = toast_mark(toast.kind);
+        let mut right = Vec::new();
+        if let Some(spinner) = spinner {
+            right.extend([spinner, Span::raw("  ")]);
+        }
+        right.extend(pinned);
+        let last = layout.rows.len() - 1;
+        return layout
+            .rows
+            .into_iter()
+            .enumerate()
+            .map(|(n, row)| {
+                let marked = mark.filter(|_| n == 0).and_then(|(mark, role)| {
+                    row.strip_prefix(mark)
+                        .map(|rest| (Span::styled(mark, theme.role(role)), rest.to_owned()))
+                });
+                let left = match marked {
+                    Some((mark, rest)) => vec![mark, Span::raw(rest)],
+                    None => vec![Span::raw(row)],
+                };
+                if n == last && layout.right {
+                    beside(left, right.clone())
+                } else {
+                    Line::from(left)
+                }
+            })
+            .collect();
+    }
+    if let Some(spinner) = spinner {
+        let room = columns.saturating_sub(spans_width(&pinned) + keys::RIGHT_INSET + 2);
+        let left = vec![spinner];
+        if spans_width(&left) > room {
+            return vec![Line::from(fit_spans(left, columns))];
+        }
+        return vec![beside(left, pinned)];
+    }
+    let mut left = Vec::new();
+    for (n, (key, label)) in keys::footer_items(state, width).into_iter().enumerate() {
+        if n > 0 {
+            left.push(Span::raw("  "));
+        }
+        left.extend(item(theme, key, label));
+    }
+    vec![beside(left, pinned)]
 }
 
 /// The banner's words and role (T2-14), its rows as `banner_rows` wraps them. One shows at a
@@ -219,6 +356,7 @@ mod tests {
     use tagteam_daemon::protocol::{Event, Status, StatusBackoff, StatusSwitch};
 
     use super::*;
+    use crate::host::{AccountRef, Action};
     use crate::live::Live;
     use crate::msg::Msg;
     use crate::testutil::*;
@@ -981,6 +1119,107 @@ mod tests {
                         "{screen:?} {w}"
                     );
                 }
+            }
+        }
+    }
+    /// Row `y` of `state` drawn at `w` columns, and its role letters under `theme`.
+    fn footer_of(state: &State, w: u16, theme: Theme) -> (String, String) {
+        let h = if w >= WIDE { 40 } else { 24 };
+        let buf = draw_buffer(state, w, h, NOW_MS);
+        let last = h - 1;
+        (
+            text_of(&buf)[usize::from(last)].clone(),
+            roles(&buf, theme, last),
+        )
+    }
+
+    #[test]
+    fn a_toast_keeps_the_pinned_keys_and_the_spinner_on_its_right() {
+        // §5.5: the toast replaces the left side; the spinner moves right of it, before the
+        // pinned two, in accent.
+        let busy = "still switching to 1 a1 · wait for it to finish";
+        let right = "⠋ switching to 1 a1…  ? keys  q quit";
+        for theme in TIERS {
+            let mut state = accounts_of(2);
+            state.theme = theme;
+            state.running = Some(Action::Switch(AccountRef {
+                id: id(1),
+                provider: cc(),
+                position: 1,
+            }));
+            state.toast(ToastKind::Info, busy, NOW_MS);
+            let (text, letters) = footer_of(&state, 120, theme);
+            let gap = 120 - 1 - width_of(busy) - width_of(right);
+            assert_eq!(text, format!("{busy}{}{right}", " ".repeat(gap)));
+            let spelled = format!(
+                "{}{}{}",
+                spell(&[(busy, 't')]),
+                " ".repeat(gap),
+                spell(&[("⠋ switching to 1 a1…", 'a'), ("  ", ' ')])
+            );
+            let pinned = "a mmmm  a mmmm";
+            assert_eq!(
+                letters.trim_end(),
+                canon(theme, &format!("{spelled}{pinned}")),
+                "{theme:?}"
+            );
+        }
+        // At 80 columns the room beside the right part is 41: it wraps, and the right part sits
+        // on the last row.
+        let mut state = accounts_of(2);
+        state.running = Some(Action::Switch(AccountRef {
+            id: id(1),
+            provider: cc(),
+            position: 1,
+        }));
+        state.toast(ToastKind::Info, busy, NOW_MS);
+        let lines = draw(&state, 80, 24);
+        assert_eq!(lines[22], "still switching to 1 a1 · wait for it to");
+        assert_eq!(
+            lines[23],
+            format!("finish{}{right}", " ".repeat(80 - 1 - 6 - width_of(right)))
+        );
+        // With too little room beside it (under 40 columns) the toast takes the full width
+        // and the right part is dropped.
+        state.running = Some(Action::AddLive { provider: cc() });
+        let lines = draw(&state, 80, 24);
+        assert_eq!(lines[23], busy);
+        assert_eq!(areas(&state, Rect::new(0, 0, 80, 24)).footer.height, 1);
+        // Without a toast the spinner stands on the left and the pinned two stay.
+        state.toast = None;
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            footer_row("⠋ adding Claude Code's login…", 80)
+        );
+    }
+
+    #[test]
+    fn each_kind_has_its_mark_in_its_role() {
+        let words = "Switched to a1@x.co";
+        for theme in TIERS {
+            for (kind, mark, letter) in [
+                (ToastKind::Done, Some("✓"), 'o'),
+                (ToastKind::Info, None, 't'),
+                (ToastKind::Warn, Some("!"), 'w'),
+                (ToastKind::Failed, Some("✕"), 'c'),
+            ] {
+                let mut state = accounts_of(2);
+                state.theme = theme;
+                state.toast(kind, words, NOW_MS);
+                let (text, letters) = footer_of(&state, 80, theme);
+                let said = match mark {
+                    Some(mark) => format!("{mark} {words}"),
+                    None => words.to_owned(),
+                };
+                assert_eq!(text, footer_row(&said, 80), "{kind:?}");
+                let lead = match mark {
+                    Some(_) => format!("{letter} "),
+                    None => String::new(),
+                };
+                let body = spell(&[(words, 't')]);
+                let gap = " ".repeat(80 - 1 - width_of(&said) - 14);
+                let want = canon(theme, &format!("{lead}{body}{gap}a mmmm  a mmmm"));
+                assert_eq!(letters.trim_end(), want.trim_end(), "{kind:?} in {theme:?}");
             }
         }
     }
