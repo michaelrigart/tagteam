@@ -64,6 +64,17 @@ with the one before, so any release may contain breaking changes. Each section s
   stored credential `relogin-required` (both were `invalid-input`). A broken or unreadable
   provider lock reports `lock` (it was `provider`). The active-token refresh's log line gives an
   unmanaged live login the type `unmanaged-account` (it was `invalid-input`).
+- `list`, `status` and `history` say usage states in plain words (`needs a new login`,
+  `rate-limited (retry 5m)`, `not checked yet`, `▲ fast`). `list`'s `AGE` column is `UPDATED`.
+  `history` gives burn rates in `%/h` and says when a window is full, without the projection
+  method, which `--json` still has.
+- `tagteam auto` and `tagteam daemon` say auto's decisions in plain words, such as
+  `no switch needed (77%, switches at 90%)`.
+- `tagteam tui`'s Accounts screen leads with the account in use, its bars with pace marks and the
+  best account to switch to. Its table has a STATUS column, and the selected account's card shows
+  sparklines, what is wrong and how to fix it.
+- `tagteam tui` shows the account in use on Tokens and History, and `A` adds the login of the
+  provider the screen follows.
 
 ### Security
 

@@ -233,14 +233,15 @@ pub enum ActionOutcome {
  s switch  b best  n next  ⏎ history  P pause auto  r refresh                    ? keys  q quit
 ```
 
-- **The chrome rows** are the header, the auto line, a faint rule from 30 rows, the banner, the
-  body and the footer (the Now strip on Tokens and History comes with T3). Which rows show does
-  not change with the daemon's mode. The header shows the tabs and auto's state with its
-  threshold (§7.4), the auto line shows auto's last action in plain words, the banner shows an
-  unmanaged live login, a run shell, the start-up warnings or an error (§10.4), and the footer
-  shows the screen's keys with `? keys` and `q quit` pinned. A toast replaces the footer's keys,
-  and a running action shows a spinner with its label. *(Amended by the TUI redesign spec
-  §5.1–§5.6.)*
+- **The chrome rows** are the header, the auto line, the Now strip on Tokens and History, a faint
+  rule from 30 rows, the banner, the body and the footer. Which rows show does not change with
+  the daemon's mode. The header shows the tabs and auto's state with its threshold (§7.4), the
+  auto line shows auto's last action in plain words, the banner shows an unmanaged live login, a
+  run shell, the start-up warnings or an error (§10.4), and the footer shows the screen's keys
+  with `? keys` and `q quit` pinned. A toast replaces the footer's keys, and a running action
+  shows a spinner with its label. *(Amended by the TUI redesign spec §5.1–§5.6.)* The Now strip
+  shows the account in use, its short and long windows, and the best account to switch to. On
+  Accounts the lead card plays its part. *(Amended by the TUI redesign spec §5.1, §5.4.)*
 - **Colour.**
   - Three tiers: tier 0 under `NO_COLOR`, `--no-color` or `ui.color = never`; tier 1 with the 16
     named ANSI colours; tier 2 in truecolor when `COLORTERM` says so and the terminal reports its
@@ -258,26 +259,23 @@ pub enum ActionOutcome {
 
 ### 5.2 Accounts
 
-```
-    #  ACCOUNT               5H               7D                       SPEND     AGE
- *  1  michael@example.com   ██░░░░  9% 2h40m ███████░ 77% 3d09h ▲pace  €0/€20     2m
- ▶  2  spare@example.com     ███░░░ 31% 4h02m █░░░░░░░ 12% 5d01h       —         14m
-    3  work (w@corp.com)     relogin required
- ─ 1 michael@example.com · active · oauth ───────────────────────────────────────────
- 5h    9%  resets 2h40m
- 7d   77%  resets 3d09h  ▲ ahead of pace (expected 62%)  runs out ~2d04h (regression)
- fetched 2m ago · next poll in 1m · login expires in 6d
-```
+The screen is the redesign spec's §6.1 layout. From the top: the lead card, the table and the
+selected account's card.
 
-- **The table** has the same rows, columns, markers and words as `list` (core §13.1): the
-  active `*`, session-owned `▶` (`▶ this` in a run shell), disabled, quarantined, `▲ pace`, a
-  scoped-window column per model that any account has, `usageStatus` in words with
-  `retry <countdown>`, and `AGE`. Each window adds a gauge.
-- **The detail pane** shows the selected account:
-  - each relevant window with its reset, pace and projection (core §8.7);
-  - the data age and the next poll;
-  - `usageError` and `usageRetryAt` when the status is not `ok`;
-  - the login's expiry, and whether it is session-owned.
+- **The lead card** shows the account in use: its facts, its windows as bars with pace marks,
+  each window's reset and where it is heading, and any problem with its remedy. On the right it
+  shows the best account to switch to (`best now  3 spare   b switch`).
+- **The table** has a row per account: the marker (`●` in use, `▶` in a session, `○` disabled),
+  the name, 5H and 7D as gauges with `▲`, UPDATED and STATUS. STATUS is one short phrase, the
+  first that applies: a `✕` login problem, `○ disabled`, a `!` problem (`! rate-limited`,
+  `! old reading`, …), `in use`, `best` or `api key`. A disabled account says `○ disabled` over
+  every `!` problem; a `✕` problem still shows. Scoped and spend windows stay on the cards below
+  160 columns.
+- **The words** are the same as `list`'s (core §13.1, the redesign spec's §11.1). That means the
+  same words, not the same columns.
+- **The selected card** shows every window with a sparkline, its percentage, `▲`, the reset and
+  the projection. Under them come any problem in one sentence and its remedy, then the keys for
+  the account. *(Amended by the TUI redesign spec §6.1–§6.5, §11.1, M-3.)*
 - **Countdowns tick.** The UI's tick redraws when a visible countdown's text changes. The data
   itself is re-read only on refresh (§6).
 - **`Enter`** opens History for the selected account.
@@ -357,8 +355,9 @@ pub enum ActionOutcome {
 
 - **The account list** is on the left (`j`/`k`). The selected account's windows, as
   `Engine::history` returns them (core §13.4: the relevant windows), are on the right.
-- **Per window:** a sparkline, the latest `pct`, the burn rate in points per hour, the ETA with
-  its projection method, and whether the window will last to its reset (core §8.7).
+- **Per window:** a sparkline, the latest `pct`, the burn rate in `%/h`, and when the window is
+  full or whether it lasts until it resets (core §8.7). The projection method is not shown.
+  *(Amended by the TUI redesign spec §11.1.)*
 - **The sparkline** has one bucket per column across the range. Each bucket shows the highest
   `pct` sampled in it, an empty bucket stays blank, and a reset shows as a drop.
 - **Range** (`[`/`]`): 1, 7, 14 or 30 days. The default is 7, as for `history`.
