@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/33
 **Branch:** `refactor-r4c-gate-classifier`, based on `refactor-r4b2-store-lock-tokens` (R4b ships as two PRs)
 **Goal:** One classifier reads the refresh gate's outcome for the manual switch, the automatic switch and launch (CC-E-4), keeping every intentional difference and text, except that `tagteam run` now names the damaged files when a pending rescue cannot be read (C-2).
 **Architecture:** `switch/freshen.rs` gains `GateMode`, `GateVerdict` and `Engine::classify_gate` (one `GateOutcome` in, one verdict per mode out). `freshen`, `freshen_auto` and `freshen_for_launch` keep their pre-gate work and map the verdict to `Freshened`, `AutoFreshened` or `LaunchFresh`. Auto's failure reason is typed first (`FreshenFailure`), so the verdict can carry it.
