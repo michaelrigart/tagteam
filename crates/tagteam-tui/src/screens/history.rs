@@ -525,7 +525,12 @@ mod tests {
         assert_eq!(right[1], "    no rate yet");
         assert!(right[2].ends_with("   95%"), "{:?}", right[2]);
         assert_eq!(right[3], "    +5.0 pts/h · runs out in 12h00m (regression)");
-        assert_eq!(lines[21].get(27..).unwrap_or(""), "7 days  [ ] range");
+        let last = lines.last().unwrap();
+        assert_eq!(
+            last.get(27..).unwrap_or(""),
+            "7 days  [ ] range",
+            "on the body's last row"
+        );
     }
 
     #[test]
@@ -704,8 +709,13 @@ mod tests {
             account(1, "a1@x.co", read(60, 1.0, 1.0, false)),
             windows,
         ));
+        // 80×25 and 80×32 give the body the rows 80×24 and 80×30 gave it before the auto line
+        // and the rule. The panel's footer is the body's last row.
+        state.size = (80, 25);
         let footer = |state: &State, h: u16| {
-            body_of(state, 80, h, NOW_MS)[usize::from(h) - 3]
+            body_of(state, 80, h, NOW_MS)
+                .last()
+                .unwrap()
                 .get(27..)
                 .unwrap()
                 .to_owned()
@@ -713,29 +723,31 @@ mod tests {
         for _ in 0..20 {
             update(&mut state, ch('J'), NOW_MS);
         }
-        assert!(footer(&state, 24).ends_with("J K: windows 11–20 of 20"));
+        assert!(footer(&state, 25).ends_with("J K: windows 11–20 of 20"));
         // Taller: the last window shows from further up, and `K` moves from what shows.
         update(
             &mut state,
             Msg::Resize {
                 width: 80,
-                height: 30,
+                height: 32,
             },
             NOW_MS,
         );
-        assert!(footer(&state, 30).ends_with("J K: windows 8–20 of 20"));
+        assert!(footer(&state, 32).ends_with("J K: windows 8–20 of 20"));
         update(&mut state, ch('K'), NOW_MS);
         assert!(
-            footer(&state, 30).ends_with("J K: windows 7–19 of 20"),
+            footer(&state, 32).ends_with("J K: windows 7–19 of 20"),
             "{}",
-            footer(&state, 30)
+            footer(&state, 32)
         );
     }
 
     #[test]
     fn windows_beyond_the_screen_scroll_into_view_with_shift_j_and_k() {
-        // Spec §5.4: the account's windows, every one. 80×24 holds ten of two lines each.
+        // Spec §5.4: the account's windows, every one. 80×25 holds ten of two lines each, as
+        // 80×24 did before the auto line.
         let mut state = on_history(many(2));
+        state.size = (80, 25);
         state.history.select(id(1));
         let twelve = |position| {
             let windows = (1..=12)
@@ -753,7 +765,7 @@ mod tests {
         };
         state.history.apply(twelve(1));
         let labels = |state: &State| -> Vec<String> {
-            body_of(state, 80, 24, NOW_MS)[0..21]
+            body_of(state, 80, 25, NOW_MS)[0..21]
                 .iter()
                 .filter_map(|l| l.get(27..))
                 .filter(|r| r.starts_with('M'))
@@ -761,7 +773,7 @@ mod tests {
                 .collect()
         };
         let footer = |state: &State| {
-            body_of(state, 80, 24, NOW_MS)[21]
+            body_of(state, 80, 25, NOW_MS)[21]
                 .get(27..)
                 .unwrap()
                 .to_owned()
@@ -784,8 +796,8 @@ mod tests {
         update(&mut state, ch('j'), NOW_MS);
         state.history.apply(twelve(2));
         assert_eq!(labels(&state), first);
-        // A taller terminal shows them all.
-        assert!(body_of(&state, 80, 40, NOW_MS)[37].get(27..).unwrap() == "7 days  [ ] range");
+        // A taller terminal shows them all: 42 rows give the body the 38 that 40 gave it.
+        assert!(body_of(&state, 80, 42, NOW_MS)[37].get(27..).unwrap() == "7 days  [ ] range");
         // Help lists the keys.
         update(&mut state, ch('?'), NOW_MS);
         let help = draw(&state, 80, 24);
@@ -857,6 +869,7 @@ mod tests {
         state.theme = Theme::new(false);
         let buf = draw_buffer(&state, 80, 24, NOW_MS);
         assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
+        assert!(buf[(x, y)].modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]
@@ -879,8 +892,9 @@ mod tests {
             });
         let mut state = fresh(Screen::History);
         state.accounts.apply(snap);
+        // 80×25: the 22 body rows 80×24 gave before the auto line.
         let left = |state: &State| -> Vec<String> {
-            body_of(state, 80, 24, NOW_MS)[0..22]
+            body_of(state, 80, 25, NOW_MS)[0..22]
                 .iter()
                 .map(|l| l.chars().take(26).collect::<String>().trim_end().to_owned())
                 .collect()

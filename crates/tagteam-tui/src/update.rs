@@ -679,7 +679,7 @@ mod tests {
         );
         assert_eq!(state.accounts.shown_ids(), [id(1), id(2)]);
         let drawn = draw(&state, 80, 24);
-        assert_eq!(drawn[1], " the store is locked");
+        assert_eq!(drawn[2], " ✕ the store is locked");
         let body = body_of(&state, 80, 24, NOW_MS);
         assert!(body[1].contains("a1@x.co"), "{body:?}");
         // The next good read clears it.
@@ -777,12 +777,12 @@ mod tests {
             NOW_MS,
         );
         let lines = draw(&state, 80, 24);
-        let shown: String = lines[1..3]
+        let shown: String = lines[2..4]
             .iter()
             .map(|l| l.trim())
             .collect::<Vec<_>>()
             .join(" ");
-        assert_eq!(shown, format!("usage was not collected: {message}"));
+        assert_eq!(shown, format!("! usage was not collected: {message}"));
         assert_eq!(body_of(&state, 80, 24, NOW_MS)[0], " loading…");
     }
 

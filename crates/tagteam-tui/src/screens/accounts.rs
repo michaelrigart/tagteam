@@ -1145,8 +1145,8 @@ mod tests {
 
     #[test]
     fn the_worst_live_stack_at_80_by_24_still_shows_a_long_labelled_window_whole() {
-        // A 2-row header, the activity line, a 3-row banner and a 3-row toast leave a 15-row
-        // body; the window's label, value, reset, pace, rate and trouble all fit in what is left.
+        // The header, the auto line, a 3-row banner and a 3-row toast leave a 16-row body; the
+        // window's label, value, reset, pace, rate and trouble all fit in what is left.
         let mut usage = with_windows(&["Opus"]);
         usage.status = UsageStatus::Unavailable;
         usage.error = Some("http-429".into());
@@ -1175,11 +1175,13 @@ mod tests {
         let lines = draw(&state, 80, 24);
         assert_eq!(lines.len(), 24, "{lines:?}");
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
-        // The stack: header (2 rows), banner (3), a 15-row body, the activity line, the toast (3).
+        // The stack: the header, the auto line, the banner (3), a 16-row body, the toast (3).
         assert!(
-            lines[1].contains("● live · auto on · keychain locked until 15:05"),
+            lines[0].ends_with("! keychain locked 15:05   ? keys"),
             "{lines:?}"
         );
+        assert!(lines[1].starts_with(" ! 14:04  xxx"), "{lines:?}");
+        assert!(lines[1].ends_with('…'), "{lines:?}");
         assert!(
             lines[2..5]
                 .iter()
@@ -1190,7 +1192,6 @@ mod tests {
             lines[5].contains("ACCOUNT"),
             "the body starts at row 5: {lines:?}"
         );
-        assert!(lines[20].starts_with(" 14:04 error: xxx"), "{lines:?}");
         assert!(
             lines[21..]
                 .iter()
@@ -1291,21 +1292,22 @@ mod tests {
             update(&mut state, ch('J'), NOW_MS);
         }
         assert!(rule(&state, 24).ends_with(" J K: windows 10–13 of 13 ─"));
-        // Taller: the last window shows from further up, and `K` moves from what shows.
+        // Taller: the last window shows from further up, and `K` moves from what shows. At 32
+        // rows the body has the 28 rows 30 gave it before the auto line and the rule.
         update(
             &mut state,
             Msg::Resize {
                 width: 80,
-                height: 30,
+                height: 32,
             },
             NOW_MS,
         );
-        assert!(rule(&state, 30).ends_with(" J K: windows 8–13 of 13 ─"));
+        assert!(rule(&state, 32).ends_with(" J K: windows 8–13 of 13 ─"));
         update(&mut state, ch('K'), NOW_MS);
         assert!(
-            rule(&state, 30).ends_with(" J K: windows 7–12 of 13 ─"),
+            rule(&state, 32).ends_with(" J K: windows 7–12 of 13 ─"),
             "{}",
-            rule(&state, 30)
+            rule(&state, 32)
         );
     }
 
@@ -1450,6 +1452,11 @@ mod tests {
                     assert_eq!(buf[(x, y)].fg, Color::Reset);
                     assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
                 }
+                // §4.1: crit is underlined as well, so it reads apart from warn without colour.
+                for (x, y) in [(x, y), (gx, gy)] {
+                    assert!(buf[(x, y)].modifier.contains(Modifier::UNDERLINED));
+                }
+                assert!(!buf[(wx, wy)].modifier.contains(Modifier::UNDERLINED));
             }
         }
     }
@@ -1458,9 +1465,14 @@ mod tests {
     fn the_selected_row_is_reverse_video_across_the_width() {
         let state = loaded(three());
         let buf = draw_buffer(&state, 80, 24, NOW_MS);
+        // The body's first row is the column heads, its second the selected account.
+        let y = crate::view::areas(&state, buf.area).body.y + 1;
         for x in [0, 10, 79] {
-            assert!(buf[(x, 2)].modifier.contains(Modifier::REVERSED), "{x}");
-            assert!(!buf[(x, 3)].modifier.contains(Modifier::REVERSED), "{x}");
+            assert!(buf[(x, y)].modifier.contains(Modifier::REVERSED), "{x}");
+            assert!(
+                !buf[(x, y + 1)].modifier.contains(Modifier::REVERSED),
+                "{x}"
+            );
         }
     }
 
@@ -1524,9 +1536,11 @@ mod tests {
     #[test]
     fn more_accounts_than_fit_scroll_with_the_selection() {
         let mut state = loaded(many(30));
-        // 80×24: 22 body rows, 7 for the detail, 1 for the header: 14 account rows.
+        // 80×25: 22 body rows (80×24's before the auto line), 7 for the detail, 1 for the
+        // header: 14 account rows.
+        state.size = (80, 25);
         let shown = |state: &State| {
-            body_of(state, 80, 24, NOW_MS)[1..15]
+            body_of(state, 80, 25, NOW_MS)[1..15]
                 .iter()
                 .map(|l| {
                     l.split_whitespace()
@@ -1583,7 +1597,9 @@ mod tests {
 
     #[test]
     fn a_resize_keeps_the_tables_scroll_in_range_and_the_next_key_moves_at_once() {
+        // At 80×25 the body has the 22 rows 80×24 gave it before the auto line.
         let mut state = loaded(many(30));
+        state.size = (80, 25);
         update(&mut state, key(KeyCode::End), NOW_MS);
         let first = |state: &State, h: u16| {
             body_of(state, 80, h, NOW_MS)[1]
@@ -1592,7 +1608,7 @@ mod tests {
                 .unwrap()
                 .to_owned()
         };
-        assert_eq!(first(&state, 24), "a17@x.co");
+        assert_eq!(first(&state, 25), "a17@x.co");
         // Tall enough for every row: the table shows from the top, never blank rows.
         update(
             &mut state,
@@ -1720,17 +1736,17 @@ mod tests {
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snap.clone());
         assert_eq!(
-            draw(&state, 80, 24)[1],
-            " Live: s@x.co (not managed by tagteam); press A to add it"
+            draw(&state, 80, 24)[2],
+            " ! Live: s@x.co (not managed by tagteam); press A to add it"
         );
         snap.in_run_shell = true;
         state.accounts.apply(snap);
         assert_eq!(
-            draw(&state, 80, 24)[1],
-            " inside a `tagteam run` session: account changes are refused here"
+            draw(&state, 80, 24)[2],
+            " ! inside a `tagteam run` session: account changes are refused here"
         );
         state.raise_banner(BannerKind::Refusal, "the store is locked");
-        assert_eq!(draw(&state, 80, 24)[1], " the store is locked");
+        assert_eq!(draw(&state, 80, 24)[2], " ! the store is locked");
     }
 
     #[test]
@@ -1743,10 +1759,10 @@ mod tests {
         state.accounts.apply(snap);
         let lines = draw(&state, 80, 24);
         assert_eq!(
-            lines[1..3],
+            lines[2..4],
             [
-                format!(" Live: {long} (not managed"),
-                " by tagteam); press A to add it".to_owned(),
+                format!(" ! Live: {long} (not"),
+                "   managed by tagteam); press A to add it".to_owned(),
             ]
         );
         let body = body_of(&state, 80, 24, NOW_MS);

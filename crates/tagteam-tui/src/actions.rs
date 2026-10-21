@@ -1371,7 +1371,7 @@ mod tests {
         let mut state = loaded(1);
         let link = go_live(&mut state, job_in("collect", true));
         update(&mut state, Msg::Tick, NOW_MS + 250);
-        assert!(draw(&state, 80, 24)[0].ends_with("● live · auto off (one account)"));
+        assert!(draw(&state, 80, 24)[0].ends_with("○ needs 2 usable accounts   ? keys"));
         update(&mut state, ch('P'), NOW_MS);
         let cmds = update(&mut state, ch('y'), NOW_MS);
         let [Cmd::Act(pause)] = cmds.as_slice() else {
@@ -1403,7 +1403,7 @@ mod tests {
             result: Ok(job_in("collect", false)),
         };
         update(&mut state, reply, NOW_MS + 2_800);
-        assert!(draw(&state, 80, 24)[0].ends_with("● live · auto paused   ? help"));
+        assert!(draw(&state, 80, 24)[0].ends_with("‖ paused · P resumes   ? keys"));
     }
 
     #[test]
@@ -1437,7 +1437,7 @@ mod tests {
         };
         update(&mut state, early, NOW_MS + 800);
         assert!(
-            draw(&state, 80, 24)[0].ends_with("● live · auto off (one account)"),
+            draw(&state, 80, 24)[0].ends_with("○ needs 2 usable accounts   ? keys"),
             "read before the daemon applied it"
         );
         let fetch = |cmds: Vec<Cmd>| cmds.contains(&Cmd::FetchStatus { link: 2 });
@@ -1448,7 +1448,7 @@ mod tests {
             result: Ok(job_in("collect", false)),
         };
         update(&mut state, applied, NOW_MS + 2_600);
-        assert!(draw(&state, 80, 24)[0].ends_with("● live · auto paused   ? help"));
+        assert!(draw(&state, 80, 24)[0].ends_with("‖ paused · P resumes   ? keys"));
     }
 
     #[test]
@@ -1502,7 +1502,7 @@ mod tests {
                 update(&mut state, paused, NOW_MS + 2_600);
             }
             assert!(
-                draw(&state, 80, 24)[0].ends_with("● live · auto paused   ? help"),
+                draw(&state, 80, 24)[0].ends_with("‖ paused · P resumes   ? keys"),
                 "{up_at}"
             );
             let later = update(&mut state, Msg::Tick, up_at + 250);
