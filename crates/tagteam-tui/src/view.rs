@@ -28,6 +28,8 @@ pub(crate) struct Areas {
     pub(crate) header: Rect,
     /// The auto line (§5.3), in both modes.
     pub(crate) auto: Rect,
+    /// The Now strip (§5.4), under the auto line on Tokens and History.
+    pub(crate) now: Option<Rect>,
     /// The faint rule under the chrome, from `chrome::RULE_FROM` rows (§4.3).
     pub(crate) rule: Option<Rect>,
     pub(crate) banner: Option<Rect>,
@@ -35,8 +37,8 @@ pub(crate) struct Areas {
     pub(crate) footer: Rect,
 }
 
-/// The header and the auto line on the first two rows, the rule under them from
-/// `chrome::RULE_FROM` rows, the banner (when there is one) below, the footer on the last rows,
+/// The header and the auto line on the first two rows, the Now strip under them on Tokens and
+/// History, the rule under those from `chrome::RULE_FROM` rows, the banner (when there is one) below, the footer on the last rows,
 /// and the body between. None of them depends on the daemon's mode, so the body never moves
 /// when it changes (UX-5). The banner, and a toast in the footer, take as many rows as their
 /// words need at the width, `WRAP_ROWS` at most, from the body, which keeps a row at least.
@@ -45,8 +47,10 @@ pub(crate) fn areas(state: &State, area: Rect) -> Areas {
     let height = area.height;
     let header = height.min(1);
     let auto = height.saturating_sub(header).min(1);
+    let strip = matches!(state.screen, Screen::Tokens | Screen::History);
+    let now = u16::from(strip).min(height.saturating_sub(header + auto));
     let rule = u16::from(height >= chrome::RULE_FROM);
-    let chrome = header + auto + rule;
+    let chrome = header + auto + now + rule;
     let spare = height.saturating_sub(chrome + 2);
     let banner = rows(chrome::banner_rows(state, area.width).len()).min(spare);
     let footer = chrome::toast_height(state, area.width).map_or(1, rows);
@@ -58,7 +62,8 @@ pub(crate) fn areas(state: &State, area: Rect) -> Areas {
     Areas {
         header: Rect::new(area.x, area.y, area.width, header),
         auto: Rect::new(area.x, area.y + header, area.width, auto),
-        rule: (rule > 0).then(|| Rect::new(area.x, area.y + header + auto, area.width, 1)),
+        now: (now > 0).then(|| Rect::new(area.x, area.y + header + auto, area.width, 1)),
+        rule: (rule > 0).then(|| Rect::new(area.x, area.y + header + auto + now, area.width, 1)),
         banner: (banner > 0).then(|| Rect::new(area.x, area.y + chrome, area.width, banner)),
         body: Rect::new(area.x, top, area.width, bottom.saturating_sub(top)),
         footer: Rect::new(area.x, bottom, area.width, footer),
@@ -204,6 +209,12 @@ pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
         Paragraph::new(chrome::auto_line(state, area.width, now_ms)),
         areas.auto,
     );
+    if let Some(rect) = areas.now {
+        frame.render_widget(
+            Paragraph::new(chrome::now_strip(state, area.width, now_ms)),
+            rect,
+        );
+    }
     if let Some(rect) = areas.rule {
         frame.render_widget(Paragraph::new(chrome::rule(state, area.width)), rect);
     }

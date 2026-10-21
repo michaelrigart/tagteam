@@ -846,7 +846,7 @@ mod tests {
         );
         assert_eq!(state.tokens.report().map(|r| r.rows.len()), Some(3));
         assert_eq!(
-            draw(&state, 80, 24)[2],
+            draw(&state, 80, 24)[3],
             " ! couldn't read the token index (the store is locked) · r retries"
         );
         update(&mut state, ch('1'), NOW_MS);

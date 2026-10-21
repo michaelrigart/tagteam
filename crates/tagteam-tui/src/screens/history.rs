@@ -683,8 +683,8 @@ mod tests {
 
     #[test]
     fn a_1000_character_label_leaves_its_window_reachable_at_80x24_under_a_full_banner() {
-        // A label takes two rows at most; under a 3-row banner and a 3-row toast the panel has
-        // 16 rows, and a window at most five (R20).
+        // A label takes two rows at most; under the Now strip, a 3-row banner and a 2-row toast
+        // the panel has 16 rows, and a window at most five (R20).
         let mut state = on_history(many(1));
         state.history.select(id(1));
         let long = "Claude ".repeat(143).trim_end().to_owned();
@@ -716,7 +716,7 @@ mod tests {
         );
         state.toast(
             crate::state::ToastKind::Info,
-            ["Switched to a@x.co (position 1)"; 8].join(" "),
+            ["Switched to a@x.co (position 1)"; 3].join(" "),
             NOW_MS,
         );
         let right: Vec<String> = body_of(&state, 80, 24, NOW_MS)[0..16]
@@ -785,10 +785,10 @@ mod tests {
 
     #[test]
     fn windows_beyond_the_screen_scroll_into_view_with_shift_j_and_k() {
-        // Spec §5.4: the account's windows, every one. 80×25 holds ten of two lines each, as
-        // 80×24 did before the auto line.
+        // Spec §5.4: the account's windows, every one. 80×26 holds ten of two lines each, as
+        // 80×24 did before the auto line and the Now strip.
         let mut state = on_history(many(2));
-        state.size = (80, 25);
+        state.size = (80, 26);
         state.history.select(id(1));
         let twelve = |position| {
             let windows = (1..=12)
@@ -806,7 +806,7 @@ mod tests {
         };
         state.history.apply(twelve(1));
         let labels = |state: &State| -> Vec<String> {
-            body_of(state, 80, 25, NOW_MS)[0..21]
+            body_of(state, 80, 26, NOW_MS)[0..21]
                 .iter()
                 .filter_map(|l| right_of(l))
                 .filter(|r| r.starts_with('M'))
@@ -814,7 +814,7 @@ mod tests {
                 .collect()
         };
         let footer = |state: &State| {
-            right_of(&body_of(state, 80, 25, NOW_MS)[21])
+            right_of(&body_of(state, 80, 26, NOW_MS)[21])
                 .unwrap()
                 .to_owned()
         };
@@ -836,8 +836,8 @@ mod tests {
         update(&mut state, ch('j'), NOW_MS);
         state.history.apply(twelve(2));
         assert_eq!(labels(&state), first);
-        // A taller terminal shows them all: 42 rows give the body the 38 that 40 gave it.
-        assert!(right_of(&body_of(&state, 80, 42, NOW_MS)[37]).unwrap() == "7 days  [ ] range");
+        // A taller terminal shows them all: 43 rows give the body the 38 that 40 gave it.
+        assert!(right_of(&body_of(&state, 80, 43, NOW_MS)[37]).unwrap() == "7 days  [ ] range");
         // Help lists the keys.
         update(&mut state, ch('?'), NOW_MS);
         let help = draw(&state, 80, 24);
@@ -939,9 +939,9 @@ mod tests {
             });
         let mut state = fresh(Screen::History);
         state.accounts.apply(snap);
-        // 80×25: the 22 body rows 80×24 gave before the auto line.
+        // 80×26: the 22 body rows 80×24 gave before the auto line and the Now strip.
         let left = |state: &State| -> Vec<String> {
-            body_of(state, 80, 25, NOW_MS)[0..22]
+            body_of(state, 80, 26, NOW_MS)[0..22]
                 .iter()
                 .map(|l| l.chars().take(26).collect::<String>().trim_end().to_owned())
                 .collect()

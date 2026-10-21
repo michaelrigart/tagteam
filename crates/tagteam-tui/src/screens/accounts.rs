@@ -1,10 +1,10 @@
 //! The Accounts screen (redesign §6): the lead card with the account in use (§6.2), the table
 //! of accounts (§6.3), and the selected account's card (§6.4), stacked from the top (§6.1).
 
-mod card;
-mod lead;
-mod status;
-mod table;
+pub(crate) mod card;
+pub(crate) mod lead;
+pub(crate) mod status;
+pub(crate) mod table;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;

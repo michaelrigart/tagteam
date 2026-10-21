@@ -1235,10 +1235,11 @@ mod tests {
         let mut state = warned(10);
         assert_eq!(draw(&state, 80, 24)[2], shown);
         update(&mut state, ch('2'), NOW_MS);
-        assert_eq!(draw(&state, 80, 24)[2], shown, "on Tokens too");
+        // Under the Now strip there.
+        assert_eq!(draw(&state, 80, 24)[3], shown, "on Tokens too");
         update(&mut state, key(KeyCode::Esc), NOW_MS);
         assert_eq!(
-            draw(&state, 80, 24)[2],
+            draw(&state, 80, 24)[3],
             shown,
             "Esc on Tokens goes back a level, and it is at the top"
         );

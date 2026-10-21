@@ -1,12 +1,19 @@
-//! The rows around the body (redesign §5.1): the header (§5.2), the auto line (§5.3), the faint
-//! rule under them from 30 rows (§4.3), the banner (§5.6), and the footer's keys (§5.5).
+//! The rows around the body (redesign §5.1): the header (§5.2), the auto line (§5.3), the Now
+//! strip on Tokens and History (§5.4), the faint rule under them from 30 rows (§4.3), the banner
+//! (§5.6), and the footer's keys (§5.5).
 
 use ratatui::text::{Line, Span};
+use tagteam_core::WindowKind;
+use tagteam_engine::views::AccountView;
+use tagteam_engine::words::{self, Problem};
 
 use crate::autoline;
+use crate::daemon;
 use crate::daemon::words::auto_state;
+use crate::gauge::line_gauge;
 use crate::keys;
 use crate::screens;
+use crate::screens::accounts::{card, lead, status, table};
 use crate::state::{BannerKind, Screen, State, Toast, ToastKind};
 use crate::theme::{Role, Theme};
 use crate::view::{WRAP_ROWS, fit, width_of, wrap, wrap_rows};
@@ -98,6 +105,108 @@ pub(crate) fn auto_line(state: &State, width: u16, now_ms: i64) -> Line<'static>
         spans.push(Span::styled(format!(" · {next}"), theme.role(Role::Muted)));
     }
     Line::from(fit_spans(spans, usize::from(width)))
+}
+
+/// §5.4's Now strip for focus's provider (T3-24): on Tokens and History only.
+/// ` ● {pos} {alias, else email}   {label} [{gauge} ]{pct:>4} {span}   …` for its account in
+/// use, its first short and first long window, the gauge from `WIDE` columns; a problem in their
+/// place as `{glyph} {status words} · see Accounts`, in its role; with no account in use
+/// `NO_ACCOUNT_IN_USE`, muted. On the right, one column in, `lead::pick_words`' Now strip form,
+/// dropped when it would leave the left part less than `lead::LEFT_LEAST` columns, or the hint
+/// with no account in use less than its whole width; the left part is cut to the room it
+/// leaves. Empty before the first snapshot and with no accounts.
+pub(crate) fn now_strip(state: &State, width: u16, now_ms: i64) -> Line<'static> {
+    let theme = state.theme;
+    let Some(view) = state
+        .view_of(&daemon::focus(state))
+        .filter(|view| !view.accounts.is_empty())
+    else {
+        return Line::default();
+    };
+    let mut left = vec![Span::raw(" ")];
+    // The hint is what to do, so it is never cut for the pick: the pick gives way instead.
+    let least = match lead::in_use(state) {
+        Some((_, v)) => {
+            left.extend(in_use_spans(v, width, now_ms, theme));
+            lead::LEFT_LEAST
+        }
+        None => {
+            left.push(Span::styled(NO_ACCOUNT_IN_USE, theme.role(Role::Muted)));
+            spans_width(&left)
+        }
+    };
+    let width = usize::from(width);
+    let pick = lead::pick_words(state, view, false).unwrap_or_default();
+    let pick_w = spans_width(&pick);
+    let room = width.checked_sub(pick_w + lead::PICK_GAP + keys::RIGHT_INSET);
+    let Some(room) = room.filter(|&room| pick_w > 0 && room >= least) else {
+        return Line::from(fit_spans(left, width));
+    };
+    let mut spans = fit_spans(left, room);
+    let gap = width - keys::RIGHT_INSET - pick_w - spans_width(&spans);
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(pick);
+    Line::from(spans)
+}
+
+/// What the Now strip says with no account in use (§5.4).
+const NO_ACCOUNT_IN_USE: &str = "no account in use · s on Accounts switches to one";
+/// What follows a problem on the Now strip, where its card is.
+const SEE_ACCOUNTS: &str = " · see Accounts";
+/// The Now strip's gauge cells, from `WIDE` columns (§5.4).
+const NOW_GAUGE: usize = 10;
+/// Between the Now strip's name and windows, and between its windows (§4.3's group gap).
+const NOW_GAP: &str = "   ";
+
+/// The Now strip's account in use: `● {pos} {name}`, then its windows or its problem (T3-24).
+/// An old reading keeps its windows: they are still what was read, and its status words say
+/// nothing of its age.
+fn in_use_spans(v: &AccountView, width: u16, now_ms: i64, theme: Theme) -> Vec<Span<'static>> {
+    let name = v.row.alias.clone().unwrap_or_else(|| words::email(&v.row));
+    let mut spans = vec![
+        Span::styled(table::IN_USE, theme.role(Role::Accent)),
+        Span::raw(format!(" {} ", v.row.position)),
+        Span::styled(name, theme.strong()),
+    ];
+    if let Some(problem) = words::problem(v).filter(|p| *p != Problem::OldReading) {
+        let (glyph, role) = status::mark(problem);
+        let said = words::status_words(&v.usage);
+        let said = match glyph {
+            Some(glyph) => format!("{glyph} {said}"),
+            None => said,
+        };
+        spans.push(Span::raw(NOW_GAP));
+        spans.push(Span::styled(said, theme.role(role)));
+        spans.push(Span::styled(SEE_ACCOUNTS, theme.role(Role::Muted)));
+        return spans;
+    }
+    let now_s = now_ms.div_euclid(1000);
+    for (w, p) in card::short_and_long(v) {
+        spans.push(Span::raw(NOW_GAP));
+        spans.push(Span::styled(w.label.clone(), theme.role(Role::Muted)));
+        spans.push(Span::raw(" "));
+        if width >= WIDE {
+            // C-8: only a long window has a pace mark.
+            let expected = (w.kind == WindowKind::Long)
+                .then_some(p.expected_pct)
+                .flatten();
+            spans.extend(line_gauge(w.pct, expected, NOW_GAUGE, theme));
+            spans.push(Span::raw(" "));
+        }
+        let pct = w.pct.round() as i64;
+        spans.push(Span::styled(
+            format!("{:>4}", format!("{pct}%")),
+            theme.severity(words::severity(pct)),
+        ));
+        if let Some(at) = w.resets_at {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                words::countdown(at, now_s),
+                theme.role(Role::Muted),
+            ));
+        }
+    }
+    spans
 }
 
 /// `─` across `width`, faint: under the chrome from `RULE_FROM` rows (§4.3).
@@ -385,6 +494,7 @@ mod tests {
     use tagteam_core::ProviderId;
     use tagteam_core::autoswitch::AutoStrategy;
     use tagteam_daemon::protocol::{Event, Status, StatusBackoff, StatusSwitch, Wire};
+    use tagteam_engine::views::{AccountView, UsageStatus};
 
     use super::*;
     use crate::host::{AccountRef, Action};
@@ -895,6 +1005,254 @@ mod tests {
         }
     }
 
+    /// `screen` with `alex@example.com` (1) and `work` (2) read, `work` in use at 53% and 6%:
+    /// `alex@example.com` is the best pick.
+    fn work_in_use(screen: Screen) -> State {
+        let mut state = fresh(screen);
+        state.accounts.apply(snapshot(alex_and_work()));
+        state
+    }
+
+    fn alex_and_work() -> Vec<AccountView> {
+        let alex = account(1, "alex@example.com", read(60, 5.0, 2.0, false));
+        let mut work = account(2, "sam@corp.example", read(60, 53.0, 6.0, false));
+        work.row.alias = Some("work".into());
+        work.active = true;
+        vec![alex, work]
+    }
+
+    /// Row 2 of `state` drawn at `w` columns in `theme`, and its role letters.
+    fn now_row(state: &State, w: u16, theme: Theme) -> (String, String) {
+        let buf = draw_buffer(state, w, if w >= WIDE { 40 } else { 24 }, NOW_MS);
+        (text_of(&buf)[2].clone(), roles(&buf, theme, 2))
+    }
+
+    /// `left`, then `right` ending one column in, across `width`.
+    fn edged(left: &str, right: &str, width: usize) -> String {
+        let gap = width - 1 - width_of(left) - width_of(right);
+        format!("{left}{}{right}", " ".repeat(gap))
+    }
+
+    const BEST_ALEX: &str = "best now 1 alex@example.com";
+
+    #[test]
+    fn the_now_strip_shows_the_account_in_use_and_the_best_pick() {
+        // §5.4, T3-24: on Tokens and History, under the auto line.
+        let wide = " ● 2 work   5h ━━━━━─────  53% 2h40m   7d ╸─────────   6% 3d09h";
+        let narrow = " ● 2 work   5h  53% 2h40m   7d   6% 3d09h";
+        for screen in [Screen::Tokens, Screen::History] {
+            let mut state = work_in_use(screen);
+            state.theme = TIERS[1];
+            assert_eq!(
+                now_row(&state, 120, TIERS[1]).0,
+                edged(wide, BEST_ALEX, 120),
+                "{screen:?}"
+            );
+            assert_eq!(
+                now_row(&state, 80, TIERS[1]).0,
+                edged(narrow, BEST_ALEX, 80),
+                "{screen:?}: no gauge below 120 columns"
+            );
+        }
+        for theme in TIERS {
+            let mut state = work_in_use(Screen::Tokens);
+            state.theme = theme;
+            let track = if theme.colourless() { "·" } else { "─" };
+            let (five_track, seven_track) = (track.repeat(5), track.repeat(9));
+            for w in [120, 80] {
+                let gauge = w >= WIDE;
+                let mut pieces = vec![(" ", ' '), ("●", 'a'), (" 2 ", 't'), ("work", 'B')];
+                pieces.extend([("   ", ' '), ("5h", 'm'), (" ", ' ')]);
+                if gauge {
+                    pieces.extend([("━━━━━", 'a'), (five_track.as_str(), 'f'), (" ", ' ')]);
+                }
+                pieces.extend([(" 53%", 't'), (" ", ' '), ("2h40m", 'm')]);
+                pieces.extend([("   ", ' '), ("7d", 'm'), (" ", ' ')]);
+                if gauge {
+                    pieces.extend([("╸", 'a'), (seven_track.as_str(), 'f'), (" ", ' ')]);
+                }
+                pieces.extend([("  6%", 't'), (" ", ' '), ("3d09h", 'm')]);
+                let left: usize = pieces.iter().map(|(t, _)| width_of(t)).sum();
+                let gap = " ".repeat(usize::from(w) - 1 - left - width_of(BEST_ALEX));
+                pieces.extend([(gap.as_str(), ' '), ("best now", 'm')]);
+                pieces.push((" 1 alex@example.com", 't'));
+                let (text, letters) = now_row(&state, w, theme);
+                assert_eq!(width_of(&text), usize::from(w) - 1, "{theme:?} {w}");
+                assert_eq!(
+                    letters.trim_end(),
+                    canon(theme, &spell(&pieces)),
+                    "{theme:?} {w}"
+                );
+            }
+        }
+        // On the best account, the right part says so.
+        let mut state = fresh(Screen::Tokens);
+        let mut accounts = alex_and_work();
+        accounts[0].active = true;
+        accounts[1].active = false;
+        state.accounts.apply(snapshot(accounts));
+        let row = &draw(&state, 80, 24)[2];
+        assert!(
+            row.starts_with(" ● 1 alex@example.com   5h   5% 2h40m"),
+            "{row}"
+        );
+        assert!(row.ends_with("   on the best account"), "{row}");
+        // Accounts has its lead card in the strip's place.
+        let lines = draw(&work_in_use(Screen::Accounts), 80, 24);
+        assert!(
+            lines.iter().all(|l| !l.starts_with(" ● 2 work")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_problem_replaces_the_now_strip_s_windows() {
+        let quarantined = || {
+            let mut accounts = alex_and_work();
+            accounts[1].usage = unread(UsageStatus::ReloginRequired, None, None);
+            accounts[1].row.quarantine_reason = Some("invalid_grant".into());
+            accounts
+        };
+        // A quarantined account is no candidate, which leaves too few for a pick: no right part.
+        let left = " ● 2 work   ✕ needs a new login · see Accounts";
+        for theme in TIERS {
+            let mut state = fresh(Screen::History);
+            state.theme = theme;
+            state.accounts.apply(snapshot(quarantined()));
+            for w in [80, 120] {
+                let (text, letters) = now_row(&state, w, theme);
+                assert_eq!(text, left, "{w}");
+                let pieces = [
+                    (" ", ' '),
+                    ("●", 'a'),
+                    (" 2 ", 't'),
+                    ("work", 'B'),
+                    ("   ", ' '),
+                    ("✕ needs a new login", 'c'),
+                    (" · see Accounts", 'm'),
+                ];
+                assert!(
+                    letters.starts_with(&canon(theme, &spell(&pieces))),
+                    "{theme:?} {w}: {letters}"
+                );
+            }
+        }
+        // M-8 governs the table's STATUS only: a disabled account in use still shows its
+        // real problem here.
+        let mut state = fresh(Screen::Tokens);
+        let mut accounts = alex_and_work();
+        accounts[1].usage = unread(UsageStatus::Unavailable, Some("http-429"), Some(120));
+        accounts[1].row.disabled = true;
+        state.accounts.apply(snapshot(accounts));
+        let row = &draw(&state, 80, 24)[2];
+        assert!(
+            row.starts_with(" ● 2 work   ! rate-limited · see Accounts"),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn with_no_account_in_use_the_now_strip_says_how_to_switch_to_one() {
+        let words = " no account in use · s on Accounts switches to one";
+        // The hint is never cut: at 80 columns, where the best pick would leave it 49 of its 51
+        // columns, the pick gives way; at 120 both show.
+        for theme in TIERS {
+            let mut state = fresh(Screen::Tokens);
+            state.theme = theme;
+            assert_eq!(
+                now_row(&state, 80, theme).0,
+                "",
+                "before the first snapshot"
+            );
+            let mut accounts = alex_and_work();
+            accounts[1].active = false;
+            state.accounts.apply(snapshot(accounts));
+            for (w, row) in [(120, edged(words, BEST_ALEX, 120)), (80, words.to_owned())] {
+                let (text, letters) = now_row(&state, w, theme);
+                assert_eq!(text, row, "{w}");
+                assert!(
+                    letters.starts_with(&canon(theme, &spell(&[(words, 'm')]))),
+                    "{theme:?} {w}: {letters}"
+                );
+            }
+            state.accounts.apply(snapshot(vec![]));
+            assert_eq!(now_row(&state, 80, theme).0, "", "no accounts");
+        }
+    }
+
+    #[test]
+    fn the_now_strip_follows_the_selected_account_s_provider() {
+        // Review Focus 2: with several providers, the selected account's provider.
+        use tagteam_engine::views::{ProviderAccounts, ProviderNames, forecast_of};
+        let fake = ProviderId::new("fake-agent");
+        let mut sam = account(3, "sam@corp.example", read(60, 81.0, 40.0, false));
+        sam.row.provider = fake.clone();
+        sam.active = true;
+        let live = tagteam_engine::switch::LiveLogin::Managed { position: 3 };
+        let mut snap = snapshot(alex_and_work());
+        snap.providers.push(ProviderAccounts {
+            provider: fake,
+            active_position: Some(3),
+            forecast: forecast_of(std::slice::from_ref(&sam), &live, &[]),
+            accounts: vec![sam],
+            threshold: 75.0,
+            strategy: AutoStrategy::Best,
+            names: ProviderNames {
+                display_name: "FakeAgent",
+                launch_command: "fakeagent",
+            },
+            models: vec![],
+            live,
+        });
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snap);
+        update(&mut state, ch('j'), NOW_MS);
+        update(&mut state, ch('j'), NOW_MS);
+        // FakeAgent's one account leaves too few candidates for a pick: no right part.
+        for screen in [Screen::Tokens, Screen::History] {
+            state.screen = screen;
+            assert_eq!(
+                draw(&state, 80, 24)[2],
+                " ● 3 sam@corp.example   5h  81% 2h40m   7d  40% 3d09h",
+                "{screen:?}"
+            );
+        }
+        state.screen = Screen::Accounts;
+        update(&mut state, ch('k'), NOW_MS);
+        state.screen = Screen::Tokens;
+        let row = &draw(&state, 80, 24)[2];
+        assert_eq!(
+            row,
+            &edged(" ● 2 work   5h  53% 2h40m   7d   6% 3d09h", BEST_ALEX, 80)
+        );
+    }
+
+    #[test]
+    fn the_rows_above_the_body_on_tokens_and_history_are_three_and_on_accounts_two() {
+        // §5.1, §7.8, UX-5: the Now strip's row never comes or goes with the daemon's mode.
+        for (screen, body) in [
+            (Screen::Tokens, Rect::new(0, 3, 80, 20)),
+            (Screen::History, Rect::new(0, 3, 80, 20)),
+            (Screen::Accounts, Rect::new(0, 2, 80, 21)),
+        ] {
+            let area = Rect::new(0, 0, 80, 24);
+            let mut state = work_in_use(screen);
+            let timer = areas(&state, area).body;
+            go_live(&mut state, one_job("auto", true));
+            let live = areas(&state, area).body;
+            update(&mut state, Msg::Live(Live::Down), NOW_MS);
+            let down = areas(&state, area).body;
+            assert_eq!((timer, live, down), (body, body, body), "{screen:?}");
+            let now = areas(&state, area).now;
+            let want = (screen != Screen::Accounts).then(|| Rect::new(0, 2, 80, 1));
+            assert_eq!(now, want, "{screen:?}");
+        }
+        // From 30 rows the rule sits under the strip.
+        let a = areas(&work_in_use(Screen::History), Rect::new(0, 0, 120, 40));
+        assert_eq!(a.rule.map(|r| r.y), Some(3));
+        assert_eq!(a.body, Rect::new(0, 4, 120, 35));
+    }
+
     #[test]
     fn from_30_rows_a_faint_rule_sits_under_the_chrome() {
         for theme in TIERS {
@@ -1196,8 +1554,10 @@ mod tests {
                         "{screen:?} {w}"
                     );
                     if h >= RULE_FROM {
+                        // Under the Now strip on Tokens and History.
+                        let y = if screen == Screen::Accounts { 2 } else { 3 };
                         let rule = "f".repeat(width);
-                        assert_eq!(roles(&buf, theme, 2), canon(theme, &rule));
+                        assert_eq!(roles(&buf, theme, y), canon(theme, &rule), "{screen:?}");
                     }
                     go_live(&mut state, daemon_status(vec![job.clone()], vec![]));
                     let buf = draw_buffer(&state, w, h, NOW_MS);
