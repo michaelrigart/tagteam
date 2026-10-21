@@ -73,10 +73,12 @@ pub(crate) fn header(state: &State, width: u16) -> Line<'static> {
 
 /// The auto line (§5.3): ` {mark} {when}  {text}`, with no `when` ` {mark} {text}`, then
 /// ` · next check HH:MM`; the mark in its role, the time, rank 3's `last switch … · ` and the
-/// suffix muted, cut to `width`.
+/// suffix muted, cut to `width`. Empty when there is nothing to say (M-7): the row stays.
 pub(crate) fn auto_line(state: &State, width: u16, now_ms: i64) -> Line<'static> {
     let theme = state.theme;
-    let said = autoline::said(state, width, now_ms);
+    let Some(said) = autoline::said(state, width, now_ms) else {
+        return Line::default();
+    };
     let mut spans = vec![Span::raw(" ")];
     spans.push(match said.mark {
         Some((mark, role)) => Span::styled(mark, theme.role(role)),
@@ -1168,7 +1170,8 @@ mod tests {
         });
         job.next_tick_at = Some("2026-09-21T14:16:00Z".into());
         let timer_state = [("○", 'm'), (" auto off", 't'), (" · no daemon", 'm')];
-        let timer_line = spell(&[("   ", ' '), ("no switches in the last 30 days", 'm')]);
+        // M-7: timer mode's auto line is empty until T4 reads the store.
+        let timer_line = String::new();
         for theme in TIERS {
             for screen in [Screen::Accounts, Screen::Tokens, Screen::History] {
                 for (w, h) in [(80, 24), (120, 40)] {
