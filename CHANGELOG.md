@@ -55,6 +55,9 @@ with the one before, so any release may contain breaking changes. Each section s
 - The daemon no longer wakes every 60 s because of an account its usage collection skips (one a
   `tagteam run` session owns, or a managed API key); it waits for the next account a round will
   collect.
+- When `tagteam run` cannot refresh an account's token because a pending rescue cannot be read,
+  it names the damaged files, as `tagteam switch` does; it said only that a pending rescue could
+  not be adopted.
 
 ### Security
 

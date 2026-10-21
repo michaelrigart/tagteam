@@ -302,7 +302,7 @@ pub(super) fn session_owned(
 }
 
 /// §9.2's refusal for a target whose profile and vault both moved (§12.5).
-pub(super) fn profile_conflict(target: &AccountRow) -> EngineError {
+pub(crate) fn profile_conflict(target: &AccountRow) -> EngineError {
     EngineError::ProfileConflict {
         position: target.position,
         label: target.label.clone(),
