@@ -9,12 +9,13 @@ use tagteam_engine::Engine;
 use tagteam_engine::collect::{CollectMode, Collected};
 use tagteam_engine::daemon::{daemon_lock_path, read_daemon_record};
 use tagteam_engine::error::EngineError;
+use tagteam_engine::failure::FailureKind;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::tokens::{
     IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport, Wait,
 };
 use tagteam_engine::views::{HistoryView, ProviderAccounts, ShellAccount};
-use tagteam_provider::{Liveness, Read, RunShell};
+use tagteam_provider::{Liveness, Read, RunShell, TransientKind};
 
 /// A read that failed, in the CLI's own words (`kind` is the JSON `error.type`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +56,8 @@ pub struct CollectSummary {
     pub warnings: Vec<String>,
     /// The accounts whose reading was recorded (`Collected::Recorded`).
     pub updated: usize,
-    /// The accounts the usage endpoint refused for rate limiting (`Failed { kind: "http-429" }`).
+    /// The accounts the usage endpoint refused for rate limiting
+    /// (`Failed { kind: FailureKind::Provider(TransientKind::Http(429)) }`).
     pub rate_limited: Vec<AccountId>,
 }
 
@@ -144,7 +146,14 @@ impl Source for EngineSource {
             rate_limited: report
                 .outcomes
                 .iter()
-                .filter(|(_, c)| matches!(c, Collected::Failed { kind } if kind == "http-429"))
+                .filter(|(_, c)| {
+                    matches!(
+                        c,
+                        Collected::Failed {
+                            kind: FailureKind::Provider(TransientKind::Http(429))
+                        }
+                    )
+                })
                 .map(|(id, _)| id.clone())
                 .collect(),
         })
@@ -197,8 +206,8 @@ fn foreign_engine_holders(
 
 /// Whether one account's collection changed what the views show (`Collected`): a reading was
 /// recorded (`Recorded`), or a failure was (`Failed`, and `OverBudget`, which the store records
-/// as an `over-budget` failure). `Failed { kind: "error" }` recorded nothing, nor did
-/// `Ineligible`, `Dropped` or `Unsupported`.
+/// as an `over-budget` failure). `Errored` recorded nothing, nor did `Ineligible`, `Dropped` or
+/// `Unsupported`.
 fn recorded(c: &Collected) -> bool {
     match c {
         Collected::Recorded | Collected::OverBudget { .. } => true,
