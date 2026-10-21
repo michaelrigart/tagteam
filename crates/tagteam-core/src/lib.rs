@@ -12,6 +12,7 @@ pub mod poll;
 pub mod provenance;
 pub mod rank;
 pub mod rotation;
+mod str_enum;
 pub mod text;
 pub mod time;
 pub mod tokens;
