@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/31 (§8.1, Tasks 1–4); §8.2 (Task 5) follows in a stacked PR
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/31 (§8.1, Tasks 1–4), https://github.com/michaelrigart/tagteam/pull/32 (§8.2, Task 5)
 **Goal:** One switchable rule on `AccountRow`, engine queries in place of the daemon's raw-row reads, one structural poll-candidate test shared by collection and the daemon's wake-up, and lock tokens on three store mutators. User-visible: the daemon no longer wakes at its 60 s floor for an account collection skips.
 **Architecture:** The rule's store-only halves become `AccountRow` methods. A round's structural candidacy becomes one function in `collect.rs`, which `scheduled_candidates` filters by due-ness and `Engine::earliest_poll_at` minimises over. The mutators take `&MutationGuard` or `&AccountLock`, as `Vault::store` does.
 **Tech Stack:** Rust 1.88 (edition 2024), cargo workspace; rusqlite.
