@@ -26,8 +26,8 @@ use tagteam_provider::http::Method;
 use tagteam_provider::liveness::FakeProcessProbe;
 use tagteam_provider::process::ScriptedSpawner;
 use tagteam_provider::{
-    Cancel, Env, FakeClock, FakeKeychain, FlockGuard, Identity, ProfileMarker, RunShell,
-    ScriptedHttp,
+    Cancel, Env, FakeClock, FakeKeychain, FlockGuard, Identity, ProcessStamp, ProfileMarker,
+    RunShell, ScriptedHttp,
 };
 use tagteam_tui::source::{EngineSource, Source};
 
@@ -238,6 +238,55 @@ fn a_live_login_tagteam_does_not_manage_is_named() {
     let snap = home.source().accounts(None).unwrap();
     assert_eq!(snap.unmanaged_live.as_deref(), Some("s@x.co"));
     assert_eq!(snap.providers[0].active_position, None);
+}
+
+#[test]
+fn a_live_engine_lock_holder_is_named_and_a_dead_one_is_not() {
+    // C-16, T2-11: another process holds the provider's engine lock when its record names a live
+    // pid with the start time it was written with, and is not the daemon.
+    let home = Home::new();
+    let locks = home.env.data_dir().join("locks");
+    fs::create_dir_all(&locks).unwrap();
+    let write = |name: &str, stamp: ProcessStamp| {
+        fs::write(
+            locks.join(name),
+            format!("{{\"pid\":{},\"start\":{}}}\n", stamp.pid, stamp.start),
+        )
+        .unwrap();
+    };
+    let me = ProcessStamp::current().unwrap();
+    let cc = ProviderId::new(CLAUDE_CODE);
+    let holders = || home.source().accounts(None).unwrap().auto_holders;
+    assert_eq!(holders(), [], "no record, no holder");
+
+    write("autoswitch-claude-code.lock", me);
+    assert_eq!(holders(), [(cc.clone(), me.pid)]);
+
+    let recycled = ProcessStamp {
+        pid: me.pid,
+        start: me.start - 1,
+    };
+    write("autoswitch-claude-code.lock", recycled);
+    assert_eq!(
+        holders(),
+        [],
+        "the pid runs, but it started at another time"
+    );
+
+    write("autoswitch-claude-code.lock", me);
+    fs::write(
+        locks.join("daemon.lock"),
+        format!(
+            "{{\"pid\":{},\"start\":{},\"version\":\"1.0.0\"}}\n",
+            me.pid, me.start
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        holders(),
+        [],
+        "the daemon holding its own job's lock is not another terminal"
+    );
 }
 
 #[test]

@@ -180,6 +180,7 @@ pub(crate) fn snapshot(accounts: Vec<AccountView>) -> AccountsSnapshot {
         unmanaged_live: None,
         in_run_shell: false,
         read_at_s: NOW_S,
+        auto_holders: vec![],
     }
 }
 
