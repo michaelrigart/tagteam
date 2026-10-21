@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/35
 **Goal:** Rebuild the Accounts screen around the account in use (a lead card with bars and the best pick, a quiet table with a loud STATUS column, a selected card with sparklines, problems and remedies), show the account in use on Tokens and History, say every usage state in one plain vocabulary shared by `list`, `status`, `history`, `auto` and the TUI, and close the R3 items the refactor handed to this branch, with no `--json`, store or wire change.
 **Architecture:** The engine gains `best_candidate`, the pure pre-vault rule of `switch --strategy best`, which both the switch and the accounts view call. The view carries each provider's `models`, `live` login and `forecast`, from one live-identity read. `words.rs` changes the shared words and adds the problem sentences and remedies. The TUI gains `gauge.rs` (lead bar, line gauge, sparkline), three Accounts parts (`screens/accounts/{table,card,lead}.rs` and `status.rs`) and the Now strip in `chrome.rs`. The binary adopts R3's `engine_for`, `fail_to` and `ColorEnv`, hands the host its warnings and the unlock prompt (D-2), and the TUI reads the daemon through R3's typed wire, after which `protocol.rs`'s `String` fields become `Wire<T>`.
 **Tech Stack:** Rust 1.88 (edition 2024), ratatui 0.30.2, crossterm =0.29.0. No new dependency.
