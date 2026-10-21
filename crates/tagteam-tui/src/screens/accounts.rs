@@ -334,7 +334,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     for line in lines.iter().skip(offset).take(rows) {
         shown.push(match line {
             TableLine::Provider(name) => Line::from(Span::styled(
-                format!(" {name}"),
+                fit(&format!(" {name}"), width),
                 state.theme.role(Role::Muted),
             )),
             TableLine::Header(i) => tables[*i].header(state.theme),
@@ -797,6 +797,93 @@ mod tests {
         assert!(body[1].ends_with("  2m"), "{}", body[1]);
         assert!(body[2].ends_with("  1m"), "{}", body[2]);
         assert!(body[0..4].iter().all(|l| width_of(l) <= 80), "{body:?}");
+    }
+
+    #[test]
+    fn a_stale_reading_s_age_is_warn_whatever_its_status() {
+        // §6.3: UPDATED is warn when the reading is not decision-grade, a retry's included.
+        let mut retrying = read(840, 9.0, 12.0, false);
+        retrying.status = UsageStatus::Unavailable;
+        retrying.error = Some("refresh-failed".into());
+        let mut limited = read(60, 9.0, 12.0, false);
+        limited.status = UsageStatus::Unavailable;
+        limited.error = Some("http-429".into());
+        let accounts = vec![
+            account(1, "alex@example.com", read(60, 9.0, 12.0, false)),
+            account(2, "sam@corp.example", read(840, 9.0, 12.0, false)),
+            account(3, "alex@personal.example", retrying),
+            account(4, "a4@x.co", limited),
+        ];
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            let body = body_of(&state, 120, 40, NOW_MS);
+            let updated = col(&body[0], "UPDATED");
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let y = body_y(&state, 120, 40);
+            let rows = [
+                ("1m", "m", "best"),
+                ("14m", "w", "! old reading"),
+                ("14m", "w", "! retrying"),
+                ("1m", "m", "! rate-limited"),
+            ];
+            for (i, (age, role, phrase)) in rows.into_iter().enumerate() {
+                let row = &body[i + 1];
+                assert_eq!(columns(row, updated, updated + 7).trim(), age, "{row}");
+                assert!(row.ends_with(phrase), "{row}");
+                let letters = roles(&buf, theme, y + 1 + i as u16);
+                let at = updated + 7 - age.len();
+                let want = canon(theme, &role.repeat(age.len()));
+                let got: String = letters.chars().skip(at).take(age.len()).collect();
+                assert_eq!(got, want, "{theme:?}: {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_table_draws_the_pace_mark_on_long_windows_only() {
+        // C-8: a long window's pace mark shows in the table; a short window has none, even with
+        // an expected percentage.
+        let mut usage = read(60, 30.0, 30.0, false);
+        let windows = usage.windows.as_mut().unwrap();
+        windows[0].1.expected_pct = Some(10.0);
+        windows[1].1.expected_pct = Some(50.0);
+        let mut inside = read(60, 30.0, 60.0, false);
+        inside.windows.as_mut().unwrap()[1].1.expected_pct = Some(20.0);
+        for theme in TIERS {
+            let mut state = loaded(vec![
+                account(1, "alex@example.com", usage.clone()),
+                account(2, "sam@corp.example", inside.clone()),
+            ]);
+            state.theme = theme;
+            let body = body_of(&state, 120, 40, NOW_MS);
+            let (five, seven) = (col(&body[0], "5H"), col(&body[0], "7D"));
+            let track = if theme.colourless() { "·" } else { "─" };
+            let gauge = |row: &str, at: usize| columns(row, at, at + 14);
+            assert_eq!(gauge(&body[1], five), format!("━━━━{}", track.repeat(10)));
+            assert_eq!(
+                gauge(&body[1], seven),
+                format!("━━━━{}┼{}", track.repeat(3), track.repeat(6))
+            );
+            assert_eq!(
+                gauge(&body[2], seven),
+                format!("━━┿━━━━━{}", track.repeat(6))
+            );
+            // `┿` in the fill's role inside it, `┼` muted outside.
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let y = body_y(&state, 120, 40);
+            let at = |row: u16, x: usize| roles(&buf, theme, y + row).chars().nth(x);
+            assert_eq!(
+                at(1, seven + 7),
+                canon(theme, "m").chars().next(),
+                "{theme:?}"
+            );
+            assert_eq!(
+                at(2, seven + 2),
+                canon(theme, "a").chars().next(),
+                "{theme:?}"
+            );
+        }
     }
 
     #[test]
@@ -1815,26 +1902,47 @@ mod tests {
         let mut spend = window("spend", "spend", WindowKind::Spend, 0.0, Some(1_209_630));
         spend.detail = Some(r#"{"used": 0, "limit": 20, "currency": "EUR"}"#.parse().unwrap());
         windows.push((spend, Pace::default()));
+        let mut more = read(60, 9.0, 12.0, false);
+        let mut spent = window("spend", "spend", WindowKind::Spend, 24.8, Some(1_209_630));
+        spent.detail = Some(r#"{"used": 12.4, "limit": 50, "currency": "EUR"}"#.parse().unwrap());
+        more.windows
+            .as_mut()
+            .unwrap()
+            .push((spent, Pace::default()));
         let mut state = loaded(vec![
             account(1, "alex@example.com", usage),
             account(2, "sam@corp.example", read(60, 9.0, 12.0, false)),
+            account(3, "alex@personal.example", more),
         ]);
         state.theme = Theme::new(true);
         let wide = body_of(&state, 160, 40, NOW_MS);
         let head = &wide[0];
         let (fable, spend) = (col(head, "FABLE"), col(head, "SPEND"));
         assert!(col(head, "7D") < fable && fable < spend, "{head}");
-        assert!(spend < col(head, "UPDATED"), "{head}");
+        // The spend column is its widest amount, `€12.40 of €50`, and the group ends there.
+        assert_eq!(spend + 13 + 3, col(head, "UPDATED"), "{head}");
         assert_eq!(columns(&wide[1], fable, fable + 6), " 40%  ", "{}", wide[1]);
+        // §4.3: amounts are right-aligned.
         assert_eq!(
-            columns(&wide[1], spend, spend + 9),
-            "€0 of €20",
+            columns(&wide[1], spend, spend + 13),
+            "    €0 of €20",
             "{}",
             wide[1]
         );
-        // A row without them has `—` in their place.
+        assert_eq!(
+            columns(&wide[3], spend, spend + 13),
+            "€12.40 of €50",
+            "{}",
+            wide[3]
+        );
+        // A row without them has `—` where their values end.
         assert_eq!(columns(&wide[2], fable, fable + 4), "   —", "{}", wide[2]);
-        assert_eq!(columns(&wide[2], spend, spend + 1), "—", "{}", wide[2]);
+        assert_eq!(
+            columns(&wide[2], spend, spend + 13),
+            format!("{}—", " ".repeat(12)),
+            "{}",
+            wide[2]
+        );
         assert!(wide.iter().all(|l| width_of(l) <= 160));
         let narrow = body_of(&state, 120, 40, NOW_MS);
         assert!(
@@ -1917,6 +2025,10 @@ mod tests {
     fn wide_names_are_cut_by_display_width_and_never_overflow() {
         let mut long = account(1, "alex@example.com", read(60, 9.0, 12.0, false));
         long.row.alias = Some("a".repeat(200));
+        let mut wide_alias = account(4, "a4@x.co", read(60, 9.0, 12.0, false));
+        wide_alias.row.alias = Some("仕事用アカウント😀😀😀😀".into());
+        let mut empty_alias = account(5, "sam@corp.example", read(60, 9.0, 12.0, false));
+        empty_alias.row.alias = Some(String::new());
         let accounts = vec![
             long,
             account(2, "例のアカウント@example.com", read(840, 9.0, 12.0, false)),
@@ -1925,6 +2037,8 @@ mod tests {
                 "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀@x.co",
                 read(60, 9.0, 12.0, false),
             ),
+            wide_alias,
+            empty_alias,
         ];
         for w in [80, 100, 120] {
             let state = loaded(accounts.clone());
@@ -1935,7 +2049,7 @@ mod tests {
             // Every row's UPDATED still sits under its head.
             let body = body_of(&state, w, 24, NOW_MS);
             let updated = col(&body[0], "UPDATED");
-            for (row, age) in body[1..4].iter().zip(["1m", "14m", "1m"]) {
+            for (row, age) in body[1..6].iter().zip(["1m", "14m", "1m", "1m", "1m"]) {
                 assert_eq!(
                     columns(row, updated, updated + 7).trim_start(),
                     age,
@@ -1953,6 +2067,15 @@ mod tests {
             "{}",
             narrow[2]
         );
+        // The 23-column name: a wide alias cut by display width to half of it, two spaces and
+        // the email; an empty alias leaves its column blank.
+        let name = |row: &str| columns(row, 8, 8 + 23);
+        assert_eq!(
+            name(&narrow[4]),
+            format!("仕事用アカ…  a4@x.co{}", " ".repeat(3))
+        );
+        assert_eq!(width_of(&name(&narrow[4])), 23);
+        assert_eq!(name(&narrow[5]), format!("{}sam@corp.…", " ".repeat(13)));
     }
 
     /// Review Focus 3: with no store and no accounts, the empty state (redesign §5.7).
@@ -2256,6 +2379,7 @@ mod tests {
             assert_eq!(body[3], " FakeAgent");
             assert!(body[4].starts_with("    #   ACCOUNT"));
             assert!(body[5].contains("o@x.co"));
+            assert!(body.iter().all(|l| width_of(l) <= 80), "{body:?}");
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
             let y = body_y(&state, 80, 24);
             for row in [y, y + 3] {
