@@ -129,7 +129,7 @@ fn once_exits_0_switched_1_error_2_no_action_and_3_blocked() {
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
     assert_eq!(
         untimed(&out.stdout),
-        ["#2 b@x.co  60%  no switch: below-threshold"]
+        ["#2 b@x.co  60%  no switch needed (60%, switches at 90%)"]
     );
     assert_eq!(text(&out.stderr), "");
 
@@ -139,7 +139,7 @@ fn once_exits_0_switched_1_error_2_no_action_and_3_blocked() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(
         untimed(&out.stdout),
-        ["#2 b@x.co  95%  switched to #1 (proactive)"]
+        ["#2 b@x.co  95%  switched to #1 (before it reached the limit)"]
     );
     assert_eq!(live_email(d.path()), "a@x.co");
 
@@ -150,7 +150,7 @@ fn once_exits_0_switched_1_error_2_no_action_and_3_blocked() {
     assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
     let line = &untimed(&out.stdout)[0];
     assert!(
-        line.starts_with("#2 b@x.co  95%  no switch: all-exhausted, the first back at ")
+        line.starts_with("#2 b@x.co  95%  every account is near its limit; the first frees up at ")
             && line.ends_with(" (2h40m)"),
         "{line}"
     );
@@ -218,7 +218,7 @@ fn dry_run_says_what_it_would_switch_and_writes_nothing() {
     let out = auto(d.path(), &["--once", "--dry-run"]);
     assert_eq!(
         untimed(&out.stdout),
-        ["#2 b@x.co  95%  would switch to #1 (proactive)"]
+        ["#2 b@x.co  95%  would switch to #1 (before it reached the limit)"]
     );
 }
 
@@ -459,7 +459,7 @@ fn bad_flag_values_are_usage_errors() {
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
     assert_eq!(
         untimed(&out.stdout),
-        ["#2 b@x.co  60%  no switch: below-threshold"]
+        ["#2 b@x.co  60%  no switch needed (60%, switches at 99.9%)"]
     );
 }
 
