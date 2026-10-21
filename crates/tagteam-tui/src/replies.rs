@@ -31,7 +31,8 @@ enum State {
     OscEsc,
     /// A DA1 answer is being dropped, up to its `c`.
     Da1,
-    /// A CSI that detection cut off after `ESC [`: its next key is dropped.
+    /// A CSI that detection cut off after `ESC [`: its next key is dropped, unless it opens a new
+    /// sequence (Esc, Alt+`]`) or is the `?` of a DA1 answer.
     Cut,
 }
 
@@ -177,11 +178,15 @@ impl ReplyFilter {
                 }
             }
             State::Cut => {
-                self.state = if is_char(&key, '?') {
-                    State::Da1
+                if is_char(&key, '?') {
+                    self.state = State::Da1;
+                } else if is_alt(&key, ']') || is_esc(&key) {
+                    // The cut CSI ended, and this key opens a new sequence: held, not dropped.
+                    self.state = State::Open;
+                    self.open(key, pass);
                 } else {
-                    State::Open
-                };
+                    self.state = State::Open;
+                }
             }
         }
     }
@@ -428,6 +433,24 @@ mod tests {
         let mut filter = ReplyFilter::wary(Handoff::Csi);
         assert_eq!(filter.key(plain('x')), vec![]);
         passes(&mut filter);
+    }
+
+    #[test]
+    fn a_new_sequence_after_a_cut_csi_is_held_and_its_reply_dropped() {
+        let reply = typed("11;rgb:2b3b");
+        for opener in [vec![alt(']')], vec![esc(), plain(']')]] {
+            let mut filter = ReplyFilter::wary(Handoff::Csi);
+            assert_eq!(through(&mut filter, opener.clone()), vec![], "{opener:?}");
+            assert_eq!(through(&mut filter, reply.clone()), vec![], "{opener:?}");
+            assert!(filter.holding(), "{opener:?}");
+            assert_eq!(filter.key(ctrl('g')), vec![], "{opener:?}");
+            assert!(!filter.holding(), "{opener:?}");
+            passes(&mut filter);
+        }
+        // An Esc that starts nothing is the person's, as in the open.
+        let mut filter = ReplyFilter::wary(Handoff::Csi);
+        assert_eq!(filter.key(esc()), vec![]);
+        assert_eq!(filter.key(plain('j')), vec![esc(), plain('j')]);
     }
 
     #[test]

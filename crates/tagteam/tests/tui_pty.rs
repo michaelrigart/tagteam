@@ -654,6 +654,20 @@ fn a_typed_ahead_esc_does_not_unhold_a_truncated_answer() {
 }
 
 #[test]
+fn a_reply_after_a_typed_alt_bracket_and_the_give_up_never_reaches_the_keys() {
+    let home = Home::new();
+    one_response(&home);
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    tui.type_keys(b"\x1b[");
+    thread::sleep(Duration::from_millis(1_300));
+    tui.type_keys(b"\x1b]11;rgb:2b3b/2b3b/2b3b\x07");
+    then_history(&mut tui, &[&tokens]);
+    assert_eq!(live_email(home.root()), "b@x.co");
+    quit(tui);
+}
+
+#[test]
 fn a_typed_backslash_does_not_end_a_held_answer() {
     let home = Home::new();
     one_response(&home);
