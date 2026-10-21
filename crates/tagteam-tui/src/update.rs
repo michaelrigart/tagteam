@@ -76,7 +76,9 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
             // A collection slower than the timer is overtaken by the next. What it recorded is
             // in the store all the same, so it is read back; its banner and toast are dropped,
             // unless a person's `r` asked for it: that one is answered whatever came since.
-            let asked = state.checking == Some(r#gen);
+            // The lane replaces a queued collection with the next, so the one `r` asked for may
+            // never complete: any at or after it (generations only grow) answers the person.
+            let asked = state.checking.is_some_and(|asked_gen| r#gen >= asked_gen);
             if asked {
                 state.checking = None;
                 state.dirty = true;
@@ -917,6 +919,75 @@ mod tests {
         };
         update(&mut state, older, NOW_MS);
         assert!(state.banner.is_none());
+    }
+
+    #[test]
+    fn a_later_collection_answers_an_r_whose_own_the_lane_replaced() {
+        // The lane replaces a queued collection with the next, so the completion of the one
+        // `r` asked for never comes.
+        let summary = |fetched, updated| CollectSummary {
+            fetched,
+            warnings: vec![],
+            updated,
+            rate_limited: vec![],
+        };
+        let collected = |r#gen, summary| Msg::Collected {
+            r#gen,
+            result: Ok(summary),
+        };
+        let pressed = || {
+            let mut state = fresh(Screen::Accounts);
+            state.start();
+            update(&mut state, accounts_msg(1, 1), NOW_MS);
+            update(&mut state, ch('r'), NOW_MS);
+            state
+        };
+        let said = |state: &State| state.toast.as_ref().map(|t| (t.kind, t.text.clone()));
+
+        // Nothing fetched: said at once.
+        let mut state = pressed();
+        let asked = state.checking.expect("r asked for a collection");
+        let Cmd::CollectDue { r#gen: later, .. } = state.collect_due(vec![id(1)]) else {
+            unreachable!()
+        };
+        assert_eq!(later, asked + 1);
+        assert!(update(&mut state, collected(later, summary(0, 0)), NOW_MS).is_empty());
+        assert_eq!(state.checking, None, "the spinner stops");
+        assert_eq!(
+            said(&state),
+            Some((ToastKind::Info, "already current".to_owned()))
+        );
+
+        // Something fetched: deferred to the accounts read after it.
+        let mut state = pressed();
+        state.collect_due(vec![id(1)]);
+        let cmds = update(&mut state, collected(2, summary(1, 1)), NOW_MS);
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::LoadAccounts { .. }]),
+            "{cmds:?}"
+        );
+        assert_eq!(state.checking, None);
+        assert!(state.checked.is_some() && state.toast.is_none());
+        let Cmd::LoadAccounts { r#gen } = state.load_accounts() else {
+            unreachable!()
+        };
+        update(&mut state, accounts_msg(r#gen, 1), NOW_MS);
+        assert_eq!(
+            said(&state),
+            Some((ToastKind::Done, "updated 1 account".to_owned()))
+        );
+
+        // A collection from before `r` does not answer it.
+        let mut state = pressed();
+        update(&mut state, ch('r'), NOW_MS);
+        let asked = state.checking.expect("the second r");
+        assert_eq!(asked, 2);
+        update(&mut state, collected(asked - 1, summary(0, 0)), NOW_MS);
+        assert_eq!(state.checking, Some(asked));
+        assert_eq!(said(&state), None);
+        update(&mut state, collected(asked, summary(0, 0)), NOW_MS);
+        assert_eq!(state.checking, None);
+        assert!(said(&state).is_some());
     }
 
     #[test]
