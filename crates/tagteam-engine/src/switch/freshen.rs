@@ -1,3 +1,5 @@
+use std::fmt;
+
 use tagteam_core::AccountId;
 use tagteam_provider::{Provider, Read};
 
@@ -30,6 +32,30 @@ enum Freshened {
     Replan,
 }
 
+/// Why an automatic switch's target could not be freshened (§11.2 step 10), as the tick's
+/// error names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FreshenFailure {
+    /// A gate kind (§7.3), spelled by `GateFailure::as_str`.
+    Gate(GateFailure),
+    /// The gate's successor is only in `rescue/` (`Transient { rescued: true, .. }`).
+    Rescued,
+    /// In words: the token endpoint's systemic refusal, or an error's text.
+    Text(String),
+}
+
+impl fmt::Display for FreshenFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FreshenFailure::Gate(kind) => f.write_str(&kind.as_str()),
+            FreshenFailure::Rescued => {
+                f.write_str("its refreshed token is in rescue/, not yet in the vault")
+            }
+            FreshenFailure::Text(text) => f.write_str(text),
+        }
+    }
+}
+
 /// What freshening an automatic switch's target decided (§11.2 step 10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AutoFreshened {
@@ -39,7 +65,7 @@ pub(crate) enum AutoFreshened {
     /// (§7.4). Try the next target.
     Quarantined,
     /// Transient or systemic, with what went wrong. Try the next target.
-    Failed(String),
+    Failed(FreshenFailure),
     /// Not a candidate after all: no stored credential, owned by a session, or a session
     /// profile that conflicts with the vault (§12.5). Try the next target.
     Skip,
@@ -260,11 +286,13 @@ impl Engine {
                         account = %row.id,
                         "a pending rescue could not be settled; the target is passed over"
                     );
-                    return Ok(AutoFreshened::Failed(
-                        GateFailure::RescueUnreadable.as_str().into_owned(),
-                    ));
+                    return Ok(AutoFreshened::Failed(FreshenFailure::Gate(
+                        GateFailure::RescueUnreadable,
+                    )));
                 }
-                Err(EngineError::Unreadable(e)) => return Ok(AutoFreshened::Failed(e.to_string())),
+                Err(EngineError::Unreadable(e)) => {
+                    return Ok(AutoFreshened::Failed(FreshenFailure::Text(e.to_string())));
+                }
                 Err(e) => return Err(e),
             }
             match self.apply_provenance(p, &row, &lock) {
@@ -276,18 +304,22 @@ impl Engine {
                         account = %row.id,
                         "the session profile could not be read; the target is passed over"
                     );
-                    return Ok(AutoFreshened::Failed(
-                        GateFailure::ProfileUnreadable.as_str().into_owned(),
-                    ));
+                    return Ok(AutoFreshened::Failed(FreshenFailure::Gate(
+                        GateFailure::ProfileUnreadable,
+                    )));
                 }
                 Ok(_) => {}
-                Err(EngineError::Unreadable(e)) => return Ok(AutoFreshened::Failed(e.to_string())),
+                Err(EngineError::Unreadable(e)) => {
+                    return Ok(AutoFreshened::Failed(FreshenFailure::Text(e.to_string())));
+                }
                 Err(e) => return Err(e),
             }
         }
         let vault = match self.vault.read(&target.id) {
             Read::Present(b) if !b.is_empty() => b,
-            Read::Unreadable(e) => return Ok(AutoFreshened::Failed(e.to_string())),
+            Read::Unreadable(e) => {
+                return Ok(AutoFreshened::Failed(FreshenFailure::Text(e.to_string())));
+            }
             Read::Present(_) | Read::Absent => return Ok(AutoFreshened::Skip),
         };
         if !self.due(p, &vault) {
@@ -308,13 +340,13 @@ impl Engine {
             GateOutcome::Dead(_) | GateOutcome::Unpersisted => AutoFreshened::Quarantined,
             // The vault's generation is spent and its successor waits in `rescue/`: activating
             // it would hand the agent a used refresh token. A later tick adopts the rescue.
-            GateOutcome::Transient { rescued: true, .. } => AutoFreshened::Failed(
-                "its refreshed token is in rescue/, not yet in the vault".into(),
-            ),
-            GateOutcome::Transient { kind, .. } => {
-                AutoFreshened::Failed(kind.as_str().into_owned())
+            GateOutcome::Transient { rescued: true, .. } => {
+                AutoFreshened::Failed(FreshenFailure::Rescued)
             }
-            GateOutcome::Systemic(detail) => AutoFreshened::Failed(detail),
+            GateOutcome::Transient { kind, .. } => {
+                AutoFreshened::Failed(FreshenFailure::Gate(kind))
+            }
+            GateOutcome::Systemic(detail) => AutoFreshened::Failed(FreshenFailure::Text(detail)),
             GateOutcome::Owned(OwnedBy::Session) | GateOutcome::Conflict => AutoFreshened::Skip,
         })
     }
@@ -353,6 +385,45 @@ impl Engine {
             Ok(report) => Ok(report.warnings),
             Err(e) if e.signal().is_some() => Err(e),
             Err(e) => Ok(vec![format!("usage was not collected: {e}")]),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tagteam_provider::TransientKind;
+
+    use super::*;
+
+    #[test]
+    fn a_freshen_failure_reads_as_the_reason_the_tick_reports() {
+        for (failure, text) in [
+            (
+                FreshenFailure::Gate(GateFailure::RescueUnreadable),
+                "rescue-unreadable",
+            ),
+            (
+                FreshenFailure::Gate(GateFailure::ProfileUnreadable),
+                "profile-unreadable",
+            ),
+            (
+                FreshenFailure::Gate(GateFailure::Provider(TransientKind::PreSend)),
+                "pre-send",
+            ),
+            (
+                FreshenFailure::Gate(GateFailure::Provider(TransientKind::Http(503))),
+                "http-503",
+            ),
+            (
+                FreshenFailure::Rescued,
+                "its refreshed token is in rescue/, not yet in the vault",
+            ),
+            (
+                FreshenFailure::Text("invalid_client".into()),
+                "invalid_client",
+            ),
+        ] {
+            assert_eq!(failure.to_string(), text);
         }
     }
 }

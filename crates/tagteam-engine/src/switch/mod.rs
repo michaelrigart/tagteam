@@ -19,7 +19,7 @@ mod select;
 mod support;
 mod transact;
 
-pub(crate) use freshen::AutoFreshened;
+pub(crate) use freshen::{AutoFreshened, FreshenFailure};
 pub(crate) use support::{
     Axis, OracleHint, Settle, answer_for, cannot_refresh, needs_relogin, refuse_unreadable,
     refuse_unsafe_live_reads, works_until_expiry,
