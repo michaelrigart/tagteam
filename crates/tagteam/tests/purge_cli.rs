@@ -419,3 +419,34 @@ fn a_provider_purge_accepts_a_provider_the_store_holds_accounts_of_though_this_b
         assert_eq!(json_of(&out)["error"]["type"], "unknown-provider", "{name}");
     }
 }
+
+#[test]
+fn a_purge_that_would_delete_the_live_login_reports_deletion_refused_with_the_entry() {
+    // R4d: the refusal's kind says what it is, and the path it names stays in the message.
+    let d = tempfile::tempdir().unwrap();
+    let (a, _) = two_fresh_accounts(d.path());
+    let data = Env::for_test(d.path()).data_dir();
+    let live = data.join("displaced").join("live");
+    fs::create_dir_all(&live).unwrap();
+    fs::write(live.join(".claude.json"), r#"{"oauthAccount":{}}"#).unwrap();
+    let out = cmd(d.path())
+        .env("CLAUDE_CONFIG_DIR", &live)
+        .args(["purge", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "{{\"schemaVersion\":1,\"error\":{{\"type\":\"deletion-refused\",\"message\":\"{}/displaced: the live login's files are inside what this would delete, since the environment names it; nothing was deleted (tagteam never deletes the live login)\"}}}}\n",
+            data.display()
+        )
+    );
+    assert!(keychain(d.path()).find(SERVICE, &a).is_present());
+    assert!(live.join(".claude.json").exists());
+}

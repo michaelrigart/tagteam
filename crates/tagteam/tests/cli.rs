@@ -8,7 +8,9 @@ use std::path::Path;
 use std::process::Stdio;
 
 use assert_cmd::assert::OutputAssertExt;
-use common::{LOCKED, cmd, expire_vault, live_email, login, seed_home, std_cmd, two_accounts};
+use common::{
+    LOCKED, cc_profile, cmd, expire_vault, live_email, login, seed_home, std_cmd, two_accounts,
+};
 use predicates::prelude::PredicateBooleanExt;
 use serde_json::{Value, json};
 use tagteam::prompt::ARGV_TOKEN_WARNING;
@@ -570,4 +572,30 @@ fn the_binary_names_the_live_item_from_the_secure_storage_dir_it_was_started_wit
         .stderr(predicates::str::contains(
             "there is no live login to add; log in with `claude` first",
         ));
+}
+
+#[test]
+fn remove_reports_deletion_refused_when_the_live_login_lives_in_the_profile() {
+    // R4d: the file guard's refusal has a kind of its own, and no path in front of it.
+    let d = tempfile::tempdir().unwrap();
+    let (a, _) = two_accounts(d.path());
+    let (_, spelling) = cc_profile(d.path(), &a);
+    let out = cmd(d.path())
+        .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", &spelling)
+        .args(["remove", "1", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"schemaVersion\":1,\"error\":{\"type\":\"deletion-refused\",\"message\":\"the live login's files are inside what this would delete, since the environment names it; nothing was deleted (tagteam never deletes the live login)\"}}\n"
+    );
+    let list = cmd(d.path()).args(["list", "--json"]).output().unwrap();
+    let v: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(v["accounts"][0]["id"], json!(a));
 }

@@ -9,7 +9,7 @@ use tagteam_provider::{Credential, Identity, Provenance, Provider, Read};
 
 use crate::account_lock::AccountLock;
 use crate::engine::{Engine, GuardRequest, Reconcile};
-use crate::error::EngineError;
+use crate::error::{DeletionRefusal, EngineError, GuardScope};
 use crate::fsutil::{FileId, absent, trace_path};
 use crate::rescue::RescueUnlisted;
 use crate::store::{AccountRow, EventRow, LoginMeta, NewAccount, Store, StoreError};
@@ -392,10 +392,12 @@ impl Engine {
             account = %row.id,
             "the Keychain item the session profile names is the live login's; nothing was deleted"
         );
-        Err(EngineError::Io(io::Error::other(format!(
-            "the Keychain item account {}'s profile names is the live login's, since the environment ({var}, or the provider's override of it) names the same directory; nothing was deleted (tagteam never deletes the live login)",
-            row.position
-        ))))
+        Err(EngineError::DeletionRefused {
+            why: DeletionRefusal::LiveLoginKeychain {
+                var,
+                position: Some(row.position),
+            },
+        })
     }
 
     /// §10.5 "never deletes or replaces a provider's live login", by path and apart from any
@@ -417,10 +419,8 @@ impl Engine {
         p: &dyn Provider,
         entry: &Path,
     ) -> Result<(), EngineError> {
-        let unresolved = || {
-            EngineError::Io(io::Error::other(
-                "a path the live login lives at could not be resolved, so it cannot be told whether deleting this profile entry would break it; nothing was deleted (tagteam never deletes the live login)",
-            ))
+        let unresolved = || EngineError::DeletionRefused {
+            why: DeletionRefusal::LiveLoginUnresolved(GuardScope::ProfileEntry),
         };
         let (Some(parent), Some(name)) = (entry.parent(), entry.file_name()) else {
             return Err(unresolved());
@@ -470,9 +470,9 @@ impl Engine {
                 tracing::warn!(
                     "the live login's files are inside a profile directory; nothing was deleted"
                 );
-                return Err(EngineError::Io(io::Error::other(
-                    "the live login's files are inside what this would delete, since the environment names it; nothing was deleted (tagteam never deletes the live login)",
-                )));
+                return Err(EngineError::DeletionRefused {
+                    why: DeletionRefusal::LiveLoginInside(GuardScope::ProfileEntry),
+                });
             }
         }
         Ok(())
