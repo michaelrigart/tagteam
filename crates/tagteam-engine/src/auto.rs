@@ -772,7 +772,7 @@ impl AutoEngine<'_> {
                     id: a.row.id.clone(),
                     position: a.row.position,
                     api_key: p.kind_traits(&a.row.kind).managed_key_axis,
-                    switchable: !a.row.disabled && a.row.identity_json.is_object(),
+                    switchable: a.row.is_switchable(),
                     quarantined: a.row.quarantine_reason.is_some(),
                     session_owned: a.session_owned,
                     windows: a.windows.clone(),
