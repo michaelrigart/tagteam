@@ -89,6 +89,54 @@ fn accounts_lists_every_provider_with_accounts() {
 }
 
 #[test]
+fn each_provider_s_view_carries_its_own_settings_and_names() {
+    use tagteam_core::autoswitch::Strategy;
+    use tagteam_engine::views::ProviderNames;
+
+    let ffx = FakeFx::new();
+    let config = tagteam_engine::settings::config_path(&ffx.fx.env);
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        "[autoswitch]\nthreshold = 80\n\n[provider.fake-agent.autoswitch]\nthreshold = 95\nstrategy = \"consume-first\"\n",
+    )
+    .unwrap();
+    ffx.fx.add("a@b.co", "rt-a");
+    ffx.fake_add("alice", "tok-a", "renew-a");
+    let seen = |ffx: &FakeFx| -> Vec<(f64, Strategy, ProviderNames)> {
+        ffx.engine
+            .accounts(None)
+            .unwrap()
+            .iter()
+            .map(|l| (l.threshold, l.strategy, l.names))
+            .collect()
+    };
+    assert_eq!(
+        seen(&ffx),
+        vec![
+            (
+                80.0,
+                Strategy::Best,
+                ProviderNames {
+                    display_name: "Claude Code",
+                    launch_command: "claude"
+                }
+            ),
+            (
+                95.0,
+                Strategy::ConsumeFirst,
+                ProviderNames {
+                    display_name: "FakeAgent",
+                    launch_command: "fakeagent"
+                }
+            ),
+        ]
+    );
+    fs::write(&config, "[autoswitch]\nthreshold = 85\n").unwrap();
+    assert_eq!(seen(&ffx)[0].0, 85.0);
+}
+
+#[test]
 fn a_fake_agent_account_has_no_claude_code_shaped_field() {
     let ffx = FakeFx::new();
     let alice = ffx.fake_add("alice", "tok-a", "renew-a");

@@ -19,7 +19,8 @@ use tagteam_engine::tokens::{
     TokenQuery, TokenReport, TokenRow, TokenTotal,
 };
 use tagteam_engine::views::{
-    AccountView, HistoryView, HistoryWindow, ProviderAccounts, UsageStatus, UsageView,
+    AccountView, HistoryView, HistoryWindow, ProviderAccounts, ProviderNames, UsageStatus,
+    UsageView,
 };
 use tagteam_provider::KindTraits;
 
@@ -34,6 +35,11 @@ use crate::theme::Theme;
 pub(crate) const NOW_S: i64 = 1_790_000_000;
 pub(crate) const NOW_MS: i64 = NOW_S * 1000;
 pub(crate) const HOUR: i64 = 3_600;
+
+pub(crate) const CC_NAMES: ProviderNames = ProviderNames {
+    display_name: "Claude Code",
+    launch_command: "claude",
+};
 
 pub(crate) const OAUTH: KindTraits = KindTraits {
     refreshable: true,
@@ -156,6 +162,9 @@ pub(crate) fn snapshot(accounts: Vec<AccountView>) -> AccountsSnapshot {
             provider: cc(),
             active_position: accounts.iter().find(|v| v.active).map(|v| v.row.position),
             accounts,
+            threshold: 90.0,
+            strategy: tagteam_core::autoswitch::Strategy::Best,
+            names: CC_NAMES,
         }],
         this: None,
         unmanaged_live: None,
