@@ -507,11 +507,15 @@ mod tests {
         assert_eq!(later[23], footer_row(&adding("⠙"), 80));
         let busy = "still adding Claude Code's login · wait for it to finish";
         state.toast(ToastKind::Info, busy, NOW_MS);
+        let glyph = "⠋  ? keys  q quit";
         assert_eq!(
             draw(&state, 80, 24)[23],
-            busy,
-            "a spinner this long leaves the toast too little room beside it, so the toast takes \
-             the row"
+            format!(
+                "{busy}{}{glyph}",
+                " ".repeat(80 - 1 - width_of(busy) - width_of(glyph))
+            ),
+            "a spinner this long leaves the toast too little room beside it, so it shows its \
+             glyph alone and keeps the pinned two"
         );
         state.running = Some(Action::Doctor {
             provider: None,

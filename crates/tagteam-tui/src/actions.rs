@@ -978,6 +978,9 @@ mod tests {
         };
         let auto = |on| Action::Autoswitch { provider: cc(), on };
         let set = "Set provider.claude-code.daemon.autoswitch = false in ~/.config/tagteam/config.toml.\n";
+        let long = "word ".repeat(60);
+        let long = long.trim_end();
+        let long_err = format!("{long}\n");
         let scrollback = "switch failed · its output is above in your terminal's scrollback";
         let cases = [
             // 2. A suspended action is worded by its exit code alone, whatever it printed.
@@ -1170,6 +1173,25 @@ mod tests {
                 "Switched.\n",
                 "tagteam: x\n",
                 panel("switch", "Switched.\ntagteam: x"),
+            ),
+            // One line, but too long for a toast's three rows: the panel, so no word is cut.
+            (
+                "long warning",
+                switch(),
+                false,
+                0,
+                "",
+                &long_err,
+                panel("switch", long),
+            ),
+            (
+                "long failure",
+                switch(),
+                false,
+                1,
+                "",
+                &long_err,
+                panel("switch", long),
             ),
         ];
         for (case, action, on_terminal, exit, out, err, want) in cases {
@@ -1883,6 +1905,50 @@ mod tests {
         assert_eq!(
             said(&state),
             (ToastKind::Done, "updated 1 account".to_owned())
+        );
+
+        // T2-9's order: rate-limited beats a warning, and a warning beats updated.
+        let warning = || vec!["usage for a1@x.co (position 1) was not collected: x".to_owned()];
+        let mut state = pressed(1, &|_| {});
+        let both = CollectSummary {
+            rate_limited: vec![id(1)],
+            warnings: warning(),
+            ..summary(1, 0)
+        };
+        update(&mut state, collected(1, both), NOW_MS);
+        read_back(&mut state, 1, limited(vec![240]));
+        assert_eq!(
+            said(&state),
+            (
+                ToastKind::Warn,
+                "1 account rate-limited · retry in 4m".to_owned()
+            )
+        );
+        let mut state = pressed(1, &|_| {});
+        let both = CollectSummary {
+            warnings: warning(),
+            ..summary(1, 1)
+        };
+        update(&mut state, collected(1, both), NOW_MS);
+        read_back(&mut state, 1, |_| {});
+        assert_eq!(
+            said(&state),
+            (
+                ToastKind::Warn,
+                "warning: usage for a1@x.co (position 1) was not collected: x".to_owned()
+            )
+        );
+        // Rate-limited with no retry time in the new read: no span.
+        let mut state = pressed(1, &|_| {});
+        let refused = CollectSummary {
+            rate_limited: vec![id(1)],
+            ..summary(1, 0)
+        };
+        update(&mut state, collected(1, refused), NOW_MS);
+        read_back(&mut state, 1, |_| {});
+        assert_eq!(
+            said(&state),
+            (ToastKind::Warn, "1 account rate-limited".to_owned())
         );
 
         // Already current: at once, with the soonest next poll of the accounts shown.

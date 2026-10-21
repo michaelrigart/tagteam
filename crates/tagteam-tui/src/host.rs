@@ -134,8 +134,8 @@ impl Action {
     }
 
     /// The command's name as the CLI spells it: "switch", "enable", "disable", "alias", "move",
-    /// "remove", "add", "run", "doctor", "config". The footer shows it while the action runs,
-    /// and says `busy: <name>` to a second action key (spec §7.2).
+    /// "remove", "add", "run", "doctor", "config". The finishing line, the result panel's title
+    /// and the outcome toasts use it; the spinner and the busy toast use `label`.
     pub fn name(&self) -> &'static str {
         match self {
             Action::Switch(_) | Action::SwitchBy { .. } => "switch",
