@@ -52,6 +52,9 @@ with the one before, so any release may contain breaking changes. Each section s
   Code has, still names it.
 - `tagteam completions` exits with an error when it cannot write the script, rather than exiting 0
   with a partial one; a reader that closes the pipe early is still not an error.
+- The daemon no longer wakes every 60 s because of an account its usage collection skips (one a
+  `tagteam run` session owns, or a managed API key); it waits for the next account a round will
+  collect.
 
 ### Security
 

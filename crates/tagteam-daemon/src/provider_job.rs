@@ -44,7 +44,7 @@ const JITTER_FRAC: f64 = 0.1;
 pub struct ProviderJobCtx {
     /// Where the job writes its line after each run (Decision 12).
     pub board: Arc<StatusBoard>,
-    /// Where the job queues D6.1's `limit` notice (Task 11); `None` when there is no notifier.
+    /// Where the job queues D6.1's `limit` notice; `None` when there is no notifier.
     pub notices: Option<NoticeQueue>,
     /// The Keychain read counts the keychain backoff compares around each run (D4.1,
     /// Decision 7); empty where there is no Keychain.
@@ -541,7 +541,7 @@ impl<'e> ProviderJob<'e> {
             Err(e) => self.failed(cx, &e),
         }
         // A store that cannot be read plans nothing, and the floor applies.
-        let earliest = self.earliest_next_poll().unwrap_or(None);
+        let earliest = self.engine.earliest_poll_at(&self.provider).unwrap_or(None);
         let delay = collect_delay_s(self.cfg.interval_s, self.now_s(), earliest, (cx.jitter)());
         Some(Worked {
             delay_ms: delay * 1000,
@@ -613,24 +613,6 @@ impl<'e> ProviderJob<'e> {
             });
         }
         Ok(())
-    }
-
-    /// The earliest `next_poll_at` among the accounts a round can collect: the switchable
-    /// ones that are not quarantined (§8.6).
-    fn earliest_next_poll(&self) -> Result<Option<i64>, EngineError> {
-        let Some(store) = self.engine.existing_store()? else {
-            return Ok(None);
-        };
-        let mut earliest: Option<i64> = None;
-        for row in store.accounts(&self.provider)? {
-            if row.disabled || !row.identity_json.is_object() || row.quarantine_reason.is_some() {
-                continue;
-            }
-            if let Some(at) = store.usage_state(&row.id)?.and_then(|s| s.next_poll_at) {
-                earliest = Some(earliest.map_or(at, |e| e.min(at)));
-            }
-        }
-        Ok(earliest)
     }
 
     /// D6.1's `limit`, after a run that did work: judged only when the run did not switch
@@ -726,6 +708,7 @@ mod tests {
     use std::cell::Cell;
 
     use serde_json::{Value, json};
+    use tagteam_engine::lifecycle::AddTokenOptions;
     use tagteam_engine::settings::config_path;
     use tagteam_provider::{FlockGuard, Method};
 
@@ -1429,6 +1412,51 @@ mod tests {
                 trigger: trigger.as_str().to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn a_collect_round_waits_for_an_account_it_collects_never_one_it_skips() {
+        // §8.1: the round skips a managed API key (its plan is 10 s out, which the 60 s floor
+        // would turn into a minute), so the wait is the next account it does collect.
+        let fx = Fx::new();
+        let (a, b) = two(&fx);
+        fx.read(&a, 10.0, 10.0, T0, T0 + 120);
+        fx.read(&b, 20.0, 50.0, T0, T0 + 400);
+        let key = fx
+            .engine
+            .add_token(AddTokenOptions {
+                provider: cc(),
+                token: "sk-ant-api03-abcdefghijklmnopqrstuvwxyz".into(),
+                position: None,
+                email: None,
+                alias: None,
+                yes: false,
+            })
+            .unwrap()
+            .account
+            .id;
+        fx.read(&key, 0.0, 0.0, T0, T0 + 10);
+        fx.settings(
+            "[autoswitch]\ninterval_seconds = 300\n\n[daemon]\nautoswitch = false\n",
+            1,
+        );
+        let board = board();
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        let mut job = ProviderJob::new(&fx.engine, cc(), job_ctx(&board));
+        job.run(&mut cx);
+        assert_eq!(events.modes(&cc()), [(0, Mode::Collect, None, None)]);
+        assert_eq!(
+            status(&board, &cc()).next_tick_at,
+            Some(T0 + 120),
+            "not the 60 s floor the key's plan forced"
+        );
+        assert_eq!(fx.http.count(Method::Get, CC_USAGE), 0);
     }
 }
 
