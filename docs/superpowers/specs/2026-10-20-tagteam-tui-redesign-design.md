@@ -110,6 +110,8 @@ internal (`relogin required`, `pts/h (regression)`, `no-qualifying-candidate`).
 | M-3 | Wording | **One plain vocabulary, in the shared engine words**, so `list` reads the same. TUI §5.2's "same words as `list`" is amended to mean words, not columns. Human output only; `--json` is unchanged |
 | M-4 | Visual direction | **Direction A** of `visual.md`: quiet and borderless; `▌` and bold for the selection; a loud status column; the active account's bars with pace marks as the single bold element; "best now: N · b switch"; dialogs with a dimmed backdrop and a rounded frame |
 | M-5 | Store pauses and failed switches as events, outside the TUI's files? | "Do what is best": **yes**, after refactor R4 (§12.4) |
+| M-6 | (2026-10-21, T2 review) A late DA1 reply cut short is held whole by crossterm 0.29, Ctrl-C included. Fix it or accept it? | **Accept, and amend §4.2**: a known residual. No crossterm upgrade, no byte pre-reader |
+| M-7 | (2026-10-21, T2 review) Before T4, should timer mode say `no switches in the last 30 days` without reading the store? | **Show nothing until T4**: rank 4's place stays empty in timer mode (§5.3) |
 
 **Inherited rulings:**
 - **D-2** (refactor §2): keep driving the CLI through argv, and fix its two string couplings with
@@ -257,6 +259,12 @@ a `Modifier`.
     warn banner says `! the terminal sent an unfinished colour report · keys resume when it ends ·
     Ctrl-C quits`. A key dropped this way is lost, never misread. The builder confirms how
     crossterm surfaces those bytes before choosing the filter.
+  - **Known residual (M-6).** The terminal may stay silent past the give-up and then send a DA1
+    reply cut short (`ESC [ ? 62` with no final `c`). crossterm 0.29 keeps that unfinished CSI in
+    its own parser and holds every byte after it, Ctrl-C and Ctrl-Z included, until a `c` or `u`
+    arrives. The filter never sees those keys, so no banner shows. They are lost, never misread.
+    SIGTERM and SIGHUP still end the TUI, and typing `c` ends the held reply. T2 accepts this. It
+    adds no crossterm upgrade and no byte pre-reader.
   - **Tests**, through a pty: a key before the OSC reply; a key between the two replies; a reply
     split across reads; a reply starting after the give-up; a truncated reply whose suffix arrives
     long after the deadline (its bytes, `b` included, never reach `update`; keys resume after its
@@ -391,6 +399,8 @@ One row: a glyph, a time, auto's last action in plain words, and on the right `w
   `last_auto_event`), so it is never blank because the TUI just started (UX-3).
 - **Before T4** (§15) the store's events are not read yet: the line takes ranks 2 and 4 only, plus
   the daemon's `status.lastSwitch` worded from its trigger (§11.3). T4 adds ranks 1 and 3.
+- **In timer mode before T4** (M-7) the line stays empty in rank 4's place. Without the store, the
+  TUI cannot know there were no switches. T4 brings rank 4 back there.
 
 ### 5.4 Now strip (Tokens and History)
 
