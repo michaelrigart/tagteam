@@ -767,7 +767,8 @@ fn sigterm_waits_for_a_switch_inside_its_critical_span_and_reports_it_as_switche
         .env("TAGTEAM_TEST_PAUSE_DIR", &pause);
     let mut tui = Pty::spawn(c, true);
     tui.wait_for(LONG, "the accounts table", accounts);
-    tui.type_keys(b"s");
+    // The selection starts on the live login, `b` (T3-23): `k` selects `a`.
+    tui.type_keys(b"ks");
     tui.wait_until(LONG, "the switch's journal row", || {
         pause.join("paused").exists()
     });
@@ -1025,7 +1026,8 @@ fn a_locked_keychain_runs_the_action_on_the_terminal_and_returns() {
     fs::write(home.root().join("keychain").join("LOCKED"), b"").unwrap();
     let mut tui = home.tui(&["tui"]);
     tui.wait_for(LONG, "the accounts table", accounts);
-    tui.type_keys(b"s");
+    // The selection starts on the live login, `b` (T3-23): `k` selects `a`.
+    tui.type_keys(b"ks");
     tui.wait_for(LONG, "the hand-over question", |s| {
         s.on_alt() && s.contains("Your login keychain is locked.")
     });
@@ -1079,7 +1081,8 @@ fn debug_lines_go_to_the_log_file_and_never_to_the_terminal() {
     c.args(["--debug", "tui"]);
     let mut tui = Pty::spawn(c, true);
     tui.wait_for(LONG, "the accounts table", accounts);
-    tui.type_keys(b"s");
+    // The selection starts on the live login, `b` (T3-23): `k` selects `a`.
+    tui.type_keys(b"ks");
     tui.wait_for(LONG, "the switch's outcome", |s| {
         s.contains("Switched to a@x.co")
     });
@@ -1105,7 +1108,8 @@ fn a_lane_that_panics_restores_the_terminal_before_the_panic_shows_and_exits_1()
     c.env("TAGTEAM_TEST_FAIL_AT", "panic:after-journal");
     let mut tui = Pty::spawn(c, true);
     tui.wait_for(LONG, "the accounts table", accounts);
-    tui.type_keys(b"s");
+    // The selection starts on the live login, `b` (T3-23): `k` selects `a`.
+    tui.type_keys(b"ks");
     let f = tui.finish(LONG);
     assert_eq!(f.status.code(), Some(1), "{}", f.screen.text());
     assert_restored(&f);

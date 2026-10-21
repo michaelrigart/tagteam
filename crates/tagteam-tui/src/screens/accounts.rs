@@ -1,7 +1,8 @@
-//! The Accounts screen (redesign §6): the table of accounts (§6.3), and the selected account's
-//! card below it (§6.4).
+//! The Accounts screen (redesign §6): the lead card with the account in use (§6.2), the table
+//! of accounts (§6.3), and the selected account's card (§6.4), stacked from the top (§6.1).
 
 mod card;
+mod lead;
 mod status;
 mod table;
 
@@ -32,10 +33,12 @@ const NO_ACCOUNTS: &str = "No accounts yet";
 /// The banners the accounts view raises (spec §5.1).
 pub const RUN_SHELL: &str = "inside a `tagteam run` session: account changes are refused here";
 /// The table keeps this many lines at least, its header and the selected row among them, when
-/// the card grows to hold its windows (T3-22).
+/// the cards grow to hold their windows (T3-22).
 const TABLE_LEAST: usize = 4;
-/// The blank row between the table and the card (§6.1).
+/// The blank row under the lead card, and the one under the table (§6.1).
 const BLANK: u16 = 1;
+/// The lead card's least rows (T3-22).
+const LEAD_LEAST: u16 = 2;
 
 #[derive(Default)]
 pub struct AccountsState {
@@ -61,15 +64,23 @@ impl AccountsState {
         self.snapshot.as_ref()
     }
 
-    /// Takes a new read. The selection stays on the same account; when that account is gone it
-    /// moves to the row now at its old place, or the last row (Review Focus 5).
+    /// Takes a new read. With no selection yet, it starts on the first account in use in table
+    /// order, else on row 1 (§6.5, T3-23). The selection stays on the same account; when that
+    /// account is gone it moves to the row now at its old place, or the last row (Review Focus
+    /// 5).
     pub fn apply(&mut self, snap: AccountsSnapshot) {
         let old = self.index();
-        let ids: Vec<AccountId> = rows_of(&snap).iter().map(|v| v.row.id.clone()).collect();
+        let rows = rows_of(&snap);
+        let ids: Vec<AccountId> = rows.iter().map(|v| v.row.id.clone()).collect();
         let selected = match &self.selected {
             Some(id) if ids.contains(id) => Some(id.clone()),
             _ if ids.is_empty() => None,
-            _ => Some(ids[old.unwrap_or(0).min(ids.len() - 1)].clone()),
+            None => Some(
+                rows.iter()
+                    .find(|v| v.active)
+                    .map_or_else(|| ids[0].clone(), |v| v.row.id.clone()),
+            ),
+            Some(_) => Some(ids[old.unwrap_or(0).min(ids.len() - 1)].clone()),
         };
         if selected != self.selected {
             self.card_from = 0;
@@ -241,7 +252,7 @@ fn scroll_card(state: &mut State, body: Rect, now_ms: i64, by: isize) {
     let Some(v) = state.accounts.selected_view() else {
         return;
     };
-    let rows = usize::from(split(state, body, now_ms).1.height);
+    let rows = usize::from(parts(state, body, now_ms).card.height);
     let furthest = card::furthest(state, v, body.width, rows, now_ms);
     // From what shows: a resize or a new read may have left the stored scroll past the end.
     let st = &mut state.accounts;
@@ -249,39 +260,81 @@ fn scroll_card(state: &mut State, body: Rect, now_ms: i64, by: isize) {
     st.card_from = (from + by).clamp(0, furthest as isize) as usize;
 }
 
-/// The table's area and the card's (T3-22). The card has its lines, at most what the table's
-/// least lines and the blank row above the card leave, and never fewer than its own least; the
-/// table takes the rest. Windows that do not fit scroll (`J`/`K`), a row each.
-fn split(state: &State, body: Rect, now_ms: i64) -> (Rect, Rect) {
-    let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
-    let height = state.accounts.selected_view().map_or(0, |v| {
-        let table = rows(table_lines(&state.accounts).min(TABLE_LEAST));
-        let most = rows(card::height(state, v, body.width, now_ms));
-        let least = rows(card::min_height(state, v, body.width, now_ms));
-        most.min(body.height.saturating_sub(table + BLANK))
-            .max(least)
-            .min(body.height.saturating_sub(BLANK))
-    });
-    let blank = if height > 0 { BLANK } else { 0 };
-    let table = Rect::new(
-        body.x,
-        body.y,
-        body.width,
-        body.height.saturating_sub(height + blank),
-    );
-    let pane = Rect::new(body.x, body.y + body.height - height, body.width, height);
-    (table, pane)
+/// The body's parts, top down (§6.1): the lead card, a blank row, the table, a blank row, the
+/// selected card; spare rows stay at the bottom (VIS-5).
+struct Parts {
+    lead: Rect,
+    table: Rect,
+    card: Rect,
 }
 
-/// The table's lines: its pinned header, with one provider, and its scrolling lines.
-fn table_lines(state: &AccountsState) -> usize {
-    layout(state).len() + usize::from(sections(state).len() == 1)
+/// T3-22: the table's least lines (`TABLE_LEAST`), the blank rows and the card's least are
+/// reserved first. The lead card has its lines, at most what that leaves (T3-32 folds the rest)
+/// and never fewer than `LEAD_LEAST`; the card has its lines, at most what the lead card, the
+/// blank rows and the table's least leave, and never fewer than its own least (its windows
+/// scroll by `J`/`K`); the table takes the rest, at most its lines, and scrolls with the
+/// selection. A part the body has no room left for is empty.
+fn parts(state: &State, body: Rect, now_ms: i64) -> Parts {
+    let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+    let width = body.width;
+    let Some(v) = state.accounts.selected_view() else {
+        let none = |y| Rect::new(body.x, y, width, 0);
+        return Parts {
+            lead: none(body.y),
+            table: body,
+            card: none(body.y + body.height),
+        };
+    };
+    let h = body.height;
+    let lines = rows(table_lines(state));
+    let table_least = lines.min(rows(TABLE_LEAST));
+    let card_most = rows(card::height(state, v, width, now_ms));
+    let card_least = rows(card::min_height(state, v, width, now_ms));
+    let lead_most = rows(lead::height(state, width, now_ms));
+    let blanks = 2 * BLANK;
+    let reserved = table_least
+        .saturating_add(blanks)
+        .saturating_add(card_least);
+    let lead = lead_most
+        .min(h.saturating_sub(reserved))
+        .max(lead_most.min(LEAD_LEAST));
+    let card = card_most
+        .min(h.saturating_sub(lead.saturating_add(blanks).saturating_add(table_least)))
+        .max(card_least);
+    let table = lines.min(h.saturating_sub(lead.saturating_add(blanks).saturating_add(card)));
+    let bottom = body.y + h;
+    let mut y = body.y;
+    let mut take = |n: u16| {
+        let at = y.min(bottom);
+        y = at + n.min(bottom - at);
+        Rect::new(body.x, at, width, y - at)
+    };
+    let lead = take(lead);
+    take(BLANK);
+    let table = take(table);
+    take(BLANK);
+    let card = take(card);
+    Parts { lead, table, card }
+}
+
+/// The table's lines: its pinned header, with one provider, its scrolling lines, and the hint
+/// to add a second account when focus's provider has one (§5.7, T3-7).
+fn table_lines(state: &State) -> usize {
+    let st = &state.accounts;
+    layout(st).len() + usize::from(sections(st).len() == 1) + usize::from(one_account(state))
+}
+
+/// Whether focus's provider has exactly one account: the table says how to add a second.
+fn one_account(state: &State) -> bool {
+    state
+        .view_of(&daemon::focus(state))
+        .is_some_and(|p| p.accounts.len() == 1)
 }
 
 /// How many scrolling table lines fit in `body`: one provider's header is pinned above them.
 fn visible_rows(state: &State, body: Rect, now_ms: i64) -> usize {
     let pinned = sections(&state.accounts).len() == 1;
-    usize::from(split(state, body, now_ms).0.height).saturating_sub(usize::from(pinned))
+    usize::from(parts(state, body, now_ms).table.height).saturating_sub(usize::from(pinned))
 }
 
 /// One line of the scrolling part of the table.
@@ -347,7 +400,10 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     }
     let now_s = now_ms.div_euclid(1000);
     let width = usize::from(area.width);
-    let (table_area, pane) = split(state, area, now_ms);
+    let parts = parts(state, area, now_ms);
+    let lead = lead::lead(state, area.width, usize::from(parts.lead.height), now_ms);
+    frame.render_widget(Paragraph::new(lead.lines), parts.lead);
+    let table_area = parts.table;
     let sections = sections(st);
     let tables: Vec<Table<'_>> = sections
         .iter()
@@ -391,13 +447,10 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
             }
         });
     }
-    if let Some(focus) = state
-        .view_of(&daemon::focus(state))
-        .filter(|p| p.accounts.len() == 1)
-    {
+    if one_account(state) {
         let room = usize::from(table_area.height).saturating_sub(shown.len());
         if room > 0 {
-            let display = focus.names.display_name;
+            let display = state.names_of(&daemon::focus(state)).display_name;
             let hint = format!(
                 " Add a second account to switch: log in to {display} as it, then press A."
             );
@@ -410,15 +463,11 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     }
     frame.render_widget(Paragraph::new(shown), table_area);
     if let Some(v) = st.selected_view() {
-        // The lead card shows the account in use's windows (§6.4, T3-32).
-        let on_lead = if v.active {
-            card::lead_keys(v, area.width)
-        } else {
-            vec![]
-        };
-        let rows = usize::from(pane.height);
+        // The account in use leaves out what the lead card shows of it (§6.4, T3-32).
+        let on_lead = if v.active { lead.shown } else { vec![] };
+        let rows = usize::from(parts.card.height);
         let lines = card::lines(state, v, area.width, rows, st.card_from, &on_lead, now_ms);
-        frame.render_widget(Paragraph::new(lines), pane);
+        frame.render_widget(Paragraph::new(lines), parts.card);
     }
 }
 
@@ -458,11 +507,10 @@ mod tests {
         state
     }
 
-    /// `three()` in `theme`, the selection on row 2.
+    /// `three()` in `theme`, the selection on row 2, where it starts: the account in use.
     fn on_work(theme: Theme) -> State {
         let mut state = loaded(three());
         state.theme = theme;
-        update(&mut state, ch('j'), NOW_MS);
         state
     }
 
@@ -491,6 +539,19 @@ mod tests {
     /// The body's first row on a `w`×`h` terminal.
     fn body_y(state: &State, w: u16, h: u16) -> u16 {
         crate::view::areas(state, Rect::new(0, 0, w, h)).body.y
+    }
+
+    /// The table's first row on a `w`×`h` terminal (§6.1: under the lead card).
+    fn table_y(state: &State, w: u16, h: u16) -> u16 {
+        rows_of_part(state, w, h, |p| p.table).0
+    }
+
+    /// What the table draws at `w`×`h` and `now_ms`, trailing spaces trimmed.
+    fn table_of(state: &State, w: u16, h: u16, now_ms: i64) -> Vec<String> {
+        let body = crate::view::areas(state, Rect::new(0, 0, w, h)).body;
+        let at = parts(state, body, now_ms).table;
+        let rows = draw_at(state, w, h, now_ms);
+        rows[usize::from(at.y)..usize::from(at.y + at.height)].to_vec()
     }
 
     /// The columns of row `y` whose cell draws a glyph in bold.
@@ -530,7 +591,9 @@ mod tests {
 
     #[test]
     fn a_readings_age_advances_with_the_clock_between_reads() {
-        let state = loaded(three());
+        let mut state = loaded(three());
+        update(&mut state, key(KeyCode::Home), NOW_MS);
+        let state = state;
         let at = |seconds: i64| draw_at(&state, 120, 24, NOW_MS + seconds * 1000);
         // UPDATED, right-aligned under its head.
         let row_age = |lines: &[String]| {
@@ -567,7 +630,7 @@ mod tests {
         );
         for theme in TIERS {
             let state = on_work(theme);
-            let body = body_of(&state, 120, 40, NOW_MS);
+            let body = table_of(&state, 120, 40, NOW_MS);
             let head = &body[0];
             for (name, at) in [
                 ("ACCOUNT", 8),
@@ -579,7 +642,7 @@ mod tests {
                 assert_eq!(col(head, name), at, "{theme:?} {name}: {head}");
             }
             let buf = draw_buffer(&state, 120, 40, NOW_MS);
-            let y = body_y(&state, 120, 40);
+            let y = table_y(&state, 120, 40);
             let heads: String = roles(&buf, theme, y)
                 .chars()
                 .filter(|c| *c != ' ')
@@ -626,7 +689,7 @@ mod tests {
     #[test]
     fn the_table_at_80_columns_has_9_cell_gauges_and_a_status_glyph() {
         let state = on_work(Theme::new(true));
-        let body = body_of(&state, 80, 24, NOW_MS);
+        let body = table_of(&state, 80, 24, NOW_MS);
         // The name column is cut to 23.
         assert_eq!(col(&body[0], "5H"), 8 + 23 + 3, "{}", body[0]);
         assert!(!body[0].contains("STATUS"), "{}", body[0]);
@@ -666,10 +729,10 @@ mod tests {
         for theme in TIERS {
             let mut state = loaded(accounts.clone());
             state.theme = theme;
-            let body = body_of(&state, 120, 40, NOW_MS);
+            let body = table_of(&state, 120, 40, NOW_MS);
             let updated = col(&body[0], "UPDATED");
             let buf = draw_buffer(&state, 120, 40, NOW_MS);
-            let y = body_y(&state, 120, 40);
+            let y = table_y(&state, 120, 40);
             let rows = [
                 ("1m", "m", "best"),
                 ("14m", "w", "! old reading"),
@@ -690,7 +753,7 @@ mod tests {
             }
         }
         // Under 100 columns the disabled row's glyph is `○`, not its old reading's `!`.
-        let body = body_of(&loaded(accounts), 80, 24, NOW_MS);
+        let body = table_of(&loaded(accounts), 80, 24, NOW_MS);
         assert!(body[2].ends_with("14m !"), "{}", body[2]);
         assert!(body[5].ends_with("14m ○"), "{}", body[5]);
     }
@@ -711,7 +774,7 @@ mod tests {
                 account(2, "sam@corp.example", inside.clone()),
             ]);
             state.theme = theme;
-            let body = body_of(&state, 120, 40, NOW_MS);
+            let body = table_of(&state, 120, 40, NOW_MS);
             let (five, seven) = (col(&body[0], "5H"), col(&body[0], "7D"));
             let track = if theme.colourless() { "·" } else { "─" };
             let gauge = |row: &str, at: usize| columns(row, at, at + 14);
@@ -726,7 +789,7 @@ mod tests {
             );
             // `┿` in the fill's role inside it, `┼` muted outside.
             let buf = draw_buffer(&state, 120, 40, NOW_MS);
-            let y = body_y(&state, 120, 40);
+            let y = table_y(&state, 120, 40);
             let at = |row: u16, x: usize| roles(&buf, theme, y + row).chars().nth(x);
             assert_eq!(
                 at(1, seven + 7),
@@ -762,13 +825,13 @@ mod tests {
         for theme in TIERS {
             let mut state = loaded(vec![in_use.clone(), off_quarantined.clone(), off.clone()]);
             state.theme = theme;
-            let body = body_of(&state, 120, 40, NOW_MS);
+            let body = table_of(&state, 120, 40, NOW_MS);
             assert!(body[1].ends_with("  ✕ new login"), "{}", body[1]);
             assert_eq!(columns(&body[1], 6, 7), "●", "{}", body[1]);
             assert!(body[2].ends_with("  ✕ new login"), "{}", body[2]);
             assert!(body[3].ends_with("  ○ disabled"), "{}", body[3]);
             let buf = draw_buffer(&state, 120, 40, NOW_MS);
-            let y = body_y(&state, 120, 40) + 1;
+            let y = table_y(&state, 120, 40) + 1;
             let row = roles(&buf, theme, y);
             let at = col(&body[1], "✕ new login");
             let crit = canon(theme, "c").chars().next().unwrap();
@@ -902,7 +965,7 @@ mod tests {
         for theme in TIERS {
             let mut state = loaded(vec![v.clone()]);
             state.theme = theme;
-            let body = body_of(&state, 120, 40, NOW_MS);
+            let body = table_of(&state, 120, 40, NOW_MS);
             assert_eq!(
                 body[1],
                 format!(
@@ -912,7 +975,7 @@ mod tests {
                 "{theme:?}"
             );
             let buf = draw_buffer(&state, 120, 40, NOW_MS);
-            let row = roles(&buf, theme, body_y(&state, 120, 40) + 1);
+            let row = roles(&buf, theme, table_y(&state, 120, 40) + 1);
             let warn = canon(theme, "w").chars().next();
             for x in [27, col(&body[1], "! retrying")] {
                 assert_eq!(row.chars().nth(x), warn, "{theme:?} {x}: {row}");
@@ -953,14 +1016,14 @@ mod tests {
             let mut state = loaded(accounts.clone());
             state.theme = theme;
             for w in [80u16, 120] {
-                let body = body_of(&state, w, 40, NOW_MS);
+                let body = table_of(&state, w, 40, NOW_MS);
                 let head = &body[0];
                 let from = col(head, "5H");
                 let to = col(head, "UPDATED") - 3;
                 assert_eq!(to - from, if w == 80 { 34 } else { 44 }, "{head}");
                 let updated = col(head, "UPDATED");
                 let buf = draw_buffer(&state, w, 40, NOW_MS);
-                let y = body_y(&state, w, 40);
+                let y = table_y(&state, w, 40);
                 for (i, (words, role)) in said.iter().enumerate() {
                     let row = &body[i + 2];
                     assert_eq!(
@@ -984,7 +1047,7 @@ mod tests {
             }
         }
         // At 80 columns the longer two are cut.
-        let body = body_of(&loaded(accounts), 80, 24, NOW_MS);
+        let body = table_of(&loaded(accounts), 80, 24, NOW_MS);
         assert!(
             body[3].contains("api key · has no usage limits to …"),
             "{}",
@@ -1013,11 +1076,11 @@ mod tests {
             let mut state = fresh(Screen::Accounts);
             state.theme = theme;
             state.accounts.apply(snap.clone());
-            let body = body_of(&state, 120, 40, NOW_MS);
+            let body = table_of(&state, 120, 40, NOW_MS);
             let marks: Vec<String> = body[1..5].iter().map(|l| columns(l, 6, 7)).collect();
             assert_eq!(marks, ["▶", "●", "○", " "], "{body:?}");
             let buf = draw_buffer(&state, 120, 40, NOW_MS);
-            let y = body_y(&state, 120, 40);
+            let y = table_y(&state, 120, 40);
             let at = |row: u16| roles(&buf, theme, y + row).chars().nth(6);
             assert_eq!(at(1), canon(theme, "a").chars().next(), "{theme:?}");
             assert_eq!(at(2), canon(theme, "a").chars().next(), "{theme:?}");
@@ -1038,7 +1101,7 @@ mod tests {
     /// The card's rows at `w`×`h` and `now_ms`, under the table, and the row it starts at.
     fn card_at(state: &State, w: u16, h: u16, now_ms: i64) -> (u16, Vec<String>) {
         let body = crate::view::areas(state, Rect::new(0, 0, w, h)).body;
-        let (_, pane) = split(state, body, now_ms);
+        let pane = parts(state, body, now_ms).card;
         let rows = draw_at(state, w, h, now_ms);
         let (from, to) = (usize::from(pane.y), usize::from(pane.y + pane.height));
         (pane.y, rows[from..to].to_vec())
@@ -1204,7 +1267,7 @@ mod tests {
         };
         windows[1].1.ahead = Some(true);
         let mut state = loaded(accounts);
-        update(&mut state, ch('j'), NOW_MS);
+        assert_eq!(state.accounts.selected().map(|a| a.position), Some(2));
         let card = card_rows(&state, 120, 40).1;
         assert!(card[1].ends_with(" 53%"), "{card:?}");
         assert!(
@@ -1235,8 +1298,8 @@ mod tests {
             ),
             Pace::default(),
         ));
-        let mut state = loaded(accounts);
-        update(&mut state, ch('j'), NOW_MS);
+        let state = loaded(accounts);
+        assert_eq!(state.accounts.selected().map(|a| a.position), Some(2));
         let card = card_rows(&state, 80, 24).1;
         assert!(card[1].starts_with("    5h ") && card[1].ends_with(" 53%"));
         assert!(card[2].starts_with("    7d ") && card[2].ends_with("  6%"));
@@ -1301,7 +1364,7 @@ mod tests {
         spare.usage.retry_at = Some(NOW_S + 900);
         let mut state = loaded(accounts);
         update(&mut state, key(KeyCode::End), NOW_MS);
-        let body = body_of(&state, 120, 40, NOW_MS);
+        let body = table_of(&state, 120, 40, NOW_MS);
         assert!(body[3].ends_with("  ○ disabled"), "{}", body[3]);
         let card = card_rows(&state, 120, 40).1;
         assert!(
@@ -1401,6 +1464,7 @@ mod tests {
     fn a_selection_change_reads_the_card_s_history_once_after_250_ms() {
         let week = 7 * 86_400;
         let mut state = loaded(three());
+        assert!(card_reads(&update(&mut state, ch('k'), NOW_MS)).is_empty());
         assert!(card_reads(&update(&mut state, ch('j'), NOW_MS)).is_empty());
         let tick = |state: &mut State, at: i64| card_reads(&update(state, Msg::Tick, at));
         assert!(tick(&mut state, NOW_MS + 249).is_empty());
@@ -1434,12 +1498,14 @@ mod tests {
             tick(&mut state, NOW_MS + 2_450),
             [(id(2), NOW_S + 2 - week)]
         );
-        // The first selection counts: the first accounts read is read for its card too.
+        // The first selection counts: the first accounts read is read for its card too. It is
+        // the account in use (T3-23).
         let mut fresh = fresh(Screen::Accounts);
         assert!(read_back(&mut fresh, three(), NOW_MS).is_empty());
-        assert_eq!(tick(&mut fresh, NOW_MS + 250), [(id(1), NOW_S - week)]);
+        assert_eq!(tick(&mut fresh, NOW_MS + 250), [(id(2), NOW_S - week)]);
         // Elsewhere it waits for Accounts.
         let mut away = loaded(three());
+        update(&mut away, ch('k'), NOW_MS);
         update(&mut away, ch('j'), NOW_MS);
         update(&mut away, ch('2'), NOW_MS);
         assert!(tick(&mut away, NOW_MS + 250).is_empty());
@@ -1451,6 +1517,7 @@ mod tests {
     fn a_card_read_for_another_account_or_an_older_generation_is_dropped() {
         // Review Focus 4.
         let mut state = loaded(three());
+        update(&mut state, key(KeyCode::Home), NOW_MS);
         let since = NOW_S - card::CARD_SINCE_S;
         let Cmd::LoadCard { r#gen: old, .. } = state.load_card(id(1), since) else {
             unreachable!()
@@ -1633,6 +1700,7 @@ mod tests {
         for theme in TIERS {
             let mut state = loaded(accounts.clone());
             state.theme = theme;
+            update(&mut state, key(KeyCode::Home), NOW_MS);
             // No history read yet: the sparklines' buckets are empty.
             let (y, card) = card_rows(&state, 120, 40);
             assert_eq!(
@@ -1658,7 +1726,9 @@ mod tests {
             assert_eq!(got, want, "{theme:?}");
         }
         // At 80 columns: 16 cells, the projection's clause, and no keys row.
-        let card = card_rows(&loaded(accounts), 80, 24).1;
+        let mut state = loaded(accounts);
+        update(&mut state, key(KeyCode::Home), NOW_MS);
+        let card = card_rows(&state, 80, 24).1;
         assert_eq!(
             card,
             [
@@ -1696,7 +1766,8 @@ mod tests {
         let mut accounts = three();
         accounts[0].usage.next_poll_at = Some(NOW_S + 60);
         accounts[0].row.login_expires_at = Some((NOW_S + 6 * 86_400) * 1000);
-        let state = loaded(accounts);
+        let mut state = loaded(accounts);
+        update(&mut state, key(KeyCode::Home), NOW_MS);
         assert_eq!(
             card_rows(&state, 120, 40).1[0],
             "    1 alex@example.com    not in use · updated 2m ago · next update in 1m · login valid 6 more days"
@@ -1943,9 +2014,13 @@ mod tests {
                 .all(|l| l.contains("the store could not be")),
             "{lines:?}"
         );
-        assert!(
-            lines[5].contains("ACCOUNT"),
+        assert_eq!(
+            lines[5], "  No account in use",
             "the body starts at row 5: {lines:?}"
+        );
+        assert!(
+            lines[8].contains("ACCOUNT"),
+            "the table under the lead card: {lines:?}"
         );
         assert!(
             lines[21..].iter().all(|l| l.contains("(position 1)")
@@ -2129,11 +2204,11 @@ mod tests {
         for theme in TIERS {
             let mut state = loaded(accounts.clone());
             state.theme = theme;
-            let body = body_of(&state, 120, 40, NOW_MS);
+            let body = table_of(&state, 120, 40, NOW_MS);
             let five = col(&body[0], "5H");
             let seven = col(&body[0], "7D");
             let buf = draw_buffer(&state, 120, 40, NOW_MS);
-            let y = body_y(&state, 120, 40);
+            let y = table_y(&state, 120, 40);
             let cell = |row: u16, from: usize| -> String {
                 roles(&buf, theme, y + row)
                     .chars()
@@ -2175,7 +2250,7 @@ mod tests {
             let state = on_work(theme);
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
             // The body's first row is the column heads; the selection is on the third.
-            let y = body_y(&state, 80, 24) + 2;
+            let y = table_y(&state, 80, 24) + 2;
             assert!(
                 roles(&buf, theme, y).starts_with(&canon(theme, "a")),
                 "{theme:?}"
@@ -2220,7 +2295,7 @@ mod tests {
         for theme in &TIERS[1..] {
             let theme = *theme;
             let mut state = on_work(theme);
-            let y = body_y(&state, 120, 40);
+            let y = table_y(&state, 120, 40);
             let buf = draw_buffer(&state, 120, 40, NOW_MS);
             assert_eq!(
                 bold_cells(&buf, y + 2),
@@ -2249,7 +2324,7 @@ mod tests {
         // `in use`.
         let theme = TIERS[0];
         let state = on_work(theme);
-        let y = body_y(&state, 120, 40) + 2;
+        let y = table_y(&state, 120, 40) + 2;
         let buf = draw_buffer(&state, 120, 40, NOW_MS);
         let bold = bold_cells(&buf, y);
         let (identity, rest): (Vec<u16>, Vec<u16>) = bold.into_iter().partition(|x| *x < 39);
@@ -2267,7 +2342,7 @@ mod tests {
         for theme in TIERS {
             let mut state = loaded(accounts.clone());
             state.theme = theme;
-            let y = body_y(&state, 120, 40) + 1;
+            let y = table_y(&state, 120, 40) + 1;
             update(&mut state, ch('j'), NOW_MS);
             let buf = draw_buffer(&state, 120, 40, NOW_MS);
             let drawn = width_of(&text_of(&buf)[usize::from(y)]) as u16;
@@ -2278,7 +2353,7 @@ mod tests {
                     "{theme:?} {x}"
                 );
             }
-            update(&mut state, ch('k'), NOW_MS);
+            update(&mut state, key(KeyCode::Home), NOW_MS);
             let buf = draw_buffer(&state, 120, 40, NOW_MS);
             assert_eq!(buf[(0, y)].symbol(), "▌");
             let tint = theme.sel_bg().bg.unwrap_or(Color::Reset);
@@ -2320,7 +2395,7 @@ mod tests {
             account(3, "alex@personal.example", more),
         ]);
         state.theme = Theme::new(true);
-        let wide = body_of(&state, 160, 40, NOW_MS);
+        let wide = table_of(&state, 160, 40, NOW_MS);
         let head = &wide[0];
         let (fable, spend) = (col(head, "FABLE"), col(head, "SPEND"));
         assert!(col(head, "7D") < fable && fable < spend, "{head}");
@@ -2349,7 +2424,7 @@ mod tests {
             wide[2]
         );
         assert!(wide.iter().all(|l| width_of(l) <= 160));
-        let narrow = body_of(&state, 120, 40, NOW_MS);
+        let narrow = table_of(&state, 120, 40, NOW_MS);
         assert!(
             !narrow[0].contains("FABLE") && !narrow[0].contains("SPEND"),
             "{}",
@@ -2452,7 +2527,7 @@ mod tests {
                 assert!(width_of(line) <= usize::from(w), "{w}: {line}");
             }
             // Every row's UPDATED still sits under its head.
-            let body = body_of(&state, w, 24, NOW_MS);
+            let body = table_of(&state, w, 24, NOW_MS);
             let updated = col(&body[0], "UPDATED");
             for (row, age) in body[1..6].iter().zip(["1m", "14m", "1m", "1m", "1m"]) {
                 assert_eq!(
@@ -2465,7 +2540,7 @@ mod tests {
             let mark = if w < 100 { " !" } else { "  ! old reading" };
             assert!(body[2].ends_with(mark), "{w}: {}", body[2]);
         }
-        let narrow = body_of(&loaded(accounts), 80, 24, NOW_MS);
+        let narrow = table_of(&loaded(accounts), 80, 24, NOW_MS);
         assert!(narrow[1].contains("aaaa…"), "{}", narrow[1]);
         assert!(
             narrow[2].starts_with("    2   例のアカウント@"),
@@ -2496,18 +2571,30 @@ mod tests {
         }
         assert_eq!(state.accounts.selected(), None);
         assert!(state.accounts.shown_ids().is_empty());
+        // No lead card: the empty block is the whole body.
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert!(
+            !body
+                .iter()
+                .any(|l| l.contains("No account in use") || l.contains("●")),
+            "{body:?}"
+        );
         let unloaded = draw(&fresh(Screen::Accounts), 80, 24);
         assert!(unloaded.iter().any(|l| l.trim() == "Loading accounts…"));
+        assert!(
+            !unloaded.iter().any(|l| l.contains("No account in use")),
+            "{unloaded:?}"
+        );
     }
 
     #[test]
     fn with_one_account_the_table_says_how_to_add_a_second() {
         let state = loaded(many(1));
-        let body = body_of(&state, 80, 24, NOW_MS);
+        let body = table_of(&state, 80, 24, NOW_MS);
         let hint = " Add a second account to switch: log in to Claude Code as it, then press A.";
         assert_eq!(body[2], hint, "{body:?}");
         assert!(body[1].contains("a1@x.co"), "{body:?}");
-        let two = body_of(&loaded(many(2)), 80, 24, NOW_MS);
+        let two = table_of(&loaded(many(2)), 80, 24, NOW_MS);
         assert!(!two.iter().any(|l| l.contains("Add a second")), "{two:?}");
     }
 
@@ -2589,11 +2676,11 @@ mod tests {
     #[test]
     fn more_accounts_than_fit_scroll_with_the_selection() {
         let mut state = loaded(many(30));
-        // 80×25: 22 body rows (80×24's before the auto line), 3 for the card and a blank row
-        // above it, 1 for the header: 17 account rows.
-        state.size = (80, 25);
+        // 80×28: 25 body rows, 2 for the lead card and a blank row under it, 3 for the card and a
+        // blank row above it, 1 for the header: 17 account rows.
+        state.size = (80, 28);
         let shown = |state: &State| {
-            body_of(state, 80, 25, NOW_MS)[1..18]
+            table_of(state, 80, 28, NOW_MS)[1..18]
                 .iter()
                 .map(|l| {
                     l.split_whitespace()
@@ -2650,18 +2737,18 @@ mod tests {
 
     #[test]
     fn a_resize_keeps_the_tables_scroll_in_range_and_the_next_key_moves_at_once() {
-        // At 80×25 the body has the 22 rows 80×24 gave it before the auto line.
+        // At 80×28 the table has the 18 rows 80×24 gave it before the auto line and the lead card.
         let mut state = loaded(many(30));
-        state.size = (80, 25);
+        state.size = (80, 28);
         update(&mut state, key(KeyCode::End), NOW_MS);
         let first = |state: &State, h: u16| {
-            body_of(state, 80, h, NOW_MS)[1]
+            table_of(state, 80, h, NOW_MS)[1]
                 .split_whitespace()
                 .find(|w| w.contains('@'))
                 .unwrap()
                 .to_owned()
         };
-        assert_eq!(first(&state, 25), "a14@x.co");
+        assert_eq!(first(&state, 28), "a14@x.co");
         // Tall enough for every row: the table shows from the top, never blank rows.
         update(
             &mut state,
@@ -2692,8 +2779,11 @@ mod tests {
     fn the_selection_follows_the_account_across_a_refresh() {
         let mut st = AccountsState::default();
         let mut accounts = many(4);
+        accounts[1].active = true;
+        // The first selection is the account in use (T3-23).
         st.apply(snapshot(accounts.clone()));
-        st.step(2);
+        assert_eq!(st.selected().unwrap().id, id(2));
+        st.step(1);
         assert_eq!(st.selected().unwrap().id, id(3));
         // Reordered: 3 moved to the top.
         let moved = accounts.remove(2);
@@ -2713,11 +2803,16 @@ mod tests {
         accounts.retain(|v| v.row.id != last);
         st.apply(snapshot(accounts.clone()));
         assert_eq!(st.selected().unwrap().id, accounts.last().unwrap().row.id);
-        // Everything gone, then back: the first row.
+        // Everything gone, then back: the account in use, else the first row.
         st.apply(snapshot(vec![]));
         assert_eq!(st.selected(), None);
         st.apply(snapshot(many(2)));
         assert_eq!(st.selected().unwrap().id, id(1));
+        st.apply(snapshot(vec![]));
+        let mut back = many(2);
+        back[1].active = true;
+        st.apply(snapshot(back));
+        assert_eq!(st.selected().unwrap().id, id(2));
     }
 
     #[test]
@@ -2777,7 +2872,7 @@ mod tests {
             let mut state = fresh(Screen::Accounts);
             state.theme = theme;
             state.accounts.apply(snap.clone());
-            let body = body_of(&state, 80, 24, NOW_MS);
+            let body = table_of(&state, 80, 24, NOW_MS);
             assert_eq!(body[0], " Claude Code");
             assert!(body[1].starts_with("    #   ACCOUNT"), "{}", body[1]);
             assert!(body[2].contains("a1@x.co"));
@@ -2786,7 +2881,7 @@ mod tests {
             assert!(body[5].contains("o@x.co"));
             assert!(body.iter().all(|l| width_of(l) <= 80), "{body:?}");
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
-            let y = body_y(&state, 80, 24);
+            let y = table_y(&state, 80, 24);
             for row in [y, y + 3] {
                 let letters: String = roles(&buf, theme, row)
                     .chars()
@@ -2855,7 +2950,7 @@ mod tests {
                 "   doesn't manage · press A to add it".to_owned(),
             ]
         );
-        let body = body_of(&state, 80, 24, NOW_MS);
+        let body = table_of(&state, 80, 24, NOW_MS);
         assert!(body[0].starts_with("    #   ACCOUNT"), "{}", body[0]);
     }
 
@@ -2945,11 +3040,11 @@ mod tests {
         let mut off = account(2, "b@x.co", read(60, 9.0, 12.0, false));
         off.row.disabled = true;
         let state = loaded(vec![key, off]);
-        let wide = body_of(&state, 120, 40, NOW_MS);
+        let wide = table_of(&state, 120, 40, NOW_MS);
         assert!(wide[1].ends_with("  api key"), "{}", wide[1]);
         assert!(wide[2].ends_with("  ○ disabled"), "{}", wide[2]);
         // At 80 columns only the disabled glyph follows UPDATED.
-        let body = body_of(&state, 80, 24, NOW_MS);
+        let body = table_of(&state, 80, 24, NOW_MS);
         assert!(body[1].ends_with("  —"), "{}", body[1]);
         assert!(body[2].ends_with("1m ○"), "{}", body[2]);
     }
@@ -2982,7 +3077,7 @@ mod tests {
         // Below 160 columns the scoped and spend columns give way; the status keeps its glyph.
         let lines = draw(&loaded(crowded("http-429")), 80, 24);
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
-        let body = body_of(&loaded(crowded("http-429")), 80, 24, NOW_MS);
+        let body = table_of(&loaded(crowded("http-429")), 80, 24, NOW_MS);
         let head = &body[0];
         assert!(head.contains("5H") && head.contains("7D"), "{head}");
         assert!(head.ends_with("UPDATED"), "{head}");
@@ -2995,7 +3090,7 @@ mod tests {
         // At 160 columns every column and every phrase fit.
         let lines = draw(&loaded(crowded("http-429")), 160, 40);
         assert!(lines.iter().all(|l| width_of(l) <= 160), "{lines:?}");
-        let wide = body_of(&loaded(crowded("http-429")), 160, 40, NOW_MS);
+        let wide = table_of(&loaded(crowded("http-429")), 160, 40, NOW_MS);
         assert!(wide[0].contains("CLAUDE SONNET 4.5"), "{}", wide[0]);
         assert!(
             wide[0].contains("SPEND") && wide[0].ends_with("STATUS"),
@@ -3014,7 +3109,7 @@ mod tests {
         accounts[2].usage.windows = None;
         let lines = draw(&loaded(accounts.clone()), 80, 24);
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
-        let body = body_of(&loaded(accounts), 80, 24, NOW_MS);
+        let body = table_of(&loaded(accounts), 80, 24, NOW_MS);
         let from = col(&body[0], "5H");
         let to = col(&body[0], "UPDATED") - 3;
         let group = columns(&body[3], from, to);
@@ -3025,5 +3120,706 @@ mod tests {
             body[3]
         );
         assert!(body[3].ends_with("      — !"), "{}", body[3]);
+    }
+
+    /// The rows of `area` (one of `parts`) at `w`×`h`, and the row it starts at.
+    fn rows_of_part(state: &State, w: u16, h: u16, area: fn(&Parts) -> Rect) -> (u16, Vec<String>) {
+        let body = crate::view::areas(state, Rect::new(0, 0, w, h)).body;
+        let at = area(&parts(state, body, NOW_MS));
+        let rows = draw(state, w, h);
+        let (from, to) = (usize::from(at.y), usize::from(at.y + at.height));
+        (at.y, rows[from..to].to_vec())
+    }
+
+    /// The lead card's rows at `w`×`h`, and the row it starts at.
+    fn lead_rows(state: &State, w: u16, h: u16) -> (u16, Vec<String>) {
+        rows_of_part(state, w, h, |p| p.lead)
+    }
+
+    /// The text of `spans`.
+    fn joined(spans: Option<Vec<Span<'static>>>) -> Option<String> {
+        spans.map(|s| s.iter().map(|s| s.content.as_ref()).collect())
+    }
+
+    /// `fill` cells of `▆`, then `▁` to `cells`.
+    fn lead_bar_of(fill: usize, cells: usize) -> String {
+        format!("{}{}", "▆".repeat(fill), "▁".repeat(cells - fill))
+    }
+
+    const NO_ACCOUNT_IN_USE: [&str; 2] = [
+        "  No account in use",
+        "  s switches to the selected account",
+    ];
+
+    #[test]
+    fn the_lead_card_shows_the_account_in_use_with_its_bars_and_the_best_pick() {
+        for theme in TIERS {
+            let mut state = loaded(three());
+            state.theme = theme;
+            let (y, lead) = lead_rows(&state, 120, 40);
+            assert_eq!(lead.len(), 3, "{lead:?}");
+            assert!(
+                lead[0].starts_with("  ● 2 work  sam@corp.example · Example Corp    in use"),
+                "{}",
+                lead[0]
+            );
+            assert!(
+                lead[0].ends_with("best now  1 alex@example.com   b switch"),
+                "{}",
+                lead[0]
+            );
+            assert_eq!(width_of(&lead[0]), 120, "{}", lead[0]);
+            assert_eq!(
+                lead[1],
+                format!("    5h    {}   53%  resets in 2h40m", lead_bar_of(28, 52))
+            );
+            assert_eq!(
+                lead[2],
+                format!("    7d    {}    6%  resets in 3d09h", lead_bar_of(3, 52))
+            );
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let check = |row: u16, needle: &str, role: char| {
+                let (got, want) = role_of(&buf, theme, y + row, needle, role);
+                assert_eq!(got, want, "{theme:?} {needle:?}");
+            };
+            check(0, "●", 'a');
+            check(0, "sam@corp.example · Example Corp", 'm');
+            check(0, "in use", 'm');
+            check(0, "best now", 'm');
+            check(0, "1 alex@example.com", 't');
+            check(0, "switch", 'm');
+            let b = col(&lead[0], "b switch");
+            assert_eq!(
+                roles(&buf, theme, y).chars().nth(b),
+                canon(theme, "a").chars().next(),
+                "{theme:?}"
+            );
+            for x in 6..10 {
+                assert!(
+                    buf[(x, y)].modifier.contains(Modifier::BOLD),
+                    "{theme:?} {x}"
+                );
+            }
+            // The bars: the fill accent, the baseline faint.
+            for (row, fill) in [(1, 28), (2, 3)] {
+                let letters: String = roles(&buf, theme, y + row)
+                    .chars()
+                    .skip(10)
+                    .take(52)
+                    .collect();
+                let want = "a".repeat(fill) + &"f".repeat(52 - fill);
+                assert_eq!(letters, canon(theme, &want), "{theme:?} {row}");
+            }
+        }
+        // At 80 columns: 30 cells, the short and long windows, and no org.
+        let lead = lead_rows(&loaded(three()), 80, 24).1;
+        assert_eq!(
+            lead,
+            [
+                "  ● 2 work  sam@corp.example    in use   best now  1 alex@example.com   b switch"
+                    .to_owned(),
+                format!("    5h    {}   53%  resets in 2h40m", lead_bar_of(16, 30)),
+                format!("    7d    {}    6%  resets in 3d09h", lead_bar_of(2, 30)),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_forecast_has_its_words_on_the_lead_card() {
+        use tagteam_engine::switch::{BestForecast, NoPick};
+        let cases = [
+            (
+                BestForecast::Pick { order: vec![1] },
+                Some("best now  1 alex@example.com   b switch"),
+                Some("best now 1 alex@example.com"),
+            ),
+            (
+                BestForecast::Pick { order: vec![3, 1] },
+                Some("best now  3 spare   b switch"),
+                Some("best now 3 spare"),
+            ),
+            (
+                BestForecast::AlreadyBest,
+                Some("on the best account"),
+                Some("on the best account"),
+            ),
+            (
+                BestForecast::None(NoPick::UsageUnknown),
+                Some("b checks usage first, then picks"),
+                None,
+            ),
+            (BestForecast::None(NoPick::TooFewCandidates), None, None),
+            (BestForecast::None(NoPick::UnmanagedLogin), None, None),
+            (BestForecast::None(NoPick::CandidatesExhausted), None, None),
+        ];
+        for theme in TIERS {
+            for (forecast, keyed, bare) in cases.clone() {
+                let mut snap = snapshot(three());
+                snap.providers[0].forecast = forecast.clone();
+                let mut state = fresh(Screen::Accounts);
+                state.theme = theme;
+                state.accounts.apply(snap);
+                let (y, lead) = lead_rows(&state, 120, 40);
+                match keyed {
+                    Some(words) => {
+                        assert!(lead[0].ends_with(words), "{forecast:?}: {}", lead[0]);
+                        assert_eq!(width_of(&lead[0]), 120, "{}", lead[0]);
+                    }
+                    None => assert!(lead[0].ends_with("    in use"), "{forecast:?}: {}", lead[0]),
+                }
+                let view = &state.accounts.snapshot().unwrap().providers[0];
+                assert_eq!(
+                    joined(lead::pick_words(&state, view, true)).as_deref(),
+                    keyed
+                );
+                assert_eq!(
+                    joined(lead::pick_words(&state, view, false)).as_deref(),
+                    bare
+                );
+                let buf = draw_buffer(&state, 120, 40, NOW_MS);
+                match forecast {
+                    BestForecast::AlreadyBest => {
+                        let (got, want) = role_of(&buf, theme, y, "on the best account", 'm');
+                        assert_eq!(got, want, "{theme:?}");
+                    }
+                    BestForecast::None(NoPick::UsageUnknown) => {
+                        let (got, want) =
+                            role_of(&buf, theme, y, "checks usage first, then picks", 'm');
+                        assert_eq!(got, want, "{theme:?}");
+                        let b = col(&lead[0], "b checks");
+                        assert_eq!(
+                            roles(&buf, theme, y).chars().nth(b),
+                            canon(theme, "a").chars().next(),
+                            "{theme:?}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// `three()` with row 2, in use, quarantined: its stored login refused (`invalid_grant`).
+    fn quarantined_in_use(mut accounts: Vec<AccountView>) -> Vec<AccountView> {
+        accounts[1].usage.status = UsageStatus::ReloginRequired;
+        accounts[1].row.quarantine_reason = Some("invalid_grant".into());
+        accounts
+    }
+
+    const NEEDS_LOGIN_ROWS: [&str; 2] = [
+        "    ✕ Needs a new login: its stored login was refused (invalid_grant).",
+        "      Log in to Claude Code as sam@corp.example, then press A here.",
+    ];
+
+    #[test]
+    fn a_problem_with_the_account_in_use_shows_under_its_bars() {
+        let accounts = quarantined_in_use(three());
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            let (y, lead) = lead_rows(&state, 120, 40);
+            assert_eq!(lead.len(), 5, "{lead:?}");
+            assert!(lead[0].starts_with("  ● 2 work"), "{lead:?}");
+            assert!(lead[1].starts_with("    5h    ▆"), "{lead:?}");
+            assert!(lead[2].starts_with("    7d    ▆"), "{lead:?}");
+            assert_eq!(lead[3..], NEEDS_LOGIN_ROWS, "{lead:?}");
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let (got, want) = role_of(&buf, theme, y + 3, &NEEDS_LOGIN_ROWS[0][4..], 'c');
+            assert_eq!(got, want, "{theme:?}");
+            let (got, want) = role_of(&buf, theme, y + 4, &NEEDS_LOGIN_ROWS[1][6..], 't');
+            assert_eq!(got, want, "{theme:?}");
+            // The table's STATUS says it too, whatever is selected.
+            update(&mut state, key(KeyCode::End), NOW_MS);
+            let table = rows_of_part(&state, 120, 40, |p| p.table).1;
+            assert!(table[2].ends_with("  ✕ new login"), "{table:?}");
+            assert_eq!(lead_rows(&state, 120, 40).1[3..], NEEDS_LOGIN_ROWS);
+        }
+    }
+
+    #[test]
+    fn a_login_close_to_expiry_is_warn_and_says_to_log_in_again() {
+        let mut accounts = three();
+        accounts[1].row.login_expires_at = Some((NOW_S + 6 * 86_400 + 3 * HOUR) * 1000);
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            let (y, lead) = lead_rows(&state, 120, 40);
+            let facts = "    in use · login valid 6 more days · log in again before then";
+            assert!(lead[0].contains(facts), "{}", lead[0]);
+            assert!(
+                lead[0].ends_with("best now  1 alex@example.com   b switch"),
+                "{}",
+                lead[0]
+            );
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            for (needle, role) in [
+                ("in use", 'm'),
+                ("login valid 6 more days", 'w'),
+                ("log in again before then", 'w'),
+            ] {
+                let (got, want) = role_of(&buf, theme, y, needle, role);
+                assert_eq!(got, want, "{theme:?} {needle}");
+            }
+        }
+        accounts[1].row.login_expires_at = Some((NOW_S + 27 * 86_400) * 1000);
+        let state = loaded(accounts);
+        let (y, lead) = lead_rows(&state, 120, 40);
+        assert!(
+            lead[0].contains("    in use · login valid 27 more days   "),
+            "{}",
+            lead[0]
+        );
+        assert!(!lead[0].contains("log in again"), "{}", lead[0]);
+        let buf = draw_buffer(&state, 120, 40, NOW_MS);
+        let (got, want) = role_of(&buf, state.theme, y, "login valid 27 more days", 'm');
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn from_120_columns_the_lead_card_shows_every_window_and_spend_as_amounts() {
+        let mut accounts = three();
+        let windows = accounts[1].usage.windows.as_mut().unwrap();
+        windows.push((
+            window(
+                "scoped:fable",
+                "Fable",
+                WindowKind::Scoped,
+                40.0,
+                Some(291_630),
+            ),
+            Pace::default(),
+        ));
+        let mut spend = window("spend", "spend", WindowKind::Spend, 24.8, Some(1_209_630));
+        spend.detail = Some(r#"{"used": 12.4, "limit": 50, "currency": "EUR"}"#.parse().unwrap());
+        windows.push((spend, Pace::default()));
+        let state = loaded(accounts);
+        let lead = lead_rows(&state, 120, 40).1;
+        assert_eq!(lead.len(), 5, "{lead:?}");
+        // The label column is the widest label shown.
+        assert!(lead[1].starts_with("    5h     ▆"), "{lead:?}");
+        assert!(lead[3].starts_with("    Fable  ▆"), "{lead:?}");
+        assert!(lead[3].ends_with("   40%  resets in 3d09h"), "{lead:?}");
+        assert!(lead[4].starts_with("    spend  ▆"), "{lead:?}");
+        assert!(
+            lead[4].ends_with("  €12.40 of €50  resets in 14d00h"),
+            "{lead:?}"
+        );
+        assert_eq!(
+            col(&lead[4], "€12.40 of €50"),
+            col(&lead[1], " 53%"),
+            "{lead:?}"
+        );
+        // At 80 columns the short and long windows only.
+        let narrow = lead_rows(&state, 80, 24).1;
+        assert_eq!(narrow.len(), 3, "{narrow:?}");
+        assert!(
+            !narrow
+                .iter()
+                .any(|l| l.contains("Fable") || l.contains('€'))
+        );
+    }
+
+    #[test]
+    fn with_no_account_in_use_the_lead_card_says_so() {
+        for theme in TIERS {
+            let mut state = loaded(many(3));
+            state.theme = theme;
+            let (y, lead) = lead_rows(&state, 80, 24);
+            assert_eq!(lead, NO_ACCOUNT_IN_USE);
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            let title: Vec<u16> = (2..19).filter(|x| ![4, 12, 15].contains(x)).collect();
+            assert_eq!(bold_cells(&buf, y), title, "{theme:?}");
+            let (got, want) = role_of(
+                &buf,
+                theme,
+                y + 1,
+                "s switches to the selected account",
+                'm',
+            );
+            assert_eq!(got, want, "{theme:?}");
+        }
+    }
+
+    #[test]
+    fn with_several_providers_the_lead_card_follows_the_selected_account_s_provider() {
+        // Review Focus 2.
+        let mut snap = snapshot(three());
+        snap.providers.push(fake_agent(
+            vec![fake_account(1, "a1@x.co"), fake_account(2, "a2@x.co")],
+            LiveLogin::None,
+        ));
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snap);
+        let lead = lead_rows(&state, 120, 40).1;
+        assert!(lead[0].starts_with("  ● 2 work"), "{lead:?}");
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        assert_eq!(
+            state.accounts.selected().unwrap().provider,
+            ProviderId::new("fake-agent")
+        );
+        assert_eq!(lead_rows(&state, 120, 40).1, NO_ACCOUNT_IN_USE);
+    }
+
+    #[test]
+    fn a_long_name_on_the_lead_card_keeps_the_best_pick() {
+        // Review Focus 3: the name is cut before the facts, and the pick is never cut.
+        let mut accounts = three();
+        accounts[1].row.alias = Some("a".repeat(200));
+        accounts[1].row.email = Some("例のアカウント@example.com".into());
+        let state = loaded(accounts);
+        for (w, h) in [(80, 24), (120, 40)] {
+            let lead = lead_rows(&state, w, h).1;
+            let title = &lead[0];
+            assert!(title.starts_with("  ● 2 aaaa"), "{title}");
+            assert!(title.contains("…    in use   "), "{title}");
+            assert!(
+                title.ends_with("best now  1 alex@example.com   b switch"),
+                "{title}"
+            );
+            assert_eq!(width_of(title), usize::from(w), "{title}");
+            assert!(
+                lead.iter().all(|l| width_of(l) <= usize::from(w)),
+                "{lead:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_body_stacks_lead_table_and_card_from_the_top_and_leaves_spare_rows_at_the_bottom() {
+        // VIS-5.
+        let state = loaded(three());
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(body.len(), 21, "{body:?}");
+        assert!(body[0].starts_with("  ● 2 work"), "{body:?}");
+        assert!(body[1].starts_with("    5h    ▆"), "{body:?}");
+        assert!(body[2].starts_with("    7d    ▆"), "{body:?}");
+        assert_eq!(body[3], "", "{body:?}");
+        assert!(body[4].starts_with("    #   ACCOUNT"), "{body:?}");
+        for (row, email) in [
+            (5, "alex@example.com"),
+            (6, "sam@corp.example"),
+            (7, "alex@personal."),
+        ] {
+            assert!(body[row].contains(email), "{body:?}");
+        }
+        assert_eq!(body[8], "", "{body:?}");
+        assert!(
+            body[9].starts_with("    2 work  sam@corp.example"),
+            "{body:?}"
+        );
+        assert!(body[10].starts_with("    5h "), "{body:?}");
+        assert!(body[11].starts_with("    7d "), "{body:?}");
+        assert!(body[12..].iter().all(String::is_empty), "{body:?}");
+    }
+
+    #[test]
+    fn with_sixteen_accounts_at_80_by_24_the_table_scrolls_between_the_lead_and_the_card() {
+        let mut accounts = many(16);
+        accounts[0].active = true;
+        let mut state = loaded(accounts);
+        let rows = |state: &State| {
+            rows_of_part(state, 80, 24, |p| p.table)
+                .1
+                .iter()
+                .filter_map(|l| {
+                    l.split_whitespace()
+                        .find(|w| w.contains('@'))
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>()
+        };
+        let shown = rows(&state);
+        assert!(shown.len() < 16, "{shown:?}");
+        assert_eq!(shown[0], "a1@x.co");
+        let (lead_y, lead) = lead_rows(&state, 80, 24);
+        let (card_y, card) = card_rows(&state, 80, 24);
+        assert!(lead[0].starts_with("  ● 1 a1@x.co"), "{lead:?}");
+        assert!(card[0].starts_with("    1 a1@x.co"), "{card:?}");
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        assert_eq!(state.accounts.selected().unwrap().position, 16);
+        let shown = rows(&state);
+        assert_eq!(
+            shown.last().map(String::as_str),
+            Some("a16@x.co"),
+            "{shown:?}"
+        );
+        let (y, lead) = lead_rows(&state, 80, 24);
+        assert_eq!(y, lead_y);
+        assert!(lead[0].starts_with("  ● 1 a1@x.co"), "{lead:?}");
+        let (y, card) = card_rows(&state, 80, 24);
+        assert_eq!(y, card_y);
+        assert!(card[0].starts_with("    16 a16@x.co"), "{card:?}");
+        let lines = draw(&state, 80, 24);
+        assert!(lines[usize::from(lead_y)].starts_with("  ● 1 a1@x.co"));
+        assert!(lines[usize::from(card_y)].starts_with("    16 a16@x.co"));
+    }
+
+    /// `three()` with 20 decision-grade windows on row 2, in use: 5h, 7d and `m1` … `m18`.
+    fn twenty() -> Vec<AccountView> {
+        let mut accounts = three();
+        let windows = accounts[1].usage.windows.as_mut().unwrap();
+        for i in 1..=18 {
+            windows.push((
+                window(
+                    &format!("scoped:m{i}"),
+                    &format!("m{i}"),
+                    WindowKind::Scoped,
+                    10.0 + i as f64,
+                    Some(291_630),
+                ),
+                Pace::default(),
+            ));
+        }
+        accounts
+    }
+
+    /// The first word of each row: a window row's label.
+    fn labels(rows: &[String]) -> Vec<&str> {
+        rows.iter()
+            .map(|l| l.split_whitespace().next().unwrap_or(""))
+            .collect()
+    }
+
+    fn m(range: std::ops::RangeInclusive<usize>) -> Vec<String> {
+        range.map(|i| format!("m{i}")).collect()
+    }
+
+    #[test]
+    fn twenty_windows_on_the_account_in_use_fold_the_lead_card_and_keep_the_table_and_the_card() {
+        // T3-22, T3-32.
+        let mut state = loaded(twenty());
+        state.size = (120, 24);
+        assert_eq!(state.accounts.selected().unwrap().position, 2);
+        let body = body_of(&state, 120, 24, NOW_MS);
+        assert_eq!(body.len(), 21, "{body:?}");
+        assert!(body[0].starts_with("  ● 2 work"), "{body:?}");
+        let mut bars = vec!["5h".to_owned(), "7d".to_owned()];
+        bars.extend(m(1..=8));
+        assert_eq!(labels(&body[1..11]), bars, "{body:?}");
+        assert_eq!(
+            body[11], "    +10 more windows · in the card below",
+            "{body:?}"
+        );
+        let y = body_y(&state, 120, 24);
+        let buf = draw_buffer(&state, 120, 24, NOW_MS);
+        let (got, want) = role_of(&buf, state.theme, y + 11, &body[11][4..], 'm');
+        assert_eq!(got, want);
+        assert_eq!(body[12], "", "{body:?}");
+        assert!(body[13].starts_with("    #   ACCOUNT"), "{body:?}");
+        assert!(body[14].contains("alex@example.com"), "{body:?}");
+        assert!(body[15].contains("sam@corp.example"), "{body:?}");
+        assert!(body[16].contains("alex@personal.example"), "{body:?}");
+        assert_eq!(body[17], "", "{body:?}");
+        assert!(
+            body[18].starts_with("    2 work  sam@corp.example"),
+            "{body:?}"
+        );
+        assert!(body[19].starts_with("    5h "), "{body:?}");
+        assert!(!body[19].contains("resets in"), "{body:?}");
+        assert!(body[20].starts_with("    ⏎ history of work"), "{body:?}");
+        let table = body[13..17].to_vec();
+        for _ in 0..10 {
+            update(&mut state, ch('J'), NOW_MS);
+        }
+        let body = body_of(&state, 120, 24, NOW_MS);
+        assert!(body[19].starts_with("    m9 "), "{body:?}");
+        assert!(body[19].ends_with("resets in 3d09h"), "{body:?}");
+        assert_eq!(body[13..17], table);
+        loop {
+            let before = body_of(&state, 120, 24, NOW_MS);
+            update(&mut state, ch('J'), NOW_MS);
+            let after = body_of(&state, 120, 24, NOW_MS);
+            assert_eq!(after[13..17], table);
+            if after == before {
+                break;
+            }
+        }
+        let body = body_of(&state, 120, 24, NOW_MS);
+        assert!(body[19].starts_with("    m18 "), "{body:?}");
+        // With row 1 selected, the fold line says where the rest are.
+        update(&mut state, key(KeyCode::Home), NOW_MS);
+        let body = body_of(&state, 120, 24, NOW_MS);
+        assert_eq!(
+            body[11], "    +10 more windows · select it for its card",
+            "{body:?}"
+        );
+        // At 80×24: §6.2's short and long windows, no fold; the card has the rest of the body.
+        let mut state = loaded(twenty());
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(body.len(), 21, "{body:?}");
+        assert!(body[0].starts_with("  ● 2 work"), "{body:?}");
+        assert_eq!(labels(&body[1..3]), ["5h", "7d"], "{body:?}");
+        assert_eq!(body[3], "", "{body:?}");
+        assert!(!body.iter().any(|l| l.contains("more windows")), "{body:?}");
+        assert!(body[4].starts_with("    #   ACCOUNT"), "{body:?}");
+        assert!(body[7].contains("alex@personal."), "{body:?}");
+        assert_eq!(body[8], "", "{body:?}");
+        let card = &body[9..];
+        assert!(
+            card[0].starts_with("    2 work  sam@corp.example"),
+            "{card:?}"
+        );
+        let mut windows = vec!["5h".to_owned(), "7d".to_owned()];
+        windows.extend(m(1..=8));
+        assert_eq!(labels(&card[1..11]), windows, "{card:?}");
+        assert_eq!(card[11], "    J K: windows 1–10 of 20", "{card:?}");
+        assert!(
+            !card[1].contains("resets in") && !card[2].contains("resets in"),
+            "{card:?}"
+        );
+        assert!(card[3].ends_with("resets in 3d09h"), "{card:?}");
+        let table = body[4..8].to_vec();
+        loop {
+            let before = body_of(&state, 80, 24, NOW_MS);
+            update(&mut state, ch('J'), NOW_MS);
+            let after = body_of(&state, 80, 24, NOW_MS);
+            assert_eq!(after[4..8], table);
+            if after == before {
+                break;
+            }
+        }
+        let card = body_of(&state, 80, 24, NOW_MS)[9..].to_vec();
+        assert_eq!(labels(&card[10..11]), ["m18"], "{card:?}");
+    }
+
+    #[test]
+    fn a_folded_lead_card_keeps_its_problem_under_its_bars() {
+        // §6.2, T3-32.
+        let state = loaded(quarantined_in_use(twenty()));
+        let body = body_of(&state, 120, 24, NOW_MS);
+        assert_eq!(body.len(), 21, "{body:?}");
+        assert!(body[0].starts_with("  ● 2 work"), "{body:?}");
+        let mut bars = vec!["5h".to_owned(), "7d".to_owned()];
+        bars.extend(m(1..=4));
+        assert_eq!(labels(&body[1..7]), bars, "{body:?}");
+        assert_eq!(
+            body[7], "    +14 more windows · in the card below",
+            "{body:?}"
+        );
+        assert_eq!(body[8..10], NEEDS_LOGIN_ROWS, "{body:?}");
+        let y = body_y(&state, 120, 24);
+        let buf = draw_buffer(&state, 120, 24, NOW_MS);
+        let (got, want) = role_of(&buf, state.theme, y + 8, &NEEDS_LOGIN_ROWS[0][4..], 'c');
+        assert_eq!(got, want);
+        assert_eq!(body[10], "", "{body:?}");
+        assert!(body[11].starts_with("    #   ACCOUNT"), "{body:?}");
+        assert!(body[13].contains("sam@corp.example"), "{body:?}");
+        assert!(body[13].ends_with("  ✕ new login"), "{body:?}");
+        assert_eq!(body[15], "", "{body:?}");
+        let card = &body[16..];
+        assert!(
+            card[0].starts_with("    2 work  sam@corp.example"),
+            "{card:?}"
+        );
+        assert!(card[1].starts_with("    5h "), "{card:?}");
+        assert_eq!(card[2..4], NEEDS_LOGIN_ROWS, "{card:?}");
+        assert!(card[4].starts_with("    ⏎ history of work"), "{card:?}");
+        // Two windows only: the title, both bars, then the problem.
+        let lead = lead_rows(&loaded(quarantined_in_use(three())), 120, 40).1;
+        assert_eq!(labels(&lead[1..3]), ["5h", "7d"], "{lead:?}");
+        assert_eq!(lead[3..], NEEDS_LOGIN_ROWS, "{lead:?}");
+    }
+
+    #[test]
+    fn selection_starts_on_the_account_in_use() {
+        // UX-2: the account in use, else row 1.
+        let selected = |state: &State| state.accounts.selected().map(|a| a.id);
+        let mut state = loaded(three());
+        assert_eq!(selected(&state), Some(id(2)));
+        assert_eq!(selected(&loaded(many(3))), Some(id(1)));
+        // In table order, whatever its provider.
+        let mut snap = snapshot(many(2));
+        let mut fake = fake_agent(
+            vec![fake_account(1, "a1@x.co"), fake_account(2, "a2@x.co")],
+            LiveLogin::Managed { position: 2 },
+        );
+        fake.accounts[1].active = true;
+        snap.providers.push(fake);
+        let mut several = fresh(Screen::Accounts);
+        several.accounts.apply(snap);
+        assert_eq!(selected(&several), Some(AccountId::from_string("fake-2")));
+        // A refresh keeps the selection by ID.
+        update(&mut state, ch('k'), NOW_MS);
+        state.accounts.apply(snapshot(three()));
+        assert_eq!(selected(&state), Some(id(1)));
+    }
+
+    #[test]
+    fn the_accounts_screen_s_roles_in_each_tier() {
+        // §16.
+        for theme in TIERS {
+            for (w, h) in [(80u16, 24u16), (120, 40)] {
+                let mut state = loaded(three());
+                state.theme = theme;
+                let buf = draw_buffer(&state, w, h, NOW_MS);
+                let body = crate::view::areas(&state, Rect::new(0, 0, w, h)).body;
+                let p = parts(&state, body, NOW_MS);
+                let rows = text_of(&buf);
+                let check = |y: u16, needle: &str, role: char| {
+                    let (got, want) = role_of(&buf, theme, y, needle, role);
+                    assert_eq!(got, want, "{theme:?} {w}: {needle:?}");
+                };
+                // The lead card: `●` and `b` accent, the alias bold, the rest muted, the bars
+                // accent on faint.
+                let y = p.lead.y;
+                check(y, "●", 'a');
+                check(y, "sam@corp.example", 'm');
+                check(y, "best now", 'm');
+                let b = col(&rows[usize::from(y)], "b switch");
+                assert_eq!(
+                    roles(&buf, theme, y).chars().nth(b),
+                    canon(theme, "a").chars().next()
+                );
+                assert!(
+                    buf[(6, y)].modifier.contains(Modifier::BOLD),
+                    "{theme:?} {w}"
+                );
+                let cells = if w >= 120 { 52 } else { 30 };
+                let fill = if w >= 120 { 28 } else { 16 };
+                let bar: String = roles(&buf, theme, y + 1)
+                    .chars()
+                    .skip(10)
+                    .take(cells)
+                    .collect();
+                let want = "a".repeat(fill) + &"f".repeat(cells - fill);
+                assert_eq!(bar, canon(theme, &want), "{theme:?} {w}");
+                // The table: muted heads, the selected row's `▌` accent and `sel-bg` behind it.
+                let y = p.table.y;
+                let heads: String = roles(&buf, theme, y)
+                    .chars()
+                    .filter(|c| *c != ' ')
+                    .collect();
+                assert_eq!(
+                    heads,
+                    canon(theme, "m").repeat(heads.chars().count()),
+                    "{theme:?}"
+                );
+                let selected = y + 2;
+                assert_eq!(buf[(0, selected)].symbol(), "▌");
+                check(selected, "▌", 'a');
+                let tint = theme.sel_bg().bg.unwrap_or(Color::Reset);
+                for x in 0..w {
+                    assert_eq!(buf[(x, selected)].bg, tint, "{theme:?} {w} {x}");
+                    assert_eq!(buf[(x, selected - 1)].bg, Color::Reset, "{theme:?} {w} {x}");
+                }
+                // The card: the alias bold, the facts muted, the sparkline's tag faint.
+                let y = p.card.y;
+                for x in 6..10 {
+                    assert!(
+                        buf[(x, y)].modifier.contains(Modifier::BOLD),
+                        "{theme:?} {w} {x}"
+                    );
+                }
+                check(y, "in use", 'm');
+                check(y + 1, "24h", 'f');
+                let tag = 10 + if w >= 120 { 32 } else { 16 } + 1;
+                let letters: String = roles(&buf, theme, y + 2)
+                    .chars()
+                    .skip(tag)
+                    .take(2)
+                    .collect();
+                assert_eq!(letters, canon(theme, "ff"), "{theme:?} {w}");
+            }
+        }
     }
 }

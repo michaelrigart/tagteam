@@ -38,7 +38,7 @@ const PCT_W: usize = 4;
 /// The `▲` slot: ` ▲`, or two spaces, so the columns stay put when pace changes.
 const AHEAD_W: usize = 2;
 const AHEAD_MARK: &str = "▲";
-const IN_USE: &str = "●";
+pub(super) const IN_USE: &str = "●";
 const ALIAS_GAP: usize = 2;
 const ORG_SEP: &str = " · ";
 const STATUS_HEAD: &str = "STATUS";

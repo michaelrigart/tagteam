@@ -776,8 +776,9 @@ mod tests {
             lines[0]
         );
         assert_eq!(areas(&state, Rect::new(0, 0, 80, 24)).body.y, 2);
+        // The body: the lead card's two rows, a blank one, then the table.
         assert!(
-            body_of(&state, 80, 24, NOW_MS)[0].contains("ACCOUNT"),
+            body_of(&state, 80, 24, NOW_MS)[3].contains("ACCOUNT"),
             "the table under it: {lines:?}"
         );
         assert!(draw(&state, 120, 40)[0].ends_with("keychain locked until 15:05   ? keys"));
