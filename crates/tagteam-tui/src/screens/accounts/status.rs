@@ -14,6 +14,10 @@ const RETRIES: &str = "!";
 pub(super) const DISABLED: &str = "○";
 /// What an API key's row adds to its status words, in place of its windows.
 const NO_LIMITS: &str = "has no usage limits to show";
+/// The account in use, in words: STATUS's phrase and the cards' facts.
+pub(super) const IN_USE_WORDS: &str = "in use";
+/// The run shell's own account, after `words::IN_SESSION` (T3-14).
+pub(super) const THIS_SESSION: &str = "this session";
 
 /// A STATUS phrase: its glyph, when it has one, its words and its role.
 struct Phrase {
@@ -81,11 +85,11 @@ fn first(v: &AccountView, this: bool, best: bool) -> Option<Phrase> {
     let (glyph, words, role) = if this {
         (
             Some(words::IN_SESSION),
-            "this session".to_owned(),
+            THIS_SESSION.to_owned(),
             Role::Muted,
         )
     } else if v.active {
-        (None, "in use".to_owned(), Role::Accent)
+        (None, IN_USE_WORDS.to_owned(), Role::Accent)
     } else if best {
         (None, "best".to_owned(), Role::Text)
     } else if v.usage.status == UsageStatus::ApiKey {

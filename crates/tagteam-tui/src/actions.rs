@@ -119,8 +119,9 @@ pub(crate) fn say_checked(state: &mut State, summary: &CollectSummary, now_ms: i
             .filter_map(|v| v.usage.retry_at)
             .min();
         let mut text = format!(
-            "{} rate-limited",
-            words::plural(summary.rate_limited.len() as u64, "account")
+            "{} {}",
+            words::plural(summary.rate_limited.len() as u64, "account"),
+            words::RATE_LIMITED
         );
         if let Some(at) = retry {
             text.push_str(&format!(" · retry in {}", in_span(at)));
@@ -134,7 +135,7 @@ pub(crate) fn say_checked(state: &mut State, summary: &CollectSummary, now_ms: i
     } else {
         let next = views(state).filter_map(|v| v.usage.next_poll_at).min();
         let text = match next {
-            Some(at) => format!("already current · next update in {}", in_span(at)),
+            Some(at) => format!("already current · {}", words::next_update(at, now_s)),
             None => "already current".to_owned(),
         };
         (ToastKind::Info, text)

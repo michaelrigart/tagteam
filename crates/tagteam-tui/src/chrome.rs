@@ -20,7 +20,9 @@ use crate::view::{WRAP_ROWS, fit, width_of, wrap, wrap_rows};
 
 /// From this many rows a faint rule sits under the chrome (§4.5).
 pub(crate) const RULE_FROM: u16 = 30;
-/// From this many columns the header and the auto line take their long forms (§4.5).
+/// From this many columns the long forms take over (§4.5): the header's and the auto line's,
+/// the Now strip's gauges, and the Accounts screen's wide gauges, bars, sparklines, org, `▲`
+/// words and keys row.
 pub(crate) const WIDE: u16 = 120;
 
 const TABS: [(Screen, &str); 3] = [
@@ -206,11 +208,7 @@ fn in_use_parts(v: &AccountView, width: u16, now_ms: i64, theme: Theme) -> NowPa
             spans.extend(line_gauge(w.pct, expected, NOW_GAUGE, theme));
             spans.push(Span::raw(" "));
         }
-        let pct = w.pct.round() as i64;
-        spans.push(Span::styled(
-            format!("{:>4}", format!("{pct}%")),
-            theme.severity(words::severity(pct)),
-        ));
+        spans.push(card::value_cell(w, theme));
         if let Some(at) = w.resets_at {
             spans.push(Span::raw(" "));
             spans.push(Span::styled(

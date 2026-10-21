@@ -9,10 +9,10 @@ use tagteam_engine::store::AccountRow;
 use tagteam_engine::views::{AccountView, HistoryWindow, UsageStatus};
 use tagteam_engine::words;
 
-use super::status;
+use super::status::{self, IN_USE_WORDS, THIS_SESSION};
 use super::table::age_now;
 use crate::autoline;
-use crate::chrome::fit_spans;
+use crate::chrome::{WIDE, fit_spans};
 use crate::gauge::sparkline;
 use crate::state::State;
 use crate::theme::{Role, Theme};
@@ -25,20 +25,19 @@ pub(crate) const CARD_DEBOUNCE_MS: i64 = 250;
 pub(crate) const CARD_SINCE_S: i64 = 7 * 86_400;
 /// A short window's sparkline spans the last day (§6.4).
 const SHORT_SINCE_S: i64 = 86_400;
-/// The width from which the sparkline takes `SPARK_WIDE` cells, `▲` its words, the projection
-/// its rate, the title the org, and the card its keys row (§4.5, §6.4, T3-20).
-const WIDE_FROM: u16 = 120;
+/// The sparkline's cells from `WIDE` columns, where `▲` takes its words, the projection its
+/// rate, the title the org, and the card its keys row (§4.5, §6.4, T3-20), and below.
 const SPARK_WIDE: usize = 32;
 const SPARK: usize = 16;
-/// Every row of the card starts this far in.
-const INDENT: &str = "    ";
+/// Every row of the card, and of the lead card's bars, starts this far in.
+pub(super) const INDENT: &str = "    ";
 /// Between a row's parts (§4.3).
-const GAP: &str = "  ";
+pub(super) const GAP: &str = "  ";
 /// Between the title's name and its facts.
 const TITLE_GAP: &str = "    ";
 /// Between the keys row's keys.
 const KEYS_GAP: &str = "   ";
-const FACT_SEP: &str = " · ";
+pub(super) const FACT_SEP: &str = " · ";
 /// The rows a problem's sentence, and its remedy, take at most.
 const PROBLEM_ROWS: usize = 2;
 /// The label column's least width; it takes a quarter of the card's at most (T3-20).
@@ -138,7 +137,7 @@ impl Shown {
 /// the first long below 120 columns, every window from 120. The lead card picks its bars from
 /// them (T3-32).
 pub(crate) fn lead_keys(v: &AccountView, width: u16) -> Vec<String> {
-    if width >= WIDE_FROM {
+    if width >= WIDE {
         return windows_of(v).iter().map(|(w, _)| w.key.clone()).collect();
     }
     short_and_long(v).map(|(w, _)| w.key.clone()).collect()
@@ -163,7 +162,7 @@ pub(crate) fn height(state: &State, v: &AccountView, width: u16, now_ms: i64) ->
 pub(crate) fn min_height(state: &State, v: &AccountView, width: u16, now_ms: i64) -> usize {
     1 + usize::from(!windows_of(v).is_empty())
         + problem_rows(state, v, width, now_ms).len()
-        + usize::from(width >= WIDE_FROM)
+        + usize::from(width >= WIDE)
 }
 
 /// A problem and its remedy as rows (§6.2, §6.4): `✕ Needs a new login: …` in its role, the
@@ -242,7 +241,7 @@ pub(super) fn name_spans(row: &AccountRow, width: u16, theme: Theme) -> Vec<Span
         ],
         None => vec![Span::styled(email, theme.strong())],
     };
-    if let Some(org) = row.org_name.as_deref().filter(|_| width >= WIDE_FROM) {
+    if let Some(org) = row.org_name.as_deref().filter(|_| width >= WIDE) {
         name.push(Span::styled(format!("{FACT_SEP}{org}"), muted));
     }
     name
@@ -340,13 +339,17 @@ fn facts_of(state: &State, v: &AccountView, now_ms: i64) -> Vec<(String, Role)> 
     let now_s = now_ms.div_euclid(1000);
     let (row, u) = (&v.row, &v.usage);
     let snap = state.accounts.snapshot();
-    let mut facts = vec![if v.active { "in use" } else { "not in use" }.to_owned()];
+    let mut facts = vec![if v.active {
+        IN_USE_WORDS.to_owned()
+    } else {
+        format!("not {IN_USE_WORDS}")
+    }];
     facts.extend(v.kind.display.map(str::to_owned));
     if v.in_session {
         facts.push("in a session".to_owned());
     }
     if snap.and_then(|s| s.this.as_ref()) == Some(&row.id) {
-        facts.push(format!("{} this session", words::IN_SESSION));
+        facts.push(format!("{} {THIS_SESSION}", words::IN_SESSION));
     }
     if row.disabled {
         facts.push("disabled".to_owned());
@@ -429,10 +432,10 @@ impl Row<'_> {
     fn line(&self, now_s: i64, theme: Theme) -> Line<'static> {
         let width = usize::from(self.width);
         let (mut spans, mark) = self.spans(now_s, theme);
-        if let Some(at) = mark.filter(|_| self.width >= WIDE_FROM) {
+        if let Some(at) = mark.filter(|_| self.width >= WIDE) {
             let words = words::ahead_words(self.pace.expected_pct);
             let drawn: usize = spans.iter().map(|s| width_of(&s.content)).sum();
-            if drawn - width_of(AHEAD) + width_of(&words) <= width {
+            if drawn - width_of(AHEAD_MARK) + width_of(&words) <= width {
                 spans[at].content = words.into();
                 return Line::from(spans);
             }
@@ -443,27 +446,25 @@ impl Row<'_> {
     /// The row's spans with `▲` alone, and which span `▲` is when the window is ahead.
     fn spans(&self, now_s: i64, theme: Theme) -> (Vec<Span<'static>>, Option<usize>) {
         let (w, p) = (self.window, self.pace);
-        let wide = self.width >= WIDE_FROM;
+        let wide = self.width >= WIDE;
         let (since, tag) = match w.kind {
             WindowKind::Short => (SHORT_SINCE_S, "24h"),
             WindowKind::Long | WindowKind::Scoped | WindowKind::Spend => (CARD_SINCE_S, "7d"),
         };
         let cells = if wide { SPARK_WIDE } else { SPARK };
-        let pct = w.pct.round() as i64;
-        let value = words::spend_text(w).unwrap_or_else(|| format!("{:>4}", format!("{pct}%")));
         let mut spans = vec![
             Span::raw(format!("{INDENT}{}{GAP}", pad(&w.label, self.label_w))),
             sparkline(self.samples, now_s - since, now_s + 1, cells, theme),
             Span::raw(" "),
             Span::styled(format!("{tag:<3}"), theme.role(Role::Faint)),
             Span::raw(GAP),
-            Span::styled(value, theme.severity(words::severity(pct))),
+            value_cell(w, theme),
         ];
         let mut mark = None;
         if p.ahead == Some(true) {
             spans.push(Span::raw(" "));
             mark = Some(spans.len());
-            spans.push(Span::styled(AHEAD, theme.role(Role::Warn)));
+            spans.push(Span::styled(AHEAD_MARK, theme.role(Role::Warn)));
         }
         if !self.on_lead {
             spans.extend(reset_tail(w, p, wide, now_s, theme));
@@ -519,15 +520,23 @@ pub(super) fn reset_tail(
     spans
 }
 
-/// The ahead-of-pace mark on its own, below 120 columns or where its words do not fit.
-const AHEAD: &str = "▲";
+/// The ahead-of-pace mark on its own, below 120 columns or where its words do not fit, and on
+/// the lead card's bars.
+pub(super) const AHEAD_MARK: &str = "▲";
+/// A window's value cell, in its severity's role (T3-19, T3-20): its spend (`€12.40 of €50`),
+/// else its percentage right-aligned in four columns.
+pub(crate) fn value_cell(w: &Window, theme: Theme) -> Span<'static> {
+    let pct = w.pct.round() as i64;
+    let value = words::spend_text(w).unwrap_or_else(|| format!("{:>4}", format!("{pct}%")));
+    Span::styled(value, theme.severity(words::severity(pct)))
+}
 /// A short or long window that has no reset yet (T3-20).
 const NOT_STARTED: &str = "not started";
 
 /// The keys for this account (§6.4), from 120 columns: `⏎ history of spare   e disable   a
 /// alias   x remove`, the keys in accent and their labels muted.
 fn keys_row(v: &AccountView, width: u16, theme: Theme) -> Vec<Line<'static>> {
-    if width < WIDE_FROM {
+    if width < WIDE {
         return vec![];
     }
     let email = words::email(&v.row);
