@@ -311,15 +311,10 @@ impl Engine {
         let results = self.collect_each(store, &first, &roles, policy);
         self.check_cancel()?;
         report.add(results);
+        let now_s = self.now_ms().div_euclid(1000);
         let polls = self.poll_rows(p.as_ref(), &rows, live)?;
-        let picked = self.scheduled_candidates(
-            store,
-            p.as_ref(),
-            &polls.candidates,
-            live,
-            threshold,
-            models,
-        )?;
+        let picked =
+            self.scheduled_candidates(store, p.as_ref(), &polls.candidates, live, policy, now_s)?;
         let results = self.collect_each(store, &picked, &roles, policy);
         self.check_cancel()?;
         report.add(results);
@@ -391,7 +386,8 @@ impl Engine {
         Ok(earliest)
     }
 
-    /// §8.6 phase 2's pick, read from the store, among `candidates` (`poll_rows`). One is due as
+    /// §8.6 phase 2's pick, read from the store, among `candidates` (`poll_rows`), judged at
+    /// `now_s`, which the round reads before it inspects any candidate's session. One is due as
     /// `reserve_usage` would find it for a scheduled caller, leaving the lease and the budget to
     /// the reservation: not in backoff, and a poll due or no reading yet. Escalation reads the
     /// live account's decision-grade reading under `models` (§8.4); without a managed live
@@ -402,14 +398,13 @@ impl Engine {
         p: &dyn Provider,
         candidates: &[&'r AccountRow],
         live: Option<&AccountRow>,
-        threshold: f64,
-        models: &[String],
+        policy: Policy<'_>,
+        now_s: i64,
     ) -> Result<Vec<&'r AccountRow>, EngineError> {
         if !p.capabilities().usage {
             return Ok(Vec::new());
         }
         let budget = p.poll_budget();
-        let now_s = self.now_ms().div_euclid(1000);
         let mut cands = Vec::new();
         for row in candidates {
             let state = store.usage_state(&row.id)?;
@@ -423,6 +418,9 @@ impl Engine {
                 fetched_at: fetched_at.filter(|t| !is_future_stamped(*t, now_s)),
             });
         }
+        let Policy {
+            threshold, models, ..
+        } = policy;
         let live_pct = match live {
             Some(row) => self
                 .decision_windows(row, models)?
