@@ -1,6 +1,6 @@
 # tagteam — review refactor: the provider boundary and clean code
 
-**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/22 (R1), https://github.com/michaelrigart/tagteam/pull/24 (R2), https://github.com/michaelrigart/tagteam/pull/25 (R3), https://github.com/michaelrigart/tagteam/pull/30 (R4a), https://github.com/michaelrigart/tagteam/pull/31 (R4b), https://github.com/michaelrigart/tagteam/pull/32 (R4b2), https://github.com/michaelrigart/tagteam/pull/33 (R4c)
+**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/22 (R1), https://github.com/michaelrigart/tagteam/pull/24 (R2), https://github.com/michaelrigart/tagteam/pull/25 (R3), https://github.com/michaelrigart/tagteam/pull/30 (R4a), https://github.com/michaelrigart/tagteam/pull/31 (R4b), https://github.com/michaelrigart/tagteam/pull/32 (R4b2), https://github.com/michaelrigart/tagteam/pull/33 (R4c), https://github.com/michaelrigart/tagteam/pull/34 (R4d)
 **Date:** 2026-10-19
 **Scope:** Fixes the architecture and clean-code findings of the 2026-10-19 codebase review, plus
 its PERF-R-1, on branch `review-refactor`. Every finding the review raised on that axis is
@@ -115,6 +115,12 @@ and the next provider arrive:
 | D-1 | ARCH-1: restore the provider boundary, or relax core §1.2/§4.1? | **Restore it.** R1 and R5 below |
 | D-2 | ARCH-7/CC-O-20: does the TUI keep driving the CLI through argv and captured text? | **Keep argv, and fix its two string couplings**: a typed unlock prompt, and warnings passed in rather than stripped from captured stderr. Typed calls wait for the menu-bar spec. The fix touches `tui_host.rs`, so it is handed to the TUI redesign (§10) |
 | D-3 | CC-E-3: are the `--json` `error.type` values `io` and `invalid-input` a stable interface? | **Kind values are stable, but the mapping can be corrected.** No kind is ever renamed or removed. Which kind a given refusal reports may be corrected, as an additive change noted in `CHANGELOG.md` (§8.5, §11) |
+
+**Michael's ruling during R4 (2026-10-21, relayed by the coordinator session):**
+
+| # | Question | Ruling |
+|---|---|---|
+| D-4 | C-2 after R4c (#33): `tagteam switch` and a not-due `tagteam run` still name an unreadable rescue through `settle_rescues`' own wording, while a due `tagteam run` uses the classifier's file-naming text. Unify them? | **Leave both.** Both name the file; no §11 change |
 
 **Calls made while drafting** (Michael checks these at sign-off):
 
