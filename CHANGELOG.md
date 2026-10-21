@@ -62,7 +62,8 @@ with the one before, so any release may contain breaking changes. Each section s
   names its entry reports the type of the error behind it (both were `io`).
 - A session profile without its marker reports `profile-marker-missing`, and an account with no
   stored credential `relogin-required` (both were `invalid-input`). A broken or unreadable
-  provider lock reports `lock` (it was `provider`).
+  provider lock reports `lock` (it was `provider`). The active-token refresh's log line gives an
+  unmanaged live login the type `unmanaged-account` (it was `invalid-input`).
 
 ### Security
 
