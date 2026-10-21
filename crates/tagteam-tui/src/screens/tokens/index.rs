@@ -127,11 +127,19 @@ pub(crate) fn first_refresh(state: &mut State) -> Vec<Cmd> {
 
 /// `r` on Tokens (spec §7.1): a refresh at once, on the index lane, so no action holds it up.
 pub(crate) fn refresh_now(state: &mut State, now_ms: i64) -> Vec<Cmd> {
+    // The banner of a failed report promises "r retries": the report is read again, whether or
+    // not the index moved (T2-22).
+    let mut cmds = if state.tokens.stale() {
+        requery(state, now_ms)
+    } else {
+        vec![]
+    };
     if state.tokens.watch.refreshing.is_some() {
         state.toast(ToastKind::Info, ALREADY, now_ms);
-        return vec![];
+        return cmds;
     }
-    refresh(state)
+    cmds.extend(refresh(state));
+    cmds
 }
 
 /// The index's state from the report lane, under the next generation.
@@ -244,10 +252,13 @@ pub(crate) fn on_load(state: &mut State, now_ms: i64) {
     }
 }
 
-/// A report arrived, or failed: the 60 s re-query counts from now, and a report's index state
-/// is the latest read.
-pub(crate) fn on_report(state: &mut State, now_ms: i64) {
-    let index = state.tokens.report().map(|r| r.index);
+/// A report arrived, or failed: the 60 s re-query counts from now, and a report just read
+/// (`read`) gives the latest index state. A failed query leaves the state as it was: the report
+/// kept on screen is an older read.
+pub(crate) fn on_report(state: &mut State, now_ms: i64, read: bool) {
+    let index = read
+        .then(|| state.tokens.report().map(|r| r.index))
+        .flatten();
     let watch = &mut state.tokens.watch;
     watch.next_query_ms = now_ms + REQUERY_MS;
     if index.is_some() {
@@ -394,7 +405,7 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier};
     use serde_json::json;
     use tagteam_daemon::protocol::{Event, Status, StatusJob};
     use tagteam_engine::tokens::{ActiveBlock, IndexReport, TokenPeriod, TokenRow};
@@ -1084,6 +1095,124 @@ mod tests {
         warn_row(
             &state,
             "the token index was not refreshed: the store is locked",
+        );
+    }
+
+    const REPORT_FAILED: &str = "couldn't read the token index (the index is locked) · r retries";
+
+    /// Starts a report query on Tokens and fails it.
+    fn fail_report(state: &mut State, at_ms: i64) {
+        let cmds = crate::screens::tokens::on_enter(state, at_ms);
+        fail_asked(state, &cmds, at_ms);
+    }
+
+    /// Fails the report query in `cmds`.
+    fn fail_asked(state: &mut State, cmds: &[Cmd], at_ms: i64) {
+        let [Cmd::LoadReport { r#gen, .. }] = cmds else {
+            panic!("{cmds:?}");
+        };
+        let result = Err(SourceError {
+            kind: "store".into(),
+            message: "the index is locked".into(),
+        });
+        update(
+            state,
+            Msg::TokenReport {
+                r#gen: *r#gen,
+                result,
+            },
+            at_ms,
+        );
+    }
+
+    /// The index check that `tick` at `at_ms` asks for, answered with `result`: the commands the
+    /// answer leaves.
+    fn check_with(
+        state: &mut State,
+        at_ms: i64,
+        result: Result<IndexState, SourceError>,
+    ) -> Vec<Cmd> {
+        let asked = tick(state, at_ms);
+        let Some(Cmd::LoadIndexState { r#gen, .. }) = asked
+            .iter()
+            .find(|c| matches!(c, Cmd::LoadIndexState { .. }))
+        else {
+            panic!("{asked:?}");
+        };
+        let r#gen = *r#gen;
+        token_cmds(update(state, Msg::IndexState { r#gen, result }, at_ms))
+    }
+
+    /// Whether the account cell of the report's one row is DIM.
+    fn row_is_dim(state: &State) -> bool {
+        let buf = draw_buffer(state, 80, 24, NOW_MS);
+        let (x, y) = locate(&buf, "a1@x.co").unwrap();
+        buf[(x, y)].modifier.contains(Modifier::DIM)
+    }
+
+    #[test]
+    fn a_dim_report_keeps_its_banner_through_the_index_checks() {
+        // T2-22: the checks write and clear their own words, never the failed report's.
+        let mut state = on_tokens();
+        assert!(!row_is_dim(&state));
+        fail_report(&mut state, NOW_MS);
+        assert_eq!(state.tokens.error(), Some(REPORT_FAILED));
+        assert!(row_is_dim(&state));
+        let failed = || SourceError {
+            kind: "store".into(),
+            message: "the store is locked".into(),
+        };
+        check_with(&mut state, NOW_MS + 1_000, Err(failed()));
+        assert_eq!(state.tokens.error(), Some(REPORT_FAILED));
+        assert_eq!(draw(&state, 80, 24)[2], format!(" ! {REPORT_FAILED}"));
+        check_with(
+            &mut state,
+            NOW_MS + 6_100,
+            Ok(index_changed_at(NOW_MS - 60_000)),
+        );
+        assert_eq!(state.tokens.error(), Some(REPORT_FAILED));
+        assert_eq!(draw(&state, 80, 24)[2], format!(" ! {REPORT_FAILED}"));
+        assert!(
+            row_is_dim(&state),
+            "the index is unchanged, the report stale"
+        );
+    }
+
+    #[test]
+    fn r_reads_a_stale_report_again_whether_or_not_the_index_moved() {
+        let mut state = on_tokens();
+        update(&mut state, Msg::Refreshed { result: done() }, NOW_MS);
+        assert_eq!(
+            update(&mut state, ch('r'), NOW_MS),
+            [Cmd::RefreshIndex { provider: cc() }],
+            "a good report is not read again by r"
+        );
+        update(&mut state, Msg::Refreshed { result: done() }, NOW_MS);
+        fail_report(&mut state, NOW_MS);
+        let cmds = update(&mut state, ch('r'), NOW_MS + 1_000);
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::LoadReport { .. }, Cmd::RefreshIndex { .. }]
+            ),
+            "{cmds:?}"
+        );
+        assert!(state.tokens.pending());
+    }
+
+    #[test]
+    fn a_failed_report_leaves_the_index_state_the_checks_read() {
+        let mut state = on_tokens();
+        let moved = check_with(
+            &mut state,
+            NOW_MS + 1_000,
+            Ok(index_changed_at(NOW_MS - 30_000)),
+        );
+        fail_asked(&mut state, &moved, NOW_MS + 1_100);
+        assert_eq!(
+            state.tokens.watch().state().and_then(|i| i.changed_at_ms),
+            Some(NOW_MS - 30_000),
+            "not rewound to the report kept on screen"
         );
     }
 

@@ -1261,7 +1261,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     let table = Table::new(report, &t.level().widths, width, state.theme, now_ms);
     // A failed query keeps the last report, DIM (T2-22).
     let dim = |line: Line<'static>| {
-        if t.stale {
+        if t.stale() {
             line.patch_style(state.theme.dim())
         } else {
             line
@@ -1292,7 +1292,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
         }));
     }
     lines.push(dim(table.total()));
-    lines.extend(plan.below);
+    lines.extend(plan.below.into_iter().map(dim));
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -2082,7 +2082,7 @@ mod tests {
             let mut state = showing(many_days(3), |_| {});
             state.theme = theme;
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
-            for needle in ["ACCOUNT", "2026-09-21", "2026-09-20", "TOTAL"] {
+            for needle in ["ACCOUNT", "2026-09-21", "2026-09-20", "TOTAL", "API cost"] {
                 assert!(
                     plain(&buf, needle),
                     "{theme:?} {needle}: a good report is plain"
@@ -2121,7 +2121,15 @@ mod tests {
                 text_of(&buf)[2],
                 " ! couldn't read the token index (the index is locked) · r retries"
             );
-            for needle in ["ACCOUNT", "2026-09-21", "2026-09-20", "2026-09-19", "TOTAL"] {
+            for needle in [
+                "ACCOUNT",
+                "2026-09-21",
+                "2026-09-20",
+                "2026-09-19",
+                "TOTAL",
+                "API cost",
+                "cache write",
+            ] {
                 assert!(dim(&buf, needle), "{theme:?} {needle}: DIM on every cell");
             }
             let again = update(&mut state, ch('p'), NOW_MS);
@@ -2146,7 +2154,7 @@ mod tests {
                 !text_of(&buf).iter().any(|l| l.contains("couldn't read")),
                 "{theme:?}"
             );
-            for needle in ["ACCOUNT", "2026-09-21", "TOTAL"] {
+            for needle in ["ACCOUNT", "2026-09-21", "TOTAL", "API cost", "cache write"] {
                 assert!(plain(&buf, needle), "{theme:?} {needle}: cleared");
             }
         }

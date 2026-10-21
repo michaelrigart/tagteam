@@ -135,7 +135,7 @@ pub(crate) const KEYS: &[KeyRow] = &[
     KeyRow {
         screen: None,
         keys: "Esc",
-        does: "close the overlay; else back one level",
+        does: "close overlay; back; Accounts: clear warnings",
         footer: Footer::No,
         #[cfg(test)]
         probes: &[named(KeyCode::Esc)],
@@ -592,6 +592,15 @@ mod tests {
         state
     }
 
+    /// `state` with a start-up warning showing.
+    fn warned(mut state: State) -> State {
+        state
+            .startup
+            .warnings
+            .push("config.toml: unknown key x (ignored)".into());
+        state
+    }
+
     fn opened(mut state: State) -> State {
         update(&mut state, ch('?'), NOW_MS);
         state
@@ -616,7 +625,7 @@ mod tests {
             (None, Char('2' | '3') | Tab | BackTab, false) => vec![accounts(1)],
             (None, Char('?'), false) => vec![accounts(1)],
             (None, Char('q'), false) => vec![opened(accounts(1)), accounts(1)],
-            (None, Esc, false) => vec![opened(accounts(1))],
+            (None, Esc, false) => vec![opened(accounts(1)), warned(accounts(1))],
             (None, Char('P' | 'r' | 'A' | 'D'), false) => vec![accounts(2)],
             (
                 Some(Accounts),
