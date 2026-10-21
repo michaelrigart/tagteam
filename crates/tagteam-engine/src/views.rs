@@ -355,16 +355,22 @@ impl Engine {
     /// pace, and whether that reading is decision-grade (§8.4). Reads the store only.
     ///
     /// `with_pace` is whether each window carries §8.7's pace, which costs a query per window
-    /// of samples; a view that never shows it asks for none (`Pace::default()`).
+    /// of samples; a view that never shows it asks for none (`Pace::default()`). Trust is
+    /// judged under `models` (§8.2's relevance sets the post-429 horizon), and against the
+    /// row's provider's poll budget.
     fn usage_view(
         &self,
         store: Option<&Store>,
         row: &AccountRow,
         kind: &KindTraits,
         supported: bool,
-        budget: &PollBudget,
         with_pace: bool,
+        models: &[String],
     ) -> Result<UsageView, EngineError> {
+        let budget = &self
+            .registry
+            .get(&row.provider)
+            .map_or(PollBudget::STANDARD, |p| p.poll_budget());
         let state = match store {
             Some(s) if supported => s.usage_state(&row.id)?,
             _ => None,
@@ -385,8 +391,8 @@ impl Engine {
             }
             None => None,
         };
-        let trusted = windows.is_some()
-            && self.is_decision_grade(store, row, &state, &self.settings().models, budget)?;
+        let trusted =
+            windows.is_some() && self.is_decision_grade(store, row, &state, models, budget)?;
         let failing = state
             .last_error
             .clone()
@@ -536,16 +542,24 @@ impl Engine {
         };
         let live = self.liveness(p.as_ref(), store.as_deref(), provider)?;
         let supported = p.capabilities().usage;
+        // §12.1: trust and the forecast's headroom under the same `models`, as `b` reads them.
+        let (settings, _) = Settings::load(&self.env, provider);
         let accounts = rows
             .into_iter()
             .map(|row| {
                 let active = live.is_active(&row);
-                self.account_view_of(p.as_ref(), store.as_deref(), row, active, supported, true)
+                self.account_view_of(
+                    p.as_ref(),
+                    store.as_deref(),
+                    row,
+                    active,
+                    supported,
+                    &settings.models,
+                )
             })
             .collect::<Result<Vec<_>, EngineError>>()?;
         let active_position = accounts.iter().find(|v| v.active).map(|v| v.row.position);
         let live_label = live.identity.map(|i| i.email.unwrap_or(i.label));
-        let (settings, _) = Settings::load(&self.env, provider);
         // T3-5: the account the view marks active, the stored-active fallback included.
         let live = match (active_position, &live_label) {
             (Some(position), _) => LiveLogin::Managed { position },
@@ -595,8 +609,8 @@ impl Engine {
         })
     }
 
-    /// One account as the views show it, its usage read from `store` (with pace, or without:
-    /// see `usage_view`).
+    /// One account as the views show it, its usage read from `store` with pace, its trust
+    /// judged under `models` (see `usage_view`).
     fn account_view_of(
         &self,
         p: &dyn Provider,
@@ -604,10 +618,10 @@ impl Engine {
         row: AccountRow,
         active: bool,
         supported: bool,
-        with_pace: bool,
+        models: &[String],
     ) -> Result<AccountView, EngineError> {
         let kind = p.kind_traits(&row.kind);
-        let usage = self.usage_view(store, &row, &kind, supported, &p.poll_budget(), with_pace)?;
+        let usage = self.usage_view(store, &row, &kind, supported, true, models)?;
         let in_session = self.in_session(p, &row);
         Ok(AccountView {
             kind,
@@ -648,13 +662,19 @@ impl Engine {
         let kind = provider
             .as_ref()
             .map_or(UNREGISTERED, |p| p.kind_traits(&row.kind));
-        let budget = provider
-            .as_ref()
-            .map_or(PollBudget::STANDARD, |p| p.poll_budget());
         let supported = provider.is_some_and(|p| p.capabilities().usage);
         let usage = self
             .existing_store()
-            .and_then(|s| self.usage_view(s.as_deref(), &row, &kind, supported, &budget, with_pace))
+            .and_then(|s| {
+                self.usage_view(
+                    s.as_deref(),
+                    &row,
+                    &kind,
+                    supported,
+                    with_pace,
+                    &self.settings().models,
+                )
+            })
             .unwrap_or_else(|e| {
                 if status_bar {
                     tracing::debug!(
@@ -795,7 +815,7 @@ impl Engine {
             row.clone(),
             live.is_active(&row),
             p.capabilities().usage,
-            true,
+            &self.settings().models,
         )?;
         // Each window with the time its `pct` is as of, and its pace when the view has it: the
         // last good reading's own windows are the view's, as read then.

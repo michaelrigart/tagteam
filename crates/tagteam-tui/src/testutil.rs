@@ -192,6 +192,12 @@ pub(crate) fn snapshot(accounts: Vec<AccountView>) -> AccountsSnapshot {
     }
 }
 
+/// Sets `view`'s live login to `live`, and its forecast to the one the engine computes with it.
+pub(crate) fn set_live(view: &mut ProviderAccounts, live: LiveLogin) {
+    view.forecast = forecast_of(&view.accounts, &live, &view.models);
+    view.live = live;
+}
+
 /// `n` accounts `a1@x.co` … at positions 1 to `n`, each with a reading.
 pub(crate) fn many(n: u32) -> Vec<AccountView> {
     (1..=n)
