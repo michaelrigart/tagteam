@@ -381,7 +381,7 @@ fn an_active_token_refresh_logs_its_outcome_by_provider_and_account() {
 
 #[test]
 fn an_active_token_refresh_that_fails_transiently_logs_its_kind_as_a_string() {
-    // §7.5, §8.6.2: `kind` is a quoted string like the gate's, never a `Debug` rendering.
+    // §7.5: `kind` is a quoted string like the gate's, never a `Debug` rendering.
     let _serial = one_at_a_time();
     let fx = Fx::new();
     fx.add("a@x.co", "rt-a");

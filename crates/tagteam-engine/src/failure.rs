@@ -76,13 +76,15 @@ impl From<TransientKind> for FailureKind {
 }
 
 /// Compares the stored spelling: `kind == "http-429"` holds for the kind `parse("http-429")` gives.
+/// It keeps the held TUI's `source.rs` comparison compiling (review refactor §3.4); engine code
+/// compares variants, not strings.
 impl PartialEq<str> for FailureKind {
     fn eq(&self, other: &str) -> bool {
         self.as_str() == other
     }
 }
 
-/// Why the refresh gate (§7.3) or active-token refresh (§7.5) did nothing decisive (§8.6.2).
+/// Why the refresh gate (§7.3) or active-token refresh (§7.5) did nothing decisive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateFailure {
     VaultAbsent,
@@ -177,6 +179,40 @@ mod tests {
         assert!(kind == "http-429");
         assert!(kind != "http-401");
         assert!(&FailureKind::Other("x-new".into()) == "x-new");
+    }
+
+    #[test]
+    fn named_lists_every_named_variant() {
+        fn listed(v: FailureKind) {
+            match v {
+                FailureKind::NoAccessToken
+                | FailureKind::Http401
+                | FailureKind::RefreshFailed
+                | FailureKind::KeychainUnavailable
+                | FailureKind::ProfileDrifted
+                | FailureKind::LiveReplaced
+                | FailureKind::ForeignCredential
+                | FailureKind::VaultAbsent
+                | FailureKind::TokenExpired
+                | FailureKind::OverBudget => {
+                    assert!(
+                        FailureKind::NAMED.contains(&v),
+                        "{v:?} is missing from NAMED"
+                    )
+                }
+                FailureKind::Provider(_) | FailureKind::Other(_) => {}
+            }
+        }
+        listed(FailureKind::NoAccessToken);
+        listed(FailureKind::Http401);
+        listed(FailureKind::RefreshFailed);
+        listed(FailureKind::KeychainUnavailable);
+        listed(FailureKind::ProfileDrifted);
+        listed(FailureKind::LiveReplaced);
+        listed(FailureKind::ForeignCredential);
+        listed(FailureKind::VaultAbsent);
+        listed(FailureKind::TokenExpired);
+        listed(FailureKind::OverBudget);
     }
 
     #[test]
