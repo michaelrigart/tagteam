@@ -394,6 +394,7 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::style::Color;
     use serde_json::json;
     use tagteam_daemon::protocol::{Event, Status, StatusJob};
     use tagteam_engine::tokens::{ActiveBlock, IndexReport, TokenPeriod, TokenRow};
@@ -1033,6 +1034,57 @@ mod tests {
             NOW_MS + 6_100,
         );
         assert_eq!(state.tokens.error(), None);
+    }
+
+    #[test]
+    fn the_index_check_s_banner_keeps_its_words_in_warn() {
+        // T2-22: only a failed report query changes its words; the check's and the refresh's
+        // keep theirs, in warn under `!`.
+        let store = || SourceError {
+            kind: "store".into(),
+            message: "the store is locked".into(),
+        };
+        let warn_row = |state: &State, words: &str| {
+            let theme = TIERS[1];
+            let buf = draw_buffer(state, 80, 24, NOW_MS);
+            assert_eq!(text_of(&buf)[2], format!(" ! {words}"));
+            let warn = theme.role(crate::theme::Role::Warn);
+            for x in [1, 3, 10] {
+                assert_eq!(buf[(x, 2)].fg, warn.fg.unwrap_or(Color::Reset), "{x}");
+            }
+        };
+        let mut state = on_tokens();
+        state.theme = TIERS[1];
+        let check = tick(&mut state, NOW_MS + 1_000);
+        let [Cmd::LoadIndexState { r#gen, .. }] = check.as_slice() else {
+            panic!("{check:?}");
+        };
+        let result = Err(store());
+        update(
+            &mut state,
+            Msg::IndexState {
+                r#gen: *r#gen,
+                result,
+            },
+            NOW_MS + 1_100,
+        );
+        warn_row(
+            &state,
+            "the token index's state was not read: the store is locked",
+        );
+        let mut state = on_tokens();
+        state.theme = TIERS[1];
+        update(
+            &mut state,
+            Msg::Refreshed {
+                result: Err(store()),
+            },
+            NOW_MS,
+        );
+        warn_row(
+            &state,
+            "the token index was not refreshed: the store is locked",
+        );
     }
 
     /// The fixture daemon switching Claude Code's accounts, with the index job (D13), whose last

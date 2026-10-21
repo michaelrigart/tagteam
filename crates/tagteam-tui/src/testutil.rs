@@ -30,7 +30,7 @@ use crate::live::Live;
 use crate::msg::{Cmd, Msg};
 use crate::screens::tokens::TokensState;
 use crate::source::AccountsSnapshot;
-use crate::state::{Screen, State};
+use crate::state::{Screen, Startup, State};
 use crate::theme::{Background, Role, Theme};
 
 /// Any fixed instant: every reading, reset and sample below is placed relative to it.
@@ -181,6 +181,7 @@ pub(crate) fn snapshot(accounts: Vec<AccountView>) -> AccountsSnapshot {
         in_run_shell: false,
         read_at_s: NOW_S,
         auto_holders: vec![],
+        config_mtime: None,
     }
 }
 
@@ -195,7 +196,15 @@ pub(crate) fn many(n: u32) -> Vec<AccountView> {
 /// Code in UTC.
 pub(crate) fn fresh(screen: Screen) -> State {
     let tokens = TokensState::new(cc(), TimeZone::UTC);
-    let mut state = State::new(screen, Theme::new(false), None, tokens, CC_NAMES, NOW_MS);
+    let mut state = State::new(
+        screen,
+        Theme::new(false),
+        None,
+        tokens,
+        CC_NAMES,
+        Startup::default(),
+        NOW_MS,
+    );
     state.size = (80, 24);
     state
 }

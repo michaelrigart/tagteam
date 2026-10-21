@@ -2,12 +2,14 @@
 //! thread, never on the UI thread, and the token index's catch-up (§6.4).
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::Engine;
 use tagteam_engine::collect::{CollectMode, Collected};
 use tagteam_engine::daemon::{daemon_lock_path, read_daemon_record};
 use tagteam_engine::error::EngineError;
+use tagteam_engine::settings::Settings;
 use tagteam_engine::tokens::{
     IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport, Wait,
 };
@@ -44,6 +46,9 @@ pub struct AccountsSnapshot {
     /// Each listed provider whose engine lock names a live process other than the daemon: its
     /// pid (C-16, T2-11).
     pub auto_holders: Vec<(ProviderId, u32)>,
+    /// `config.toml`'s modification time when this was read (`Settings::mtime`): a change from
+    /// the one start-up saw clears the start-up warnings (redesign §5.6, T2-21).
+    pub config_mtime: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +126,7 @@ impl Source for EngineSource {
             in_run_shell: matches!(engine.run_shell(), RunShell::Inside { .. }),
             read_at_s: engine.now_ms().div_euclid(1000),
             auto_holders,
+            config_mtime: Settings::mtime(engine.env()),
         })
     }
 

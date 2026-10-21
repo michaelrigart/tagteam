@@ -22,7 +22,7 @@ use crate::live::{self, Backoff};
 use crate::msg::{ActionsReq, Cmd, DaemonReq, IndexReq, Msg, ReportReq, ViewsReq};
 use crate::screens::tokens::TokensState;
 use crate::source::SourceFactory;
-use crate::state::{Screen, State};
+use crate::state::{Screen, Startup, State};
 use crate::term::{self, RealTty, Tty};
 use crate::theme::Theme;
 use crate::update::{drawn, update};
@@ -63,6 +63,12 @@ pub struct TuiOptions {
     /// The default provider's names (redesign §12.2): the screens' words for a provider the
     /// accounts view does not list, as before its first read.
     pub names: ProviderNames,
+    /// The settings warnings the CLI printed before the alternate screen (redesign §5.6): shown
+    /// as a banner until `Esc` on Accounts, or the next config change.
+    pub warnings: Vec<String>,
+    /// `config.toml`'s modification time, read before the settings were loaded
+    /// (`Settings::mtime`): an accounts read that sees another one clears `warnings`.
+    pub config_mtime: Option<SystemTime>,
 }
 
 /// How the TUI ended.
@@ -281,6 +287,10 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
             opts.provider.clone(),
             tokens,
             opts.names,
+            Startup {
+                warnings: opts.warnings.clone(),
+                mtime: opts.config_mtime,
+            },
             now,
         );
         if opts.daemon.is_some() {
@@ -815,6 +825,7 @@ mod tests {
                 in_run_shell: false,
                 read_at_s: 0,
                 auto_holders: vec![],
+                config_mtime: None,
             })
         }
 
@@ -1090,6 +1101,8 @@ mod tests {
             shutdown: Cancel::new(),
             daemon: None,
             names: CC_NAMES,
+            warnings: vec![],
+            config_mtime: None,
         }
     }
 
@@ -1364,7 +1377,7 @@ mod tests {
             }
             assert_eq!(
                 ui.state.tokens.error(),
-                Some("no token report in this test")
+                Some("couldn't read the token index (no token report in this test) · r retries")
             );
             fx.key('q');
             ui.run()

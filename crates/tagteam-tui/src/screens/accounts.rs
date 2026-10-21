@@ -170,6 +170,11 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
         KeyCode::PageUp => state.accounts.step(-page),
         KeyCode::Home => state.accounts.step(isize::MIN / 2),
         KeyCode::End => state.accounts.step(isize::MAX / 2),
+        KeyCode::Esc => {
+            // The start-up warnings stay until a person has seen them (redesign §5.6, T2-21).
+            state.startup.warnings.clear();
+            return vec![];
+        }
         KeyCode::Char('J') => {
             scroll_detail(state, body, now_s, 1);
             return vec![];
