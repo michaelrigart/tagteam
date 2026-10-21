@@ -37,6 +37,8 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                         state.startup.warnings.clear();
                     }
                     state.accounts.apply(snapshot);
+                    // T3-21: a new selection, or a new reading of it, is read for its card.
+                    state.accounts.schedule_card(now_ms);
                     state.clear_banner(BannerKind::Accounts);
                     // The read after `r`'s collection: the toast needs what it shows.
                     if let Some(summary) = state.checked.take() {
@@ -70,6 +72,14 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                 }
                 Err(e) => state.raise_banner(BannerKind::History, e.message),
             }
+            vec![]
+        }
+        Msg::Card {
+            r#gen,
+            account,
+            result,
+        } => {
+            screens::accounts::on_card(state, r#gen, account, result);
             vec![]
         }
         Msg::Collected { r#gen, result } => {
@@ -317,6 +327,8 @@ fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     let mut cmds = screens::tokens::index::on_tick(state, now_ms);
     // Spec §6.3, §8: the daemon's link.
     cmds.extend(daemon::on_tick(state, now_ms));
+    // Redesign §6.4: the selected account's card, read once its selection has settled.
+    cmds.extend(screens::accounts::on_tick(state, now_ms));
     if state.quitting.is_some() || now_ms < state.refresh.next_ms {
         return cmds;
     }
@@ -744,11 +756,22 @@ mod tests {
         }
     }
 
+    /// The card's read of the first account, as the first accounts read selects it at `NOW_MS`.
+    fn first_card() -> Cmd {
+        Cmd::LoadCard {
+            r#gen: 1,
+            account: id(1),
+            since_s: NOW_S - 7 * 86_400,
+        }
+    }
+
     #[test]
     fn every_30_seconds_the_views_are_read_and_the_shown_accounts_offered_to_the_collector() {
         let mut state = fresh(Screen::Accounts);
         state.start();
         update(&mut state, accounts_msg(1, 2), NOW_MS);
+        // The first selection's card is read 250 ms after it (T3-21).
+        assert_eq!(update(&mut state, Msg::Tick, NOW_MS + 250), [first_card()]);
         assert!(update(&mut state, Msg::Tick, NOW_MS + 29_999).is_empty());
         assert_eq!(
             update(&mut state, Msg::Tick, NOW_MS + 30_000),
@@ -781,6 +804,7 @@ mod tests {
         let mut state = fresh(Screen::Accounts);
         state.start();
         update(&mut state, accounts_msg(1, 2), NOW_MS);
+        assert_eq!(update(&mut state, Msg::Tick, NOW_MS + 250), [first_card()]);
         state.running = Some(crate::host::Action::AddLive { provider: cc() });
         assert_eq!(
             update(&mut state, Msg::Tick, NOW_MS + 30_000),

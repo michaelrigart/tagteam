@@ -215,6 +215,15 @@ impl Lanes {
                     r#gen,
                     result: source.history(&account, since_s),
                 },
+                ViewsReq::Card {
+                    r#gen,
+                    account,
+                    since_s,
+                } => Msg::Card {
+                    r#gen,
+                    result: source.history(&account, since_s),
+                    account,
+                },
             };
             let _ = out.send(msg);
         });

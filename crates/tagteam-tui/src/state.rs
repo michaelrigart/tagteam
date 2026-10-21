@@ -145,6 +145,8 @@ pub struct Toast {
 pub struct Gens {
     pub accounts: u64,
     pub history: u64,
+    /// The selected account's card's history read (T3-21).
+    pub card: u64,
     pub collect: u64,
     pub report: u64,
     pub index: u64,
@@ -256,6 +258,17 @@ impl State {
         self.gens.history += 1;
         Cmd::LoadHistory {
             r#gen: self.gens.history,
+            account,
+            since_s,
+        }
+    }
+
+    /// A read of `account`'s history since `since_s` for the selected account's card, under the
+    /// card's next generation (T3-21).
+    pub(crate) fn load_card(&mut self, account: AccountId, since_s: i64) -> Cmd {
+        self.gens.card += 1;
+        Cmd::LoadCard {
+            r#gen: self.gens.card,
             account,
             since_s,
         }

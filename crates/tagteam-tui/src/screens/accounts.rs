@@ -1,6 +1,7 @@
 //! The Accounts screen (redesign §6): the table of accounts (§6.3), and the selected account's
-//! detail below it.
+//! card below it (§6.4).
 
+mod card;
 mod status;
 mod table;
 
@@ -9,24 +10,20 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use tagteam_core::{AccountId, Pace, Window};
+use tagteam_core::AccountId;
 use tagteam_engine::switch::LiveLogin;
-use tagteam_engine::views::{AccountView, HistoryWindow, ProviderAccounts, UsageStatus};
-use tagteam_engine::words;
+use tagteam_engine::views::{AccountView, HistoryView, ProviderAccounts};
 
-use self::table::{NAME_SPAN, Table, age_now};
+use self::table::{NAME_SPAN, Table};
 
 use crate::daemon;
 use crate::host::AccountRef;
 use crate::msg::Cmd;
-use crate::source::AccountsSnapshot;
+use crate::source::{AccountsSnapshot, SourceError};
 use crate::state::{Screen, State};
-use crate::theme::{Role, Theme};
+use crate::theme::Role;
 use crate::update;
-use crate::view::{
-    centred_block, fit, flow, furthest_scroll, keep_visible, pad, scrolled_windows, select,
-    width_of, wrap_rows,
-};
+use crate::view::{centred_block, fit, keep_visible, select};
 
 /// Redesign §5.7: drawn until the first `accounts` result arrives.
 const LOADING: &str = "Loading accounts…";
@@ -34,16 +31,11 @@ const LOADING: &str = "Loading accounts…";
 const NO_ACCOUNTS: &str = "No accounts yet";
 /// The banners the accounts view raises (spec §5.1).
 pub const RUN_SHELL: &str = "inside a `tagteam run` session: account changes are refused here";
-/// The detail pane's least height: a rule, four windows, the reading's age, and its trouble.
-const DETAIL_MIN: u16 = 7;
-/// The detail pane's lines besides its windows' own: the rule, the reading's age, and its
-/// trouble.
-const DETAIL_FRAME: usize = 3;
-/// The table keeps this many rows at least, its header and the selected row among them, when
-/// the pane grows past half the body to hold its tallest window.
-const TABLE_MIN: u16 = 3;
-/// The rows a long label takes above its value, at most (R20).
-const LABEL_ROWS: usize = 2;
+/// The table keeps this many lines at least, its header and the selected row among them, when
+/// the card grows to hold its windows (T3-22).
+const TABLE_LEAST: usize = 4;
+/// The blank row between the table and the card (§6.1).
+const BLANK: u16 = 1;
 
 #[derive(Default)]
 pub struct AccountsState {
@@ -52,9 +44,16 @@ pub struct AccountsState {
     selected: Option<AccountId>,
     /// The first table line shown.
     offset: usize,
-    /// The first of the selected account's windows the detail pane shows (`J`/`K`), when they
-    /// do not all fit.
-    detail_from: usize,
+    /// The first of the selected account's windows the card shows (`J`/`K`), when they do not
+    /// all fit.
+    card_from: usize,
+    /// The card's last history read (T3-21), for the account it names.
+    card: Option<HistoryView>,
+    /// The selected account, and its reading's `fetched_at`, that the card's read was last
+    /// scheduled for.
+    card_for: Option<(AccountId, Option<i64>)>,
+    /// When the card's read is due (T3-21).
+    card_due_ms: Option<i64>,
 }
 
 impl AccountsState {
@@ -73,10 +72,23 @@ impl AccountsState {
             _ => Some(ids[old.unwrap_or(0).min(ids.len() - 1)].clone()),
         };
         if selected != self.selected {
-            self.detail_from = 0;
+            self.card_from = 0;
         }
         self.selected = selected;
         self.snapshot = Some(snap);
+    }
+
+    /// The card's half of a new selection or read (T3-21): when the selected account, or its
+    /// reading's `fetched_at`, is not what the card's read was last scheduled for, that read
+    /// is due `CARD_DEBOUNCE_MS` from `now_ms`. A change before then puts it off again.
+    pub(crate) fn schedule_card(&mut self, now_ms: i64) {
+        let now = self
+            .selected_view()
+            .map(|v| (v.row.id.clone(), v.usage.fetched_at));
+        if now != self.card_for {
+            self.card_due_ms = now.is_some().then_some(now_ms + card::CARD_DEBOUNCE_MS);
+            self.card_for = now;
+        }
     }
 
     /// The selected account, as the TUI last read it: what every account action names.
@@ -118,7 +130,7 @@ impl AccountsState {
         let to = (at + by).clamp(0, rows.len() as isize - 1) as usize;
         let id = rows[to].row.id.clone();
         if self.selected.as_ref() != Some(&id) {
-            self.detail_from = 0;
+            self.card_from = 0;
         }
         self.selected = Some(id);
     }
@@ -127,11 +139,6 @@ impl AccountsState {
 /// Every provider's accounts, in the order `list` prints them.
 fn rows_of(snap: &AccountsSnapshot) -> Vec<&AccountView> {
     snap.providers.iter().flat_map(|p| &p.accounts).collect()
-}
-
-/// An account's windows, as its reading lists them; none without a reading.
-fn windows_of(v: &AccountView) -> &[(Window, Pace)] {
-    v.usage.windows.as_deref().unwrap_or_default()
 }
 
 /// What the accounts view has to say above the body: a run shell (spec §3), else a live login
@@ -153,10 +160,42 @@ pub fn banner(state: &State) -> Option<String> {
     }
 }
 
+/// T3-21: the card's read once it is due, while Accounts shows; it waits for Accounts
+/// otherwise.
+pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
+    let due = state.accounts.card_due_ms.is_some_and(|at| at <= now_ms);
+    if !due || state.screen != Screen::Accounts || state.quitting.is_some() {
+        return vec![];
+    }
+    state.accounts.card_due_ms = None;
+    let Some(id) = state.accounts.selected.clone() else {
+        return vec![];
+    };
+    let since = now_ms.div_euclid(1000) - card::CARD_SINCE_S;
+    vec![state.load_card(id, since)]
+}
+
+/// T3-21: the card's read for the selected account, under the card's latest generation; any
+/// other is dropped. A failed read keeps the last view and raises no banner: the accounts
+/// read's own banner covers a broken store.
+pub(crate) fn on_card(
+    state: &mut State,
+    r#gen: u64,
+    account: AccountId,
+    result: Result<HistoryView, SourceError>,
+) {
+    if r#gen != state.gens.card || state.accounts.selected.as_ref() != Some(&account) {
+        return;
+    }
+    if let Ok(view) = result {
+        state.accounts.card = Some(view);
+        state.dirty = true;
+    }
+}
+
 pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
     let body = crate::view::body_at(state);
-    let now_s = now_ms.div_euclid(1000);
-    let page = visible_rows(&state.accounts, body, now_s).max(1) as isize;
+    let page = visible_rows(state, body, now_ms).max(1) as isize;
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => state.accounts.step(1),
         KeyCode::Char('k') | KeyCode::Up => state.accounts.step(-1),
@@ -170,11 +209,11 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
             return vec![];
         }
         KeyCode::Char('J') => {
-            scroll_detail(state, body, now_s, 1);
+            scroll_card(state, body, now_ms, 1);
             return vec![];
         }
         KeyCode::Char('K') => {
-            scroll_detail(state, body, now_s, -1);
+            scroll_card(state, body, now_ms, -1);
             return vec![];
         }
         KeyCode::Enter => {
@@ -186,63 +225,61 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
         }
         _ => return vec![],
     }
+    state.accounts.schedule_card(now_ms);
     let lines = layout(&state.accounts).len();
     let at = line_of(&state.accounts);
-    let rows = visible_rows(&state.accounts, body, now_s);
+    let rows = visible_rows(state, body, now_ms);
     state.accounts.offset = keep_visible(state.accounts.offset, at, at, rows, lines);
     vec![]
 }
 
-/// `J`/`K`: the detail pane's windows move `by` one, stopping once the last one shows, or at
-/// the first.
-fn scroll_detail(state: &mut State, body: Rect, now_s: i64, by: isize) {
-    let st = &mut state.accounts;
-    let Some(v) = st.selected_view() else {
+/// `J`/`K`: the card's windows move `by` one, stopping once the last one shows, or at the
+/// first.
+fn scroll_card(state: &mut State, body: Rect, now_ms: i64, by: isize) {
+    let Some(v) = state.accounts.selected_view() else {
         return;
     };
-    let heights = window_heights(v, usize::from(body.width), now_s);
-    let furthest = furthest_scroll(&heights, window_rows(st, v, body, now_s));
+    let rows = usize::from(split(state, body, now_ms).1.height);
+    let furthest = card::furthest(state, v, body.width, rows, now_ms);
     // From what shows: a resize or a new read may have left the stored scroll past the end.
-    let from = st.detail_from.min(furthest) as isize;
-    st.detail_from = (from + by).clamp(0, furthest as isize) as usize;
+    let st = &mut state.accounts;
+    let from = st.card_from.min(furthest) as isize;
+    st.card_from = (from + by).clamp(0, furthest as isize) as usize;
 }
 
-/// The table's area and the detail pane's. The pane has room for the lines of the most windows
-/// any account shown has, at the body's width (spec §5.2: each relevant window), and at least
-/// `DETAIL_MIN` lines, in at most half the body: the table keeps the rest. Windows that still
-/// do not fit scroll (`J`/`K`), a whole window at a time, so the pane is never shorter than its
-/// tallest window, taking rows from the table down to `TABLE_MIN` for it (R20).
-fn split(state: &AccountsState, body: Rect, now_s: i64) -> (Rect, Rect) {
-    let width = usize::from(body.width);
-    let heights: Vec<Vec<usize>> = state
-        .rows()
-        .iter()
-        .map(|v| window_heights(v, width, now_s))
-        .collect();
-    let rows = |n: usize| u16::try_from(DETAIL_FRAME + n).unwrap_or(u16::MAX);
-    let most = rows(heights.iter().map(|h| h.iter().sum()).max().unwrap_or(0));
-    let tallest = rows(heights.iter().flatten().copied().max().unwrap_or(0));
-    let detail = most
-        .max(DETAIL_MIN)
-        .min(body.height / 2)
-        .max(tallest)
-        .min(body.height.saturating_sub(TABLE_MIN));
-    let table = Rect::new(body.x, body.y, body.width, body.height - detail);
-    let pane = Rect::new(body.x, body.y + table.height, body.width, detail);
+/// The table's area and the card's (T3-22). The card has its lines, at most what the table's
+/// least lines and the blank row above the card leave, and never fewer than its own least; the
+/// table takes the rest. Windows that do not fit scroll (`J`/`K`), a row each.
+fn split(state: &State, body: Rect, now_ms: i64) -> (Rect, Rect) {
+    let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+    let height = state.accounts.selected_view().map_or(0, |v| {
+        let table = rows(table_lines(&state.accounts).min(TABLE_LEAST));
+        let most = rows(card::height(state, v, body.width, now_ms));
+        let least = rows(card::min_height(state, v, body.width, now_ms));
+        most.min(body.height.saturating_sub(table + BLANK))
+            .max(least)
+            .min(body.height.saturating_sub(BLANK))
+    });
+    let blank = if height > 0 { BLANK } else { 0 };
+    let table = Rect::new(
+        body.x,
+        body.y,
+        body.width,
+        body.height.saturating_sub(height + blank),
+    );
+    let pane = Rect::new(body.x, body.y + body.height - height, body.width, height);
     (table, pane)
 }
 
-/// How many lines the detail pane has for `v`'s windows: its height less the rule, the
-/// reading's age, and the trouble line when the usage is not current.
-fn window_rows(state: &AccountsState, v: &AccountView, body: Rect, now_s: i64) -> usize {
-    let trouble = usize::from(v.usage.status != UsageStatus::Ok);
-    usize::from(split(state, body, now_s).1.height).saturating_sub(2 + trouble)
+/// The table's lines: its pinned header, with one provider, and its scrolling lines.
+fn table_lines(state: &AccountsState) -> usize {
+    layout(state).len() + usize::from(sections(state).len() == 1)
 }
 
 /// How many scrolling table lines fit in `body`: one provider's header is pinned above them.
-fn visible_rows(state: &AccountsState, body: Rect, now_s: i64) -> usize {
-    let pinned = sections(state).len() == 1;
-    usize::from(split(state, body, now_s).0.height).saturating_sub(usize::from(pinned))
+fn visible_rows(state: &State, body: Rect, now_ms: i64) -> usize {
+    let pinned = sections(&state.accounts).len() == 1;
+    usize::from(split(state, body, now_ms).0.height).saturating_sub(usize::from(pinned))
 }
 
 /// One line of the scrolling part of the table.
@@ -308,7 +345,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     }
     let now_s = now_ms.div_euclid(1000);
     let width = usize::from(area.width);
-    let (table_area, pane) = split(st, area, now_s);
+    let (table_area, pane) = split(state, area, now_ms);
     let sections = sections(st);
     let tables: Vec<Table<'_>> = sections
         .iter()
@@ -328,7 +365,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     if tables.len() == 1 {
         shown.push(tables[0].header(state.theme));
     }
-    let rows = visible_rows(st, area, now_s);
+    let rows = visible_rows(state, area, now_ms);
     let at = line_of(st);
     let offset = keep_visible(st.offset, at, at, rows, lines.len());
     for line in lines.iter().skip(offset).take(rows) {
@@ -371,198 +408,22 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     }
     frame.render_widget(Paragraph::new(shown), table_area);
     if let Some(v) = st.selected_view() {
-        let shown = Shown {
-            from: st.detail_from,
-            rows: window_rows(st, v, area, now_s),
-        };
-        frame.render_widget(
-            Paragraph::new(detail(v, snap, shown, width, now_s, state.theme)),
-            pane,
-        );
-    }
-}
-
-/// Where the detail pane's windows are scrolled to (`from`, a window), and how many lines they
-/// have (`rows`).
-struct Shown {
-    from: usize,
-    rows: usize,
-}
-
-/// Each of `v`'s windows' lines in the detail pane at `width`: its label and value, then its
-/// reset, its pace and its projection, which go on under the value when they do not fit (R20).
-/// The label column is a third of the width at most, so the value and what follows it always
-/// have room.
-fn window_blocks(
-    v: &AccountView,
-    width: usize,
-    now_s: i64,
-    theme: Theme,
-) -> Vec<Vec<Line<'static>>> {
-    let windows = windows_of(v);
-    let label_w = windows
-        .iter()
-        .map(|(w, _)| width_of(&w.label))
-        .max()
-        .unwrap_or(0)
-        .min(width / 3);
-    windows
-        .iter()
-        .map(|(w, p)| window_lines(w, p, label_w, width, now_s, theme))
-        .collect()
-}
-
-/// How many lines each of `v`'s windows takes in the detail pane at `width`.
-fn window_heights(v: &AccountView, width: usize, now_s: i64) -> Vec<usize> {
-    window_blocks(v, width, now_s, Theme::new(false))
-        .iter()
-        .map(Vec::len)
-        .collect()
-}
-
-fn window_lines(
-    w: &Window,
-    p: &Pace,
-    label_w: usize,
-    width: usize,
-    now_s: i64,
-    theme: Theme,
-) -> Vec<Line<'static>> {
-    let style = theme.severity(words::severity(w.pct.round() as i64));
-    let value = words::spend_text(w)
-        .unwrap_or_else(|| format!("{:>4}", format!("{}%", w.pct.round() as i64)));
-    // A label wider than the column takes rows of its own, above its value: `LABEL_ROWS` at
-    // most, the rest cut.
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let label = if width_of(&w.label) > label_w {
-        let rows = wrap_rows(&w.label, width.saturating_sub(1), LABEL_ROWS);
-        lines.extend(rows.into_iter().map(|row| Line::from(format!(" {row}"))));
-        ""
-    } else {
-        w.label.as_str()
-    };
-    let lead = format!(" {}  ", pad(label, label_w));
-    let indent = width_of(&lead);
-    // One row for the value whatever it is: a spend can be any number.
-    let value = fit(&value, width.saturating_sub(indent));
-    let mut parts = Vec::new();
-    if let Some(at) = w.resets_at {
-        let when = words::countdown(at, now_s);
-        parts.push(if at > now_s {
-            format!("resets in {when}")
+        // The lead card shows the account in use's windows (§6.4, T3-32).
+        let on_lead = if v.active {
+            card::lead_keys(v, area.width)
         } else {
-            when
-        });
-    }
-    if p.ahead == Some(true) {
-        let expected = p.expected_pct.map_or_else(String::new, |e| {
-            format!(" (expected {}%)", e.round() as i64)
-        });
-        parts.push(format!("▲ ahead of pace{expected}"));
-    }
-    if p.rate_per_hour.is_some() {
-        let hw = HistoryWindow {
-            window: w.clone(),
-            samples: vec![],
-            pace: *p,
+            vec![]
         };
-        parts.push(words::projection_text(&hw, now_s));
+        let rows = usize::from(pane.height);
+        let lines = card::lines(state, v, area.width, rows, st.card_from, &on_lead, now_ms);
+        frame.render_widget(Paragraph::new(lines), pane);
     }
-    let head = vec![Span::raw(lead), Span::styled(value, style)];
-    lines.extend(flow(head, parts, indent, width));
-    lines
-}
-
-/// The detail pane (spec §5.2): the account, each window with its reset, pace and projection,
-/// the reading's age and the login's expiry, and why the usage is not current. Windows that do
-/// not fit are scrolled to (`J`/`K`), which the rule says. On the rule the name gives way
-/// first: the facts after it are the pane's to say.
-fn detail(
-    v: &AccountView,
-    snap: &AccountsSnapshot,
-    shown: Shown,
-    width: usize,
-    now_s: i64,
-    theme: Theme,
-) -> Vec<Line<'static>> {
-    let row = &v.row;
-    let mut facts = vec![
-        if v.active { "active" } else { "not active" }.to_owned(),
-        v.kind
-            .display
-            .map_or_else(|| row.kind.clone(), str::to_owned),
-    ];
-    if v.in_session {
-        facts.push("in a session".into());
-    }
-    if snap.this.as_ref() == Some(&row.id) {
-        facts.push(format!("{} {}", words::IN_SESSION, words::THIS));
-    }
-    if row.disabled {
-        facts.push("disabled".into());
-    }
-    let blocks = window_blocks(v, width, now_s, theme);
-    let heights: Vec<usize> = blocks.iter().map(Vec::len).collect();
-    let range = scrolled_windows(&heights, shown.from, shown.rows);
-    let more = if range != (0..blocks.len()) {
-        let (from, to) = (range.start + 1, range.end);
-        format!(" J K: windows {from}–{to} of {} ─", blocks.len())
-    } else {
-        String::new()
-    };
-    let head = format!("─ {} ", row.position);
-    let facts = format!(" · {} ", facts.join(" · "));
-    // One column of rule at least.
-    let room = width.saturating_sub(width_of(&head) + width_of(&facts) + width_of(&more) + 1);
-    let name = fit(&words::account_cell(row), room.max(1));
-    let title = fit(
-        &format!("{head}{name}{facts}"),
-        width.saturating_sub(width_of(&more)),
-    );
-    let rule = "─".repeat(width.saturating_sub(width_of(&title) + width_of(&more)));
-    let mut lines = vec![Line::from(Span::styled(
-        format!("{title}{rule}{more}"),
-        theme.strong(),
-    ))];
-    for block in blocks.into_iter().take(range.end).skip(range.start) {
-        lines.extend(block);
-    }
-    let mut status = Vec::new();
-    match v.usage.age_s {
-        Some(age) => {
-            let age = age_now(age, snap.read_at_s, now_s);
-            status.push(format!("fetched {} ago", words::duration(age)));
-        }
-        None => status.push("never fetched".to_owned()),
-    }
-    if let Some(at) = v
-        .usage
-        .next_poll_at
-        .filter(|&at| v.usage.status == UsageStatus::Ok && at > now_s)
-    {
-        status.push(format!("next poll in {}", words::countdown(at, now_s)));
-    }
-    if let Some(at_ms) = row.login_expires_at {
-        let at = at_ms.div_euclid(1000);
-        status.push(if at > now_s {
-            format!("login expires in {}", words::duration(at - now_s))
-        } else {
-            "login expired".to_owned()
-        });
-    }
-    lines.push(Line::from(format!(" {}", status.join(" · "))));
-    if v.usage.status != UsageStatus::Ok {
-        lines.push(Line::from(format!(
-            " usage: {}",
-            words::usage_words(&v.usage, now_s)
-        )));
-    }
-    lines
 }
 
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyCode;
+    use ratatui::buffer::Buffer;
     use ratatui::style::{Color, Modifier};
     use tagteam_core::{Pace, ProviderId, WindowKind};
     use tagteam_engine::switch::LiveLogin;
@@ -574,22 +435,7 @@ mod tests {
     use crate::testutil::*;
     use crate::theme::Theme;
     use crate::update::update;
-
-    /// The detail pane's fixture, until Task 12 replaces the pane: an active account ahead of
-    /// pace, a stale spare, a quarantined alias.
-    fn detail_three() -> Vec<AccountView> {
-        let mut live = account(1, "michael@example.com", read(120, 9.0, 77.0, true));
-        live.active = true;
-        let spare = account(2, "spare@example.com", read(840, 31.0, 12.0, false));
-        let mut work = account(
-            3,
-            "w@corp.com",
-            unread(UsageStatus::ReloginRequired, None, None),
-        );
-        work.row.alias = Some("work".into());
-        work.row.quarantine_reason = Some("invalid_grant".into());
-        vec![live, spare, work]
-    }
+    use crate::view::width_of;
 
     /// T3-27's fixture: `alex@example.com` read 2m ago, `work` of Example Corp in use, and
     /// `spare` with an old reading. The forecast picks 1.
@@ -693,24 +539,22 @@ mod tests {
                 .find(|l| l.contains("alex@example.com") && l.contains('%'));
             row.map(|l| columns(l, from, from + 7).trim().to_owned())
         };
-        let detail = |lines: &[String]| {
-            let line = lines.iter().find(|l| l.contains("fetched "));
-            line.map(|l| l.split(" ago").next().unwrap().to_owned())
+        // The card's title, the first row selected.
+        let card = |lines: &[String]| {
+            let line = lines.iter().find(|l| l.contains("updated "))?;
+            let age = line.split("updated ").nth(1)?.split(" ago").next()?;
+            Some(age.to_owned())
         };
         let now = at(0);
         assert_eq!(row_age(&now).as_deref(), Some("2m"), "{now:?}");
-        assert_eq!(detail(&now).as_deref(), Some(" fetched 2m"), "{now:?}");
+        assert_eq!(card(&now).as_deref(), Some("2m"), "{now:?}");
         let later = at(185);
         assert_eq!(row_age(&later).as_deref(), Some("5m"), "{later:?}");
-        assert_eq!(detail(&later).as_deref(), Some(" fetched 5m"), "{later:?}");
+        assert_eq!(card(&later).as_deref(), Some("5m"), "{later:?}");
         // A clock behind the read never makes an age shorter than the reading's own.
         let earlier = at(-500);
         assert_eq!(row_age(&earlier).as_deref(), Some("2m"), "{earlier:?}");
-        assert_eq!(
-            detail(&earlier).as_deref(),
-            Some(" fetched 2m"),
-            "{earlier:?}"
-        );
+        assert_eq!(card(&earlier).as_deref(), Some("2m"), "{earlier:?}");
     }
 
     #[test]
@@ -1189,64 +1033,475 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_detail_pane_shows_the_selected_account() {
-        let mut accounts = detail_three();
-        accounts[0].usage.windows.as_mut().unwrap()[1].1 = Pace {
-            expected_pct: Some(62.0),
-            ahead: Some(true),
-            rate_per_hour: Some(1.2),
-            method: Some(tagteam_core::ProjectionMethod::Regression),
-            exhaustion_at: Some(NOW_S + 187_200),
-            will_last_to_reset: Some(false),
+    /// The card's rows at `w`×`h` and `now_ms`, under the table, and the row it starts at.
+    fn card_at(state: &State, w: u16, h: u16, now_ms: i64) -> (u16, Vec<String>) {
+        let body = crate::view::areas(state, Rect::new(0, 0, w, h)).body;
+        let (_, pane) = split(state, body, now_ms);
+        let rows = draw_at(state, w, h, now_ms);
+        let (from, to) = (usize::from(pane.y), usize::from(pane.y + pane.height));
+        (pane.y, rows[from..to].to_vec())
+    }
+
+    fn card_rows(state: &State, w: u16, h: u16) -> (u16, Vec<String>) {
+        card_at(state, w, h, NOW_MS)
+    }
+
+    /// The first word of each of the card's window rows: its label's.
+    fn card_windows(state: &State, w: u16, h: u16) -> Vec<String> {
+        let v = state.accounts.selected_view().unwrap();
+        let labels: Vec<&str> = v
+            .usage
+            .windows
+            .iter()
+            .flatten()
+            .filter_map(|(w, _)| w.label.split_whitespace().next())
+            .collect();
+        card_rows(state, w, h)
+            .1
+            .iter()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|word| labels.contains(word))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The selected account's card read back as the views lane answers it: each window's
+    /// samples one every 20 minutes over the last 7 days, at its reading's percentage.
+    fn with_card(state: &mut State) {
+        let v = state.accounts.selected_view().unwrap().clone();
+        let windows = v
+            .usage
+            .windows
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(w, p)| {
+                let samples = (0..7 * 72).map(|i| sample(i * 1200 + 600, w.pct)).collect();
+                history_window(w, samples, p)
+            })
+            .collect();
+        let account = v.row.id.clone();
+        let since = NOW_S - card::CARD_SINCE_S;
+        let Cmd::LoadCard { r#gen, .. } = state.load_card(account.clone(), since) else {
+            unreachable!()
         };
-        accounts[0].row.login_expires_at = Some((NOW_S + 6 * 86_400 + 3 * HOUR) * 1000);
-        let body = body_of(&loaded(accounts), 120, 40, NOW_MS);
-        let top = body.len() - 7;
+        let result = Ok(history_of(v, windows));
+        update(
+            state,
+            Msg::Card {
+                r#gen,
+                account,
+                result,
+            },
+            NOW_MS,
+        );
+    }
+
+    /// The role letters `roles` reads under `needle` in row `y` of `buf`, and the ones `role`
+    /// draws it in.
+    fn role_of(buf: &Buffer, theme: Theme, y: u16, needle: &str, role: char) -> (String, String) {
+        let line = &text_of(buf)[usize::from(y)];
+        let at = col(line, needle);
+        let n = needle.chars().count();
+        let got: String = roles(buf, theme, y).chars().skip(at).take(n).collect();
+        let want: String = needle
+            .chars()
+            .map(|c| if c == ' ' { ' ' } else { role })
+            .collect();
+        (got, canon(theme, &want))
+    }
+
+    #[test]
+    fn the_selected_card_shows_its_facts_sparklines_and_windows() {
+        let mut accounts = three();
+        accounts[2].usage.next_poll_at = Some(NOW_S + 120);
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            update(&mut state, key(KeyCode::End), NOW_MS);
+            with_card(&mut state);
+            let (y, card) = card_rows(&state, 120, 40);
+            assert_eq!(
+                card,
+                [
+                    "    3 spare  alex@personal.example    not in use · updated 14m ago · next update in 2m".to_owned(),
+                    format!("    5h    {} 24h    0%  resets in 2h40m", "▁".repeat(32)),
+                    format!("    7d    {} 7d    31%  resets in 3d09h", "▃".repeat(32)),
+                    "    ! Old reading: too old to pick the best account by.".to_owned(),
+                    "      tagteam checks it within 2m.".to_owned(),
+                    "    ⏎ history of spare   e disable   a alias   x remove".to_owned(),
+                ],
+                "{theme:?}"
+            );
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let check = |row: u16, needle: &str, role: char| {
+                let (got, want) = role_of(&buf, theme, y + row, needle, role);
+                assert_eq!(got, want, "{theme:?} {needle:?}");
+            };
+            // The title: its facts muted, the old reading's age in warn.
+            check(0, "alex@personal.example", 'm');
+            check(0, "not in use", 'm');
+            check(0, "updated 14m ago", 'w');
+            check(0, "next update in 2m", 'm');
+            // The windows: the sparkline accent, its tag faint, the rest in text.
+            for (row, spark, tag) in [(1, "▁", "24h"), (2, "▃", "7d")] {
+                check(row, &spark.repeat(32), 'a');
+                // The tag follows the sparkline's 32 cells and a space.
+                let letters: String = roles(&buf, theme, y + row)
+                    .chars()
+                    .skip(43)
+                    .take(tag.len())
+                    .collect();
+                assert_eq!(
+                    letters,
+                    canon(theme, &"f".repeat(tag.len())),
+                    "{theme:?} {tag}"
+                );
+            }
+            check(1, "  0%  resets in 2h40m", 't');
+            check(2, " 31%  resets in 3d09h", 't');
+            // The problem in its role, its remedy in text.
+            check(
+                3,
+                "! Old reading: too old to pick the best account by.",
+                'w',
+            );
+            check(4, "tagteam checks it within 2m.", 't');
+            // The keys accent, their labels muted.
+            for (key, label) in [
+                ("⏎", "history of spare"),
+                ("e", "disable"),
+                ("a", "alias"),
+                ("x", "remove"),
+            ] {
+                check(5, label, 'm');
+                let at = col(&card[5], &format!("{key} {label}"));
+                let letter = roles(&buf, theme, y + 5).chars().nth(at);
+                assert_eq!(letter, canon(theme, "a").chars().next(), "{theme:?} {key}");
+            }
+            // The alias is the title's one bold, past tier 0's roles.
+            if theme != TIERS[0] {
+                assert_eq!(
+                    bold_cells(&buf, y),
+                    (6..11).collect::<Vec<_>>(),
+                    "{theme:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_card_of_the_account_in_use_leaves_out_its_reset_and_projection() {
+        // T3-32: the lead card shows them for the account in use.
+        let mut accounts = three();
+        let windows = accounts[1].usage.windows.as_mut().unwrap();
+        windows[0].1 = Pace {
+            rate_per_hour: Some(15.7),
+            will_last_to_reset: Some(true),
+            ..Pace::default()
+        };
+        windows[1].1.ahead = Some(true);
+        let mut state = loaded(accounts);
+        update(&mut state, ch('j'), NOW_MS);
+        let card = card_rows(&state, 120, 40).1;
+        assert!(card[1].ends_with(" 53%"), "{card:?}");
+        assert!(
+            card[2].ends_with("  6% ▲ faster than an even pace"),
+            "{card:?}"
+        );
+        let narrow = card_rows(&state, 80, 24).1;
+        assert!(narrow[1].ends_with(" 53%"), "{narrow:?}");
+        assert!(narrow[2].ends_with("  6% ▲"), "{narrow:?}");
+        // Another account's card has them.
+        update(&mut state, ch('k'), NOW_MS);
+        let card = card_rows(&state, 120, 40).1;
+        assert!(card[1].ends_with("  resets in 2h40m"), "{card:?}");
+        assert!(card[2].ends_with("  resets in 3d09h"), "{card:?}");
+    }
+
+    #[test]
+    fn a_window_the_lead_card_does_not_show_keeps_its_reset_on_the_in_use_card() {
+        // T3-32: at 80 columns the lead card shows the short and long windows only.
+        let mut accounts = three();
+        accounts[1].usage.windows.as_mut().unwrap().push((
+            window(
+                "scoped:fable",
+                "Fable",
+                WindowKind::Scoped,
+                40.0,
+                Some(291_630),
+            ),
+            Pace::default(),
+        ));
+        let mut state = loaded(accounts);
+        update(&mut state, ch('j'), NOW_MS);
+        let card = card_rows(&state, 80, 24).1;
+        assert!(card[1].starts_with("    5h ") && card[1].ends_with(" 53%"));
+        assert!(card[2].starts_with("    7d ") && card[2].ends_with("  6%"));
+        assert!(
+            card[3].starts_with("    Fable ") && card[3].ends_with(" 40%  resets in 3d09h"),
+            "{card:?}"
+        );
+        // From 120 columns the lead card shows every window.
+        let wide = card_rows(&state, 120, 40).1;
+        assert!(wide[3].ends_with(" 40%"), "{wide:?}");
+    }
+
+    #[test]
+    fn a_problem_shows_its_sentence_and_remedy_under_the_windows() {
+        let mut accounts = three();
+        let spare = &mut accounts[2];
+        spare.usage = unread(UsageStatus::ReloginRequired, None, None);
+        spare.row.quarantine_reason = Some("invalid_grant".into());
+        // Saturday 09:02, two days before `NOW_S` (a Monday, 14:13:20 UTC).
+        spare.row.quarantine_at = Some((NOW_S - 2 * 86_400 - (5 * HOUR + 11 * 60 + 20)) * 1000);
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            update(&mut state, key(KeyCode::End), NOW_MS);
+            let (y, card) = card_rows(&state, 120, 40);
+            assert_eq!(
+                card,
+                [
+                    "    3 spare  alex@personal.example    not in use · not checked yet",
+                    "    ✕ Needs a new login: its stored login was refused (invalid_grant), Sat 09:02.",
+                    "      Log in to Claude Code as alex@personal.example, then press A here.",
+                    "    ⏎ history of spare   e disable   a alias   x remove",
+                ],
+                "{theme:?}"
+            );
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let (got, want) = role_of(&buf, theme, y + 1, &card[1][4..], 'c');
+            assert_eq!(got, want, "{theme:?}");
+            let (got, want) = role_of(&buf, theme, y + 2, &card[2][6..], 't');
+            assert_eq!(got, want, "{theme:?}");
+            // At 80 columns the sentence wraps at its words, under its text.
+            let (y, card) = card_rows(&state, 80, 24);
+            assert_eq!(
+                card[1..],
+                [
+                    "    ✕ Needs a new login: its stored login was refused (invalid_grant), Sat",
+                    "      09:02.",
+                    "      Log in to Claude Code as alex@personal.example, then press A here.",
+                ],
+                "{theme:?}"
+            );
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            let (got, want) = role_of(&buf, theme, y + 2, "09:02.", 'c');
+            assert_eq!(got, want, "{theme:?}");
+        }
+        // M-8: a disabled account's table says `○ disabled`; its card still says what is wrong.
+        let mut accounts = three();
+        let spare = &mut accounts[2];
+        spare.row.disabled = true;
+        spare.usage.status = UsageStatus::Unavailable;
+        spare.usage.error = Some("http-429".into());
+        spare.usage.retry_at = Some(NOW_S + 900);
+        let mut state = loaded(accounts);
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        let body = body_of(&state, 120, 40, NOW_MS);
+        assert!(body[3].ends_with("  ○ disabled"), "{}", body[3]);
+        let card = card_rows(&state, 120, 40).1;
+        assert!(
+            card[0].ends_with("not in use · disabled · updated 14m ago"),
+            "{card:?}"
+        );
         assert_eq!(
-            &body[top..top + 4],
+            card[3..5],
             [
-                format!("─ 1 michael@example.com · active · oauth {}", "─".repeat(79)),
-                " 5h    9%  resets in 2h40m".to_owned(),
-                " 7d   77%  resets in 3d09h  ▲ ahead of pace (expected 62%)  +1.2%/h · full in 2d04h".to_owned(),
-                " fetched 2m ago · login expires in 6d03h".to_owned(),
+                "    ! Rate-limited: the usage check was turned away for now.",
+                "      tagteam tries again in 15m.",
             ]
         );
+        assert_eq!(
+            card[5],
+            "    ⏎ history of spare   e enable   a alias   x remove"
+        );
     }
 
     #[test]
-    fn a_row_without_a_reading_says_why_in_the_detail_pane() {
-        let mut state = loaded(detail_three());
-        update(&mut state, key(KeyCode::End), NOW_MS);
-        let body = body_of(&state, 80, 24, NOW_MS);
-        let top = body.len() - 7;
+    fn a_window_without_a_reset_says_not_started() {
+        let mut usage = read(60, 9.0, 77.0, false);
+        let windows = usage.windows.as_mut().unwrap();
+        windows[0].0.resets_at = None;
+        windows[1].1 = Pace {
+            expected_pct: Some(62.0),
+            ahead: Some(true),
+            ..Pace::default()
+        };
+        windows.push((
+            window("scoped:fable", "Fable", WindowKind::Scoped, 40.0, None),
+            Pace::default(),
+        ));
+        windows.push((
+            window("scoped:opus", "Opus", WindowKind::Scoped, 10.0, Some(-60)),
+            Pace::default(),
+        ));
+        let state = loaded(vec![account(1, "alex@example.com", usage)]);
+        let card = card_rows(&state, 120, 40).1;
+        assert!(card[1].ends_with("   9%  not started"), "{card:?}");
+        // From 120 columns `▲` says what it means, when the row has room.
         assert!(
-            body[top].starts_with("─ 3 work (w@corp.com) · not active · oauth ──"),
-            "{}",
-            body[top]
+            card[2].ends_with(
+                " 77% ▲ faster than an even pace (62% expected by now)  resets in 3d09h"
+            ),
+            "{card:?}"
         );
-        assert_eq!(width_of(&body[top]), 80);
-        assert_eq!(body[top + 1], " never fetched");
-        assert_eq!(body[top + 2], " usage: needs a new login");
+        // A scoped window without a reset has none to say; one whose reset passed says so.
+        assert!(card[3].ends_with(" 40%"), "{card:?}");
+        assert!(card[4].ends_with(" 10%  reset"), "{card:?}");
+        let narrow = card_rows(&state, 80, 24).1;
+        assert!(narrow[2].ends_with(" 77% ▲  resets in 3d09h"), "{narrow:?}");
     }
 
     #[test]
-    fn the_detail_pane_counts_down_to_the_next_poll_while_it_is_ahead() {
-        // Spec §5.2: `fetched 2m ago · next poll in 1m · login expires in 6d`.
-        let mut accounts = detail_three();
-        accounts[0].usage.next_poll_at = Some(NOW_S + 60);
-        accounts[0].row.login_expires_at = Some((NOW_S + 6 * 86_400) * 1000);
-        let state = loaded(accounts);
-        let top = body_of(&state, 80, 24, NOW_MS).len() - 7;
-        assert_eq!(
-            body_of(&state, 80, 24, NOW_MS)[top + 3],
-            " fetched 2m ago · next poll in 1m · login expires in 6d00h"
+    fn the_card_title_cuts_the_name_before_the_facts() {
+        // Review Focus 3: the facts are the card's to say.
+        let mut v = account(1, "alex@example.com", read(120, 9.0, 12.0, false));
+        v.row.alias = Some("a".repeat(200));
+        let title = card_rows(&loaded(vec![v]), 80, 24).1[0].clone();
+        assert!(title.starts_with("    1 aaaa"), "{title}");
+        assert!(
+            title.ends_with("a…    not in use · updated 2m ago"),
+            "{title}"
         );
-        // Once it has passed, a frame drawn before the next read says nothing of it.
-        assert_eq!(
-            body_of(&state, 80, 24, NOW_MS + 60_000)[top + 3],
-            " fetched 3m ago · login expires in 5d23h"
+        assert_eq!(width_of(&title), 80);
+    }
+
+    #[test]
+    fn the_card_title_cuts_a_long_email_before_the_facts() {
+        // Whether the account is session-owned is the card's to say.
+        let long = "a".repeat(52) + "@example.com";
+        let mut v = account(1, &long, read(60, 9.0, 12.0, false));
+        v.in_session = true;
+        let title = card_rows(&loaded(vec![v]), 80, 24).1[0].clone();
+        assert!(title.starts_with("    1 aaaa"), "{title}");
+        assert!(
+            title.ends_with("…    not in use · in a session · updated 1m ago"),
+            "{title}"
         );
+        assert_eq!(width_of(&title), 80);
+    }
+
+    /// The card reads `cmds` asks for: each one's account and `since_s`.
+    fn card_reads(cmds: &[Cmd]) -> Vec<(AccountId, i64)> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                Cmd::LoadCard {
+                    account, since_s, ..
+                } => Some((account.clone(), *since_s)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_selection_change_reads_the_card_s_history_once_after_250_ms() {
+        let week = 7 * 86_400;
+        let mut state = loaded(three());
+        assert!(card_reads(&update(&mut state, ch('j'), NOW_MS)).is_empty());
+        let tick = |state: &mut State, at: i64| card_reads(&update(state, Msg::Tick, at));
+        assert!(tick(&mut state, NOW_MS + 249).is_empty());
+        assert_eq!(tick(&mut state, NOW_MS + 250), [(id(2), NOW_S - week)]);
+        assert!(tick(&mut state, NOW_MS + 500).is_empty());
+        // A read that leaves its reading as it was asks for nothing.
+        let read_back = |state: &mut State, accounts: Vec<AccountView>, at: i64| {
+            let Cmd::LoadAccounts { r#gen } = state.load_accounts() else {
+                unreachable!()
+            };
+            let result = Ok(snapshot(accounts));
+            card_reads(&update(state, Msg::Accounts { r#gen, result }, at))
+        };
+        assert!(read_back(&mut state, three(), NOW_MS + 600).is_empty());
+        assert!(tick(&mut state, NOW_MS + 1_000).is_empty());
+        // One that moved its `fetched_at`: once more, 250 ms after it arrived.
+        let mut moved = three();
+        moved[1].usage.fetched_at = Some(NOW_S);
+        assert!(read_back(&mut state, moved, NOW_MS + 1_000).is_empty());
+        assert!(tick(&mut state, NOW_MS + 1_249).is_empty());
+        assert_eq!(
+            tick(&mut state, NOW_MS + 1_250),
+            [(id(2), NOW_S + 1 - week)]
+        );
+        assert!(tick(&mut state, NOW_MS + 1_500).is_empty());
+        // A selection that moves again before then puts it off.
+        update(&mut state, ch('j'), NOW_MS + 2_000);
+        update(&mut state, ch('k'), NOW_MS + 2_200);
+        assert!(tick(&mut state, NOW_MS + 2_250).is_empty());
+        assert_eq!(
+            tick(&mut state, NOW_MS + 2_450),
+            [(id(2), NOW_S + 2 - week)]
+        );
+        // The first selection counts: the first accounts read is read for its card too.
+        let mut fresh = fresh(Screen::Accounts);
+        assert!(read_back(&mut fresh, three(), NOW_MS).is_empty());
+        assert_eq!(tick(&mut fresh, NOW_MS + 250), [(id(1), NOW_S - week)]);
+        // Elsewhere it waits for Accounts.
+        let mut away = loaded(three());
+        update(&mut away, ch('j'), NOW_MS);
+        update(&mut away, ch('2'), NOW_MS);
+        assert!(tick(&mut away, NOW_MS + 250).is_empty());
+        update(&mut away, ch('1'), NOW_MS + 300);
+        assert_eq!(tick(&mut away, NOW_MS + 500), [(id(2), NOW_S - week)]);
+    }
+
+    #[test]
+    fn a_card_read_for_another_account_or_an_older_generation_is_dropped() {
+        // Review Focus 4.
+        let mut state = loaded(three());
+        let since = NOW_S - card::CARD_SINCE_S;
+        let Cmd::LoadCard { r#gen: old, .. } = state.load_card(id(1), since) else {
+            unreachable!()
+        };
+        let Cmd::LoadCard { r#gen: new, .. } = state.load_card(id(1), since) else {
+            unreachable!()
+        };
+        let view = |pct: f64| {
+            let v = state.accounts.selected_view().unwrap().clone();
+            let windows = v
+                .usage
+                .windows
+                .clone()
+                .unwrap()
+                .into_iter()
+                .map(|(w, p)| history_window(w, vec![sample(600, pct)], p))
+                .collect();
+            history_of(v, windows)
+        };
+        let (full, half) = (view(100.0), view(50.0));
+        let card = |r#gen: u64, account: AccountId, result| Msg::Card {
+            r#gen,
+            account,
+            result,
+        };
+        let before = draw(&state, 120, 40);
+        update(&mut state, card(old, id(1), Ok(full.clone())), NOW_MS);
+        assert_eq!(draw(&state, 120, 40), before, "an older generation");
+        update(&mut state, card(new, id(2), Ok(full.clone())), NOW_MS);
+        assert_eq!(draw(&state, 120, 40), before, "another account");
+        update(&mut state, card(new, id(1), Ok(half)), NOW_MS);
+        let shown = draw(&state, 120, 40);
+        assert_ne!(shown, before);
+        assert!(card_rows(&state, 120, 40).1[1].contains('▅'), "{shown:?}");
+        // A failed read keeps the last view, and raises no banner.
+        let Cmd::LoadCard { r#gen: failed, .. } = state.load_card(id(1), since) else {
+            unreachable!()
+        };
+        let error = SourceError {
+            kind: "store".into(),
+            message: "the store could not be read".into(),
+        };
+        update(&mut state, card(failed, id(1), Err(error)), NOW_MS);
+        assert_eq!(draw(&state, 120, 40), shown);
+        assert_eq!(state.banner_text(), None);
+        // A read for the account selected before is dropped once another is selected.
+        let Cmd::LoadCard { r#gen: late, .. } = state.load_card(id(1), since) else {
+            unreachable!()
+        };
+        update(&mut state, ch('j'), NOW_MS);
+        let moved = draw(&state, 120, 40);
+        update(&mut state, card(late, id(1), Ok(full)), NOW_MS);
+        assert_eq!(draw(&state, 120, 40), moved);
     }
 
     /// `read`'s 5h and 7d, then a scoped window for each of `models`, each of those ahead of
@@ -1272,21 +1527,200 @@ mod tests {
         usage
     }
 
-    /// The window labels the detail pane shows, between its rule and the reading's age; a
-    /// window's continuation lines start further in.
-    fn pane_windows(state: &State, w: u16, h: u16) -> Vec<String> {
-        let lines = draw(state, w, h);
-        let rule = lines.iter().position(|l| l.starts_with("─ ")).unwrap();
-        lines[rule + 1..]
-            .iter()
-            .take_while(|l| !l.starts_with(" fetched"))
-            .filter(|l| !l.starts_with("  "))
-            .map(|l| l.split_whitespace().next().unwrap_or("").to_owned())
-            .collect()
+    /// `M1` … `Mn`.
+    fn models(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("M{i}")).collect()
     }
 
-    /// The widest lines a detail pane draws: a long scoped-model label, a spend value, and a
-    /// reset, pace and projection on one window.
+    /// `with_windows` for `models(n)`: 5h, 7d and `n` scoped windows.
+    fn scoped(n: usize) -> UsageView {
+        let models = models(n);
+        with_windows(&models.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn every_window_is_reachable_by_shift_j_and_k_at_80x24_under_a_full_banner() {
+        let banner = ["the store could not be read"; 12].join("; ");
+        let accounts = |usage: UsageView| {
+            vec![
+                account(1, "alex@example.com", usage),
+                account(2, "sam@corp.example", read(60, 9.0, 12.0, false)),
+                account(3, "alex@personal.example", read(60, 9.0, 12.0, false)),
+            ]
+        };
+        // Seven windows fit whole in what T3-22 leaves the card under a 3-row banner.
+        let mut state = loaded(accounts(scoped(5)));
+        state.raise_banner(BannerKind::Refusal, banner.clone());
+        let seven = card_windows(&state, 80, 24);
+        assert_eq!(seven.len(), 7, "{seven:?}");
+        update(&mut state, ch('J'), NOW_MS);
+        assert_eq!(card_windows(&state, 80, 24), seven);
+        // Twenty-four do not: `J` until nothing moves shows the last.
+        let mut state = loaded(accounts(scoped(22)));
+        state.raise_banner(BannerKind::Refusal, banner);
+        let first = card_windows(&state, 80, 24);
+        assert_eq!(first[0], "5h");
+        assert!(first.len() < 24, "{first:?}");
+        loop {
+            let before = card_windows(&state, 80, 24);
+            update(&mut state, ch('J'), NOW_MS);
+            if card_windows(&state, 80, 24) == before {
+                break;
+            }
+        }
+        let last = card_windows(&state, 80, 24);
+        assert_eq!(last.last().map(String::as_str), Some("M22"), "{last:?}");
+        assert_eq!(last.len(), first.len(), "whole rows, the same count");
+        assert!(draw(&state, 80, 24).iter().all(|l| width_of(l) <= 80));
+        // Taller: the scroll is clamped, so the last window shows from further up, and `K`
+        // moves at once.
+        update(
+            &mut state,
+            Msg::Resize {
+                width: 80,
+                height: 30,
+            },
+            NOW_MS,
+        );
+        let taller = card_windows(&state, 80, 30);
+        assert_eq!(taller.last().map(String::as_str), Some("M22"), "{taller:?}");
+        assert!(taller.len() > last.len(), "{taller:?}");
+        update(&mut state, ch('K'), NOW_MS);
+        let up = card_windows(&state, 80, 30);
+        assert_eq!(up[1..], taller[..taller.len() - 1], "{up:?}");
+    }
+
+    #[test]
+    fn the_card_shows_the_selected_account() {
+        let mut accounts = three();
+        accounts[0].usage = read(120, 9.0, 77.0, false);
+        accounts[0].usage.windows.as_mut().unwrap()[1].1 = Pace {
+            expected_pct: Some(62.0),
+            ahead: Some(true),
+            rate_per_hour: Some(1.2),
+            method: Some(tagteam_core::ProjectionMethod::Regression),
+            exhaustion_at: Some(NOW_S + 187_200),
+            will_last_to_reset: Some(false),
+        };
+        accounts[0].row.login_expires_at = Some((NOW_S + 6 * 86_400 + 3 * HOUR) * 1000);
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            // No history read yet: the sparklines' buckets are empty.
+            let (y, card) = card_rows(&state, 120, 40);
+            assert_eq!(
+                card,
+                [
+                    "    1 alex@example.com    not in use · updated 2m ago · login valid 6 more days".to_owned(),
+                    format!("    5h    {} 24h    9%  resets in 2h40m", " ".repeat(32)),
+                    format!(
+                        "    7d    {} 7d    77% ▲  resets in 3d09h · +1.2%/h · full in 2d04h",
+                        " ".repeat(32)
+                    ),
+                    "    ⏎ history of alex   e disable   a alias   x remove".to_owned(),
+                ],
+                "{theme:?}"
+            );
+            // The window fills before it resets: its projection is warn, as `▲` is.
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let (got, want) = role_of(&buf, theme, y + 2, "+1.2%/h · full in 2d04h", 'w');
+            assert_eq!(got, want, "{theme:?}");
+            let (got, want) = role_of(&buf, theme, y + 2, "▲", 'w');
+            assert_eq!(got, want, "{theme:?}");
+            let (got, want) = role_of(&buf, theme, y + 2, "77%", 'w');
+            assert_eq!(got, want, "{theme:?}");
+        }
+        // At 80 columns: 16 cells, the projection's clause, and no keys row.
+        let card = card_rows(&loaded(accounts), 80, 24).1;
+        assert_eq!(
+            card,
+            [
+                "    1 alex@example.com    not in use · updated 2m ago · login valid 6 more days"
+                    .to_owned(),
+                format!("    5h    {} 24h    9%  resets in 2h40m", " ".repeat(16)),
+                format!(
+                    "    7d    {} 7d    77% ▲  resets in 3d09h · full in 2d04h",
+                    " ".repeat(16)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_row_without_a_reading_says_why_in_the_card() {
+        let mut accounts = three();
+        accounts[2].usage = unread(UsageStatus::ReloginRequired, None, None);
+        accounts[2].row.quarantine_reason = Some("invalid_grant".into());
+        let mut state = loaded(accounts);
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        // No quarantine time: the sentence ends at its reason.
+        assert_eq!(
+            card_rows(&state, 80, 24).1,
+            [
+                "    3 spare  alex@personal.example    not in use · not checked yet",
+                "    ✕ Needs a new login: its stored login was refused (invalid_grant).",
+                "      Log in to Claude Code as alex@personal.example, then press A here.",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_card_counts_down_to_the_next_update_while_one_is_planned() {
+        let mut accounts = three();
+        accounts[0].usage.next_poll_at = Some(NOW_S + 60);
+        accounts[0].row.login_expires_at = Some((NOW_S + 6 * 86_400) * 1000);
+        let state = loaded(accounts);
+        assert_eq!(
+            card_rows(&state, 120, 40).1[0],
+            "    1 alex@example.com    not in use · updated 2m ago · next update in 1m · login valid 6 more days"
+        );
+        // Once it has come, a frame drawn before the update lands says it is close.
+        assert_eq!(
+            card_at(&state, 120, 40, NOW_MS + 60_000).1[0],
+            "    1 alex@example.com    not in use · updated 3m ago · next update in <1m · login valid 5 more days"
+        );
+        // At 80 columns the name gives way first, then the facts' end.
+        let title = card_rows(&state, 80, 24).1[0].clone();
+        assert_eq!(
+            title,
+            "    1 …    not in use · updated 2m ago · next update in 1m · login valid 6 more…"
+        );
+    }
+
+    #[test]
+    fn the_card_announces_no_update_the_status_rules_out() {
+        // A quarantined account keeps its stored plan, but no poll comes (core §8.3).
+        let mut accounts = three();
+        accounts[2].usage = unread(UsageStatus::ReloginRequired, None, None);
+        accounts[2].row.quarantine_reason = Some("invalid_grant".into());
+        accounts[2].usage.next_poll_at = Some(NOW_S + 180);
+        let mut state = loaded(accounts);
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        let lines = draw(&state, 80, 24);
+        assert!(
+            !lines.iter().any(|l| l.contains("next update")),
+            "{lines:?}"
+        );
+        // A backoff later than the plan: the remedy's retry is the only time given.
+        let mut backed_off = read(120, 9.0, 77.0, false);
+        backed_off.status = UsageStatus::Unavailable;
+        backed_off.error = Some("http-429".into());
+        backed_off.retry_at = Some(NOW_S + 900);
+        backed_off.next_poll_at = Some(NOW_S + 120);
+        let state = loaded(vec![account(1, "alex@example.com", backed_off)]);
+        let card = card_rows(&state, 80, 24).1;
+        assert!(!card.iter().any(|l| l.contains("next update")), "{card:?}");
+        assert_eq!(
+            card[3..],
+            [
+                "    ! Rate-limited: the usage check was turned away for now.",
+                "      tagteam tries again in 15m.",
+            ]
+        );
+    }
+
+    /// The widest rows a card draws: a long scoped-model label, a spend value, and a reset, pace
+    /// and projection on one window.
     fn widest() -> UsageView {
         let mut usage = read(120, 9.0, 77.0, false);
         let windows = usage.windows.as_mut().unwrap();
@@ -1327,47 +1761,40 @@ mod tests {
     }
 
     #[test]
-    fn a_window_too_wide_for_80_columns_wraps_its_parts_under_its_value() {
-        // Spec §5.1: 80×24 is enough; spec §5.2: each window's reset, pace and projection.
-        let state = loaded(vec![account(1, "a@x.co", widest())]);
-        let lines = draw(&state, 80, 24);
-        let rule = lines.iter().position(|l| l.starts_with("─ ")).unwrap();
-        let under = " ".repeat(20);
+    fn a_window_too_wide_for_80_columns_is_cut_to_its_one_row() {
+        // §4.5: 80×24 is enough; a window keeps one row and gives up its last words.
+        let state = loaded(vec![account(1, "alex@example.com", widest())]);
+        let card = card_rows(&state, 80, 24).1;
         assert_eq!(
-            lines[rule + 1..rule + 8],
-            [
-                format!(" {:<17}  {:>4}  resets in 2h40m", "5h", "9%"),
-                format!(
-                    " {:<17}  {:>4}  resets in 3d09h  ▲ ahead of pace (expected 62%)",
-                    "7d", "77%"
-                ),
-                format!("{under}+1.2%/h · full in 2d04h"),
-                format!(" {:<17}  €123.45 of €200  resets in 14d00h", "spend"),
-                format!(
-                    " {:<17}  {:>4}  resets in 3d09h  ▲ ahead of pace (expected 20%)",
-                    "Claude Sonnet 4.5", "41%"
-                ),
-                format!("{under}+1.5%/h · full in 1d00h"),
-                " fetched 2m ago".to_owned(),
-            ]
+            card_windows(&state, 80, 24),
+            ["5h", "7d", "spend", "Claude"]
         );
-        assert!(lines.iter().all(|l| width_of(l) <= 80 && !l.contains('…')));
-        // A wide terminal has room for each window on one line.
-        let wide = draw(&state, 120, 40);
-        let rule = wide.iter().position(|l| l.starts_with("─ ")).unwrap();
-        assert_eq!(
-            wide[rule + 2],
-            format!(
-                " {:<17}  {:>4}  resets in 3d09h  ▲ ahead of pace (expected 62%)  +1.2%/h · full in 2d04h",
-                "7d", "77%"
-            )
+        assert_eq!(card.len(), 5, "a row a window: {card:?}");
+        assert!(card.iter().all(|l| width_of(l) <= 80), "{card:?}");
+        let label = |name: &str| format!("    {name:<17}  ");
+        assert!(card[2].starts_with(&label("7d")), "{card:?}");
+        assert!(
+            card[2].contains(" 77% ▲  resets in 3d09h · full in ") && card[2].ends_with('…'),
+            "{card:?}"
+        );
+        assert!(card[3].starts_with(&label("spend")), "{card:?}");
+        assert!(
+            card[3].ends_with("  €123.45 of €200  resets in 14d00h"),
+            "{card:?}"
+        );
+        assert!(card[4].starts_with(&label("Claude Sonnet 4.5")), "{card:?}");
+        assert!(card[4].ends_with('…'), "{card:?}");
+        // A wide terminal has room for each window whole.
+        let wide = card_rows(&state, 120, 40).1;
+        assert!(
+            wide[2].ends_with(" 77% ▲  resets in 3d09h · +1.2%/h · full in 2d04h"),
+            "{wide:?}"
         );
         assert!(
-            wide[rule + 1..rule + 5]
-                .iter()
-                .all(|l| !l.starts_with("  ")),
-            "no continuation lines: {wide:?}"
+            wide[4].ends_with(" 41% ▲  resets in 3d09h · +1.5%/h · full in 1d00h"),
+            "{wide:?}"
         );
+        assert!(wide.iter().all(|l| !l.contains('…')), "{wide:?}");
     }
 
     /// An 80-column model name: any non-empty `display_name` is a label (the provider's §8.2).
@@ -1375,43 +1802,25 @@ mod tests {
         "Claude Opus 4.5 with extended thinking, for long-running agentic coding sessions";
 
     #[test]
-    fn an_oversized_label_goes_above_its_value_and_the_column_stays_capped() {
-        // The label column is a third of the pane at most, so every value and what follows it
-        // keep room; the oversized label is not cut, but takes rows of its own.
+    fn an_oversized_label_is_cut_to_its_column_and_the_column_stays_capped() {
+        // The label column is a quarter of the card at most (T3-20), so every value and what
+        // follows it keep their room.
         let mut usage = with_windows(&["Opus"]);
         usage.windows.as_mut().unwrap()[2].0.label = OVERSIZED.to_owned();
-        let state = loaded(vec![account(1, "a@x.co", usage)]);
-        let lines = draw(&state, 80, 40);
-        let rule = lines.iter().position(|l| l.starts_with("─ ")).unwrap();
-        let age = lines
-            .iter()
-            .position(|l| l.starts_with(" fetched"))
-            .unwrap();
-        let pane = &lines[rule + 1..age];
+        let state = loaded(vec![account(1, "alex@example.com", usage)]);
+        let card = card_rows(&state, 80, 40).1;
+        assert!(card.iter().all(|l| width_of(l) <= 80), "{card:?}");
         assert!(
-            pane.iter().all(|l| width_of(l) <= 80 && !l.contains('…')),
-            "{pane:?}"
+            card[1].starts_with(&format!("    {:<20}  ", "5h")),
+            "{card:?}"
         );
         assert!(
-            pane[0].starts_with(&format!(" {:<26}    9%", "5h")),
-            "{pane:?}"
+            card[3].starts_with(&format!("    {}  ", fit(OVERSIZED, 20))),
+            "{card:?}"
         );
-        let label = pane
-            .iter()
-            .position(|l| l.starts_with(" Claude Opus"))
-            .unwrap();
-        assert_eq!(
-            [pane[label].trim(), pane[label + 1].trim()].join(" "),
-            OVERSIZED,
-            "the whole label, on its own rows"
-        );
-        assert!(
-            pane[label + 2].starts_with(&format!(" {:26}   40%  resets in 3d09h", "")),
-            "{pane:?}"
-        );
-        let rest = pane[label + 2..].join(" ");
-        assert!(rest.contains("▲ ahead of pace (expected 20%)"), "{rest}");
-        assert!(rest.contains("+1.5%/h · full in 1d00h"), "{rest}");
+        let value = col(&card[1], "  9%");
+        assert_eq!(col(&card[3], " 40%"), value, "{card:?}");
+        assert!(card[3].contains(" 40% ▲  resets in 3d09h"), "{card:?}");
     }
 
     /// A 1,000-character model name, as the provider accepts any non-empty `display_name`.
@@ -1421,19 +1830,20 @@ mod tests {
 
     #[test]
     fn a_1000_character_label_leaves_its_window_reachable_at_80x24_under_a_full_banner() {
-        // The smallest pane 80×24 gives: a 3-row banner, a 3-row toast, and a trouble line.
+        // The smallest card 80×24 gives: a 3-row banner, a 3-row toast, and a problem.
         let mut usage = with_windows(&["Opus"]);
         usage.status = UsageStatus::Unavailable;
         usage.error = Some("http-429".into());
+        usage.retry_at = Some(NOW_S + 300);
         usage.windows.as_mut().unwrap()[2].0.label = thousand();
-        let mut state = loaded(vec![account(1, "a@x.co", usage)]);
+        let mut state = loaded(vec![account(1, "alex@example.com", usage)]);
         state.raise_banner(
             BannerKind::Refusal,
             ["the store could not be read"; 12].join("; "),
         );
         state.toast(
             crate::state::ToastKind::Info,
-            ["Switched to a@x.co (position 1)"; 8].join(" "),
+            ["Switched to alex@example.com (position 1)"; 8].join(" "),
             NOW_MS,
         );
         for _ in 0..3 {
@@ -1441,33 +1851,31 @@ mod tests {
         }
         let lines = draw(&state, 80, 24);
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
-        let label = lines
+        let card = card_rows(&state, 80, 24).1;
+        let label = format!("    {}  ", fit(&thousand(), 20));
+        let row = card
             .iter()
-            .position(|l| l.starts_with(" Claude Claude"))
+            .find(|l| l.starts_with(&label))
             .unwrap_or_else(|| panic!("{lines:?}"));
-        assert!(
-            lines[label + 1].ends_with('…'),
-            "two rows at most: {lines:?}"
+        assert!(row.contains(" 40% ▲  resets in 3d09h"), "{row}");
+        assert_eq!(
+            card[card.len() - 2..],
+            [
+                "    ! Rate-limited: the usage check was turned away for now.",
+                "      tagteam tries again in 5m.",
+            ]
         );
-        assert!(
-            lines[label + 2].starts_with(&format!(" {:26}   40%  resets in 3d09h", "")),
-            "{lines:?}"
-        );
-        let rest = lines[label + 2..].join(" ");
-        assert!(rest.contains("▲ ahead of pace (expected 20%)"), "{lines:?}");
-        assert!(rest.contains("+1.5%/h · full in 1d00h"), "{lines:?}");
-        assert!(rest.contains(" usage: rate-limited"), "{lines:?}");
     }
 
     #[test]
-    fn the_worst_live_stack_at_80_by_24_still_shows_a_long_labelled_window_whole() {
+    fn the_worst_live_stack_at_80_by_24_still_reaches_a_long_labelled_window() {
         // The header, the auto line, a 3-row banner and a 3-row toast leave a 16-row body; the
-        // window's label, value, reset, pace, rate and trouble all fit in what is left.
+        // window's row and the problem's rows fit in what is left.
         let mut usage = with_windows(&["Opus"]);
         usage.status = UsageStatus::Unavailable;
         usage.error = Some("http-429".into());
         usage.windows.as_mut().unwrap()[2].0.label = thousand();
-        let mut state = loaded(vec![account(1, "a@x.co", usage)]);
+        let mut state = loaded(vec![account(1, "alex@example.com", usage)]);
         let mut locked = daemon_job("claude-code", "auto", true);
         locked.backoff = Some(tagteam_daemon::protocol::StatusBackoff {
             reason: "keychain".into(),
@@ -1486,7 +1894,7 @@ mod tests {
         );
         state.toast(
             crate::state::ToastKind::Info,
-            ["Switched to a@x.co (position 1)"; 8].join(" "),
+            ["Switched to alex@example.com (position 1)"; 8].join(" "),
             NOW_MS,
         );
         for _ in 0..3 {
@@ -1513,28 +1921,28 @@ mod tests {
             "the body starts at row 5: {lines:?}"
         );
         assert!(
-            lines[21..]
-                .iter()
-                .all(|l| l.contains("a@x.co (position 1)") || l.starts_with("1) Switched")),
+            lines[21..].iter().all(|l| l.contains("(position 1)")
+                || l.starts_with("1) Switched")
+                || l.contains("Switched to alex")),
             "{lines:?}"
         );
-        let label = lines
+        let row = lines
             .iter()
-            .position(|l| l.starts_with(" Claude Claude"))
+            .find(|l| l.starts_with("    Claude Claude"))
             .unwrap_or_else(|| panic!("{lines:?}"));
-        assert!(lines[label + 1].starts_with(" Claude Claude"), "{lines:?}");
-        assert!(lines[label + 2].contains("40%"), "{lines:?}");
-        assert!(lines[label + 2].contains("resets in 3d09h"), "{lines:?}");
-        let rest = lines[label + 2..].join(" ");
-        assert!(rest.contains("▲ ahead of pace (expected 20%)"), "{lines:?}");
-        assert!(rest.contains("+1.5%/h · full in 1d00h"), "{lines:?}");
-        assert!(rest.contains(" usage: rate-limited"), "{lines:?}");
+        assert!(row.contains(" 40% ▲  resets in 3d09h"), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "    ! Rate-limited: the usage check was turned away for now."),
+            "{lines:?}"
+        );
     }
 
     #[test]
-    fn a_window_takes_seven_rows_at_most_whatever_its_words() {
-        // Two label rows, the value's, and a row for each of reset, pace, rate and where it
-        // leads: the bound the pane's height is held to (R20).
+    fn a_window_takes_one_row_whatever_its_words() {
+        // A 1,000-character label, a spend beyond any number, a rate and a projection 400 days
+        // past: one row at any width, cut to it.
         let mut w = window(
             "spend",
             &thousand(),
@@ -1555,176 +1963,126 @@ mod tests {
             exhaustion_at: Some(NOW_S - 86_400 * 400),
             will_last_to_reset: Some(false),
         };
-        for width in [80, 120] {
-            let lines = window_lines(&w, &p, width / 3, width, NOW_S, Theme::new(false));
-            assert!(lines.len() <= 7, "{width}: {} rows", lines.len());
-            for line in &lines {
-                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                assert!(width_of(&text) <= width, "{width}: {text}");
-            }
-        }
-        // The pane holds it whole at 80×24 under a 3-row banner, a 3-row toast and a trouble
-        // line: it takes rows from the table for its tallest window.
         let mut usage = read(120, 9.0, 77.0, false);
         usage.status = UsageStatus::Unavailable;
         usage.error = Some("http-429".into());
         usage.windows.as_mut().unwrap().push((w, p));
-        let mut state = loaded(vec![account(1, "a@x.co", usage)]);
+        let mut state = loaded(vec![account(1, "alex@example.com", usage)]);
+        for (width, height) in [(80, 24), (120, 40)] {
+            let card = card_rows(&state, width, height).1;
+            let rows: Vec<&String> = card
+                .iter()
+                .filter(|l| l.starts_with("    Claude Claude"))
+                .collect();
+            assert_eq!(rows.len(), 1, "{width}: {card:?}");
+            assert_eq!(width_of(rows[0]), usize::from(width), "{width}: {card:?}");
+            assert!(rows[0].ends_with('…'), "{width}: {card:?}");
+        }
+        // The card reaches it at 80×24 under a 3-row banner, a 3-row toast and a problem.
         state.raise_banner(
             BannerKind::Refusal,
             ["the store could not be read"; 12].join("; "),
         );
         state.toast(
             crate::state::ToastKind::Info,
-            ["Switched to a@x.co (position 1)"; 8].join(" "),
+            ["Switched to alex@example.com (position 1)"; 8].join(" "),
             NOW_MS,
         );
         for _ in 0..2 {
             update(&mut state, ch('J'), NOW_MS);
         }
-        let lines = draw(&state, 80, 24);
-        let label = lines.iter().position(|l| l.starts_with(" Claude")).unwrap();
-        let age = lines
-            .iter()
-            .position(|l| l.starts_with(" fetched"))
-            .unwrap();
-        let block = lines[label..age].join("\n");
-        assert!(block.contains("of €100…"), "{lines:?}");
+        let card = card_rows(&state, 80, 24).1;
         assert!(
-            block.contains("should have been full 400d00h ago"),
-            "{lines:?}"
+            card.iter().any(|l| l.starts_with("    Claude Claude")),
+            "{card:?}"
         );
-        assert_eq!(lines[age + 1], " usage: rate-limited");
+        assert!(
+            card.iter()
+                .any(|l| l == "    ! Rate-limited: the usage check was turned away for now."),
+            "{card:?}"
+        );
     }
 
     #[test]
-    fn a_resize_clamps_the_detail_scroll_so_the_next_key_moves_at_once() {
-        let models = [
-            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11",
-        ];
-        let mut state = loaded(vec![account(1, "a@x.co", with_windows(&models))]);
-        let rule = |state: &State, h: u16| {
-            draw(state, 80, h)
-                .into_iter()
-                .find(|l| l.starts_with("─ "))
-                .unwrap()
-        };
-        for _ in 0..10 {
+    fn a_resize_clamps_the_card_scroll_so_the_next_key_moves_at_once() {
+        let mut state = loaded(vec![account(1, "alex@example.com", scoped(22))]);
+        for _ in 0..30 {
             update(&mut state, ch('J'), NOW_MS);
         }
-        assert!(rule(&state, 24).ends_with(" J K: windows 10–13 of 13 ─"));
-        // Taller: the last window shows from further up, and `K` moves from what shows. At 32
-        // rows the body has the 28 rows 30 gave it before the auto line and the rule.
+        let at_24 = card_windows(&state, 80, 24);
+        assert_eq!(at_24.last().map(String::as_str), Some("M22"), "{at_24:?}");
+        // Taller: the last window shows from further up, and `K` moves from what shows.
         update(
             &mut state,
             Msg::Resize {
                 width: 80,
-                height: 32,
+                height: 30,
             },
             NOW_MS,
         );
-        assert!(rule(&state, 32).ends_with(" J K: windows 8–13 of 13 ─"));
+        let at_30 = card_windows(&state, 80, 30);
+        assert_eq!(at_30.last().map(String::as_str), Some("M22"), "{at_30:?}");
+        assert!(at_24.len() < at_30.len() && at_30.len() < 24, "{at_30:?}");
         update(&mut state, ch('K'), NOW_MS);
-        assert!(
-            rule(&state, 32).ends_with(" J K: windows 7–12 of 13 ─"),
-            "{}",
-            rule(&state, 32)
-        );
+        let up = card_windows(&state, 80, 30);
+        assert_eq!(up[1..], at_30[..at_30.len() - 1], "{up:?}");
     }
 
     #[test]
-    fn the_rule_cuts_the_name_before_the_facts() {
-        // Spec §5.2: whether the account is session-owned is the detail pane's to say.
-        let long = "a".repeat(52) + "@example.com";
-        let mut v = account(1, &long, read(60, 9.0, 12.0, false));
-        v.in_session = true;
-        let lines = draw(&loaded(vec![v]), 80, 24);
-        let rule = lines.iter().find(|l| l.starts_with("─ ")).unwrap();
-        assert!(rule.starts_with("─ 1 aaaa"), "{rule}");
-        assert!(
-            rule.contains("… · not active · oauth · in a session ─"),
-            "{rule}"
-        );
-        assert_eq!(width_of(rule), 80);
-    }
-
-    #[test]
-    fn the_detail_pane_grows_to_show_every_window() {
-        // Spec §5.2: each relevant window, with its reset, pace and projection. 5h, 7d and
-        // three scoped windows are five: one more than the pane's least height holds.
+    fn the_card_grows_to_show_every_window() {
+        // §6.4: a row per window, all of them. 5h, 7d and three scoped windows are five.
         let state = loaded(vec![account(
             1,
-            "a@x.co",
+            "alex@example.com",
             with_windows(&["Opus", "Sonnet", "Haiku"]),
         )]);
         for (w, h) in [(80, 24), (120, 40)] {
             assert_eq!(
-                pane_windows(&state, w, h),
+                card_windows(&state, w, h),
                 ["5h", "7d", "Opus", "Sonnet", "Haiku"],
                 "{w}×{h}"
             );
         }
-        let lines = draw(&state, 120, 40);
-        let haiku = lines.iter().find(|l| l.starts_with(" Haiku")).unwrap();
+        let card = card_rows(&state, 120, 40).1;
         assert_eq!(
-            haiku.trim_end(),
-            " Haiku    42%  resets in 3d09h  ▲ ahead of pace (expected 20%)  +1.5%/h · full in 1d00h"
-        );
-        assert!(
-            !lines.iter().any(|l| l.contains("J K")),
-            "every window fits: nothing to scroll"
+            card[5],
+            format!(
+                "    Haiku   {} 7d    42% ▲  resets in 3d09h · +1.5%/h · full in 1d00h",
+                " ".repeat(32)
+            )
         );
     }
 
     #[test]
-    fn windows_beyond_the_pane_scroll_into_view_with_shift_j_and_k() {
-        // 13 windows, each scoped one two lines at 80 columns: more than half of 80×24's body
-        // holds, so the pane scrolls them, by whole windows.
-        let models = [
-            "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11",
-        ];
+    fn windows_beyond_the_card_scroll_into_view_with_shift_j_and_k() {
+        // 24 windows: more than 80×24's card holds beside the table, so it scrolls them, a row
+        // each.
         let mut state = loaded(vec![
-            account(1, "a@x.co", with_windows(&models)),
-            account(2, "b@x.co", with_windows(&models)),
+            account(1, "alex@example.com", scoped(22)),
+            account(2, "sam@corp.example", scoped(22)),
         ]);
-        let first: Vec<&str> = vec!["5h", "7d", "M1", "M2", "M3"];
-        assert_eq!(pane_windows(&state, 80, 24), first);
-        // Whole windows only: M3's projection is the last line before the reading's age.
-        let lines = draw(&state, 80, 24);
-        let age = lines
-            .iter()
-            .position(|l| l.starts_with(" fetched"))
-            .unwrap();
-        assert!(lines[age - 2].starts_with(" M3 "), "{lines:?}");
-        assert!(lines[age - 1].trim_start().starts_with("+1.5%/h"));
-        let rule = |state: &State| {
-            draw(state, 80, 24)
-                .into_iter()
-                .find(|l| l.starts_with("─ "))
-                .unwrap()
-        };
-        assert!(
-            rule(&state).ends_with(" J K: windows 1–5 of 13 ─"),
-            "{}",
-            rule(&state)
-        );
-        assert_eq!(width_of(&rule(&state)), 80);
-        for _ in 0..10 {
+        let first = card_windows(&state, 80, 24);
+        assert_eq!(first[..3], ["5h", "7d", "M1"]);
+        let shown = first.len();
+        assert!(shown < 24, "{first:?}");
+        for _ in 0..30 {
             update(&mut state, ch('J'), NOW_MS);
         }
+        let last = card_windows(&state, 80, 24);
+        assert_eq!(last.len(), shown, "{last:?}");
         assert_eq!(
-            pane_windows(&state, 80, 24),
-            ["M8", "M9", "M10", "M11"],
+            last.last().map(String::as_str),
+            Some("M22"),
             "J stops at the last window"
         );
-        assert!(rule(&state).ends_with(" J K: windows 10–13 of 13 ─"));
         update(&mut state, ch('K'), NOW_MS);
-        assert_eq!(pane_windows(&state, 80, 24), ["M7", "M8", "M9", "M10"]);
-        // Another account's detail starts at its first window.
+        let up = card_windows(&state, 80, 24);
+        assert_eq!(up[1..], last[..shown - 1], "{up:?}");
+        // Another account's card starts at its first window.
         update(&mut state, ch('j'), NOW_MS);
-        assert_eq!(pane_windows(&state, 80, 24), first);
-        // A wider and taller terminal shows them all, a line each.
-        assert_eq!(pane_windows(&state, 120, 40).len(), 13);
+        assert_eq!(card_windows(&state, 80, 24), first);
+        // A taller terminal shows them all.
+        assert_eq!(card_windows(&state, 120, 40).len(), 24);
         // Help lists the keys.
         update(&mut state, ch('?'), NOW_MS);
         let help = draw(&state, 80, 24);
@@ -2204,11 +2562,11 @@ mod tests {
     #[test]
     fn more_accounts_than_fit_scroll_with_the_selection() {
         let mut state = loaded(many(30));
-        // 80×25: 22 body rows (80×24's before the auto line), 7 for the detail, 1 for the
-        // header: 14 account rows.
+        // 80×25: 22 body rows (80×24's before the auto line), 3 for the card and a blank row
+        // above it, 1 for the header: 17 account rows.
         state.size = (80, 25);
         let shown = |state: &State| {
-            body_of(state, 80, 25, NOW_MS)[1..15]
+            body_of(state, 80, 25, NOW_MS)[1..18]
                 .iter()
                 .map(|l| {
                     l.split_whitespace()
@@ -2225,12 +2583,12 @@ mod tests {
             1,
             "k stops at the top"
         );
-        for _ in 0..14 {
+        for _ in 0..17 {
             update(&mut state, ch('j'), NOW_MS);
         }
-        assert_eq!(state.accounts.selected().unwrap().position, 15);
+        assert_eq!(state.accounts.selected().unwrap().position, 18);
         assert_eq!(shown(&state).first().unwrap(), "a2@x.co");
-        assert_eq!(shown(&state).last().unwrap(), "a15@x.co");
+        assert_eq!(shown(&state).last().unwrap(), "a18@x.co");
         for _ in 0..40 {
             update(&mut state, key(KeyCode::Down), NOW_MS);
         }
@@ -2241,12 +2599,12 @@ mod tests {
         );
         assert_eq!(shown(&state).last().unwrap(), "a30@x.co");
         // Going back up scrolls only once the selection reaches the top line.
-        for _ in 0..13 {
+        for _ in 0..16 {
             update(&mut state, ch('k'), NOW_MS);
         }
-        assert_eq!(shown(&state).first().unwrap(), "a17@x.co");
+        assert_eq!(shown(&state).first().unwrap(), "a14@x.co");
         update(&mut state, ch('k'), NOW_MS);
-        assert_eq!(shown(&state).first().unwrap(), "a16@x.co");
+        assert_eq!(shown(&state).first().unwrap(), "a13@x.co");
         update(&mut state, key(KeyCode::Home), NOW_MS);
         assert_eq!(shown(&state).first().unwrap(), "a1@x.co");
         // A smaller terminal still shows the selected row.
@@ -2276,7 +2634,7 @@ mod tests {
                 .unwrap()
                 .to_owned()
         };
-        assert_eq!(first(&state, 25), "a17@x.co");
+        assert_eq!(first(&state, 25), "a14@x.co");
         // Tall enough for every row: the table shows from the top, never blank rows.
         update(
             &mut state,
@@ -2567,33 +2925,6 @@ mod tests {
         let body = body_of(&state, 80, 24, NOW_MS);
         assert!(body[1].ends_with("  —"), "{}", body[1]);
         assert!(body[2].ends_with("1m ○"), "{}", body[2]);
-    }
-
-    #[test]
-    fn the_detail_pane_announces_no_poll_the_status_rules_out() {
-        // A quarantined account keeps its stored plan, but no poll comes (core §8.3).
-        let mut accounts = detail_three();
-        accounts[2].usage.next_poll_at = Some(NOW_S + 180);
-        let mut state = loaded(accounts);
-        update(&mut state, key(KeyCode::End), NOW_MS);
-        let lines = draw(&state, 80, 24);
-        let body = body_of(&state, 80, 24, NOW_MS);
-        assert_eq!(body[body.len() - 7 + 1], " never fetched");
-        assert!(!lines.iter().any(|l| l.contains("next poll")), "{lines:?}");
-        // A backoff later than the plan: the usage line's retry is the only time given.
-        let mut backed_off = read(120, 9.0, 77.0, false);
-        backed_off.status = UsageStatus::Unavailable;
-        backed_off.error = Some("http-429".into());
-        backed_off.retry_at = Some(NOW_S + 900);
-        backed_off.next_poll_at = Some(NOW_S + 120);
-        let lines = draw(&loaded(vec![account(1, "a@x.co", backed_off)]), 80, 24);
-        assert!(!lines.iter().any(|l| l.contains("next poll")), "{lines:?}");
-        assert!(
-            lines
-                .iter()
-                .any(|l| l == " usage: rate-limited (retry 15m)"),
-            "{lines:?}"
-        );
     }
 
     /// A spend, a scoped model window, a disabled row and a failing one: more than 80 columns
