@@ -840,7 +840,7 @@ fn a_profile_whose_marker_or_record_cannot_be_read_is_not_synced() {
         .engine
         .sync_profile_links(fx.cc.as_ref(), &profile, false)
         .unwrap_err();
-    assert_eq!(err.kind(), "invalid-input", "{err}");
+    assert_eq!(err.kind(), "profile-marker-missing", "{err}");
     assert!(entries(&profile).is_empty(), "nothing was linked");
 
     // A corrupt marker or record is unreadable, never taken for absent (§4.3).

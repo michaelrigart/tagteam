@@ -79,6 +79,22 @@ pub enum EngineError {
     },
     #[error("{0}")]
     InvalidInput(String),
+    /// §8.5, §12.2: a profile directory without its marker, so its recorded spelling and outer
+    /// home are unknown.
+    #[error("{} has no profile marker", path.display())]
+    ProfileMarkerMissing { path: PathBuf },
+    /// §8.5: `sync_profile_links` found no marker to take the outer home from.
+    #[error("{} is missing, so the profile's outer home is unknown", marker.display())]
+    OuterHomeUnknown { marker: PathBuf },
+    /// §8.5: an account with nothing in the vault to activate or start a session from. Only a
+    /// new login brings it back, as for `NeedsRelogin`. The text names the account and what to
+    /// run, and differs by site.
+    #[error("{0}")]
+    NoStoredCredential(String),
+    /// §8.5, §7.5 step 2: the live login matches no stored account, so tagteam does not refresh
+    /// it.
+    #[error("the live login is not managed by tagteam; only {app} refreshes it")]
+    UnmanagedLiveLogin { app: &'static str },
     #[error("no account matches {0:?}")]
     NoSuchAccount(String),
     /// §6.3: an ID `displaced --purge` was given that names no entry, or that is not a
@@ -571,6 +587,11 @@ impl EngineError {
             EngineError::IdentityConflict { .. } => "identity-conflict",
             EngineError::NeedsRelogin { .. } => "relogin-required",
             EngineError::InvalidInput(_) => "invalid-input",
+            EngineError::ProfileMarkerMissing { .. } | EngineError::OuterHomeUnknown { .. } => {
+                "profile-marker-missing"
+            }
+            EngineError::NoStoredCredential(_) => "relogin-required",
+            EngineError::UnmanagedLiveLogin { .. } => "unmanaged-account",
             EngineError::NoSuchAccount(_) => "no-such-account",
             EngineError::NoSuchDisplaced(_) => "no-such-displaced",
             EngineError::Ambiguous { .. } => "ambiguous-account",
@@ -751,6 +772,26 @@ mod tests {
                 "relogin-required",
             ),
             (EngineError::InvalidInput("x".into()), "invalid-input"),
+            (
+                EngineError::ProfileMarkerMissing {
+                    path: PathBuf::from("x"),
+                },
+                "profile-marker-missing",
+            ),
+            (
+                EngineError::OuterHomeUnknown {
+                    marker: PathBuf::from("x"),
+                },
+                "profile-marker-missing",
+            ),
+            (
+                EngineError::NoStoredCredential("x".into()),
+                "relogin-required",
+            ),
+            (
+                EngineError::UnmanagedLiveLogin { app: "Claude Code" },
+                "unmanaged-account",
+            ),
             (EngineError::NoSuchAccount("x".into()), "no-such-account"),
             (
                 EngineError::NoSuchDisplaced("x".into()),

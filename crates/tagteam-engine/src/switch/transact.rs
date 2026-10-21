@@ -202,7 +202,7 @@ impl Engine {
                 label: target.label.clone(),
                 source,
             }),
-            _ => Err(EngineError::InvalidInput(format!(
+            _ => Err(EngineError::NoStoredCredential(format!(
                 "{} has no stored credential",
                 target.label
             ))),
