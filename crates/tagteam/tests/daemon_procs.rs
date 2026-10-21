@@ -24,7 +24,7 @@ use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::usage::format_iso8601;
 use tagteam_core::{AccountId, PollBudget, ProviderId, Window, WindowKind};
 use tagteam_daemon::client::{Client, Connect, connect_at};
-use tagteam_daemon::protocol::{Event, Status};
+use tagteam_daemon::protocol::{Event, Status, Wire};
 use tagteam_engine::daemon::{daemon_lock_path, daemon_socket_path, read_daemon_record};
 use tagteam_engine::store::{Eligibility, Reserve, SendGrant, Store};
 use tagteam_provider::mock_server::{MockReply, MockServer};
@@ -354,7 +354,7 @@ fn a_daemon_started_beside_a_running_auto_waits_for_its_engine_lock() {
         (
             p.provider.as_str(),
             p.mode.as_str(),
-            p.waiting_for.as_deref(),
+            p.waiting_for.as_ref().map(Wire::as_str),
             p.holder_pid,
             p.autoswitch
         ),

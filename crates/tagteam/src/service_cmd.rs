@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use tagteam_daemon::client::{ClientError, Connect, connect};
-use tagteam_daemon::protocol::{Status, StatusJob, StatusNotifications, StatusProvider};
+use tagteam_daemon::protocol::{Status, StatusJob, StatusNotifications, StatusProvider, Wire};
 use tagteam_daemon::service::{InstallReport, Uninstalled};
 use tagteam_daemon::watch::program_path;
 use tagteam_engine::daemon::{daemon_lock_path, daemon_socket_path, read_daemon_record};
@@ -205,14 +205,14 @@ fn daemon_value(s: &Status) -> Value {
         .map(|p| {
             json!({
                 "provider": p.provider,
-                "mode": p.mode,
+                "mode": p.mode.as_str(),
                 "autoswitch": p.autoswitch,
-                "waitingFor": p.waiting_for,
+                "waitingFor": p.waiting_for.as_ref().map(Wire::as_str),
                 "holderPid": p.holder_pid,
                 "backoff": p.backoff.as_ref().map(|b| json!({"reason": b.reason, "until": b.until})),
                 "lastTickAt": p.last_tick_at,
                 "nextTickAt": p.next_tick_at,
-                "lastOutcome": p.last_outcome.as_ref().map(|o| json!({"kind": o.kind, "reason": o.reason, "at": o.at})),
+                "lastOutcome": p.last_outcome.as_ref().map(|o| json!({"kind": o.kind.as_str(), "reason": o.reason, "at": o.at})),
                 "lastSwitch": p.last_switch.as_ref().map(|w| json!({"at": w.at, "from": w.from, "to": w.to, "trigger": w.trigger})),
             })
         })
@@ -312,9 +312,9 @@ fn notifications_line(n: &StatusNotifications) -> String {
 }
 
 fn provider_line(p: &StatusProvider) -> String {
-    let mut line = format!("  {}: {}", p.provider, p.mode);
+    let mut line = format!("  {}: {}", p.provider, p.mode.as_str());
     if let Some(what) = &p.waiting_for {
-        line.push_str(&format!(" for {what}"));
+        line.push_str(&format!(" for {}", what.as_str()));
         if let Some(pid) = p.holder_pid {
             line.push_str(&format!(" (pid {pid})"));
         }
@@ -331,7 +331,7 @@ fn provider_line(p: &StatusProvider) -> String {
             .as_ref()
             .map(|r| format!(" ({r})"))
             .unwrap_or_default();
-        line.push_str(&format!("; last {}{reason} at {}", o.kind, o.at));
+        line.push_str(&format!("; last {}{reason} at {}", o.kind.as_str(), o.at));
     }
     if let Some(next) = &p.next_tick_at {
         line.push_str(&format!("; next at {next}"));
@@ -417,7 +417,7 @@ mod tests {
             providers: vec![
                 StatusProvider {
                     provider: "claude-code".into(),
-                    mode: "auto".into(),
+                    mode: Wire::from_wire("auto"),
                     autoswitch: true,
                     waiting_for: None,
                     holder_pid: None,
@@ -425,7 +425,7 @@ mod tests {
                     last_tick_at: Some("2026-10-14T21:00:00Z".into()),
                     next_tick_at: Some("2026-10-14T21:05:00Z".into()),
                     last_outcome: Some(StatusOutcome {
-                        kind: "no-switch".into(),
+                        kind: Wire::from_wire("no-switch"),
                         reason: Some("below-threshold".into()),
                         at: "2026-10-14T21:00:00Z".into(),
                     }),
@@ -438,9 +438,9 @@ mod tests {
                 },
                 StatusProvider {
                     provider: "fake-agent".into(),
-                    mode: "waiting".into(),
+                    mode: Wire::from_wire("waiting"),
                     autoswitch: false,
-                    waiting_for: Some("engine-lock".into()),
+                    waiting_for: Some(Wire::from_wire("engine-lock")),
                     holder_pid: Some(777),
                     backoff: Some(StatusBackoff {
                         reason: "keychain".into(),

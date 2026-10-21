@@ -2385,7 +2385,7 @@ mod tests {
             // An event asks for `status` again, and the lane takes it.
             let mode = tagteam_daemon::protocol::Event::Mode {
                 provider: "claude-code".into(),
-                mode: "collect".into(),
+                mode: tagteam_daemon::protocol::Wire::from_wire("collect"),
                 waiting_for: None,
                 holder_pid: None,
                 backoff: None,

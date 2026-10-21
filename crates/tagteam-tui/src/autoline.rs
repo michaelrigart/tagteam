@@ -7,7 +7,9 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::{NoSwitchReason, Trigger};
+use tagteam_daemon::events::Mode;
 use tagteam_daemon::protocol::{StatusOutcome, StatusProvider, StatusSwitch};
+use tagteam_daemon::status::OutcomeKind;
 use tagteam_engine::settings::DEFAULT_THRESHOLD;
 use tagteam_engine::views::ProviderAccounts;
 use tagteam_engine::words::{self, MISSING, NoSwitchFacts};
@@ -53,7 +55,7 @@ pub(crate) fn said(state: &State, width: u16, now_ms: i64) -> Option<Said> {
     let tz = state.tokens.tz();
     let view = state.view_of(&provider);
     let next = job
-        .filter(|j| width >= WIDE && j.mode == "auto")
+        .filter(|j| width >= WIDE && j.mode.known() == Some(Mode::Auto))
         .and_then(|j| iso_ms(j.next_tick_at.as_deref()?))
         .map(|ms| format!("next check {}", clock(ms, tz)));
     let said = |mark, when, text| Said {
@@ -148,14 +150,14 @@ fn decision(state: &State, provider: &ProviderId, job: Option<&StatusProvider>) 
 /// `status.lastOutcome` as a decision: a `no-switch` (with no detail) or an `error`.
 fn outcome(o: &StatusOutcome) -> Option<Noted> {
     let (at_ms, reason) = (iso_ms(&o.at)?, o.reason.as_deref()?);
-    let what = match o.kind.as_str() {
-        "no-switch" => NotedWhat::NoSwitch {
-            reason: daemon::no_switch_reason(reason)?,
+    let what = match o.kind.known() {
+        Some(OutcomeKind::NoSwitch) => NotedWhat::NoSwitch {
+            reason: NoSwitchReason::parse(reason)?,
             detail: String::new(),
             used_pct: None,
             frees_at_ms: None,
         },
-        "error" => NotedWhat::Error(reason.to_owned()),
+        Some(OutcomeKind::Error) => NotedWhat::Error(reason.to_owned()),
         _ => return None,
     };
     Some(Noted { at_ms, what })
@@ -197,7 +199,7 @@ fn decided(
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
-    use tagteam_daemon::protocol::Event;
+    use tagteam_daemon::protocol::{Event, Wire};
 
     use super::*;
     use crate::live::Live;
@@ -361,7 +363,7 @@ mod tests {
         );
         let text = "waiting 4m after the last switch";
         assert_eq!(letters(&mut state), format!("   mmmmm  {}", all(text, 't')));
-        let poll = json!({"active": {"number": 1}, "headroomPct": {"1": 23}});
+        let poll = json!({"active": {"number": 1}, "headroomPct": {"1": 23}, "windowsPct": {"1": {"5h": 77.0}}});
         update(&mut state, auto("poll", poll), NOW_MS);
         update(&mut state, no_switch("below-threshold", ""), NOW_MS);
         assert_eq!(
@@ -407,7 +409,7 @@ mod tests {
     fn the_last_outcome_fills_the_line_on_connect() {
         // T2-7, UX-3: `status.lastOutcome` until this link's own decision, the newer winning.
         let outcome = |kind: &str, reason: &str, at: &str| StatusOutcome {
-            kind: kind.into(),
+            kind: Wire::from_wire(kind),
             reason: Some(reason.into()),
             at: at.into(),
         };
@@ -494,7 +496,7 @@ mod tests {
             "   no switches in the last 30 days · next check 14:16"
         );
         assert_eq!(line(&state, 80), "   no switches in the last 30 days");
-        job.mode = "collect".into();
+        job.mode = Wire::from_wire("collect");
         assert_eq!(
             line(&live_with(job), 120),
             "   no switches in the last 30 days"
@@ -591,7 +593,7 @@ mod tests {
         }));
         let mode = Msg::Live(Live::Event(Event::Mode {
             provider: "claude-code".into(),
-            mode: "auto".into(),
+            mode: Wire::from_wire("auto"),
             waiting_for: None,
             holder_pid: None,
             backoff: None,
@@ -675,7 +677,7 @@ mod tests {
         // C-R21: a link can come up after events were missed, so a `no-switch` reads the usage
         // only from a `poll` the same link carried.
         let mut state = live_with(auto_on());
-        let poll = json!({"active": {"number": 1}, "headroomPct": {"1": 23.0}});
+        let poll = json!({"active": {"number": 1}, "headroomPct": {"1": 23.0}, "windowsPct": {"1": {"5h": 77.0}}});
         update(&mut state, auto("poll", poll), NOW_MS);
         update(&mut state, Msg::Live(Live::Down), NOW_MS);
         go_live(&mut state, daemon_status(vec![auto_on()], vec![]));

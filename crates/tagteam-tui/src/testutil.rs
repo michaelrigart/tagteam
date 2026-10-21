@@ -14,7 +14,7 @@ use ratatui::style::Style;
 use tagteam_cc::CLAUDE_CODE;
 use tagteam_core::{AccountId, Pace, ProviderId, Sample, Window, WindowKind};
 use tagteam_daemon::protocol::{
-    Status, StatusDaemon, StatusJob, StatusNotifications, StatusProvider,
+    Status, StatusDaemon, StatusJob, StatusNotifications, StatusProvider, Wire,
 };
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::switch::LiveLogin;
@@ -560,7 +560,7 @@ pub(crate) fn daemon_status(providers: Vec<StatusProvider>, jobs: Vec<StatusJob>
 pub(crate) fn daemon_job(provider: &str, mode: &str, autoswitch: bool) -> StatusProvider {
     StatusProvider {
         provider: provider.into(),
-        mode: mode.into(),
+        mode: Wire::from_wire(mode),
         autoswitch,
         waiting_for: None,
         holder_pid: None,

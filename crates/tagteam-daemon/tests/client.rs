@@ -17,7 +17,7 @@ use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::Trigger;
 use tagteam_daemon::client::{Client, ClientError, Connect, connect, connect_at};
 use tagteam_daemon::events::{DaemonEvent, DaemonSink, Mode, StopReason, WaitingFor};
-use tagteam_daemon::protocol::{Event, Hello, MAX_LINE, PROTOCOL, Status, status_json};
+use tagteam_daemon::protocol::{Event, Hello, MAX_LINE, PROTOCOL, Status, Wire, status_json};
 use tagteam_daemon::server::{MAX_CONNECTIONS, MAX_SOCKET_PATH, Server};
 use tagteam_engine::auto::AutoEvent;
 use tagteam_engine::daemon::daemon_socket_path;
@@ -106,7 +106,7 @@ fn connect_reads_the_greeting_and_status_answers_from_the_board() {
     assert_eq!(status.notifications.backend.as_deref(), Some("osascript"));
     assert_eq!(status.providers.len(), 1);
     assert_eq!(status.providers[0].provider, "claude-code");
-    assert_eq!(status.providers[0].mode, "auto");
+    assert_eq!(status.providers[0].mode.as_str(), "auto");
     assert_eq!(status.subscribers, 0);
     assert_eq!(
         client.status().unwrap(),
@@ -403,8 +403,8 @@ fn subscribe_yields_typed_events_in_order_until_the_daemon_stops() {
         next(),
         Event::Mode {
             provider: "claude-code".into(),
-            mode: "waiting".into(),
-            waiting_for: Some("engine-lock".into()),
+            mode: Wire::from_wire("waiting"),
+            waiting_for: Some(Wire::from_wire("engine-lock")),
             holder_pid: Some(5151),
             backoff: None,
         }

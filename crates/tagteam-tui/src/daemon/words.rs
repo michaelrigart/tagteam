@@ -5,7 +5,8 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::AutoStrategy;
-use tagteam_daemon::protocol::StatusProvider;
+use tagteam_daemon::events::{Mode, WaitingFor};
+use tagteam_daemon::protocol::{StatusProvider, Wire};
 use tagteam_engine::words::{MISSING, threshold};
 
 use crate::state::State;
@@ -81,8 +82,9 @@ fn job_state(
         return said("!", Role::Warn, &format!("keychain locked {until}"), None);
     }
     let view = state.view_of(provider);
-    let mut pieces = match (job.mode.as_str(), job.waiting_for.as_deref()) {
-        ("auto", _) => {
+    let waiting_for = job.waiting_for.as_ref().and_then(Wire::known);
+    let mut pieces = match (job.mode.known(), waiting_for) {
+        (Some(Mode::Auto), _) => {
             let rest = view.map(|v| match (v.strategy, wide) {
                 (AutoStrategy::ConsumeFirst, true) => "uses the soonest reset first".to_owned(),
                 (AutoStrategy::ConsumeFirst, false) => "soonest reset".to_owned(),
@@ -91,18 +93,18 @@ fn job_state(
             });
             said("●", Role::Accent, "auto on", rest.as_deref())
         }
-        ("collect", _) if !job.autoswitch => {
+        (Some(Mode::Collect), _) if !job.autoswitch => {
             let words = if wide { "auto paused" } else { "paused" };
             said("‖", Role::Warn, words, Some("P resumes"))
         }
-        ("collect", _) if wide => said(
+        (Some(Mode::Collect), _) if wide => said(
             "○",
             Role::Muted,
             "auto idle",
             Some("needs 2 usable accounts"),
         ),
-        ("collect", _) => said("○", Role::Muted, "needs 2 usable accounts", None),
-        ("waiting", Some("engine-lock")) => {
+        (Some(Mode::Collect), _) => said("○", Role::Muted, "needs 2 usable accounts", None),
+        (Some(Mode::Waiting), Some(WaitingFor::EngineLock)) => {
             let words = match (job.holder_pid, wide) {
                 (Some(pid), true) => format!("auto runs in another terminal (pid {pid})"),
                 (Some(pid), false) => format!("auto in pid {pid}"),
@@ -111,13 +113,20 @@ fn job_state(
             };
             said("●", Role::Accent, &words, None)
         }
-        ("waiting", Some("schema")) if wide => {
+        (Some(Mode::Waiting), Some(WaitingFor::Schema)) if wide => {
             said("!", Role::Warn, "daemon is outdated", Some("restarting"))
         }
-        ("waiting", Some("schema")) => said("!", Role::Warn, "daemon outdated", None),
-        ("idle", _) if wide => said("○", Role::Muted, "auto off", Some("no usable account")),
-        ("idle", _) => said("○", Role::Muted, "no usable account", None),
-        (mode, _) => said("○", Role::Muted, &format!("daemon {mode}"), None),
+        (Some(Mode::Waiting), Some(WaitingFor::Schema)) => {
+            said("!", Role::Warn, "daemon outdated", None)
+        }
+        (Some(Mode::Idle), _) if wide => {
+            said("○", Role::Muted, "auto off", Some("no usable account"))
+        }
+        (Some(Mode::Idle), _) => said("○", Role::Muted, "no usable account", None),
+        (Some(Mode::Waiting) | None, _) => {
+            let words = format!("daemon {}", job.mode.as_str());
+            said("○", Role::Muted, &words, None)
+        }
     };
     if let Some(until) = until {
         pieces.push((format!(" · keychain locked until {until}"), Role::Warn));
@@ -230,7 +239,7 @@ mod tests {
             ),
         ] {
             let mut job = daemon_job("claude-code", mode, autoswitch);
-            job.waiting_for = waiting_for.map(str::to_owned);
+            job.waiting_for = waiting_for.map(Wire::from_wire);
             job.holder_pid = holder;
             let mut state = fresh(Screen::Accounts);
             state.accounts.apply(snapshot(many(1)));
