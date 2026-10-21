@@ -19,7 +19,7 @@ use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::{NotifyEvent, Settings};
 use tagteam_engine::store::{Eligibility, Reserve};
 use tagteam_engine::vault::{KeychainVault, Vault};
-use tagteam_engine::{Engine, EngineConfig};
+use tagteam_engine::{Engine, EngineConfig, EventSource};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::liveness::SystemProcessProbe;
 use tagteam_provider::process::ScriptedSpawner;
@@ -99,6 +99,7 @@ fn engine_on(
         process: Arc::new(SystemProcessProbe),
         spawner: spawner.clone(),
         run_shell,
+        source: EventSource::Daemon,
     })
 }
 

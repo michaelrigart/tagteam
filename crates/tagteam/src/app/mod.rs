@@ -166,7 +166,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     let provider_flag = cli.provider.map(ProviderId::new);
     let shown = Arc::clone(&ctx.shown_warnings);
     // §12.8: under a marker that cannot be read the outer home is unknown, and nothing runs.
-    let (engine, warnings) = match engine_for(ctx, provider_flag.as_ref()) {
+    let (engine, warnings) = match engine_for(ctx, provider_flag.as_ref(), command.event_source()) {
         Ok(built) => built,
         Err(e) => return Ended::Code(io.fail(json, e.kind(), &e.to_string())),
     };

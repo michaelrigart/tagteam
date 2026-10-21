@@ -25,7 +25,7 @@ use tagteam_engine::tokens::{
     TokenCounts, TokenGrouping, TokenPeriod, TokenQuery, TokenReport,
 };
 use tagteam_engine::vault::{KeychainVault, Vault};
-use tagteam_engine::{Engine, EngineConfig};
+use tagteam_engine::{Engine, EngineConfig, EventSource};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::{
     FakeProcess, MARKER_FILE, PENDING_LAUNCH_DIR, PendingLaunch, Provider, RunShell, parse_lstart,
@@ -1538,6 +1538,7 @@ fn engine_with(fx: &Fx, fake: Arc<FakeAgent>, settings: Settings) -> Engine {
         process: fx.process.clone(),
         spawner: fx.spawner.clone(),
         run_shell: RunShell::Outside,
+        source: EventSource::Cli,
     })
 }
 

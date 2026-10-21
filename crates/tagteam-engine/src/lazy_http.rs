@@ -49,6 +49,7 @@ mod tests {
 
     use super::*;
     use crate::engine::{Engine, EngineConfig};
+    use crate::event::EventSource;
     use crate::oracle::{CachingOracle, HttpOracle};
     use crate::registry::ProviderRegistry;
     use crate::settings::Settings;
@@ -140,6 +141,7 @@ mod tests {
             process: Arc::new(tagteam_provider::liveness::FakeProcessProbe::new()),
             spawner: Arc::new(tagteam_provider::process::ScriptedSpawner::new()),
             run_shell: RunShell::Outside,
+            source: EventSource::Cli,
         });
         assert!(matches!(
             engine.status(&ProviderId::new(CLAUDE_CODE)).unwrap(),

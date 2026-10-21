@@ -20,7 +20,7 @@ use tagteam_engine::oracle::{CachingOracle, HttpOracle, Oracle};
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::vault::{KeychainVault, SERVICE, Vault};
-use tagteam_engine::{Engine, EngineConfig, EngineError};
+use tagteam_engine::{Engine, EngineConfig, EngineError, EventSource};
 use tagteam_provider::http::{Http, Method};
 use tagteam_provider::mock_server::{MockReply, MockServer};
 use tagteam_provider::profile::RunShell;
@@ -297,6 +297,7 @@ fn a_hanging_profile_endpoint_delays_a_switch_by_its_timeout_and_holds_no_lock()
         process: fx.process.clone(),
         spawner: fx.spawner.clone(),
         run_shell: RunShell::Outside,
+        source: EventSource::Cli,
     });
     let env = fx.env.clone();
     let watched = b.clone();

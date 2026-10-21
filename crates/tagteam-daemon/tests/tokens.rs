@@ -23,7 +23,7 @@ use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::tokens::{IndexProgress, IndexState, Wait, tokens_lock_path};
 use tagteam_engine::vault::{KeychainVault, Vault};
-use tagteam_engine::{Engine, EngineConfig, EngineError};
+use tagteam_engine::{Engine, EngineConfig, EngineError, EventSource};
 use tagteam_provider::{
     Env, FakeClock, FakeKeychain, FakeProcess, FakeProcessProbe, FlockGuard, RunShell,
     ScriptedHttp, ScriptedSpawner,
@@ -67,6 +67,7 @@ fn fx(store: bool) -> Fx {
         process: process.clone(),
         spawner: Arc::new(ScriptedSpawner::new()),
         run_shell: RunShell::Outside,
+        source: EventSource::Daemon,
     });
     if store {
         engine.store().unwrap();

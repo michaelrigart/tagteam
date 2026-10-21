@@ -12,8 +12,8 @@ use std::process::Output;
 use std::time::Duration;
 
 use common::{
-    Running, expire_vault, live_email, now_epoch_s, record_reading, std_cmd, two_fresh_accounts,
-    usage_window,
+    Running, cmd, expire_vault, live_email, now_epoch_s, record_reading, std_cmd,
+    two_fresh_accounts, usage_window,
 };
 use serde_json::{Value, json};
 use tagteam_cc::CLAUDE_CODE;
@@ -505,5 +505,27 @@ fn auto_names_the_daemon_when_the_daemon_holds_the_engine_lock() {
     assert_eq!(
         text(&auto(d.path(), &[]).stderr),
         "tagteam: auto-switch already runs for Claude Code\n"
+    );
+}
+
+#[test]
+fn auto_records_its_switch_as_auto_and_a_later_switch_as_cli() {
+    // Review refactor §8.7: the source is the command that built the engine.
+    let d = tempfile::tempdir().unwrap();
+    switching(d.path());
+    let out = auto(d.path(), &["--once"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let last = |d: &Path| {
+        let e = store(d).events().unwrap().pop().unwrap();
+        (e.kind, e.trigger, e.source)
+    };
+    assert_eq!(
+        last(d.path()),
+        ("switch".into(), Some("proactive".into()), "auto".into())
+    );
+    cmd(d.path()).args(["switch", "2"]).assert().success();
+    assert_eq!(
+        last(d.path()),
+        ("switch".into(), Some("manual".into()), "cli".into())
     );
 }

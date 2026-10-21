@@ -678,6 +678,7 @@ mod tests {
 
     use super::*;
     use crate::engine::EngineConfig;
+    use crate::event::EventSource;
     use crate::oracle::NoOracle;
     use crate::registry::ProviderRegistry;
     use crate::settings::Settings;
@@ -698,6 +699,7 @@ mod tests {
             process: Arc::new(FakeProcessProbe::new()),
             spawner: Arc::new(ScriptedSpawner::new()),
             run_shell: RunShell::Outside,
+            source: EventSource::Cli,
         })
     }
 

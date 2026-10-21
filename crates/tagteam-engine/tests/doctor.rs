@@ -15,6 +15,7 @@ use std::time::Duration;
 use common::*;
 use tagteam_cc::live::Platform;
 use tagteam_core::{AccountId, ProviderId, WindowKind};
+use tagteam_engine::EventSource;
 use tagteam_engine::daemon::{daemon_lock_path, daemon_socket_path};
 use tagteam_engine::doctor::{DoctorOptions, DoctorReport};
 use tagteam_engine::service::{ServiceKind, render_unit, unit_path};
@@ -2085,6 +2086,7 @@ fn engine_for(
         process: fx.process.clone(),
         run_shell: tagteam_provider::profile::RunShell::Outside,
         spawner: fx.spawner.clone(),
+        source: EventSource::Cli,
     })
 }
 
@@ -2222,6 +2224,7 @@ impl Split {
             process: fx.process.clone(),
             run_shell: tagteam_provider::profile::RunShell::Outside,
             spawner: fx.spawner.clone(),
+            source: EventSource::Cli,
         });
         Split {
             engine,
