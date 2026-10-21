@@ -341,6 +341,14 @@ mod tests {
             state.overlay = Some(confirm(ConfirmThen::Reply(AnswerTo(1)), true));
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
             let ((x0, y0), (x1, y1)) = corners(&buf);
+            // Inside the box the screen is cleared: the question is not dimmed.
+            let (qx, qy) = locate(&buf, "Remove").unwrap();
+            for x in qx..qx + 6 {
+                assert!(
+                    !buf[(x, qy)].modifier.contains(Modifier::DIM),
+                    "{theme:?} question {x}"
+                );
+            }
             for y in 0..24 {
                 for x in (0..80).filter(|x| !(x0..=x1).contains(x) || !(y0..=y1).contains(&y)) {
                     assert!(

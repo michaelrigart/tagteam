@@ -933,7 +933,7 @@ mod tests {
             .iter()
             .position(|l| l.contains("the choices could not be read"))
             .unwrap_or_else(|| panic!("{drawn:?}"));
-        assert!(drawn[at + 2].contains('…'), "{drawn:?}");
+        assert!(drawn[at + 2].ends_with("…  │"), "{drawn:?}");
         assert!(
             drawn[at + 4].contains("Esc cancel ─╯"),
             "the keys in the border, after a padding row: {drawn:?}"

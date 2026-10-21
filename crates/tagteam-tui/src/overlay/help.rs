@@ -42,7 +42,7 @@ pub(crate) const MARKS: &[(&str, Role, &str)] = &[
 
 pub(super) fn key(state: &State, scroll: &mut u16, key: KeyEvent) -> KeyOutcome {
     match key.code {
-        KeyCode::Char('?' | 'q') | KeyCode::Esc | KeyCode::Enter => KeyOutcome::Close,
+        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter => KeyOutcome::Close,
         code => {
             let rows = rows(state, state.size.0).len();
             *scroll = scrolled(*scroll, code, rows, body_at(state).height);
