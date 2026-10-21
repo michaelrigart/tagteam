@@ -120,7 +120,8 @@ const KEYCHAIN: &str = "can't read the Keychain";
 const NEEDS_LOGIN: &str = "needs a new login";
 const OTHER_ACCOUNT: &str = "logged in as another account";
 const NO_LOGIN: &str = "no stored login";
-const RATE_LIMITED: &str = "rate-limited";
+/// A usage check the provider turned away for now (§11.1); also the TUI's STATUS phrase.
+pub const RATE_LIMITED: &str = "rate-limited";
 const BUDGET: &str = "paused to stay within the request budget";
 const CHECK_FAILED: &str = "usage check failed";
 

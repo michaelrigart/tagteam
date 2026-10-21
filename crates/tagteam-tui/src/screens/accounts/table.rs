@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use tagteam_core::{AccountId, Pace, Window, WindowKind};
 use tagteam_engine::switch::BestForecast;
 use tagteam_engine::views::AccountView;
-use tagteam_engine::words::{self, Problem};
+use tagteam_engine::words;
 
 use super::status;
 use crate::chrome::fit_spans;
@@ -152,9 +152,7 @@ impl<'a> Table<'a> {
                         .filter_map(reading)
                         .flatten()
                         .filter(|(w, _)| w.key == key)
-                        .map(|(w, _)| {
-                            words::spend_text(w).map_or(PCT_W + AHEAD_W, |s| width_of(&s))
-                        })
+                        .map(|(w, _)| width_of(&spend_value(w)))
                         .fold(width_of(words::MISSING), usize::max);
                     Some(Column {
                         key,
@@ -367,13 +365,14 @@ impl<'a> Table<'a> {
         spans
     }
 
-    /// UPDATED: the reading's age, muted, warn for an old reading; `—` faint without one.
+    /// UPDATED: the reading's age, muted, warn when the reading is not decision-grade
+    /// (§6.3), whatever the status; `—` faint without one.
     fn updated(&self, v: &AccountView, now_s: i64, theme: Theme) -> Vec<Span<'static>> {
         let (text, role) = match (reading(v), v.usage.age_s) {
             (Some(_), Some(age)) => {
-                let old = words::problem(v) == Some(Problem::OldReading);
+                let stale = !v.usage.decision_grade;
                 let age = words::duration(age_now(age, self.read_at_s, now_s));
-                (age, if old { Role::Warn } else { Role::Muted })
+                (age, if stale { Role::Warn } else { Role::Muted })
             }
             _ => (words::MISSING.to_owned(), Role::Faint),
         };
@@ -405,14 +404,24 @@ fn mark(v: &AccountView, theme: Theme) -> Span<'static> {
     }
 }
 
-/// A window cell, exactly `col.width()` wide: `{gauge} {pct:>4}{▲}` (T3-15), spend's amounts,
-/// or `—` faint where the reading lacks the window.
+/// A spend window's value: its amounts, else its percentage.
+fn spend_value(w: &Window) -> String {
+    words::spend_text(w).unwrap_or_else(|| format!("{}%", w.pct.round() as i64))
+}
+
+/// A window cell, exactly `col.width()` wide: `{gauge} {pct:>4}{▲}` (T3-15), or spend's value
+/// right-aligned (§4.3); `—` faint where the reading lacks the window, where its value would
+/// end.
 fn cell(col: &Column, ws: &[(Window, Pace)], theme: Theme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let gauge_w = col.gauge + usize::from(col.gauge > 0);
+    let spend = col.kind == WindowKind::Spend;
+    let right = |text: &str| " ".repeat(col.width().saturating_sub(width_of(text)));
     match ws.iter().find(|(w, _)| w.key == col.key) {
         None => {
-            if col.kind != WindowKind::Spend {
+            if spend {
+                spans.push(Span::raw(right(words::MISSING)));
+            } else {
                 spans.push(Span::raw(" ".repeat(gauge_w + PCT_W - 1)));
             }
             spans.push(Span::styled(words::MISSING, theme.role(Role::Faint)));
@@ -420,8 +429,11 @@ fn cell(col: &Column, ws: &[(Window, Pace)], theme: Theme) -> Vec<Span<'static>>
         Some((w, p)) => {
             let pct = w.pct.round() as i64;
             let style = theme.severity(words::severity(pct));
-            match words::spend_text(w).filter(|_| col.kind == WindowKind::Spend) {
-                Some(spend) => spans.push(Span::styled(spend, style)),
+            match spend.then(|| spend_value(w)) {
+                Some(value) => {
+                    spans.push(Span::raw(right(&value)));
+                    spans.push(Span::styled(value, style));
+                }
                 None => {
                     if col.gauge > 0 {
                         let expected = match col.kind {

@@ -18,7 +18,7 @@ const NO_LIMITS: &str = "has no usage limits to show";
 /// A STATUS phrase: its glyph, when it has one, its words and its role.
 struct Phrase {
     glyph: Option<&'static str>,
-    words: &'static str,
+    words: String,
     role: Role,
 }
 
@@ -45,7 +45,7 @@ fn problem_words(problem: Problem) -> Option<&'static str> {
         Problem::NeedsLogin => "new login",
         Problem::LoginExpired => "expired",
         Problem::NoLogin => "no login",
-        Problem::RateLimited => "rate-limited",
+        Problem::RateLimited => words::RATE_LIMITED,
         Problem::Keychain => "keychain",
         Problem::Budget => "budget",
         Problem::OtherAccount | Problem::Retrying => "retrying",
@@ -59,19 +59,24 @@ fn first(v: &AccountView, this: bool, best: bool) -> Option<Phrase> {
     if let Some(problem) = words::problem(v) {
         if let Some(words) = problem_words(problem) {
             let (glyph, role) = mark(problem);
+            let words = words.to_owned();
             return Some(Phrase { glyph, words, role });
         }
     }
     let (glyph, words, role) = if v.row.disabled {
-        (Some(DISABLED), "disabled", Role::Muted)
+        (Some(DISABLED), "disabled".to_owned(), Role::Muted)
     } else if this {
-        (Some(words::IN_SESSION), "this session", Role::Muted)
+        (
+            Some(words::IN_SESSION),
+            "this session".to_owned(),
+            Role::Muted,
+        )
     } else if v.active {
-        (None, "in use", Role::Accent)
+        (None, "in use".to_owned(), Role::Accent)
     } else if best {
-        (None, "best", Role::Text)
+        (None, "best".to_owned(), Role::Text)
     } else if v.usage.status == UsageStatus::ApiKey {
-        (None, "api key", Role::Muted)
+        (None, words::status_words(&v.usage), Role::Muted)
     } else {
         return None;
     };
@@ -84,7 +89,7 @@ pub(crate) fn phrase(v: &AccountView, this: bool, best: bool) -> Option<(String,
     let p = first(v, this, best)?;
     let text = match p.glyph {
         Some(glyph) => format!("{glyph} {}", p.words),
-        None => p.words.to_owned(),
+        None => p.words,
     };
     Some((text, p.role))
 }
