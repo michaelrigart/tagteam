@@ -227,7 +227,7 @@ fn on_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
         KeyCode::Tab => show(state, state.screen.next(), now_ms),
         KeyCode::BackTab => show(state, state.screen.prev(), now_ms),
         KeyCode::Char('?') => {
-            state.overlay = Some(Overlay::Help);
+            state.overlay = Some(Overlay::Help { scroll: 0 });
             vec![]
         }
         _ => match actions::handle_action_key(state, key, now_ms) {
@@ -343,7 +343,7 @@ mod tests {
     fn help_toggles_and_takes_the_keys_while_open() {
         let mut state = fresh(Screen::Accounts);
         update(&mut state, ch('?'), NOW_MS);
-        assert!(matches!(state.overlay, Some(Overlay::Help)));
+        assert!(matches!(state.overlay, Some(Overlay::Help { .. })));
         update(&mut state, ch('3'), NOW_MS);
         assert_eq!(state.screen, Screen::Accounts, "the overlay has the keys");
         update(&mut state, ch('?'), NOW_MS);
@@ -410,7 +410,7 @@ mod tests {
         assert!(update(&mut state, Msg::ShutdownBegan { code: 143 }, NOW_MS).is_empty());
         assert_eq!(state.quitting, Some(143));
         assert!(state.dirty);
-        assert!(matches!(state.overlay, Some(Overlay::Help)));
+        assert!(matches!(state.overlay, Some(Overlay::Help { .. })));
     }
 
     #[test]

@@ -400,7 +400,7 @@ mod tests {
             [Cmd::Act(Action::Doctor { .. })]
         ));
         update(&mut state, ch('?'), NOW_MS);
-        assert!(matches!(state.overlay, Some(Overlay::Help)));
+        assert!(matches!(state.overlay, Some(Overlay::Help { .. })));
     }
 
     #[test]
@@ -1227,7 +1227,7 @@ mod tests {
         assert!(
             drawn
                 .iter()
-                .any(|l| l.contains("R") && l.contains("run a session"))
+                .any(|l| l.contains("R") && l.contains("run a session on it here"))
         );
         update(&mut state, ch('?'), NOW_MS);
         assert!(state.overlay.is_none());

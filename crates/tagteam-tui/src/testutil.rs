@@ -340,6 +340,14 @@ pub(crate) fn canon(theme: Theme, row: &str) -> String {
         .collect()
 }
 
+/// The footer row of keys `left` on a terminal `width` wide, as `text_of` reads it: `left` from
+/// column 0, a gap, then `? keys  q quit` ending one column in.
+pub(crate) fn footer_row(left: &str, width: usize) -> String {
+    let pinned = "? keys  q quit";
+    let gap = width - 1 - crate::view::width_of(left) - crate::view::width_of(pinned);
+    format!("{left}{}{pinned}", " ".repeat(gap))
+}
+
 /// Where `needle` first appears in `buf`: its column and row.
 pub(crate) fn locate(buf: &Buffer, needle: &str) -> Option<(u16, u16)> {
     (0..buf.area.height).find_map(|y| {

@@ -11,6 +11,7 @@ pub(crate) mod daemon;
 mod detect;
 pub mod host;
 mod input;
+mod keys;
 pub(crate) mod lanes;
 pub mod live;
 pub(crate) mod msg;
