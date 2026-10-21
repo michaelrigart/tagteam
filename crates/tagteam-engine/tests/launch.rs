@@ -1867,7 +1867,7 @@ mod hooked {
 
         let err = refused(fx.engine.launch(&planned, claude_bin(), &cwd));
 
-        assert_eq!(err.kind(), "invalid-input", "{err}");
+        assert_eq!(err.kind(), "relogin-required", "{err}");
         assert!(err.to_string().contains("no stored credential"), "{err}");
         assert!(!fx.profile_dir(&a).exists(), "nothing was created");
     }

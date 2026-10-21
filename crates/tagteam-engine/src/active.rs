@@ -439,11 +439,8 @@ impl Engine {
             }
             None => None,
         }
-        .ok_or_else(|| {
-            EngineError::InvalidInput(format!(
-                "the live login is not managed by tagteam; only {} refreshes it",
-                p.display_name()
-            ))
+        .ok_or_else(|| EngineError::UnmanagedLiveLogin {
+            app: p.display_name(),
         })?;
         if !p.kind_traits(&row.kind).refreshable {
             return Err(EngineError::InvalidInput(format!(

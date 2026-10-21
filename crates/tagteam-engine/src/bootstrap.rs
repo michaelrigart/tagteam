@@ -174,7 +174,7 @@ impl Engine {
                 label: row.label.clone(),
                 source,
             }),
-            _ => Err(EngineError::InvalidInput(format!(
+            _ => Err(EngineError::NoStoredCredential(format!(
                 "{} (position {}) has no stored credential; log in and run `tagteam add` again",
                 row.label, row.position
             ))),
@@ -321,7 +321,9 @@ impl Engine {
             ))
         })?;
         let marker = self.own_marker(cx.row, cx.profile)?.ok_or_else(|| {
-            EngineError::InvalidInput(format!("{} has no profile marker", cx.profile.display()))
+            EngineError::ProfileMarkerMissing {
+                path: cx.profile.to_path_buf(),
+            }
         })?;
         let recorded = marker.config_dir.clone();
         let current = current_spelling(p, cx.profile)?;

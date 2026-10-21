@@ -196,7 +196,7 @@ fn a_target_emptied_while_a_direct_switch_waits_reports_no_stored_credential() {
     fx.add("b@x.co", "rt-b"); // live
     empty_vault_while_waiting(&fx, &a);
     let err = fx.switch_to(&a, false).unwrap_err();
-    assert_eq!(err.kind(), "invalid-input", "{err}");
+    assert_eq!(err.kind(), "relogin-required", "{err}");
     assert!(err.to_string().contains("no stored credential"), "{err}");
     assert!(common::journal(&fx).is_none());
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));

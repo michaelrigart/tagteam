@@ -246,8 +246,8 @@ impl Engine {
     ) -> Result<String, EngineError> {
         self.own_marker(row, profile)?
             .map(|m| m.config_dir)
-            .ok_or_else(|| {
-                EngineError::InvalidInput(format!("{} has no profile marker", profile.display()))
+            .ok_or_else(|| EngineError::ProfileMarkerMissing {
+                path: profile.to_path_buf(),
             })
     }
 

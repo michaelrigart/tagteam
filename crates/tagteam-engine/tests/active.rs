@@ -706,7 +706,7 @@ fn an_unmanaged_live_login_is_refused() {
 
     let err = active(&fx, ActiveTrigger::Expired).unwrap_err();
 
-    assert_eq!(err.kind(), "invalid-input");
+    assert_eq!(err.kind(), "unmanaged-account");
     assert_eq!(token_requests(&fx), 0);
 }
 

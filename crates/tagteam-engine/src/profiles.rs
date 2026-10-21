@@ -92,10 +92,9 @@ impl Engine {
         let marker = match ProfileMarker::read(profile) {
             Read::Present(m) => m,
             Read::Absent => {
-                return Err(EngineError::InvalidInput(format!(
-                    "{} is missing, so the profile's outer home is unknown",
-                    profile.join(MARKER_FILE).display()
-                )));
+                return Err(EngineError::OuterHomeUnknown {
+                    marker: profile.join(MARKER_FILE),
+                });
             }
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
         };
