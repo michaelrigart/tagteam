@@ -20,7 +20,9 @@ use crate::collect::{CollectMode, CollectReport};
 use crate::engine::{Engine, GuardRequest};
 use crate::error::EngineError;
 use crate::store::{AccountRow, Store, backoff_holds};
-use crate::switch::{AutoFreshened, AutoPerform, SwitchReason, SwitchRequest, SwitchTarget};
+use crate::switch::{
+    AutoFreshened, AutoPerform, FreshenFailure, SwitchReason, SwitchRequest, SwitchTarget,
+};
 
 /// Where a tick's events go (Decision 6). The CLI renders them as human lines or as JSONL.
 pub trait EventSink {
@@ -605,7 +607,7 @@ impl AutoEngine<'_> {
             let fresh = match self.engine.freshen_auto(p, &row) {
                 Ok(fresh) => fresh,
                 Err(e) if fatal(&e) => return Err(e),
-                Err(e) => AutoFreshened::Failed(e.to_string()),
+                Err(e) => AutoFreshened::Failed(FreshenFailure::Text(e.to_string())),
             };
             match fresh {
                 AutoFreshened::Ready => {}
