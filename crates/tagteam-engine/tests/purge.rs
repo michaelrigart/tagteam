@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use common::{FakeFx, Fx, add, crashed_switch, credential, journal, vault_fp};
+use common::{FakeFx, Fx, add, crashed_switch, credential, held_guard, journal, vault_fp};
 use serde_json::json;
 use tagteam_cc::live::Platform;
 use tagteam_core::tokens::TokenCounts;
@@ -396,18 +396,21 @@ fn a_provider_purge_keeps_the_other_provider_s_data_and_the_usage_budget() {
     }
     // FakeAgent's switch in flight, by a live process: not this purge's to settle.
     store
-        .insert_journal(&JournalRow {
-            provider: fake.clone(),
-            holder: ProcessStamp::current().unwrap(),
-            from_id: None,
-            to_id: h.clone(),
-            from_fp: None,
-            from_identity: None,
-            to_fp: "sha256:00".into(),
-            to_epoch: None,
-            started_at: 1,
-            prior: None,
-        })
+        .insert_journal(
+            &held_guard(&fx.env),
+            &JournalRow {
+                provider: fake.clone(),
+                holder: ProcessStamp::current().unwrap(),
+                from_id: None,
+                to_id: h.clone(),
+                from_fp: None,
+                from_identity: None,
+                to_fp: "sha256:00".into(),
+                to_epoch: None,
+                started_at: 1,
+                prior: None,
+            },
+        )
         .unwrap();
 
     let plan = ffx.engine.purge_plan(Some(&cc)).unwrap();

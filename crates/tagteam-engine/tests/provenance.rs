@@ -499,6 +499,7 @@ fn a_replacement_between_planning_and_freshening_stale_marks_the_profile() {
     // rotation: judged with the planning row's epoch, that would capture the profile over the
     // replacement. Freshen reads the row again under the account lock, sees the moved epoch,
     // and the replacement wins (§12.5).
+    use common::held_lock;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tagteam_engine::store::LoginMeta;
     let fx = Fx::new();
@@ -508,6 +509,7 @@ fn a_replacement_between_planning_and_freshening_stale_marks_the_profile() {
     let cc = fx.cc.clone();
     let id = a.clone();
     let seed_fp = fp(&fx, "rt-a");
+    let env = fx.env.clone();
     let once = AtomicBool::new(false);
     fx.engine.on_point(
         "freshen-before-lock",
@@ -526,10 +528,11 @@ fn a_replacement_between_planning_and_freshening_stale_marks_the_profile() {
             };
             // The vault already holds rt-a: the replacement's write leaves its bytes as they
             // are, and only the epoch moves.
+            let lock = held_lock(&env, &id);
             store
-                .begin_replacement(&id, &seed_fp, &meta, false)
+                .begin_replacement(&lock, &seed_fp, &meta, false)
                 .unwrap();
-            store.finish_replacement(&id, 0).unwrap();
+            store.finish_replacement(&lock, 0).unwrap();
         }),
     );
 

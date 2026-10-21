@@ -3,7 +3,7 @@
 //! `replacement-unreadable`, naming the account and `tagteam remove`; `remove` deletes it.
 mod common;
 
-use common::{Fx, credential};
+use common::{Fx, credential, held_lock};
 use tagteam_core::AccountId;
 use tagteam_engine::EngineError;
 use tagteam_engine::store::LoginMeta;
@@ -99,7 +99,7 @@ fn a_replacement_that_never_landed_rolls_back_without_its_metadata() {
         let identity = fx.cc.token_identity("a@x.co");
         store
             .begin_replacement(
-                &a,
+                &held_lock(&fx.env, &a),
                 "sha256:a-generation-never-written",
                 &LoginMeta {
                     identity_key: "a@x.co\n",

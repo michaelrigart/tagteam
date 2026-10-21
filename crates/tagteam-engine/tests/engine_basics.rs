@@ -4,7 +4,7 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::Fx;
+use common::{Fx, held_lock};
 use serde_json::json;
 use tagteam_core::{AccountId, OracleVerdict, ProviderId};
 use tagteam_engine::account_lock::AccountLock;
@@ -68,7 +68,12 @@ fn a_pending_replacement_is_reconciled_by_the_next_lock_holder() {
     };
     // A replacement that died before writing the vault: rolled back, metadata untouched.
     store
-        .begin_replacement(&id, "sha256:never-written", &meta, false)
+        .begin_replacement(
+            &held_lock(&fx.env, &id),
+            "sha256:never-written",
+            &meta,
+            false,
+        )
         .unwrap();
     drop(fx.engine.lock_account(&id).unwrap());
     let row = store.account(&id).unwrap().unwrap();
@@ -83,7 +88,7 @@ fn a_pending_replacement_is_reconciled_by_the_next_lock_holder() {
     fx.kc.put(SERVICE, id.as_str(), &cred);
     let fp = fx.cc.fingerprint(&cred).unwrap();
     store
-        .begin_replacement(&id, fp.as_str(), &meta, false)
+        .begin_replacement(&held_lock(&fx.env, &id), fp.as_str(), &meta, false)
         .unwrap();
     drop(fx.engine.lock_account(&id).unwrap());
     let row = store.account(&id).unwrap().unwrap();

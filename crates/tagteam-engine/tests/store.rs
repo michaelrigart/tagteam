@@ -1,6 +1,6 @@
 mod common;
 
-use common::{Fx, add, cc, identity};
+use common::{Fx, add, cc, held_guard, held_lock, identity};
 use serde_json::json;
 use std::cell::Cell;
 use std::os::unix::fs::PermissionsExt;
@@ -11,7 +11,7 @@ use tagteam_engine::store::{
     Activation, AutoRecord, DisplacedRow, EventRow, JournalRow, LoginMeta, NewAccount, SeedLaunch,
     Store, StoreError,
 };
-use tagteam_provider::{Identity, ProcessStamp};
+use tagteam_provider::{Env, Identity, ProcessStamp};
 
 /// Reads the on-disk journal mode through a fresh, independent connection, so the assertion
 /// reflects what was actually persisted rather than one `Store`'s in-memory view of it.
@@ -102,6 +102,7 @@ fn move_swaps_when_the_position_is_taken() {
 #[test]
 fn replacement_markers_move_the_epoch() {
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let s = Store::open(&d.path().join("t.db")).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let replacement = Identity {
@@ -115,7 +116,7 @@ fn replacement_markers_move_the_epoch() {
         login_expires_at: Some(42),
         from_live: false,
     };
-    s.begin_replacement(&a, "sha256:x", &meta("api_key"), false)
+    s.begin_replacement(&held_lock(&env, &a), "sha256:x", &meta("api_key"), false)
         .unwrap();
     let r = s.account(&a).unwrap().unwrap();
     assert_eq!(
@@ -123,7 +124,7 @@ fn replacement_markers_move_the_epoch() {
         (1, Some("sha256:x"), "oauth")
     );
     // Finishing installs the recorded metadata, kind included.
-    s.finish_replacement(&a, 0).unwrap();
+    s.finish_replacement(&held_lock(&env, &a), 0).unwrap();
     let r = s.account(&a).unwrap().unwrap();
     assert_eq!(
         (r.login_epoch, r.replacing_fp, r.kind.as_str()),
@@ -133,8 +134,13 @@ fn replacement_markers_move_the_epoch() {
         (r.account_uuid.as_deref(), r.login_expires_at),
         (Some("u-new"), Some(42))
     );
-    s.begin_replacement(&a, "sha256:y", &meta("setup_token"), false)
-        .unwrap();
+    s.begin_replacement(
+        &held_lock(&env, &a),
+        "sha256:y",
+        &meta("setup_token"),
+        false,
+    )
+    .unwrap();
     s.rollback_replacement(&a).unwrap();
     let r = s.account(&a).unwrap().unwrap();
     assert_eq!(
@@ -146,6 +152,7 @@ fn replacement_markers_move_the_epoch() {
 #[test]
 fn commit_switch_is_one_transaction_and_delete_clears_active() {
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let s = Store::open(&d.path().join("t.db")).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let b = add(&s, &cc(), "b", "b@x.co", 2);
@@ -161,7 +168,7 @@ fn commit_switch_is_one_transaction_and_delete_clears_active() {
         started_at: 5,
         prior: None,
     };
-    s.insert_journal(&j).unwrap();
+    s.insert_journal(&held_guard(&env), &j).unwrap();
     assert_eq!(s.journal(&cc()).unwrap().unwrap(), j);
     // A second write replaces the row in one statement, carrying the row it superseded.
     let replaced = JournalRow {
@@ -169,9 +176,9 @@ fn commit_switch_is_one_transaction_and_delete_clears_active() {
         prior: Some(Box::new(j.clone())),
         ..j.clone()
     };
-    s.insert_journal(&replaced).unwrap();
+    s.insert_journal(&held_guard(&env), &replaced).unwrap();
     assert_eq!(s.journal(&cc()).unwrap().unwrap(), replaced);
-    s.insert_journal(&j).unwrap();
+    s.insert_journal(&held_guard(&env), &j).unwrap();
     let ev = EventRow {
         at: 6,
         provider: cc(),
@@ -322,6 +329,7 @@ fn concurrent_first_opens_all_succeed() {
 #[test]
 fn finish_replacement_refuses_metadata_missing_required_fields() {
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let path = d.path().join("t.db");
     let s = Store::open(&path).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
@@ -333,7 +341,8 @@ fn finish_replacement_refuses_metadata_missing_required_fields() {
         login_expires_at: Some(42),
         from_live: false,
     };
-    s.begin_replacement(&a, "sha256:x", &meta, false).unwrap();
+    s.begin_replacement(&held_lock(&env, &a), "sha256:x", &meta, false)
+        .unwrap();
     drop(s);
     {
         // Corrupt the recorded metadata as if written by an incompatible version: no
@@ -347,7 +356,7 @@ fn finish_replacement_refuses_metadata_missing_required_fields() {
     }
     let s = Store::open(&path).unwrap();
     assert!(matches!(
-        s.finish_replacement(&a, 0),
+        s.finish_replacement(&held_lock(&env, &a), 0),
         Err(StoreError::ReplacementUnreadable(_))
     ));
     // Untouched: the original login and the pending marker are both still there.
@@ -359,6 +368,7 @@ fn finish_replacement_refuses_metadata_missing_required_fields() {
 #[test]
 fn begin_replacement_is_guarded_against_a_second_start() {
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let s = Store::open(&d.path().join("t.db")).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let replacement = identity("a@x.co");
@@ -369,10 +379,15 @@ fn begin_replacement_is_guarded_against_a_second_start() {
         login_expires_at: None,
         from_live: false,
     };
-    s.begin_replacement(&a, "sha256:x", &meta("api_key"), false)
+    s.begin_replacement(&held_lock(&env, &a), "sha256:x", &meta("api_key"), false)
         .unwrap();
     assert!(matches!(
-        s.begin_replacement(&a, "sha256:y", &meta("setup_token"), false),
+        s.begin_replacement(
+            &held_lock(&env, &a),
+            "sha256:y",
+            &meta("setup_token"),
+            false
+        ),
         Err(StoreError::ReplacementPending)
     ));
 }
@@ -380,6 +395,7 @@ fn begin_replacement_is_guarded_against_a_second_start() {
 #[test]
 fn rollback_after_rollback_leaves_the_epoch_at_its_start() {
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let s = Store::open(&d.path().join("t.db")).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let start = s.account(&a).unwrap().unwrap().login_epoch;
@@ -391,7 +407,8 @@ fn rollback_after_rollback_leaves_the_epoch_at_its_start() {
         login_expires_at: None,
         from_live: false,
     };
-    s.begin_replacement(&a, "sha256:x", &meta, false).unwrap();
+    s.begin_replacement(&held_lock(&env, &a), "sha256:x", &meta, false)
+        .unwrap();
     s.rollback_replacement(&a).unwrap();
     s.rollback_replacement(&a).unwrap();
     assert_eq!(s.account(&a).unwrap().unwrap().login_epoch, start);
@@ -400,6 +417,7 @@ fn rollback_after_rollback_leaves_the_epoch_at_its_start() {
 #[test]
 fn a_missing_account_is_reported_by_both_replacement_entry_points() {
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let s = Store::open(&d.path().join("t.db")).unwrap();
     let missing = AccountId::from_string("ghost");
     let replacement = identity("a@x.co");
@@ -411,11 +429,11 @@ fn a_missing_account_is_reported_by_both_replacement_entry_points() {
         from_live: false,
     };
     assert!(matches!(
-        s.begin_replacement(&missing, "sha256:x", &meta, false),
+        s.begin_replacement(&held_lock(&env, &missing), "sha256:x", &meta, false),
         Err(StoreError::NoSuchAccount)
     ));
     assert!(matches!(
-        s.finish_replacement(&missing, 0),
+        s.finish_replacement(&held_lock(&env, &missing), 0),
         Err(StoreError::NoSuchAccount)
     ));
 }
@@ -423,6 +441,7 @@ fn a_missing_account_is_reported_by_both_replacement_entry_points() {
 #[test]
 fn a_malformed_prior_journal_snapshot_is_reported_not_silently_dropped() {
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let path = d.path().join("t.db");
     let s = Store::open(&path).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
@@ -439,7 +458,7 @@ fn a_malformed_prior_journal_snapshot_is_reported_not_silently_dropped() {
         started_at: 5,
         prior: None,
     };
-    s.insert_journal(&j).unwrap();
+    s.insert_journal(&held_guard(&env), &j).unwrap();
     drop(s);
     {
         // A `prior` snapshot missing a required field: valid JSON, not a valid JournalRow.
@@ -671,21 +690,25 @@ fn the_record_lands_with_the_commit_or_not_at_all() {
     // One transaction (§9.4 step 9): a commit whose active-account write fails, here on its
     // foreign key, leaves no record, and the journal row stays for recovery.
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let s = Store::open(&d.path().join("t.db")).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let b = add(&s, &cc(), "b", "b@x.co", 2);
-    s.insert_journal(&JournalRow {
-        provider: cc(),
-        holder: ProcessStamp { pid: 1, start: 2 },
-        from_id: Some(a.clone()),
-        to_id: b.clone(),
-        from_fp: None,
-        from_identity: None,
-        to_fp: "sha256:b".into(),
-        started_at: 5,
-        to_epoch: None,
-        prior: None,
-    })
+    s.insert_journal(
+        &held_guard(&env),
+        &JournalRow {
+            provider: cc(),
+            holder: ProcessStamp { pid: 1, start: 2 },
+            from_id: Some(a.clone()),
+            to_id: b.clone(),
+            from_fp: None,
+            from_identity: None,
+            to_fp: "sha256:b".into(),
+            started_at: 5,
+            to_epoch: None,
+            prior: None,
+        },
+    )
     .unwrap();
     let ghost = AccountId::from_string("ghost");
     let ev = switch_event(&a, &ghost, "proactive", "auto");
@@ -888,22 +911,26 @@ fn a_prior_snapshot_from_before_to_epoch_reads_as_none() {
     // §9.6: a row written before the column has no epoch of its own. Its `prior` snapshot has
     // no `to_epoch` key at all, and still parses.
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let path = d.path().join("t.db");
     let s = Store::open(&path).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let b = add(&s, &cc(), "b", "b@x.co", 2);
-    s.insert_journal(&JournalRow {
-        provider: cc(),
-        holder: ProcessStamp { pid: 1, start: 2 },
-        from_id: Some(a),
-        to_id: b,
-        from_fp: None,
-        from_identity: None,
-        to_fp: "sha256:b".into(),
-        to_epoch: Some(1),
-        started_at: 5,
-        prior: None,
-    })
+    s.insert_journal(
+        &held_guard(&env),
+        &JournalRow {
+            provider: cc(),
+            holder: ProcessStamp { pid: 1, start: 2 },
+            from_id: Some(a),
+            to_id: b,
+            from_fp: None,
+            from_identity: None,
+            to_fp: "sha256:b".into(),
+            to_epoch: Some(1),
+            started_at: 5,
+            prior: None,
+        },
+    )
     .unwrap();
     drop(s);
     rusqlite::Connection::open(&path)
@@ -938,6 +965,7 @@ fn evidence_after(
     live_names_account: bool,
 ) -> Option<Activation> {
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let s = Store::open(&d.path().join("t.db")).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     add(&s, &cc(), "b", "b@x.co", 2);
@@ -947,7 +975,7 @@ fn evidence_after(
     }
     let incoming = identity("a@x.co");
     s.begin_replacement(
-        &a,
+        &held_lock(&env, &a),
         "sha256:x",
         &login_meta(&incoming, false),
         live_names_account,
@@ -986,16 +1014,27 @@ fn a_row_that_already_names_the_account_with_an_epoch_is_kept() {
     // An earlier replacement left the row at 0 while a moved to 1. A second one keeps it at 0,
     // the lineage the live store actually holds, rather than moving the mark to 1.
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let s = Store::open(&d.path().join("t.db")).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     s.set_active(&cc(), Some(&a), Some(0)).unwrap();
     let incoming = identity("a@x.co");
-    s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, false), false)
-        .unwrap();
-    s.finish_replacement(&a, 0).unwrap();
+    s.begin_replacement(
+        &held_lock(&env, &a),
+        "sha256:x",
+        &login_meta(&incoming, false),
+        false,
+    )
+    .unwrap();
+    s.finish_replacement(&held_lock(&env, &a), 0).unwrap();
 
-    s.begin_replacement(&a, "sha256:y", &login_meta(&incoming, false), true)
-        .unwrap();
+    s.begin_replacement(
+        &held_lock(&env, &a),
+        "sha256:y",
+        &login_meta(&incoming, false),
+        true,
+    )
+    .unwrap();
 
     let row = s.account(&a).unwrap().unwrap();
     assert_eq!(row.login_epoch, 2);
@@ -1014,11 +1053,17 @@ fn a_rolled_back_replacement_leaves_its_evidence_current() {
     // The evidence holds the epoch from before the increment, which a rollback restores: a
     // replacement that never landed stale-marks nothing.
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let s = Store::open(&d.path().join("t.db")).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let incoming = identity("a@x.co");
-    s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, false), true)
-        .unwrap();
+    s.begin_replacement(
+        &held_lock(&env, &a),
+        "sha256:x",
+        &login_meta(&incoming, false),
+        true,
+    )
+    .unwrap();
     assert!(
         s.live_store_stale(&s.account(&a).unwrap().unwrap())
             .unwrap()
@@ -1037,14 +1082,20 @@ fn finishing_a_replacement_taken_from_the_live_login_records_its_epoch() {
     // store current again. Any other replacer's leaves it stale-marked.
     for from_live in [true, false] {
         let d = tempfile::tempdir().unwrap();
+        let env = Env::for_test(d.path());
         let s = Store::open(&d.path().join("t.db")).unwrap();
         let a = add(&s, &cc(), "a", "a@x.co", 1);
         s.set_active(&cc(), Some(&a), Some(0)).unwrap();
         let incoming = identity("a@x.co");
-        s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, from_live), true)
-            .unwrap();
+        s.begin_replacement(
+            &held_lock(&env, &a),
+            "sha256:x",
+            &login_meta(&incoming, from_live),
+            true,
+        )
+        .unwrap();
 
-        s.finish_replacement(&a, 0).unwrap();
+        s.finish_replacement(&held_lock(&env, &a), 0).unwrap();
 
         let want = if from_live { 1 } else { 0 };
         assert_eq!(
@@ -1068,16 +1119,22 @@ fn a_finish_never_overwrites_a_switch_committed_since_the_replacer_died() {
     // An `add` over a died after its vault write; a switch to b committed before anyone
     // reconciled a. That record is newer than the one the `add` would have written.
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let s = Store::open(&d.path().join("t.db")).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let b = add(&s, &cc(), "b", "b@x.co", 2);
     let incoming = identity("a@x.co");
-    s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, true), true)
-        .unwrap();
+    s.begin_replacement(
+        &held_lock(&env, &a),
+        "sha256:x",
+        &login_meta(&incoming, true),
+        true,
+    )
+    .unwrap();
     s.commit_switch(&cc(), &b, 0, &switch_event_to(&b), None)
         .unwrap();
 
-    s.finish_replacement(&a, 0).unwrap();
+    s.finish_replacement(&held_lock(&env, &a), 0).unwrap();
 
     assert_eq!(
         s.activation(&cc()).unwrap(),
@@ -1092,13 +1149,19 @@ fn a_finish_never_overwrites_a_switch_committed_since_the_replacer_died() {
 fn replacement_metadata_without_from_live_is_not_from_the_live_login() {
     // A marker recorded before the field existed.
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let path = d.path().join("t.db");
     let s = Store::open(&path).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     s.set_active(&cc(), Some(&a), Some(0)).unwrap();
     let incoming = identity("a@x.co");
-    s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, true), true)
-        .unwrap();
+    s.begin_replacement(
+        &held_lock(&env, &a),
+        "sha256:x",
+        &login_meta(&incoming, true),
+        true,
+    )
+    .unwrap();
     rusqlite::Connection::open(&path)
         .unwrap()
         .execute(
@@ -1107,7 +1170,7 @@ fn replacement_metadata_without_from_live_is_not_from_the_live_login() {
         )
         .unwrap();
 
-    s.finish_replacement(&a, 0).unwrap();
+    s.finish_replacement(&held_lock(&env, &a), 0).unwrap();
 
     assert_eq!(
         s.activation(&cc()).unwrap(),
@@ -1156,6 +1219,7 @@ fn finishing_a_replacement_records_the_quarantine_it_clears() {
     // §7.4, §11.4: a landed replacement moved the epoch, so its clear is `account-replaced`, in
     // the transaction that installs the login.
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let s = Store::open(&d.path().join("t.db")).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let b = add(&s, &cc(), "b", "b@x.co", 2);
@@ -1169,8 +1233,9 @@ fn finishing_a_replacement_records_the_quarantine_it_clears() {
     };
     s.set_quarantine(&a, "invalid_grant", "sha256:sent", 1)
         .unwrap();
-    s.begin_replacement(&a, "sha256:new", &meta, false).unwrap();
-    s.finish_replacement(&a, 500).unwrap();
+    s.begin_replacement(&held_lock(&env, &a), "sha256:new", &meta, false)
+        .unwrap();
+    s.finish_replacement(&held_lock(&env, &a), 500).unwrap();
     let row = s.account(&a).unwrap().unwrap();
     assert_eq!((row.quarantine_reason, row.replacing_fp), (None, None));
     let events = s.events().unwrap();
@@ -1197,9 +1262,9 @@ fn finishing_a_replacement_records_the_quarantine_it_clears() {
         identity: &identity("b@x.co"),
         ..meta
     };
-    s.begin_replacement(&b, "sha256:other", &meta, false)
+    s.begin_replacement(&held_lock(&env, &b), "sha256:other", &meta, false)
         .unwrap();
-    s.finish_replacement(&b, 600).unwrap();
+    s.finish_replacement(&held_lock(&env, &b), 600).unwrap();
     assert_eq!(s.events().unwrap().len(), 1);
 }
 
@@ -1226,22 +1291,26 @@ fn installing_a_login_never_clears_a_quarantine_behind_its_event() {
 fn emptying_the_store_keeps_its_schema_and_leaves_no_row() {
     // §10.5, Decision 8: the store file stays, valid and empty, for whoever opened it.
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let path = d.path().join("t.db");
     let s = Store::open(&path).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     s.set_active(&cc(), Some(&a), Some(0)).unwrap();
-    s.insert_journal(&JournalRow {
-        provider: cc(),
-        holder: ProcessStamp { pid: 1, start: 2 },
-        from_id: None,
-        to_id: a.clone(),
-        from_fp: None,
-        from_identity: None,
-        to_fp: "sha256:to".into(),
-        to_epoch: None,
-        started_at: 5,
-        prior: None,
-    })
+    s.insert_journal(
+        &held_guard(&env),
+        &JournalRow {
+            provider: cc(),
+            holder: ProcessStamp { pid: 1, start: 2 },
+            from_id: None,
+            to_id: a.clone(),
+            from_fp: None,
+            from_identity: None,
+            to_fp: "sha256:to".into(),
+            to_epoch: None,
+            started_at: 5,
+            prior: None,
+        },
+    )
     .unwrap();
     let other = Store::open(&path).unwrap(); // another process's connection, opened before
     s.empty_all().unwrap();
@@ -1429,11 +1498,12 @@ fn recorded_replacement_metadata_parses_only_as_finish_replacement_installs_it()
         assert!(!tagteam_engine::store::replacing_meta_parses(&bad), "{bad}");
     }
     let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
     let s = Store::open(&d.path().join("t.db")).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     assert_eq!(s.replacing_meta(&a).unwrap(), None);
     s.begin_replacement(
-        &a,
+        &held_lock(&env, &a),
         "sha256:x",
         &login_meta(&identity("a@x.co"), false),
         false,

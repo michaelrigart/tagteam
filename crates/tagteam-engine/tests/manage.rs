@@ -2,7 +2,7 @@ mod common;
 
 use std::fs;
 
-use common::{Fx, block_rescue, credential, unblock_rescue, vault_fp};
+use common::{Fx, block_rescue, credential, held_guard, unblock_rescue, vault_fp};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::AddTokenOptions;
@@ -143,7 +143,11 @@ fn metadata_commands_proceed_through_an_interrupted_switch_but_remove_refuses() 
         started_at: 1,
         prior: None,
     };
-    fx.engine.store().unwrap().insert_journal(&journal).unwrap();
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_journal(&held_guard(&fx.env), &journal)
+        .unwrap();
 
     assert!(matches!(
         fx.engine.remove(&a),

@@ -1,5 +1,5 @@
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_provider::{LiveLocks, ProviderError, Undo};
+use tagteam_provider::{LiveLocks, MutationGuard, ProviderError, Undo};
 
 use crate::error::EngineError;
 use crate::store::{JournalRow, Store};
@@ -10,6 +10,7 @@ use crate::store::{JournalRow, Store};
 /// locks its undos run under, so it cannot outlive them (§9.4: "held throughout").
 pub(super) struct Rollback<'a, 'g> {
     pub(super) undos: Vec<Box<dyn Undo + 'a>>,
+    pub(super) guard: &'a MutationGuard,
     pub(super) locks: &'a LiveLocks<'g>,
     pub(super) store: &'a Store,
     pub(super) provider: &'a ProviderId,
@@ -99,7 +100,7 @@ impl<'a> Rollback<'a, '_> {
         }
         if failed.is_empty() {
             let journal = match &self.prior {
-                Some(row) => self.store.insert_journal(row),
+                Some(row) => self.store.insert_journal(self.guard, row),
                 None => self.store.delete_journal(self.provider),
             };
             if let Err(e) = journal {

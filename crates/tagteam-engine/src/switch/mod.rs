@@ -333,6 +333,7 @@ impl Engine {
             match self.rederive(p, store, req, &plan, outgoing.as_ref())? {
                 Rederived::Go(locked) => {
                     let ls = LockedSwitch {
+                        guard: &guard,
                         store,
                         account_locks: &accounts,
                         locks: &locks,
