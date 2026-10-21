@@ -13,7 +13,7 @@ use super::{BoxSpec, KeyOutcome};
 use crate::keys::KEYS;
 use crate::state::{Screen, State};
 use crate::theme::Role;
-use crate::view::{body_at, pad, width_of, wrap};
+use crate::view::{body_at, width_of, wrap};
 
 /// From this many columns wide the help runs in two columns (§9.2).
 const TWO_COLUMNS: u16 = 100;
@@ -102,17 +102,22 @@ pub(super) fn rows(state: &State, width: u16) -> Vec<Line<'static>> {
         }
         lines
     };
-    let mut marks = vec![title("Marks")];
+    // One lead column for every mark, as wide as the widest, so their words line up.
     let (rate, words) = RATE;
+    let lead_width = MARKS
+        .iter()
+        .map(|(glyph, _, _)| width_of(glyph))
+        .fold(width_of(rate), usize::max);
+    let mut marks = vec![title("Marks")];
     marks.extend(entry(
         rate,
         theme.role(Role::Muted),
         words,
-        width_of(rate),
+        lead_width,
         column,
     ));
     for (glyph, role, words) in MARKS {
-        marks.extend(entry(glyph, theme.role(*role), words, 1, column));
+        marks.extend(entry(glyph, theme.role(*role), words, lead_width, column));
     }
     let sections = [keys_of(Some(state.screen)), keys_of(None), marks];
     if !two {
@@ -154,7 +159,8 @@ fn join(sections: &[Vec<Line<'static>>]) -> Vec<Line<'static>> {
 
 /// One entry, indented two columns: `lead` in `style` in a column `lead_width` wide, two
 /// columns, then `words`, both wrapped to what a `column`-wide column leaves them. A wrapped
-/// entry's continuation rows stay under their own part.
+/// entry's continuation rows stay under their own part. Only the lead itself takes `style`; its
+/// padding goes with the gap.
 fn entry(
     lead: &str,
     style: Style,
@@ -171,8 +177,8 @@ fn entry(
             let words = words.get(i).map_or("", String::as_str);
             Line::from(vec![
                 Span::raw("  "),
-                Span::styled(pad(lead, lead_width), style),
-                Span::raw("  "),
+                Span::styled(lead.to_owned(), style),
+                Span::raw(" ".repeat(lead_width.saturating_sub(width_of(lead)) + 2)),
                 Span::raw(words.to_owned()),
             ])
         })
@@ -394,6 +400,33 @@ mod tests {
             "how fast a window fills: a fit through its last two days of readings, or its \
              average so far when there are too few"
         );
+    }
+
+    #[test]
+    fn every_mark_s_words_start_in_one_column() {
+        // `%/h` is three columns wide: the glyphs' words line up with its words, not short of them.
+        let state = open(Screen::Accounts);
+        for width in [80, 99] {
+            let rows = rows(&state, width);
+            let text = |line: &Line<'_>| -> Vec<String> {
+                line.spans.iter().map(|s| s.content.to_string()).collect()
+            };
+            let marks = rows
+                .iter()
+                .position(|l| text(l).concat() == "Marks")
+                .unwrap();
+            let starts: Vec<(String, usize)> = rows[marks + 1..]
+                .iter()
+                .map(|l| text(l))
+                .filter(|t| t.len() == 4 && !t[1].trim().is_empty())
+                .map(|t| (t[1].trim().to_owned(), width_of(&t[..3].concat())))
+                .collect();
+            assert_eq!(starts.len(), MARKS.len() + 1, "{width}: {starts:?}");
+            assert!(
+                starts.iter().all(|(_, at)| *at == starts[0].1),
+                "{width}: {starts:?}"
+            );
+        }
     }
 
     #[test]

@@ -311,9 +311,9 @@ pub fn updated(age_s: i64) -> String {
     format!("updated {} ago", duration(age_s))
 }
 
-/// `next update in 1m`.
+/// `next update in 1m`; `next update in <1m` once `at` has come, until the update lands.
 pub fn next_update(at: i64, now_s: i64) -> String {
-    format!("next update in {}", countdown(at, now_s))
+    format!("next update in {}", duration(at.saturating_sub(now_s)))
 }
 
 /// T3-10: `login valid 6 more days`, `… 1 more day`, `… 5h20m more`, `login expired`.
@@ -839,6 +839,26 @@ mod tests {
         );
         assert_eq!(words_of("http-503", None), "usage check failed (http-503)");
         assert_eq!(words_of(NO_DATA, None), "not checked yet");
+        // Every other kind is said by its token.
+        for token in [
+            "http-401",
+            "profile-drifted",
+            "live-replaced",
+            "ambiguous",
+            "bad-response",
+        ] {
+            assert!(
+                !matches!(
+                    FailureKind::parse(token),
+                    FailureKind::Other(_) | FailureKind::OverBudget
+                ),
+                "{token} is a kind of its own"
+            );
+            assert_eq!(
+                words_of(token, None),
+                format!("usage check failed ({token})")
+            );
+        }
         // Without its retry, as the TUI's card says it.
         let failed = unread(UsageStatus::Unavailable, Some("refresh-failed"), Some(300));
         assert_eq!(status_words(&failed), "usage check failed (refresh-failed)");
@@ -1244,6 +1264,8 @@ mod tests {
         assert_eq!(UPDATED_HEAD, "UPDATED");
         assert_eq!(updated(120), "updated 2m ago");
         assert_eq!(next_update(NOW + 60, NOW), "next update in 1m");
+        assert_eq!(next_update(NOW, NOW), "next update in <1m");
+        assert_eq!(next_update(NOW - 5, NOW), "next update in <1m");
         let ms = |s: i64| s * 1_000;
         let day = 86_400;
         assert_eq!(
@@ -1258,6 +1280,9 @@ mod tests {
             login_valid(ms(NOW + day + 2 * HOUR), NOW),
             "login valid 1 more day"
         );
+        assert_eq!(login_valid(ms(NOW + day), NOW), "login valid 1 more day");
+        assert_eq!(login_valid(ms(NOW + 30), NOW), "login valid <1m more");
+        assert_eq!(login_valid(ms(NOW), NOW), "login expired");
         assert_eq!(
             login_valid(ms(NOW + 5 * HOUR + 20 * 60), NOW),
             "login valid 5h20m more"
