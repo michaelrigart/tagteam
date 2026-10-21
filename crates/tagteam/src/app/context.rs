@@ -258,7 +258,7 @@ pub(crate) fn scrubbed_vars(registry: &ProviderRegistry) -> Vec<String> {
 /// §12.8: where this process stands. The marker decides the run shell and the environment the
 /// engine runs on, detected once at construction. It only detects: the variables are already
 /// in `env.vars`, captured at the process boundary (`Context::from_process`).
-pub(crate) fn locate(env: Env, registry: &ProviderRegistry) -> (RunShell, Env) {
+fn locate(env: Env, registry: &ProviderRegistry) -> (RunShell, Env) {
     detect_run_shell(&env, registry)
 }
 
@@ -452,22 +452,6 @@ impl ColorEnv {
     }
 }
 
-pub(crate) fn color_enabled(
-    flag_off: bool,
-    no_color: bool,
-    force_color: bool,
-    setting: ColorMode,
-    stdout_terminal: bool,
-) -> bool {
-    ColorEnv {
-        no_color_flag: flag_off,
-        no_color_env: no_color,
-        force_color_env: force_color,
-        stdout_terminal,
-    }
-    .enabled(setting)
-}
-
 #[cfg(test)]
 mod tests {
     use tagteam_cc::CLAUDE_CODE;
@@ -477,10 +461,10 @@ mod tests {
     use crate::statusline;
 
     use super::{
-        Arc, ClaudeCode, ColorMode, Context, Env, Io, OsString, Platform, ProviderId,
+        Arc, ClaudeCode, ColorEnv, ColorMode, Context, Env, Io, OsString, Platform, ProviderId,
         ProviderRegistry, TEST_API_BASE, TEST_KEYCHAIN_DIR, TEST_PLATFORM, TEST_VAULT_KEYCHAIN,
-        build_registry, color_enabled, command_settings, fallback_provider, home_vars, is_set,
-        scrubbed_vars, session_vars, settings, test_overrides,
+        build_registry, command_settings, fallback_provider, home_vars, is_set, scrubbed_vars,
+        session_vars, settings, test_overrides,
     };
 
     #[test]
@@ -542,8 +526,14 @@ mod tests {
             ((true, false, true, Always, true), false),
         ];
         for ((flag, no, force, setting, terminal), want) in cases {
+            let env = ColorEnv {
+                no_color_flag: flag,
+                no_color_env: no,
+                force_color_env: force,
+                stdout_terminal: terminal,
+            };
             assert_eq!(
-                color_enabled(flag, no, force, setting, terminal),
+                env.enabled(setting),
                 want,
                 "{flag} {no} {force} {setting:?} {terminal}"
             );
