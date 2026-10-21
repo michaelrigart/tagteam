@@ -240,6 +240,57 @@ fn a_refresh_whose_successor_reached_only_rescue_aborts_the_launch_before_anythi
 }
 
 #[test]
+fn an_unreadable_rescue_refuses_a_due_launch_naming_the_damaged_files() {
+    // §12.3 step 1 and §7.2: a pending rescue that cannot be read refuses the launch, naming the
+    // damaged files as a switch does; one that is readable but cannot be adopted says so.
+    for case in ["one unreadable", "two unreadable", "unadoptable"] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.expire_access(&a);
+        let dir = fx.env.data_dir().join("rescue");
+        let damaged = |n: u32| dir.join(format!("{a}-{n}-000000000000.json"));
+        let detail = match case {
+            "one unreadable" => {
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(damaged(0), "{ torn").unwrap();
+                format!("{} cannot be read", damaged(0).display())
+            }
+            "two unreadable" => {
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(damaged(0), "{ torn").unwrap();
+                fs::write(damaged(1), "{ torn").unwrap();
+                format!(
+                    "{}, {} cannot be read",
+                    damaged(0).display(),
+                    damaged(1).display()
+                )
+            }
+            _ => {
+                fx.plant_rescue(&a, &vault_fp(&fx, &a), &credential("a@x.co", "rt-a-2"));
+                fx.kc.set_fail_write(SERVICE, true);
+                "a pending rescue could not be adopted".to_owned()
+            }
+        };
+
+        let result = fx
+            .engine
+            .launch(&row(&fx, &a), claude_bin(), &fx.work_dir("app"));
+
+        fx.kc.set_fail_write(SERVICE, false);
+        let err = refused(result);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "a@x.co (position 1) has a refreshed token that is not in the vault yet: {detail}; retry once the vault can be written"
+            ),
+            "{case}"
+        );
+        assert_eq!(token_requests(&fx), 0, "{case}");
+        assert!(!fx.profile_dir(&a).exists(), "{case}: nothing was created");
+    }
+}
+
+#[test]
 fn offline_the_launch_goes_on_with_the_stored_credential_and_a_warning() {
     // §12.3 step 1: a plain `Transient` continues with the stored credential.
     let fx = Fx::new();
@@ -806,7 +857,12 @@ fn a_join_launches_whatever_the_vault_holds_and_touches_no_credential() {
     // its sync only creates missing links. The running session's Claude Code owns the token, so
     // a join reads, refreshes and writes no stored credential: a vault entry gone missing, or a
     // quarantine (§7.4), even one whose access token is due, refuses only a quiescent launch.
-    for case in ["vault entry missing", "quarantined", "quarantined, due"] {
+    for case in [
+        "vault entry missing",
+        "due",
+        "quarantined",
+        "quarantined, due",
+    ] {
         let fx = Fx::new();
         let a = two_accounts(&fx);
         let profile = killed_session(&fx, &a, "a@x.co");
@@ -815,6 +871,9 @@ fn a_join_launches_whatever_the_vault_holds_and_touches_no_credential() {
         fs::remove_file(profile.join("skills")).unwrap();
         if case == "vault entry missing" {
             fx.kc.delete(SERVICE, a.as_str()).unwrap();
+        } else if case == "due" {
+            // The gate answers `Owned(Session)` for a running session's account (§7.3 step 2).
+            fx.expire_access(&a);
         } else {
             if case == "quarantined, due" {
                 fx.expire_access(&a);
@@ -1914,10 +1973,8 @@ mod hooked {
                 "unpersisted",
                 "a@x.co (position 1) needs a new login: its stored refresh token can no longer be used; log in with `claude`, then run `tagteam add`",
             ),
-            (
-                "rescue unreadable",
-                "a@x.co (position 1) has a refreshed token that is not in the vault yet: a pending rescue could not be adopted; retry once the vault can be written",
-            ),
+            // Built in the loop: it names the planted file.
+            ("rescue unreadable", ""),
             (
                 "conflict",
                 "position 1 (a@x.co)'s session profile and the vault both moved since they last agreed; log in again with `tagteam add` to resolve it",
@@ -1925,6 +1982,7 @@ mod hooked {
         ];
         for (case, refusal) in cases {
             for joining in [false, true] {
+                let mut refusal = refusal.to_owned();
                 let at = format!("{case}, joining {joining}");
                 let fx = Fx::new();
                 let a = two_accounts(&fx);
@@ -1933,7 +1991,12 @@ mod hooked {
                     "rescue unreadable" => {
                         let dir = fx.env.data_dir().join("rescue");
                         fs::create_dir_all(&dir).unwrap();
-                        fs::write(dir.join(format!("{a}-0-000000000000.json")), "{ torn").unwrap();
+                        let planted = dir.join(format!("{a}-0-000000000000.json"));
+                        fs::write(&planted, "{ torn").unwrap();
+                        refusal = format!(
+                            "a@x.co (position 1) has a refreshed token that is not in the vault yet: {} cannot be read; retry once the vault can be written",
+                            planted.display()
+                        );
                     }
                     "conflict" => {
                         fx.rotate_profile(&profile, "rt-a-2");
