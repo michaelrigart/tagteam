@@ -101,7 +101,7 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                     // Spec §6.2: a collection that fetched is read back at once.
                     state.reload_views(now_ms)
                 }
-                Err(_) if stale => vec![],
+                Err(_) if stale && !asked => vec![],
                 Err(e) => {
                     state.dirty = true;
                     let words = format!("usage was not collected: {}", e.message);
@@ -767,6 +767,33 @@ mod tests {
                 80
             )
         );
+    }
+
+    #[test]
+    fn an_r_overtaken_by_the_timer_and_failed_still_says_so() {
+        // `r` does not push back the timer, so its collection can be overtaken. Whatever came
+        // since, the person who pressed `r` hears how it went: the spinner stops with a banner.
+        let mut state = fresh(Screen::Accounts);
+        state.start();
+        update(&mut state, accounts_msg(1, 1), NOW_MS);
+        update(&mut state, ch('r'), NOW_MS);
+        let r#gen = state.checking.expect("r asked for a collection");
+        state.collect_due(vec![id(1)]);
+        let failure = Msg::Collected {
+            r#gen,
+            result: Err(failed("locked")),
+        };
+        assert!(update(&mut state, failure, NOW_MS).is_empty());
+        assert_eq!(state.checking, None);
+        assert_eq!(state.banner_text(), Some("usage was not collected: locked"));
+        // A stale failure nobody asked for stays silent.
+        state.banner = None;
+        let older = Msg::Collected {
+            r#gen,
+            result: Err(failed("locked")),
+        };
+        update(&mut state, older, NOW_MS);
+        assert!(state.banner.is_none());
     }
 
     #[test]

@@ -102,14 +102,26 @@ pub(crate) fn rule(state: &State, width: u16) -> Line<'static> {
     ))
 }
 
-/// A toast wrapped beside the right part takes at least this many columns; with fewer it takes
-/// the full width and the right part is dropped (§5.5).
+/// A toast wrapped beside the right part takes at least this many columns; with fewer the
+/// spinner shrinks to its glyph, and if that still leaves fewer the toast takes the full width
+/// and the right part is dropped (§5.5).
 const TOAST_MIN: usize = 40;
 
-/// A toast's rows, and whether the right part (the spinner and the pinned two) sits on the last.
+/// What sits right of a toast's last row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Beside {
+    /// The spinner with its label (when one runs) and the pinned two.
+    Full,
+    /// The spinner's glyph alone, and the pinned two.
+    Glyph,
+    /// Nothing: the toast takes the full width.
+    Nothing,
+}
+
+/// A toast's rows, and what sits right of the last.
 pub(crate) struct ToastRows {
     pub(crate) rows: Vec<String>,
-    pub(crate) right: bool,
+    pub(crate) right: Beside,
 }
 
 /// One footer item: its key in accent and its label muted.
@@ -157,16 +169,23 @@ fn toast_mark(kind: ToastKind) -> Option<(&'static str, Role)> {
     }
 }
 
-/// The width a toast of `kind` wraps in at `width` columns, and whether the right part stays:
-/// the width less the right part and two columns, when that leaves `TOAST_MIN`; else all of it.
-fn toast_room(state: &State, width: usize) -> (usize, bool) {
-    let spinner = busy_label(state).map_or(0, |label| width_of(&label) + 3 + 2);
-    let right = spinner + keys::pinned_width() + keys::RIGHT_INSET;
-    let room = width.saturating_sub(right + 2);
+/// The width a toast wraps in at `width` columns, and what stays right of it: the width less
+/// the right part and two columns, when that leaves `TOAST_MIN`; else with the spinner cut to
+/// its glyph; else all of the width.
+fn toast_room(state: &State, width: usize) -> (usize, Beside) {
+    let fixed = keys::pinned_width() + keys::RIGHT_INSET + 2;
+    let label = busy_label(state);
+    let full = label.as_ref().map_or(0, |label| width_of(label) + 3 + 2);
+    let room = width.saturating_sub(fixed + full);
     if room >= TOAST_MIN {
-        (room, true)
+        return (room, Beside::Full);
+    }
+    // The glyph and the two spaces after it.
+    let room = width.saturating_sub(fixed + 3);
+    if label.is_some() && room >= TOAST_MIN {
+        (room, Beside::Glyph)
     } else {
-        (width, false)
+        (width, Beside::Nothing)
     }
 }
 
@@ -227,8 +246,13 @@ pub(crate) fn footer(state: &State, width: u16, frame: &str) -> Vec<Line<'static
         let layout = toast_rows(state, toast.kind, &toast.text, width);
         let mark = toast_mark(toast.kind);
         let mut right = Vec::new();
-        if let Some(spinner) = spinner {
-            right.extend([spinner, Span::raw("  ")]);
+        match layout.right {
+            Beside::Full => right.extend(spinner.into_iter().flat_map(|s| [s, Span::raw("  ")])),
+            Beside::Glyph => right.extend([
+                Span::styled(frame.to_owned(), theme.role(Role::Accent)),
+                Span::raw("  "),
+            ]),
+            Beside::Nothing => {}
         }
         right.extend(pinned);
         let last = layout.rows.len() - 1;
@@ -245,7 +269,7 @@ pub(crate) fn footer(state: &State, width: u16, frame: &str) -> Vec<Line<'static
                     Some((mark, rest)) => vec![mark, Span::raw(rest)],
                     None => vec![Span::raw(row)],
                 };
-                if n == last && layout.right {
+                if n == last && layout.right != Beside::Nothing {
                     beside(left, right.clone())
                 } else {
                     Line::from(left)
@@ -1179,12 +1203,42 @@ mod tests {
             lines[23],
             format!("finish{}{right}", " ".repeat(80 - 1 - 6 - width_of(right)))
         );
-        // With too little room beside it (under 40 columns) the toast takes the full width
-        // and the right part is dropped.
+        // With under 40 columns beside a long label, the spinner shows its glyph alone and
+        // keeps the pinned two.
         state.running = Some(Action::AddLive { provider: cc() });
         let lines = draw(&state, 80, 24);
-        assert_eq!(lines[23], busy);
+        let glyph = "⠋  ? keys  q quit";
+        assert_eq!(
+            lines[23],
+            format!(
+                "{busy}{}{glyph}",
+                " ".repeat(80 - 1 - width_of(busy) - width_of(glyph))
+            )
+        );
         assert_eq!(areas(&state, Rect::new(0, 0, 80, 24)).footer.height, 1);
+        let adding = "still adding Claude Code's login · wait for it to finish";
+        state.toast(ToastKind::Info, adding, NOW_MS);
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            format!(
+                "{adding}{}{glyph}",
+                " ".repeat(80 - 1 - width_of(adding) - width_of(glyph))
+            )
+        );
+        state.theme = TIERS[1];
+        let buf = draw_buffer(&state, 80, 24, NOW_MS);
+        assert_eq!(
+            roles(&buf, TIERS[1], 23).trim_end(),
+            canon(
+                TIERS[1],
+                &format!(
+                    "{}{}a  a mmmm  a mmmm",
+                    spell(&[(adding, 't')]),
+                    " ".repeat(80 - 1 - width_of(adding) - width_of(glyph))
+                )
+            ),
+            "the glyph is accent"
+        );
         // Without a toast the spinner stands on the left and the pinned two stay.
         state.toast = None;
         assert_eq!(
