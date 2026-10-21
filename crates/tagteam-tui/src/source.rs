@@ -13,7 +13,7 @@ use tagteam_engine::settings::Settings;
 use tagteam_engine::tokens::{
     IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport, Wait,
 };
-use tagteam_engine::views::{HistoryView, ProviderAccounts, ShellAccount, StatusView};
+use tagteam_engine::views::{HistoryView, ProviderAccounts, ShellAccount};
 use tagteam_provider::{Liveness, Read, RunShell};
 
 /// A read that failed, in the CLI's own words (`kind` is the JSON `error.type`).
@@ -34,12 +34,10 @@ impl From<EngineError> for SourceError {
 
 #[derive(Debug, Clone)]
 pub struct AccountsSnapshot {
+    /// Each provider's view; its `live` says whether tagteam manages its live login.
     pub providers: Vec<ProviderAccounts>,
     /// The run shell's own account (`ShellAccount`), for `▶ this`.
     pub this: Option<AccountId>,
-    /// The default provider's live login, when tagteam does not manage it
-    /// (`StatusView::Unmanaged`).
-    pub unmanaged_live: Option<String>,
     pub in_run_shell: bool,
     /// The engine clock, in seconds, when this was read.
     pub read_at_s: i64,
@@ -94,9 +92,9 @@ impl EngineSource {
 }
 
 impl Source for EngineSource {
-    /// `list`'s view (`Engine::accounts`), with what the TUI shows around it: the run shell's
-    /// own account (`shell_account`), the live login when tagteam does not manage it
-    /// (`status`), whether this is a run shell, and the engine clock.
+    /// `list`'s view (`Engine::accounts`), each provider's live login read once in it
+    /// (PERF-R-10a), with what the TUI shows around it: the run shell's own account
+    /// (`shell_account`), whether this is a run shell, and the engine clock.
     fn accounts(&self, provider: Option<&ProviderId>) -> Result<AccountsSnapshot, SourceError> {
         let engine = &self.engine;
         let providers = engine.accounts(provider)?;
@@ -104,25 +102,10 @@ impl Source for EngineSource {
             ShellAccount::Managed(row) => Some(row.id),
             ShellAccount::NotInShell | ShellAccount::Unmanaged => None,
         };
-        // Only a provider with no managed account active can have an unmanaged live login;
-        // asking `status` then reads its view once more. One it cannot read is no reason to
-        // fail the views: `list` shows no such login either.
-        let live = provider.unwrap_or(engine.default_provider());
-        let managed = providers
-            .iter()
-            .any(|p| &p.provider == live && p.active_position.is_some());
-        let unmanaged_live = match managed {
-            true => None,
-            false => match engine.status(live) {
-                Ok(StatusView::Unmanaged { email }) => Some(email),
-                Ok(StatusView::NoLogin | StatusView::Managed { .. }) | Err(_) => None,
-            },
-        };
         let auto_holders = foreign_engine_holders(engine, &providers);
         Ok(AccountsSnapshot {
             providers,
             this,
-            unmanaged_live,
             in_run_shell: matches!(engine.run_shell(), RunShell::Inside { .. }),
             read_at_s: engine.now_ms().div_euclid(1000),
             auto_holders,

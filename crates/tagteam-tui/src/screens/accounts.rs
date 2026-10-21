@@ -8,9 +8,11 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind};
-use tagteam_engine::views::{AccountView, HistoryWindow, ProviderNames, UsageStatus};
+use tagteam_engine::switch::LiveLogin;
+use tagteam_engine::views::{AccountView, HistoryWindow, UsageStatus};
 use tagteam_engine::words::{self, WindowColumn};
 
+use crate::daemon;
 use crate::host::AccountRef;
 use crate::msg::Cmd;
 use crate::source::AccountsSnapshot;
@@ -138,25 +140,22 @@ fn windows_of(v: &AccountView) -> &[(Window, Pace)] {
 }
 
 /// What the accounts view has to say above the body: a run shell (spec §3), else a live login
-/// tagteam does not manage (redesign §5.6's sentence).
+/// of focus's provider that tagteam does not manage (redesign §5.6's sentence, T3-7).
 pub fn banner(state: &State) -> Option<String> {
     let snap = state.accounts.snapshot.as_ref()?;
     if snap.in_run_shell {
         return Some(RUN_SHELL.to_owned());
     }
-    snap.unmanaged_live.as_ref().map(|email| {
-        let display = followed(state).display_name;
-        format!(
-            "{display} is logged in as {email}, which tagteam doesn't manage · press A to add it"
-        )
-    })
-}
-
-/// The names of the provider the accounts view follows: `--provider`'s, else the default, which
-/// Tokens reports on (the unmanaged login's, and the empty state's).
-fn followed(state: &State) -> ProviderNames {
-    let provider = state.provider.as_ref().unwrap_or(state.tokens.provider());
-    state.names_of(provider)
+    let view = state.view_of(&daemon::focus(state))?;
+    match &view.live {
+        LiveLogin::Unmanaged { email } => {
+            let display = view.names.display_name;
+            Some(format!(
+                "{display} is logged in as {email}, which tagteam doesn't manage · press A to add it"
+            ))
+        }
+        LiveLogin::None | LiveLogin::Managed { .. } => None,
+    }
 }
 
 pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
@@ -562,7 +561,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
         return;
     };
     if st.rows().is_empty() {
-        let launch = followed(state).launch_command;
+        let launch = state.names_of(&daemon::focus(state)).launch_command;
         let sentence = format!("Log in with {launch}, then press A to add that login.");
         centred_block(frame, area, NO_ACCOUNTS, Some(&sentence), state.theme);
         return;
@@ -608,10 +607,13 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
             }
         });
     }
-    if let [only] = st.rows().as_slice() {
+    if let Some(focus) = state
+        .view_of(&daemon::focus(state))
+        .filter(|p| p.accounts.len() == 1)
+    {
         let room = usize::from(table_area.height).saturating_sub(shown.len());
         if room > 0 {
-            let display = state.names_of(&only.row.provider).display_name;
+            let display = focus.names.display_name;
             let hint = format!(
                 " Add a second account to switch: log in to {display} as it, then press A."
             );
@@ -818,6 +820,7 @@ mod tests {
     use crossterm::event::KeyCode;
     use ratatui::style::{Color, Modifier};
     use tagteam_core::Pace;
+    use tagteam_engine::switch::LiveLogin;
     use tagteam_engine::views::{ProviderAccounts, UsageStatus, UsageView};
 
     use super::*;
@@ -1682,6 +1685,11 @@ mod tests {
         snap.providers.push(ProviderAccounts {
             provider: ProviderId::new("fake-agent"),
             active_position: None,
+            forecast: tagteam_engine::views::forecast_of(
+                std::slice::from_ref(&other),
+                &LiveLogin::None,
+                &[],
+            ),
             accounts: vec![other],
             threshold: 90.0,
             strategy: tagteam_core::autoswitch::AutoStrategy::Best,
@@ -1689,8 +1697,12 @@ mod tests {
                 display_name: "FakeAgent",
                 launch_command: "fakeagent",
             },
+            models: vec![],
+            live: LiveLogin::None,
         });
-        snap.unmanaged_live = Some("s@x.co".into());
+        snap.providers[1].live = LiveLogin::Unmanaged {
+            email: "s@x.co".into(),
+        };
         let mut state = fresh(Screen::Accounts);
         state.provider = Some(ProviderId::new("fake-agent"));
         state.accounts.apply(snap);
@@ -1908,6 +1920,11 @@ mod tests {
         snap.providers.push(ProviderAccounts {
             provider: ProviderId::new("fake-agent"),
             active_position: None,
+            forecast: tagteam_engine::views::forecast_of(
+                std::slice::from_ref(&other),
+                &LiveLogin::None,
+                &[],
+            ),
             accounts: vec![other],
             threshold: 90.0,
             strategy: tagteam_core::autoswitch::AutoStrategy::Best,
@@ -1915,6 +1932,8 @@ mod tests {
                 display_name: "FakeAgent",
                 launch_command: "fakeagent",
             },
+            models: vec![],
+            live: LiveLogin::None,
         });
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snap);
@@ -1935,7 +1954,9 @@ mod tests {
     #[test]
     fn a_run_shell_or_an_unmanaged_live_login_raises_a_banner() {
         let mut snap = snapshot(many(1));
-        snap.unmanaged_live = Some("s@x.co".into());
+        snap.providers[0].live = LiveLogin::Unmanaged {
+            email: "s@x.co".into(),
+        };
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snap.clone());
         assert_eq!(
@@ -1960,7 +1981,9 @@ mod tests {
         // Spec §5.1: at 80 columns the whole banner shows, its instruction included.
         let long = "a".repeat(48) + "@example.com";
         let mut snap = snapshot(many(1));
-        snap.unmanaged_live = Some(long.clone());
+        snap.providers[0].live = LiveLogin::Unmanaged {
+            email: long.clone(),
+        };
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snap);
         let lines = draw(&state, 80, 24);
@@ -1974,6 +1997,81 @@ mod tests {
         );
         let body = body_of(&state, 80, 24, NOW_MS);
         assert!(body[0].starts_with("    #  ACCOUNT"), "{}", body[0]);
+    }
+
+    /// FakeAgent's view holding `accounts`, its live login `live`.
+    fn fake_agent(accounts: Vec<AccountView>, live: LiveLogin) -> ProviderAccounts {
+        let forecast = tagteam_engine::views::forecast_of(&accounts, &live, &[]);
+        ProviderAccounts {
+            provider: ProviderId::new("fake-agent"),
+            active_position: None,
+            accounts,
+            threshold: 90.0,
+            strategy: tagteam_core::autoswitch::AutoStrategy::Best,
+            names: tagteam_engine::views::ProviderNames {
+                display_name: "FakeAgent",
+                launch_command: "fakeagent",
+            },
+            models: vec![],
+            live,
+            forecast,
+        }
+    }
+
+    /// FakeAgent's account at `position`.
+    fn fake_account(position: u32, email: &str) -> AccountView {
+        let mut v = account(position, email, read(60, 50.0, 60.0, false));
+        v.row.provider = ProviderId::new("fake-agent");
+        v.row.id = AccountId::from_string(format!("fake-{position}"));
+        v
+    }
+
+    #[test]
+    fn the_unmanaged_login_banner_follows_the_selected_account_s_provider() {
+        // T3-7: the banner names the unmanaged login of the provider focus is on.
+        let mut snap = snapshot(many(1));
+        snap.providers.push(fake_agent(
+            vec![fake_account(1, "a1@x.co")],
+            LiveLogin::Unmanaged {
+                email: "s@x.co".into(),
+            },
+        ));
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snap);
+        assert_eq!(state.accounts.selected().unwrap().provider, cc());
+        assert_eq!(banner(&state), None, "only FakeAgent's login is unmanaged");
+        update(&mut state, ch('j'), NOW_MS);
+        assert_eq!(
+            banner(&state).as_deref(),
+            Some(
+                "FakeAgent is logged in as s@x.co, which tagteam doesn't manage · press A to add it"
+            )
+        );
+    }
+
+    #[test]
+    fn with_one_account_in_the_provider_followed_the_table_says_how_to_add_a_second() {
+        // T3-7: the hint shows when focus's provider has exactly one account, and names it.
+        let mut snap = snapshot(many(1));
+        snap.providers.push(fake_agent(
+            vec![fake_account(1, "a1@x.co"), fake_account(2, "a2@x.co")],
+            LiveLogin::None,
+        ));
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snap);
+        let hint = " Add a second account to switch: log in to Claude Code as it, then press A.";
+        let lines = draw(&state, 120, 30);
+        assert!(lines.iter().any(|l| l.trim_end() == hint), "{lines:?}");
+        update(&mut state, ch('j'), NOW_MS);
+        assert_eq!(
+            state.accounts.selected().unwrap().provider,
+            ProviderId::new("fake-agent")
+        );
+        let lines = draw(&state, 120, 30);
+        assert!(
+            !lines.iter().any(|l| l.contains("Add a second")),
+            "{lines:?}"
+        );
     }
 
     #[test]

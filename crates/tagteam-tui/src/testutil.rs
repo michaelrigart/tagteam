@@ -17,13 +17,14 @@ use tagteam_daemon::protocol::{
     Status, StatusDaemon, StatusJob, StatusNotifications, StatusProvider,
 };
 use tagteam_engine::store::AccountRow;
+use tagteam_engine::switch::LiveLogin;
 use tagteam_engine::tokens::{
     Cost, IndexState, PeriodKey, RowAccount, RowKey, TokenCounts, TokenGrouping, TokenPeriod,
     TokenQuery, TokenReport, TokenRow, TokenTotal,
 };
 use tagteam_engine::views::{
     AccountView, HistoryView, HistoryWindow, ProviderAccounts, ProviderNames, UsageStatus,
-    UsageView,
+    UsageView, forecast_of,
 };
 use tagteam_provider::KindTraits;
 
@@ -91,7 +92,7 @@ pub(crate) fn account(position: u32, email: &str, usage: UsageView) -> AccountVi
             kind: "oauth".into(),
             alias: None,
             disabled: false,
-            identity_json: Default::default(),
+            identity_json: serde_json::json!({}),
             login_expires_at: None,
             login_epoch: 0,
             replacing_fp: None,
@@ -166,19 +167,24 @@ pub(crate) fn read(age_s: i64, five: f64, seven: f64, ahead: bool) -> UsageView 
     }
 }
 
-/// One Claude Code provider holding `accounts`, read at `NOW_S`.
+/// One Claude Code provider holding `accounts`, read at `NOW_S`: its live login is its active
+/// account's, else none.
 pub(crate) fn snapshot(accounts: Vec<AccountView>) -> AccountsSnapshot {
+    let active_position = accounts.iter().find(|v| v.active).map(|v| v.row.position);
+    let live = active_position.map_or(LiveLogin::None, |position| LiveLogin::Managed { position });
     AccountsSnapshot {
         providers: vec![ProviderAccounts {
             provider: cc(),
-            active_position: accounts.iter().find(|v| v.active).map(|v| v.row.position),
+            active_position,
+            forecast: forecast_of(&accounts, &live, &[]),
             accounts,
             threshold: 90.0,
             strategy: tagteam_core::autoswitch::AutoStrategy::Best,
             names: CC_NAMES,
+            models: vec![],
+            live,
         }],
         this: None,
-        unmanaged_live: None,
         in_run_shell: false,
         read_at_s: NOW_S,
         auto_holders: vec![],

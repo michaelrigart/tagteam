@@ -45,16 +45,10 @@ fn busy(state: &mut State, now_ms: i64) -> bool {
     true
 }
 
-/// The provider `A` adds to: `--provider`'s, else the default, which the accounts view lists
-/// first (`Engine::accounts`).
+/// The provider `A` adds to: focus's (`daemon::focus`, T3-7), whose unmanaged login the
+/// banner names.
 fn add_provider(state: &State) -> Option<tagteam_core::ProviderId> {
-    state.provider.clone().or_else(|| {
-        state
-            .accounts
-            .snapshot()
-            .and_then(|s| s.providers.first())
-            .map(|p| p.provider.clone())
-    })
+    Some(daemon::focus(state))
 }
 
 /// The action keys (spec §5.6, §7.1). `None` for any other key. An account key with no
@@ -782,16 +776,75 @@ mod tests {
 
     #[test]
     fn add_uses_the_provider_flag_over_the_default() {
-        let mut state = loaded(1);
-        state.provider = Some(tagteam_core::ProviderId::new("fake-agent"));
+        // With no account selected, focus is `--provider`'s.
+        let fake = tagteam_core::ProviderId::new("fake-agent");
+        let mut state = fresh(Screen::Accounts);
+        state.provider = Some(fake.clone());
+        let mut snap = snapshot(vec![]);
+        snap.providers[0].provider = fake.clone();
+        state.accounts.apply(snap);
         assert_eq!(
             update(&mut state, ch('A'), NOW_MS),
             [Cmd::Act(Action::AddLive {
-                provider: tagteam_core::ProviderId::new("fake-agent")
+                provider: fake.clone()
             })]
         );
         let mut unloaded = fresh(Screen::Accounts);
-        assert!(update(&mut unloaded, ch('A'), NOW_MS).is_empty());
+        unloaded.provider = Some(fake.clone());
+        assert_eq!(
+            update(&mut unloaded, ch('A'), NOW_MS),
+            [Cmd::Act(Action::AddLive { provider: fake })]
+        );
+    }
+
+    #[test]
+    fn a_adds_the_login_of_the_provider_the_screen_follows() {
+        // T3-7, Review Focus 2: `A` adds focus's live login, the selected account's provider.
+        let fake = tagteam_core::ProviderId::new("fake-agent");
+        let mut third = account(3, "c@x.co", read(60, 10.0, 20.0, false));
+        third.row.provider = fake.clone();
+        let live = tagteam_engine::switch::LiveLogin::None;
+        let mut snap = snapshot(many(1));
+        snap.providers
+            .push(tagteam_engine::views::ProviderAccounts {
+                provider: fake.clone(),
+                active_position: None,
+                forecast: tagteam_engine::views::forecast_of(
+                    std::slice::from_ref(&third),
+                    &live,
+                    &[],
+                ),
+                accounts: vec![third],
+                threshold: 90.0,
+                strategy: tagteam_core::autoswitch::AutoStrategy::Best,
+                names: tagteam_engine::views::ProviderNames {
+                    display_name: "FakeAgent",
+                    launch_command: "fakeagent",
+                },
+                models: vec![],
+                live,
+            });
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snap);
+        assert_eq!(
+            update(&mut state, ch('A'), NOW_MS),
+            [Cmd::Act(Action::AddLive { provider: cc() })]
+        );
+        state.running = None;
+        update(&mut state, ch('j'), NOW_MS);
+        assert_eq!(
+            update(&mut state, ch('A'), NOW_MS),
+            [Cmd::Act(Action::AddLive {
+                provider: fake.clone()
+            })]
+        );
+        // With no accounts, the default's.
+        let mut empty = fresh(Screen::Accounts);
+        empty.accounts.apply(snapshot(vec![]));
+        assert_eq!(
+            update(&mut empty, ch('A'), NOW_MS),
+            [Cmd::Act(Action::AddLive { provider: cc() })]
+        );
     }
 
     #[test]
@@ -2353,6 +2406,11 @@ mod tests {
             .push(tagteam_engine::views::ProviderAccounts {
                 provider: fake.clone(),
                 active_position: None,
+                forecast: tagteam_engine::views::forecast_of(
+                    std::slice::from_ref(&third),
+                    &tagteam_engine::switch::LiveLogin::None,
+                    &[],
+                ),
                 accounts: vec![third],
                 threshold: 90.0,
                 strategy: tagteam_core::autoswitch::AutoStrategy::Best,
@@ -2360,6 +2418,8 @@ mod tests {
                     display_name: "FakeAgent",
                     launch_command: "fakeagent",
                 },
+                models: vec![],
+                live: tagteam_engine::switch::LiveLogin::None,
             });
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snap);
@@ -2396,6 +2456,11 @@ mod tests {
                 .push(tagteam_engine::views::ProviderAccounts {
                     provider: fake.clone(),
                     active_position: None,
+                    forecast: tagteam_engine::views::forecast_of(
+                        std::slice::from_ref(&third),
+                        &tagteam_engine::switch::LiveLogin::None,
+                        &[],
+                    ),
                     accounts: vec![third],
                     threshold: 90.0,
                     strategy: tagteam_core::autoswitch::AutoStrategy::Best,
@@ -2403,6 +2468,8 @@ mod tests {
                         display_name: display,
                         launch_command: "fakeagent",
                     },
+                    models: vec![],
+                    live: tagteam_engine::switch::LiveLogin::None,
                 });
             let mut state = fresh(Screen::Accounts);
             state.accounts.apply(snap);

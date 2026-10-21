@@ -16,7 +16,7 @@ use tagteam_engine::EngineError;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::{Eligibility, Reserve};
 use tagteam_engine::switch::{
-    SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy,
+    BestForecast, NoPick, SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy,
 };
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::Keychain;
@@ -880,4 +880,179 @@ fn best_names_the_exhausted_candidates_when_the_healthy_one_holds_no_credential(
         "every candidate is at its limit: a@x.co (5h at 100%); the earliest reset is in 2h40m"
     );
     assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
+}
+
+#[test]
+fn best_with_no_live_login_and_no_ranked_candidate_holding_a_login_is_usage_unavailable() {
+    // The walk finds none to activate, no live login compares, and no candidate known to be at
+    // its limit was left out: usage-unavailable, naming why.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    read(&fx, &a, &reading(10.0, 20.0, 0.0));
+    read(&fx, &b, &reading(10.0, 50.0, 0.0));
+    log_out(&fx);
+    fx.kc.delete(SERVICE, a.as_str()).unwrap();
+    fx.kc.delete(SERVICE, b.as_str()).unwrap();
+    let out = best(&fx).unwrap();
+    assert_eq!(
+        (out.switched, out.reason, out.strategy),
+        (false, SwitchReason::UsageUnavailable, "best")
+    );
+    assert_eq!(
+        out.message,
+        "no candidate with a known usage reading holds a stored credential"
+    );
+}
+
+/// §12.1's parity: what `switch --strategy best` does with `forecast`, the accounts view's.
+fn assert_best_does(case: &str, forecast: &BestForecast, out: &SwitchOutcome) {
+    match forecast {
+        BestForecast::Pick { order } => {
+            assert!(out.switched, "{case}: {}", out.message);
+            assert_eq!(
+                out.to.as_ref().map(|r| r.position),
+                Some(order[0]),
+                "{case}"
+            );
+        }
+        BestForecast::AlreadyBest => {
+            assert_eq!(out.reason, SwitchReason::AlreadyBest, "{case}");
+        }
+        BestForecast::None(NoPick::UnmanagedLogin) => {
+            assert_eq!(out.reason, SwitchReason::UnmanagedAccount, "{case}");
+        }
+        BestForecast::None(NoPick::TooFewCandidates) => {
+            assert!(
+                matches!(
+                    out.reason,
+                    SwitchReason::OnlyOneAccount | SwitchReason::NoValidTarget
+                ),
+                "{case}: {:?}",
+                out.reason
+            );
+        }
+        BestForecast::None(NoPick::UsageUnknown) => {
+            assert_eq!(out.reason, SwitchReason::UsageUnavailable, "{case}");
+        }
+        BestForecast::None(NoPick::CandidatesExhausted) => {
+            assert_eq!(out.reason, SwitchReason::CandidatesExhausted, "{case}");
+        }
+    }
+    if !matches!(forecast, BestForecast::Pick { .. }) {
+        assert!(!out.switched, "{case}: {}", out.message);
+    }
+}
+
+/// What a parity case sets up in its fresh `Fx`.
+type Setup = fn(&Fx);
+
+#[test]
+fn the_accounts_view_s_forecast_is_what_switch_best_picks() {
+    let pick = |order: &[u32]| BestForecast::Pick {
+        order: order.to_vec(),
+    };
+    let cases: [(&str, Setup, BestForecast); 9] = [
+        (
+            "the live account is itself disabled: fewer than two candidates",
+            |fx| {
+                let a = fx.add("a@x.co", "rt-a");
+                let b = fx.add("b@x.co", "rt-b"); // live
+                read(fx, &a, &reading(10.0, 20.0, 0.0));
+                read(fx, &b, &reading(10.0, 60.0, 0.0));
+                fx.engine.set_disabled(&b, true).unwrap();
+            },
+            BestForecast::None(NoPick::TooFewCandidates),
+        ),
+        (
+            "an unmanaged live login",
+            |fx| {
+                let a = fx.add("a@x.co", "rt-a");
+                let b = fx.add("b@x.co", "rt-b");
+                read(fx, &a, &reading(10.0, 20.0, 0.0));
+                read(fx, &b, &reading(10.0, 60.0, 0.0));
+                fx.login("u@x.co", "rt-u");
+            },
+            BestForecast::None(NoPick::UnmanagedLogin),
+        ),
+        (
+            "no live login and no candidate",
+            |fx| {
+                let a = fx.add("a@x.co", "rt-a");
+                fx.engine.set_disabled(&a, true).unwrap();
+                log_out(fx);
+            },
+            BestForecast::None(NoPick::TooFewCandidates),
+        ),
+        (
+            "no live login and a candidate at negative headroom",
+            |fx| {
+                fx.add("a@x.co", "rt-a"); // never read
+                let b = fx.add("b@x.co", "rt-b");
+                read(fx, &b, &reading(104.0, 100.0, 0.0));
+                log_out(fx);
+            },
+            pick(&[2]),
+        ),
+        (
+            "the live headroom unknown",
+            |fx| {
+                let (a, b, _c) = three(fx); // c is live and never read
+                read(fx, &a, &reading(10.0, 50.0, 0.0));
+                read(fx, &b, &reading(10.0, 20.0, 0.0));
+            },
+            pick(&[2, 1]),
+        ),
+        (
+            "the live headroom unknown and every known candidate at its limit",
+            |fx| {
+                let (a, b, _c) = three(fx); // c is live and never read
+                read(fx, &a, &reading(10.0, 100.0, 0.0));
+                read(fx, &b, &reading(104.0, 100.0, 0.0));
+            },
+            BestForecast::None(NoPick::CandidatesExhausted),
+        ),
+        (
+            "a stale candidate reading",
+            |fx| {
+                let a = fx.add("a@x.co", "rt-a");
+                let b = fx.add("b@x.co", "rt-b"); // live
+                // Past the hour a failed retry extends trust to (§8.4), so the collection's
+                // failed fetch leaves it unknown.
+                record_at(fx, &a, &reading(10.0, 10.0, 0.0), T0 - 7200, T0 - 7200);
+                read(fx, &b, &reading(10.0, 60.0, 0.0));
+            },
+            BestForecast::None(NoPick::UsageUnknown),
+        ),
+        (
+            "the live account ahead of every candidate",
+            |fx| {
+                let a = fx.add("a@x.co", "rt-a");
+                let b = fx.add("b@x.co", "rt-b"); // live
+                read(fx, &a, &reading(10.0, 60.0, 0.0));
+                read(fx, &b, &reading(10.0, 40.0, 0.0));
+            },
+            BestForecast::AlreadyBest,
+        ),
+        (
+            "a tie goes to the lower position",
+            |fx| {
+                let (a, b, c) = three(fx);
+                read(fx, &a, &reading(10.0, 40.0, 0.0));
+                read(fx, &b, &reading(10.0, 40.0, 0.0));
+                read(fx, &c, &reading(10.0, 90.0, 0.0));
+            },
+            pick(&[1, 2]),
+        ),
+    ];
+    for (case, setup, expected) in cases {
+        let fx = Fx::new();
+        setup(&fx);
+        let forecast = fx.engine.accounts(Some(&fx.provider())).unwrap()[0]
+            .forecast
+            .clone();
+        assert_eq!(forecast, expected, "{case}");
+        let out = best(&fx).unwrap();
+        assert_best_does(case, &forecast, &out);
+    }
 }

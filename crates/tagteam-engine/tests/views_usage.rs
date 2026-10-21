@@ -16,9 +16,10 @@ use tagteam_core::{
 use tagteam_engine::Engine;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::{Eligibility, LiveIdentityCacheRow, Reservation, Reserve};
+use tagteam_engine::switch::{BestForecast, LiveLogin};
 use tagteam_engine::views::{
     HistoryView, HistoryWindow, LiveReading, NO_DATA, StatusView, StatuslineView, UsageStatus,
-    UsageView,
+    UsageView, forecast_of,
 };
 
 /// The fixture clock's start (`Fx`), in seconds.
@@ -1123,5 +1124,40 @@ fn live_reading_is_none_for_an_unmanaged_login_or_a_reading_past_decision_grade(
         fx.engine.live_reading(&fx.provider(), &[]).unwrap(),
         None,
         "a live login tagteam does not manage"
+    );
+}
+
+#[test]
+fn an_unreadable_live_login_falls_back_to_the_stored_active_account() {
+    // Review Focus 5 (§12.2): the one live read keeps `Read`'s three states and the fallback.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live, and the store's active account
+    record(&fx, &a, &reading(T0, 10.0, 20.0), T0, T0 + 300);
+    record(&fx, &b, &reading(T0, 10.0, 50.0), T0, T0 + 300);
+    fs::write(fx.paths().global_config, "{ \"oauthAccount\": ").unwrap();
+    let view = fx.engine.accounts(None).unwrap().remove(0);
+    let active: Vec<u32> = view
+        .accounts
+        .iter()
+        .filter(|v| v.active)
+        .map(|v| v.row.position)
+        .collect();
+    assert_eq!(active, [2]);
+    assert_eq!(view.live, LiveLogin::Managed { position: 2 });
+    assert_eq!(view.forecast, BestForecast::Pick { order: vec![1] });
+    // No stored active account either: no live login, so every candidate is ranked.
+    fx.engine
+        .store()
+        .unwrap()
+        .set_active(&fx.provider(), None, None)
+        .unwrap();
+    let view = fx.engine.accounts(None).unwrap().remove(0);
+    assert!(view.accounts.iter().all(|v| !v.active));
+    assert_eq!(view.live, LiveLogin::None);
+    assert_eq!(view.forecast, BestForecast::Pick { order: vec![1, 2] });
+    assert_eq!(
+        view.forecast,
+        forecast_of(&view.accounts, &LiveLogin::None, &view.models)
     );
 }

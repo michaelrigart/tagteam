@@ -459,3 +459,66 @@ fn a_fake_agent_link_sync_writes_only_its_create_only_entry() {
             .is_symlink()
     );
 }
+
+#[test]
+fn each_provider_s_view_carries_its_models_and_live_login() {
+    use tagteam_engine::switch::LiveLogin;
+
+    let ffx = FakeFx::new();
+    let config = tagteam_engine::settings::config_path(&ffx.fx.env);
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        "[autoswitch]\nmodels = [\"fable\"]\n\n[provider.fake-agent.autoswitch]\nmodels = [\"all\"]\n",
+    )
+    .unwrap();
+    ffx.fx.add("a@b.co", "rt-a");
+    ffx.fake_add("alice", "tok-a", "renew-a");
+    // A FakeAgent login it never added.
+    ffx.fake_login("carol", "tok-c", "renew-c");
+    let seen: Vec<(String, Vec<String>, LiveLogin)> = ffx
+        .engine
+        .accounts(None)
+        .unwrap()
+        .into_iter()
+        .map(|l| (l.provider.as_str().to_owned(), l.models, l.live))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (
+                "claude-code".to_owned(),
+                vec!["fable".to_owned()],
+                LiveLogin::Managed { position: 1 }
+            ),
+            (
+                FAKE_AGENT.to_owned(),
+                vec!["all".to_owned()],
+                LiveLogin::Unmanaged {
+                    email: "carol@ws".into()
+                }
+            ),
+        ]
+    );
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn the_accounts_view_reads_each_provider_s_live_login_once() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let ffx = FakeFx::new();
+    ffx.fx.add("a@b.co", "rt-a");
+    ffx.fake_add("alice", "tok-a", "renew-a");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counter = reads.clone();
+    ffx.engine.on_point(
+        "view-live-identity",
+        Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    assert_eq!(ffx.engine.accounts(None).unwrap().len(), 2);
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+}
