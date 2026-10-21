@@ -6,7 +6,7 @@
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use tagteam_core::ProviderId;
-use tagteam_core::autoswitch::{NoSwitchReason, Trigger};
+use tagteam_core::autoswitch::NoSwitchReason;
 use tagteam_daemon::events::Mode;
 use tagteam_daemon::protocol::{StatusOutcome, StatusProvider, StatusSwitch};
 use tagteam_daemon::status::OutcomeKind;
@@ -118,7 +118,7 @@ fn switched(view: Option<&ProviderAccounts>, s: &StatusSwitch) -> String {
         named(view, s.from),
         named(view, s.to)
     );
-    match Trigger::parse(&s.trigger) {
+    match s.trigger.known() {
         Some(trigger) => format!("{moved} ({})", words::trigger(trigger)),
         None => moved,
     }
@@ -226,7 +226,7 @@ mod tests {
             at: at.into(),
             from,
             to,
-            trigger: trigger.into(),
+            trigger: Wire::from_wire(trigger),
         }
     }
 

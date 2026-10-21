@@ -213,7 +213,7 @@ fn daemon_value(s: &Status) -> Value {
                 "lastTickAt": p.last_tick_at,
                 "nextTickAt": p.next_tick_at,
                 "lastOutcome": p.last_outcome.as_ref().map(|o| json!({"kind": o.kind.as_str(), "reason": o.reason, "at": o.at})),
-                "lastSwitch": p.last_switch.as_ref().map(|w| json!({"at": w.at, "from": w.from, "to": w.to, "trigger": w.trigger})),
+                "lastSwitch": p.last_switch.as_ref().map(|w| json!({"at": w.at, "from": w.from, "to": w.to, "trigger": w.trigger.as_str()})),
             })
         })
         .collect();
@@ -240,7 +240,11 @@ fn daemon_value(s: &Status) -> Value {
             "socket": d.socket,
             "log": d.log,
         },
-        "notifications": {"enabled": n.enabled, "backend": n.backend, "events": n.events},
+        "notifications": {
+            "enabled": n.enabled,
+            "backend": n.backend,
+            "events": n.events.iter().map(Wire::as_str).collect::<Vec<_>>(),
+        },
         "providers": providers,
         "jobs": jobs,
         "subscribers": s.subscribers,
@@ -305,7 +309,11 @@ fn notifications_line(n: &StatusNotifications) -> String {
         (true, Some(backend)) => {
             format!(
                 "  notifications: {}, through {backend}\n",
-                n.events.join(", ")
+                n.events
+                    .iter()
+                    .map(Wire::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         }
     }
@@ -339,7 +347,10 @@ fn provider_line(p: &StatusProvider) -> String {
     if let Some(w) = &p.last_switch {
         line.push_str(&format!(
             "; last switch {} → {} ({}) at {}",
-            w.from, w.to, w.trigger, w.at
+            w.from,
+            w.to,
+            w.trigger.as_str(),
+            w.at
         ));
     }
     line.push('\n');
@@ -412,7 +423,9 @@ mod tests {
             notifications: StatusNotifications {
                 enabled: true,
                 backend: Some("osascript".into()),
-                events: vec!["switch".into(), "quarantine".into(), "limit".into()],
+                events: ["switch", "quarantine", "limit"]
+                    .map(Wire::from_wire)
+                    .to_vec(),
             },
             providers: vec![
                 StatusProvider {
@@ -433,7 +446,7 @@ mod tests {
                         at: "2026-10-14T20:50:00Z".into(),
                         from: 1,
                         to: 2,
-                        trigger: "proactive".into(),
+                        trigger: Wire::from_wire("proactive"),
                     }),
                 },
                 StatusProvider {
@@ -537,6 +550,32 @@ mod tests {
                             "path": "/Users/me/Library/LaunchAgents/io.github.michaelrigart.tagteam.plist",
                             "installed": true, "loaded": true, "lastExitStatus": null}
             })
+        );
+    }
+
+    #[test]
+    fn the_daemon_s_spelled_fields_are_written_back_byte_for_byte() {
+        // Each retyped field known, spelled as a later daemon might, and null where optional.
+        let sent = concat!(
+            r#"{"daemon":{"pid":4242,"version":"20261014.2045.0","protocol":1,"startedAt":"2026-10-14T20:45:00Z","socket":null,"log":"~/.local/state/tagteam/tagteam.log"},"#,
+            r#""notifications":{"enabled":true,"backend":"osascript","events":["switch","digest"]},"#,
+            r#""providers":["#,
+            r#"{"provider":"claude-code","mode":"waiting","autoswitch":true,"waitingFor":"engine-lock","holderPid":7,"backoff":null,"lastTickAt":null,"nextTickAt":null,"lastOutcome":{"kind":"no-switch","reason":"cooldown","at":"2026-10-14T21:00:00Z"},"lastSwitch":{"at":"2026-10-14T20:50:00Z","from":1,"to":2,"trigger":"proactive"}},"#,
+            r#"{"provider":"fake-agent","mode":"paused","autoswitch":true,"waitingFor":"a-later-wait","holderPid":null,"backoff":null,"lastTickAt":null,"nextTickAt":null,"lastOutcome":{"kind":"rested","reason":null,"at":"2026-10-14T21:00:00Z"},"lastSwitch":{"at":"2026-10-14T20:50:00Z","from":2,"to":1,"trigger":"added-later"}},"#,
+            r#"{"provider":"third","mode":"idle","autoswitch":false,"waitingFor":null,"holderPid":null,"backoff":null,"lastTickAt":null,"nextTickAt":null,"lastOutcome":null,"lastSwitch":null}"#,
+            r#"],"jobs":[],"subscribers":0}"#
+        );
+        let status: Status = serde_json::from_str(sent).unwrap();
+        assert_eq!(status.providers[1].mode, Wire::Other("paused".into()));
+        assert_eq!(daemon_value(&status).to_string(), sent);
+        let line = provider_line(&status.providers[1]);
+        assert_eq!(
+            line,
+            "  fake-agent: paused for a-later-wait; last rested at 2026-10-14T21:00:00Z; last switch 2 → 1 (added-later) at 2026-10-14T20:50:00Z\n"
+        );
+        assert_eq!(
+            notifications_line(&status.notifications),
+            "  notifications: switch, digest, through osascript\n"
         );
     }
 

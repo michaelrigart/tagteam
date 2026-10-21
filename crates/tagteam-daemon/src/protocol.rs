@@ -10,6 +10,7 @@ use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::{NoSwitchReason, Trigger};
 use tagteam_core::time::format_iso8601;
 use tagteam_engine::auto::AutoEvent;
+use tagteam_engine::settings::NotifyEvent;
 use tagteam_engine::tokens::IndexState;
 
 use crate::events::{Backoff, DaemonEvent, Mode, WaitingFor};
@@ -232,7 +233,14 @@ macro_rules! spelled {
     )*};
 }
 
-spelled!(Mode, WaitingFor, OutcomeKind, NoSwitchReason, Trigger);
+spelled!(
+    Mode,
+    WaitingFor,
+    OutcomeKind,
+    NoSwitchReason,
+    Trigger,
+    NotifyEvent
+);
 
 /// A value as the wire spells it: one this client knows, or the spelling of one a later daemon
 /// added (D5.6), kept as it came.
@@ -522,7 +530,7 @@ pub struct StatusNotifications {
     pub enabled: bool,
     /// `osascript`, `notify-send`, or none (D6).
     pub backend: Option<String>,
-    pub events: Vec<String>,
+    pub events: Vec<Wire<NotifyEvent>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -586,7 +594,7 @@ pub struct StatusSwitch {
     pub at: String,
     pub from: u32,
     pub to: u32,
-    pub trigger: String,
+    pub trigger: Wire<Trigger>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -699,9 +707,7 @@ impl Event {
     /// `Some` only for `Event::TokenIndex`; a null or absent `changedAt` is `None`.
     pub fn token_index(&self) -> Option<TokenIndexPayload> {
         match self {
-            Event::TokenIndex { raw, .. } => Some(TokenIndexPayload {
-                changed_at: optional_text(raw, "changedAt"),
-            }),
+            Event::TokenIndex { raw, .. } => Some(parse_token_index(raw)),
             _ => None,
         }
     }
@@ -791,6 +797,13 @@ pub struct AllExhaustedPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenIndexPayload {
     pub changed_at: Option<String>,
+}
+
+/// A `token-index` object's fields; a null or absent `changedAt` is `None`.
+pub fn parse_token_index(raw: &Value) -> TokenIndexPayload {
+    TokenIndexPayload {
+        changed_at: optional_text(raw, "changedAt"),
+    }
 }
 
 /// `raw`'s string `key`, empty when it holds none.
@@ -1416,6 +1429,7 @@ mod tests {
         assert_eq!(index(None).token_index(), Some(never.clone()));
         let keyless = json!({"event": "token-index", "provider": "p"});
         assert_eq!(parse_event(&keyless).unwrap().token_index(), Some(never));
+        assert_eq!(parse_token_index(&json!({"changedAt": 5})).changed_at, None);
         assert_eq!(Event::Changed.token_index(), None);
         assert_eq!(Event::Changed.all_exhausted(), None);
         assert_eq!(Event::Changed.error(), None);
@@ -2060,7 +2074,11 @@ mod socket_protocol_tests {
             StatusNotifications {
                 enabled: true,
                 backend: Some("osascript".into()),
-                events: vec!["switch".into(), "quarantine".into(), "limit".into()],
+                events: vec![
+                    Wire::Known(NotifyEvent::Switch),
+                    Wire::Known(NotifyEvent::Quarantine),
+                    Wire::Known(NotifyEvent::Limit),
+                ],
             }
         );
         assert_eq!(
@@ -2083,7 +2101,7 @@ mod socket_protocol_tests {
                     at: iso(T + 30),
                     from: 1,
                     to: 2,
-                    trigger: "proactive".into(),
+                    trigger: Wire::from_wire("proactive"),
                 }),
             }
         );
@@ -2146,11 +2164,29 @@ mod socket_protocol_tests {
             status.providers[4].last_outcome.as_ref().map(|o| &o.kind),
             Some(&Wire::Known(OutcomeKind::Error))
         );
+        assert_eq!(
+            auto.last_switch.as_ref().map(|w| &w.trigger),
+            Some(&Wire::Known(Trigger::Proactive))
+        );
+        assert_eq!(
+            status.notifications.events,
+            NotifyEvent::ALL.map(Wire::Known).to_vec()
+        );
+        // An optional field left out reads as none, as a null does.
+        let mut absent = v.clone();
+        absent["providers"][2]
+            .as_object_mut()
+            .unwrap()
+            .remove("waitingFor");
+        let absent: Status = serde_json::from_value(absent).unwrap();
+        assert_eq!(absent.providers[2].waiting_for, None);
         // D5.6: a spelling a later daemon writes is kept as it came.
         let mut later = v;
         later["providers"][2]["mode"] = json!("paused");
         later["providers"][2]["waitingFor"] = json!("later");
         later["providers"][4]["lastOutcome"]["kind"] = json!("rested");
+        later["providers"][0]["lastSwitch"]["trigger"] = json!("added-later");
+        later["notifications"]["events"] = json!(["switch", "digest"]);
         let later: Status = serde_json::from_value(later).unwrap();
         let paused = &later.providers[2];
         assert_eq!(paused.mode, Wire::Other("paused".into()));
@@ -2161,6 +2197,15 @@ mod socket_protocol_tests {
         assert_eq!(
             later.providers[4].last_outcome.as_ref().map(|o| &o.kind),
             Some(&Wire::Other("rested".into()))
+        );
+        let trigger = later.providers[0].last_switch.as_ref().map(|w| &w.trigger);
+        assert_eq!(trigger, Some(&Wire::Other("added-later".into())));
+        assert_eq!(
+            later.notifications.events,
+            [
+                Wire::Known(NotifyEvent::Switch),
+                Wire::Other("digest".into())
+            ]
         );
         let mut not_a_string = status_json(&snapshot(), Path::new(HOME));
         not_a_string["providers"][0]["mode"] = json!(7);
