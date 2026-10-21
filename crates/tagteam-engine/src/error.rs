@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -258,10 +259,93 @@ pub enum EngineError {
     Transfer(#[from] TransferError),
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// §10.5: a deletion refused to protect the live login or a stored account's Keychain item;
+    /// nothing was deleted. `why` says which, and is the whole message.
+    #[error("{why}")]
+    DeletionRefused { why: DeletionRefusal },
+    /// `source`, named by the path it concerns ("<path>: <source>"). It reads as `source` does:
+    /// its `kind()` and its `signal()` (D-3).
+    #[error("{}: {source}", path.display())]
+    AtPath {
+        path: PathBuf,
+        source: Box<EngineError>,
+    },
     /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
     /// reports its own `LockError::Interrupted`; `signal()` reads either.
     #[error("interrupted")]
     Interrupted(i32),
+}
+
+/// Which guard refused, which decides its wording (§8.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardScope {
+    /// `refuse_live_files_at`: one profile or orphan entry of `sessions/`.
+    ProfileEntry,
+    /// `refuse_live_in_envelope`: everything a purge deletes.
+    Purge,
+}
+
+/// Why a deletion was refused (§10.5); every form leaves what it names where it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionRefusal {
+    /// The Keychain item a profile names is the live login's. `position` is the account whose
+    /// profile names the item; `None` for an orphan entry.
+    LiveLoginKeychain {
+        var: &'static str,
+        position: Option<u32>,
+    },
+    /// A path the live login lives at could not be resolved.
+    LiveLoginUnresolved(GuardScope),
+    /// The live login's files are inside what would be deleted.
+    LiveLoginInside(GuardScope),
+    /// The Keychain item an orphan names belongs to a stored account.
+    StoredAccountKeychain,
+    /// A stored account's profile could not be resolved, so an orphan cannot be told apart.
+    StoredAccountUnresolved,
+}
+
+impl fmt::Display for DeletionRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const LIVE: &str = "(tagteam never deletes the live login)";
+        match self {
+            Self::LiveLoginKeychain {
+                var,
+                position: Some(position),
+            } => write!(
+                f,
+                "the Keychain item account {position}'s profile names is the live login's, since the environment ({var}, or the provider's override of it) names the same directory; nothing was deleted {LIVE}"
+            ),
+            Self::LiveLoginKeychain {
+                var,
+                position: None,
+            } => write!(
+                f,
+                "the Keychain item it names is the live login's, since the environment ({var}, or the provider's override of it) names the same directory; it was left as it is, and so was the profile (a purge never deletes the live login)"
+            ),
+            Self::LiveLoginUnresolved(GuardScope::ProfileEntry) => write!(
+                f,
+                "a path the live login lives at could not be resolved, so it cannot be told whether deleting this profile entry would break it; nothing was deleted {LIVE}"
+            ),
+            Self::LiveLoginUnresolved(GuardScope::Purge) => write!(
+                f,
+                "a path the live login lives at could not be resolved, so it cannot be told whether this purge would delete it; nothing was deleted {LIVE}"
+            ),
+            Self::LiveLoginInside(GuardScope::ProfileEntry) => write!(
+                f,
+                "the live login's files are inside what this would delete, since the environment names it; nothing was deleted {LIVE}"
+            ),
+            Self::LiveLoginInside(GuardScope::Purge) => write!(
+                f,
+                "the live login's files are inside what this would delete, since the environment names them; nothing was deleted {LIVE}"
+            ),
+            Self::StoredAccountKeychain => f.write_str(
+                "the Keychain item it names belongs to a stored account, since this entry leads to that account's profile; it was left as it is, and so was the entry",
+            ),
+            Self::StoredAccountUnresolved => f.write_str(
+                "a stored account's profile could not be resolved, so this entry cannot be told apart from it; it was left as it is",
+            ),
+        }
+    }
 }
 
 /// Why a profile's must-share entry is split from the shared one (§12.2), which decides what
@@ -529,6 +613,8 @@ impl EngineError {
             EngineError::AccountBroken { .. } => "account-broken",
             EngineError::Transfer(e) => e.kind(),
             EngineError::Io(_) => "io",
+            EngineError::DeletionRefused { .. } => "deletion-refused",
+            EngineError::AtPath { source, .. } => source.kind(),
             EngineError::Interrupted(_) => "interrupted",
         }
     }
@@ -543,7 +629,16 @@ impl EngineError {
             EngineError::Lock(e)
             | EngineError::Provider(ProviderError::Lock(e))
             | EngineError::Settings(SettingsError::Lock(e)) => e.signal(),
+            EngineError::AtPath { source, .. } => source.signal(),
             _ => None,
+        }
+    }
+
+    /// `self` behind the path it concerns: the text gains "<path>: ", the kind and signal stay.
+    pub(crate) fn at_path(self, path: &Path) -> EngineError {
+        EngineError::AtPath {
+            path: path.to_path_buf(),
+            source: Box::new(self),
         }
     }
 }
@@ -925,6 +1020,39 @@ mod tests {
             ),
             (EngineError::Interrupted(1), "interrupted"),
         ];
+        let refusals = [
+            DeletionRefusal::LiveLoginKeychain {
+                var: "CLAUDE_CONFIG_DIR",
+                position: Some(2),
+            },
+            DeletionRefusal::LiveLoginKeychain {
+                var: "CLAUDE_CONFIG_DIR",
+                position: None,
+            },
+            DeletionRefusal::LiveLoginUnresolved(GuardScope::ProfileEntry),
+            DeletionRefusal::LiveLoginUnresolved(GuardScope::Purge),
+            DeletionRefusal::LiveLoginInside(GuardScope::ProfileEntry),
+            DeletionRefusal::LiveLoginInside(GuardScope::Purge),
+            DeletionRefusal::StoredAccountKeychain,
+            DeletionRefusal::StoredAccountUnresolved,
+        ];
+        let mut cases = cases;
+        for why in refusals {
+            cases.push((EngineError::DeletionRefused { why }, "deletion-refused"));
+        }
+        // A path in front changes nothing about what went wrong (D-3).
+        let at = |source: EngineError| EngineError::AtPath {
+            path: PathBuf::from("/data/displaced"),
+            source: Box::new(source),
+        };
+        cases.push((
+            at(EngineError::DeletionRefused {
+                why: DeletionRefusal::StoredAccountKeychain,
+            }),
+            "deletion-refused",
+        ));
+        cases.push((at(EngineError::Io(io::Error::other("x"))), "io"));
+        cases.push((at(EngineError::Store(StoreError::NoSuchAccount)), "store"));
         for (err, want) in cases {
             assert_eq!(err.kind(), want, "{err:?}");
         }
@@ -989,6 +1117,69 @@ mod tests {
             None
         );
         assert_eq!(EngineError::LiveMoved.signal(), None);
+        assert_eq!(
+            EngineError::AtPath {
+                path: PathBuf::from("x"),
+                source: Box::new(EngineError::Interrupted(2)),
+            }
+            .signal(),
+            Some(2)
+        );
+    }
+
+    /// Each refusal reads exactly as the `Io` text it replaced did, at every site (D-3).
+    #[test]
+    fn every_deletion_refusal_keeps_its_text() {
+        let live = |position| DeletionRefusal::LiveLoginKeychain {
+            var: "CLAUDE_CONFIG_DIR",
+            position,
+        };
+        let cases = [
+            (
+                live(Some(2)),
+                "the Keychain item account 2's profile names is the live login's, since the environment (CLAUDE_CONFIG_DIR, or the provider's override of it) names the same directory; nothing was deleted (tagteam never deletes the live login)",
+            ),
+            (
+                live(None),
+                "the Keychain item it names is the live login's, since the environment (CLAUDE_CONFIG_DIR, or the provider's override of it) names the same directory; it was left as it is, and so was the profile (a purge never deletes the live login)",
+            ),
+            (
+                DeletionRefusal::LiveLoginUnresolved(GuardScope::ProfileEntry),
+                "a path the live login lives at could not be resolved, so it cannot be told whether deleting this profile entry would break it; nothing was deleted (tagteam never deletes the live login)",
+            ),
+            (
+                DeletionRefusal::LiveLoginUnresolved(GuardScope::Purge),
+                "a path the live login lives at could not be resolved, so it cannot be told whether this purge would delete it; nothing was deleted (tagteam never deletes the live login)",
+            ),
+            (
+                DeletionRefusal::LiveLoginInside(GuardScope::ProfileEntry),
+                "the live login's files are inside what this would delete, since the environment names it; nothing was deleted (tagteam never deletes the live login)",
+            ),
+            (
+                DeletionRefusal::LiveLoginInside(GuardScope::Purge),
+                "the live login's files are inside what this would delete, since the environment names them; nothing was deleted (tagteam never deletes the live login)",
+            ),
+            (
+                DeletionRefusal::StoredAccountKeychain,
+                "the Keychain item it names belongs to a stored account, since this entry leads to that account's profile; it was left as it is, and so was the entry",
+            ),
+            (
+                DeletionRefusal::StoredAccountUnresolved,
+                "a stored account's profile could not be resolved, so this entry cannot be told apart from it; it was left as it is",
+            ),
+        ];
+        for (why, text) in cases {
+            assert_eq!(why.to_string(), text);
+            assert_eq!(EngineError::DeletionRefused { why }.to_string(), text);
+        }
+        let at = EngineError::DeletionRefused {
+            why: DeletionRefusal::StoredAccountUnresolved,
+        }
+        .at_path(Path::new("/data/sessions/x"));
+        assert_eq!(
+            at.to_string(),
+            "/data/sessions/x: a stored account's profile could not be resolved, so this entry cannot be told apart from it; it was left as it is"
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::account_lock::AccountLock;
 use crate::auto::{engine_lock_path, read_holder};
 use crate::displace::PurgeError;
 use crate::engine::Engine;
-use crate::error::{EngineError, SessionOwner};
+use crate::error::{DeletionRefusal, EngineError, GuardScope, SessionOwner};
 use crate::fsutil::{FileId, absent, trace_path};
 use crate::hooks;
 use crate::lifecycle::{PendingLaunches, UnlistedRescues};
@@ -288,9 +288,8 @@ impl Engine {
             self.refuse_orphan_split(profile)?;
             // §10.5: the live login is found here, before anything is deleted, not when this
             // entry's turn comes. The user is told which entry.
-            self.refuse_orphan_live(profile, &providers).map_err(|e| {
-                EngineError::Io(io::Error::other(format!("{}: {e}", profile.display())))
-            })?;
+            self.refuse_orphan_live(profile, &providers)
+                .map_err(|e| e.at_path(profile))?;
         }
         // §10.5: nothing else purge deletes may hold the live login either: `displaced/`, the
         // rescue path, `vault/`, dead temp files and the log, against every registered
@@ -788,9 +787,12 @@ impl Engine {
         for (p, spelling) in items {
             if p.live_item_spelling(&self.env).as_deref() == Some(spelling.as_str()) {
                 let var = p.session_dir_var().unwrap_or("the home variable");
-                return Err(EngineError::Io(io::Error::other(format!(
-                    "the Keychain item it names is the live login's, since the environment ({var}, or the provider's override of it) names the same directory; it was left as it is, and so was the profile (a purge never deletes the live login)"
-                ))));
+                return Err(EngineError::DeletionRefused {
+                    why: DeletionRefusal::LiveLoginKeychain {
+                        var,
+                        position: None,
+                    },
+                });
             }
         }
         Ok(())
@@ -806,9 +808,9 @@ impl Engine {
         let stored = self.stored_spellings()?;
         for (_, spelling) in items {
             if stored.contains(spelling) {
-                return Err(EngineError::Io(io::Error::other(
-                    "the Keychain item it names belongs to a stored account, since this entry leads to that account's profile; it was left as it is, and so was the entry",
-                )));
+                return Err(EngineError::DeletionRefused {
+                    why: DeletionRefusal::StoredAccountKeychain,
+                });
             }
         }
         Ok(())
@@ -916,15 +918,11 @@ impl Engine {
         rows: &[AccountRow],
         store: Option<&Store>,
     ) -> Result<(), EngineError> {
-        let unresolved = || {
-            EngineError::Io(io::Error::other(
-                "a path the live login lives at could not be resolved, so it cannot be told whether this purge would delete it; nothing was deleted (tagteam never deletes the live login)",
-            ))
+        let unresolved = || EngineError::DeletionRefused {
+            why: DeletionRefusal::LiveLoginUnresolved(GuardScope::Purge),
         };
-        let refused = || {
-            EngineError::Io(io::Error::other(
-                "the live login's files are inside what this would delete, since the environment names them; nothing was deleted (tagteam never deletes the live login)",
-            ))
+        let refused = || EngineError::DeletionRefused {
+            why: DeletionRefusal::LiveLoginInside(GuardScope::Purge),
         };
         // The roots are every directory purge deletes in, by what each RESOLVES to
         // (`metadata` follows links): `vault/`, `displaced/` and `sessions/` may be links to
@@ -1031,9 +1029,8 @@ impl Engine {
         rows: &[AccountRow],
     ) -> Result<(), EngineError> {
         for target in self.deletion_targets(plan, rows) {
-            self.refuse_live_at_all(&target).map_err(|e| {
-                EngineError::Io(io::Error::other(format!("{}: {e}", target.display())))
-            })?;
+            self.refuse_live_at_all(&target)
+                .map_err(|e| e.at_path(&target))?;
         }
         Ok(())
     }
@@ -1114,9 +1111,9 @@ impl Engine {
                 // Any other cause drops a stored account's spelling and opens the guard:
                 // the entry is left as it is. A fixed text (§14.2): no path, no error text.
                 Err(_) => {
-                    return Err(EngineError::Io(io::Error::other(
-                        "a stored account's profile could not be resolved, so this entry cannot be told apart from it; it was left as it is",
-                    )));
+                    return Err(EngineError::DeletionRefused {
+                        why: DeletionRefusal::StoredAccountUnresolved,
+                    });
                 }
             }
         }
@@ -1314,15 +1311,13 @@ impl Engine {
         // Outside the data directory: dead temp files and the log, guarded as the full purge's.
         for dir in [self.env.config_dir(), self.env.state_dir()] {
             for target in self.dead_temp_files(&dir) {
-                self.refuse_live_at_all(&target).map_err(|e| {
-                    EngineError::Io(io::Error::other(format!("{}: {e}", target.display())))
-                })?;
+                self.refuse_live_at_all(&target)
+                    .map_err(|e| e.at_path(&target))?;
             }
         }
         for target in self.log_paths() {
-            self.refuse_live_at_all(&target).map_err(|e| {
-                EngineError::Io(io::Error::other(format!("{}: {e}", target.display())))
-            })?;
+            self.refuse_live_at_all(&target)
+                .map_err(|e| e.at_path(&target))?;
         }
         // A vault kept in a directory keeps it in the data directory: nothing is there.
         if self.vault.dir().is_none() {
