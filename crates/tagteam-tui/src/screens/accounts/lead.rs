@@ -197,11 +197,8 @@ fn title(
 ) -> Line<'static> {
     let theme = state.theme;
     let name = card::name_spans(&v.row, width, theme);
-    // With several providers' sections, the card says whose account is in use.
-    let several = state
-        .accounts
-        .snapshot()
-        .is_some_and(|snap| snap.providers.len() > 1);
+    // With several providers' sections in the table, the card says whose account is in use.
+    let several = super::sections(&state.accounts).len() > 1;
     let provider = several.then_some(view.names.display_name);
     let facts = card::fact_spans(facts_of(v, provider, now_ms), theme);
     let head = vec![

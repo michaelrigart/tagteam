@@ -54,13 +54,13 @@ fn windows_of(v: &AccountView) -> &[(Window, Pace)] {
 /// Whether `v` is the account in use, whose card leaves to the lead card what it shows: the
 /// reset and projection of the windows it draws (T3-32), and the problem and its remedy (M-9).
 /// The lead card shows focus's account in use, and focus is the selected account's provider.
-pub(crate) fn on_lead(v: &AccountView) -> bool {
+pub(crate) fn is_on_lead(v: &AccountView) -> bool {
     v.active
 }
 
 /// The card's problem rows: none for the account in use, whose lead card shows them (M-9).
 fn own_problem_rows(state: &State, v: &AccountView, width: u16, now_ms: i64) -> Vec<Line<'static>> {
-    if on_lead(v) {
+    if is_on_lead(v) {
         return vec![];
     }
     problem_rows(state, v, width, now_ms)

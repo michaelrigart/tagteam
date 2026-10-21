@@ -270,8 +270,8 @@ selected account's card.
   first that applies: a `✕` login problem, `○ disabled`, a `!` problem (`! rate-limited`,
   `! old reading`, …), `▶ this session` (a run shell's own account), `in use`, `best` or
   `api key`. A disabled account says `○ disabled` over every `!` problem; a `✕` problem still
-  shows. Below 100 columns there is no STATUS column: only the phrase's glyph shows, after
-  UPDATED. Scoped and spend windows stay on the cards below 160 columns.
+  shows. Below 100 columns there is no STATUS column: only a `✕`, `!` or `○` phrase shows its
+  glyph, after UPDATED. Scoped and spend windows stay on the cards below 160 columns.
 - **The words** are the same as `list`'s (core §13.1, the redesign spec's §11.1). That means the
   same words, not the same columns.
 - **The selected card** shows every window with a sparkline, its percentage, `▲`, the reset and
