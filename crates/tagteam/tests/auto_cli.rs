@@ -515,17 +515,16 @@ fn auto_records_its_switch_as_auto_and_a_later_switch_as_cli() {
     switching(d.path());
     let out = auto(d.path(), &["--once"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-    let last = |d: &Path| {
-        let e = store(d).events().unwrap().pop().unwrap();
-        (e.kind, e.trigger, e.source)
-    };
+    let last = |d: &Path| store(d).events().unwrap().pop().unwrap();
+    let e = last(d.path());
     assert_eq!(
-        last(d.path()),
-        ("switch".into(), Some("proactive".into()), "auto".into())
+        (e.kind.as_str(), e.trigger.as_deref(), e.source.as_str()),
+        ("switch", Some("proactive"), "auto")
     );
     cmd(d.path()).args(["switch", "2"]).assert().success();
+    let e = last(d.path());
     assert_eq!(
-        last(d.path()),
-        ("switch".into(), Some("manual".into()), "cli".into())
+        (e.kind.as_str(), e.trigger.as_deref(), e.source.as_str()),
+        ("switch", Some("manual"), "cli")
     );
 }

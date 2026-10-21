@@ -456,7 +456,7 @@ impl Engine {
         if live.is_some() && live_row.is_none() && !req.force {
             return Ok(Vec::new());
         }
-        self.release_unbound_quarantines(&req.provider, req.source)?;
+        self.release_unbound_quarantines(&req.provider)?;
         // §9.3: the live account, then every switchable candidate; a session-owned account is
         // no candidate of any strategy, so it is not collected for one.
         let mut accounts: Vec<AccountId> = live_row.into_iter().map(|r| r.id).collect();

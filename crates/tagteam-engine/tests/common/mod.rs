@@ -513,7 +513,6 @@ impl Fx {
             provider: self.provider(),
             target: SwitchTarget::Account(id.clone()),
             force,
-            source: "cli",
             auto: None,
         }
     }
@@ -528,7 +527,6 @@ impl Fx {
             provider: self.provider(),
             target: SwitchTarget::Rotation,
             force,
-            source: "cli",
             auto: None,
         }
     }
@@ -764,7 +762,7 @@ impl Fx {
             .store(&lock, new_bytes, self.cc.as_ref())
             .unwrap();
         store
-            .finish_replacement(&lock, self.clock.now_ms())
+            .finish_replacement(&lock, EventSource::Cli, self.clock.now_ms())
             .unwrap();
     }
 
@@ -817,7 +815,14 @@ impl Fx {
         vault: Vault,
         oracle: Arc<dyn Oracle>,
     ) -> Engine {
-        self.engine_spawning(env, run_shell, vault, oracle, self.spawner.clone())
+        self.engine_spawning(
+            env,
+            run_shell,
+            vault,
+            oracle,
+            self.spawner.clone(),
+            EventSource::Cli,
+        )
     }
 
     /// `engine_in`, whose login checks spawn through `spawner` (§12.3 step 8).
@@ -828,6 +833,7 @@ impl Fx {
         vault: Vault,
         oracle: Arc<dyn Oracle>,
         spawner: Arc<dyn ProcessSpawner>,
+        source: EventSource,
     ) -> Engine {
         Engine::new(EngineConfig {
             env,
@@ -841,8 +847,21 @@ impl Fx {
             process: self.process.clone(),
             spawner,
             run_shell,
-            source: EventSource::Cli,
+            source,
         })
+    }
+
+    /// An engine over this fixture's Env, vault, oracle, clock and scripted ports, recording
+    /// `source`: another command's process (review refactor §8.7).
+    pub fn engine_as(&self, source: EventSource) -> Engine {
+        self.engine_spawning(
+            self.env.clone(),
+            RunShell::Outside,
+            self.fixture_vault(),
+            self.oracle.clone(),
+            self.spawner.clone(),
+            source,
+        )
     }
 
     /// An engine over this fixture's Env, vault, oracle and clock whose login checks spawn
@@ -854,6 +873,7 @@ impl Fx {
             self.fixture_vault(),
             self.oracle.clone(),
             spawner,
+            EventSource::Cli,
         )
     }
 
@@ -1287,7 +1307,12 @@ impl FakeFx {
     pub fn new() -> Self {
         let fx = Fx::new();
         let fake = Arc::new(FakeAgent::new().with_lock_budget(Duration::from_secs(2)));
-        let engine = Engine::new(EngineConfig {
+        let engine = Self::build(&fx, &fake, EventSource::Cli);
+        FakeFx { fx, fake, engine }
+    }
+
+    fn build(fx: &Fx, fake: &Arc<FakeAgent>, source: EventSource) -> Engine {
+        Engine::new(EngineConfig {
             env: fx.env.clone(),
             registry: ProviderRegistry::new()
                 .with(fx.cc.clone())
@@ -1301,9 +1326,14 @@ impl FakeFx {
             process: fx.process.clone(),
             spawner: fx.spawner.clone(),
             run_shell: RunShell::Outside,
-            source: EventSource::Cli,
-        });
-        FakeFx { fx, fake, engine }
+            source,
+        })
+    }
+
+    /// An engine over what `FakeFx::new` builds its own over (registry, vault, oracle, clock,
+    /// port), recording `source` (review refactor §8.7).
+    pub fn engine_as(&self, source: EventSource) -> Engine {
+        Self::build(&self.fx, &self.fake, source)
     }
 
     pub fn fake_provider(&self) -> ProviderId {
@@ -1366,7 +1396,6 @@ impl FakeFx {
                 provider: self.fake_provider(),
                 target: SwitchTarget::Account(id.clone()),
                 force: false,
-                source: "cli",
                 auto: None,
             })
             .unwrap()

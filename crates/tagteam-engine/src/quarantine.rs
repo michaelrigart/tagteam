@@ -59,7 +59,6 @@ impl Engine {
         row: &AccountRow,
         kind: &str,
         reason: Option<&str>,
-        source: &str,
     ) -> Result<(), EngineError> {
         self.store()?.insert_event(
             &EventRow {
@@ -69,7 +68,7 @@ impl Engine {
                 from_id: None,
                 to_id: Some(row.id.clone()),
                 trigger: None,
-                source: source.into(),
+                source: self.source().as_str().into(),
                 detail: reason.map(|r| json!({"reason": r})),
             },
             self.registered_id(&row.provider).is_some(),
@@ -87,7 +86,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         self.store()?
             .set_quarantine(&row.id, reason.as_str(), fp, self.now_ms())?;
-        self.quarantine_event(row, "quarantine", Some(reason.as_str()), "cli")?;
+        self.quarantine_event(row, "quarantine", Some(reason.as_str()))?;
         tracing::warn!(
             position = row.position,
             account = %row.id,
@@ -99,17 +98,15 @@ impl Engine {
 
     /// §7.4: clears `row`'s quarantine and records its one `unquarantine` event, with
     /// `reason` (`ACCOUNT_REPLACED` when the account's `login_epoch` moved, else
-    /// `CREDENTIALS_REPLACED`) and `source` (`cli` or `auto`), in one store transaction.
-    /// `false`, and no event, when there was none.
-    pub(crate) fn unquarantine(
-        &self,
-        row: &AccountRow,
-        reason: &str,
-        source: &str,
-    ) -> Result<bool, EngineError> {
-        Ok(self
-            .store()?
-            .clear_quarantine(&row.id, reason, source, self.now_ms())?)
+    /// `CREDENTIALS_REPLACED`) and this engine's source (review refactor §8.7), in one store
+    /// transaction. `false`, and no event, when there was none.
+    pub(crate) fn unquarantine(&self, row: &AccountRow, reason: &str) -> Result<bool, EngineError> {
+        Ok(self.store()?.clear_quarantine(
+            &row.id,
+            reason,
+            self.source().as_str(),
+            self.now_ms(),
+        )?)
     }
 
     /// §7.4: whether `row`'s quarantine no longer binds. The vault must hold another
@@ -176,14 +173,13 @@ impl Engine {
 
     /// §7.4 / Decision 9: clears every quarantine of `provider` that no longer binds
     /// (`quarantine_released`), each under its account lock (try-only; a busy account is
-    /// left), and records each release with `source`. A pending replacement (§12.5) has moved
+    /// left), and records each release with this engine's source. A pending replacement (§12.5) has moved
     /// the account's `login_epoch`, so its release is `account-replaced`; its reconciliation
     /// later finds no quarantine left to clear, so the account still gets one event. Returns
     /// the released accounts.
     pub fn release_unbound_quarantines(
         &self,
         provider: &ProviderId,
-        source: &'static str,
     ) -> Result<Vec<AccountId>, EngineError> {
         let Some(store) = self.existing_store()? else {
             return Ok(Vec::new());
@@ -211,7 +207,7 @@ impl Engine {
             } else {
                 CREDENTIALS_REPLACED
             };
-            if self.unquarantine(&row, reason, source)? {
+            if self.unquarantine(&row, reason)? {
                 tracing::info!(
                     position = row.position,
                     account = %row.id,
@@ -227,6 +223,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::EventSource;
     use crate::testutil::{T, cred};
 
     #[test]
@@ -262,7 +259,7 @@ mod tests {
 
     #[test]
     fn quarantine_and_unquarantine_record_events() {
-        let t = T::new();
+        let t = T::sourced(EventSource::Daemon);
         let row = t.account("a@x.co", &cred("rt-1", 9));
         t.engine
             .quarantine(&row, QuarantineReason::InvalidGrant, "sha256:sent")
@@ -272,15 +269,9 @@ mod tests {
             (q.quarantine_reason.as_deref(), q.quarantine_fp.as_deref()),
             (Some("invalid_grant"), Some("sha256:sent"))
         );
+        assert!(t.engine.unquarantine(&q, CREDENTIALS_REPLACED).unwrap());
         assert!(
-            t.engine
-                .unquarantine(&q, CREDENTIALS_REPLACED, "auto")
-                .unwrap()
-        );
-        assert!(
-            !t.engine
-                .unquarantine(&q, CREDENTIALS_REPLACED, "auto")
-                .unwrap(),
+            !t.engine.unquarantine(&q, CREDENTIALS_REPLACED).unwrap(),
             "nothing left to clear"
         );
         let events = t.engine.store().unwrap().events().unwrap();
@@ -288,12 +279,12 @@ mod tests {
         assert_eq!(kinds, ["quarantine", "unquarantine"]);
         assert_eq!(events[0].to_id.as_ref(), Some(&row.id));
         assert_eq!(events[0].detail, Some(json!({"reason": "invalid_grant"})));
-        assert_eq!(events[0].source, "cli");
+        assert_eq!(events[0].source.as_str(), "daemon");
         assert_eq!(events[1].to_id.as_ref(), Some(&row.id));
         assert_eq!(
             events[1].detail,
             Some(json!({"reason": "credentials-replaced"}))
         );
-        assert_eq!(events[1].source, "auto");
+        assert_eq!(events[1].source.as_str(), "daemon");
     }
 }

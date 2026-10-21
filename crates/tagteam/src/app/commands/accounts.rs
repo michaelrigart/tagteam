@@ -419,7 +419,6 @@ impl App<'_, '_> {
             provider: provider.clone(),
             target: target.clone(),
             force,
-            source: "cli",
             auto: None,
         };
         let mut outcome = self.engine.switch(req())?;

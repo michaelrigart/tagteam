@@ -404,7 +404,7 @@ impl Engine {
                 secret
             }
             Some(out) => {
-                self.settle_outgoing(cx, ls, out, live, plan.hint.as_ref(), req.source)?;
+                self.settle_outgoing(cx, ls, out, live, plan.hint.as_ref())?;
                 // Step 4 settled the outgoing generation: kept, captured or displaced.
                 if let Some(bytes) = Axis::of(p, &out.kind).live_secret(live) {
                     cx.held.hold(p, &bytes);
@@ -533,7 +533,7 @@ impl Engine {
 
     /// Step 4: classify the outgoing credential and act on it. A capture's write changes the
     /// vault's fingerprint (it is never `Ours`), so it clears a quarantine (§7.4) and records
-    /// the clear with the switch's `source`.
+    /// the clear with the engine's source (review refactor §8.7).
     fn settle_outgoing(
         &self,
         cx: &mut Settle<'_>,
@@ -541,7 +541,6 @@ impl Engine {
         out: &AccountRow,
         live: &LiveAuth,
         hint: Option<&OracleHint>,
-        source: &str,
     ) -> Result<(), EngineError> {
         let p = cx.p;
         let store = ls.store;
@@ -599,7 +598,7 @@ impl Engine {
                     &out.kind,
                     p.login_expires_at(&bytes),
                 )?;
-                self.unquarantine(out, CREDENTIALS_REPLACED, source)?;
+                self.unquarantine(out, CREDENTIALS_REPLACED)?;
                 if backfill_uuid {
                     if let Some(uuid) = resolved.and_then(|i| i.account_uuid.as_deref()) {
                         store.backfill_account_uuid(&out.id, uuid)?;
@@ -702,7 +701,7 @@ impl Engine {
                         .map_or("manual", |a| a.trigger.as_str())
                         .into(),
                 ),
-                source: req.source.into(),
+                source: self.source().as_str().into(),
                 detail: None,
             },
             record.as_ref(),

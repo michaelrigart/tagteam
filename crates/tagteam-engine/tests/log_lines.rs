@@ -11,6 +11,7 @@ use common::{Fx, capture_logs, crashed_switch, due, vault_fp, write_target_crede
 use serde_json::json;
 use tagteam_cc::CLAUDE_CODE;
 use tagteam_core::{AccountId, ProviderId};
+use tagteam_engine::EventSource;
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::active::{ActiveOutcome, ActiveTrigger};
 use tagteam_engine::export::ExportRequest;
@@ -205,6 +206,30 @@ fn a_recovery_logs_which_way_it_went() {
         no_email(&logs);
         no_token(&logs);
     }
+}
+
+#[test]
+fn a_daemon_engine_records_and_logs_a_recovered_switch_as_the_daemon_s() {
+    // Review refactor §8.7: the recovery runs under the engine that takes the guard, and the
+    // log quotes its source as a string.
+    let _serial = one_at_a_time();
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &b, &a);
+    write_target_credential(&fx, &a);
+    let daemon = fx.engine_as(EventSource::Daemon);
+    let (_, logs) = capture_logs(|| drop(daemon.mutation_guard().unwrap()));
+    let last = fx.engine.store().unwrap().events().unwrap().pop().unwrap();
+    assert_eq!(
+        (last.kind.as_str(), last.source.as_str()),
+        ("switch-recovered", "daemon")
+    );
+    let line = at(&logs, "INFO", "event recorded")
+        .into_iter()
+        .find(|l| field(l, "kind") == Some("\"switch-recovered\""))
+        .unwrap_or_else(|| panic!("no switch-recovered line in {logs:#?}"));
+    assert_eq!(field(line, "source"), Some("\"daemon\""), "{line}");
 }
 
 #[test]

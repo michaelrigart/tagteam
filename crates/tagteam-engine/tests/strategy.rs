@@ -12,7 +12,6 @@ use common::{
 };
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, PollBudget, PollPlan, Window, WindowKind};
-use tagteam_engine::EngineError;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::{Eligibility, Reserve};
 use tagteam_engine::switch::{
@@ -20,6 +19,7 @@ use tagteam_engine::switch::{
     UsageStrategy,
 };
 use tagteam_engine::vault::SERVICE;
+use tagteam_engine::{EngineError, EventSource};
 use tagteam_provider::Keychain;
 
 #[test]
@@ -27,7 +27,7 @@ fn nothing_is_released_or_created_without_a_store() {
     let fx = Fx::new();
     assert!(
         fx.engine
-            .release_unbound_quarantines(&fx.provider(), "cli")
+            .release_unbound_quarantines(&fx.provider())
             .unwrap()
             .is_empty()
     );
@@ -42,8 +42,8 @@ fn a_quarantine_the_vault_has_moved_past_is_released_and_recorded_with_its_sourc
     fx.add("b@x.co", "rt-b"); // live
     fx.quarantine(&a, "invalid_grant", "sha256:a-generation-long-gone");
     assert_eq!(
-        fx.engine
-            .release_unbound_quarantines(&fx.provider(), "auto")
+        fx.engine_as(EventSource::Auto)
+            .release_unbound_quarantines(&fx.provider())
             .unwrap(),
         [a.clone()]
     );
@@ -69,7 +69,7 @@ fn a_quarantine_the_vault_still_holds_stays() {
     fx.quarantine(&a, "invalid_grant", &bound);
     assert!(
         fx.engine
-            .release_unbound_quarantines(&fx.provider(), "cli")
+            .release_unbound_quarantines(&fx.provider())
             .unwrap()
             .is_empty()
     );
@@ -88,7 +88,7 @@ fn an_unreadable_vault_leaves_the_quarantine() {
     fx.kc.set_unreadable(SERVICE, a.as_str(), true);
     assert!(
         fx.engine
-            .release_unbound_quarantines(&fx.provider(), "cli")
+            .release_unbound_quarantines(&fx.provider())
             .unwrap()
             .is_empty()
     );
@@ -107,7 +107,7 @@ fn the_live_account_s_quarantine_holds_while_the_live_credential_is_its_generati
     fx.put_vault(&b, &credential("b@x.co", "rt-b2"));
     assert!(
         fx.engine
-            .release_unbound_quarantines(&fx.provider(), "cli")
+            .release_unbound_quarantines(&fx.provider())
             .unwrap()
             .is_empty()
     );
@@ -116,7 +116,7 @@ fn the_live_account_s_quarantine_holds_while_the_live_credential_is_its_generati
     fx.rotate_live("rt-b3");
     assert_eq!(
         fx.engine
-            .release_unbound_quarantines(&fx.provider(), "cli")
+            .release_unbound_quarantines(&fx.provider())
             .unwrap(),
         [b.clone()]
     );
@@ -133,7 +133,7 @@ fn a_busy_account_lock_leaves_the_quarantine_for_the_next_caller() {
     let held = fx.engine.lock_account(&a).unwrap();
     assert!(
         fx.engine
-            .release_unbound_quarantines(&fx.provider(), "cli")
+            .release_unbound_quarantines(&fx.provider())
             .unwrap()
             .is_empty()
     );
@@ -141,7 +141,7 @@ fn a_busy_account_lock_leaves_the_quarantine_for_the_next_caller() {
     drop(held);
     assert_eq!(
         fx.engine
-            .release_unbound_quarantines(&fx.provider(), "cli")
+            .release_unbound_quarantines(&fx.provider())
             .unwrap(),
         [a]
     );
@@ -223,7 +223,6 @@ fn request(fx: &Fx, target: SwitchTarget) -> SwitchRequest {
         provider: fx.provider(),
         target,
         force: false,
-        source: "cli",
         auto: None,
     }
 }
@@ -768,7 +767,7 @@ fn a_live_credential_with_no_token_to_compare_holds_the_live_quarantine() {
         fx.set_live_credential(unreadable);
         assert!(
             fx.engine
-                .release_unbound_quarantines(&fx.provider(), "cli")
+                .release_unbound_quarantines(&fx.provider())
                 .unwrap()
                 .is_empty()
         );
@@ -794,7 +793,7 @@ fn a_live_account_with_no_live_credential_has_nothing_the_quarantine_binds() {
         .unwrap();
     assert_eq!(
         fx.engine
-            .release_unbound_quarantines(&fx.provider(), "cli")
+            .release_unbound_quarantines(&fx.provider())
             .unwrap(),
         [b]
     );
@@ -811,7 +810,7 @@ fn a_managed_key_account_s_quarantine_follows_the_live_key_the_same_way() {
     fx.put_vault(&k, OTHER_API_KEY.as_bytes());
     let release = || {
         fx.engine
-            .release_unbound_quarantines(&fx.provider(), "cli")
+            .release_unbound_quarantines(&fx.provider())
             .unwrap()
     };
     fx.put_managed_key(b"");

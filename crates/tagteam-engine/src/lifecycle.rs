@@ -265,7 +265,7 @@ impl Engine {
                 from_id: from.cloned(),
                 to_id: to.cloned(),
                 trigger: None,
-                source: "cli".into(),
+                source: self.source().as_str().into(),
                 detail: None,
             },
             self.registered_id(provider).is_some(),
@@ -719,7 +719,7 @@ impl Engine {
                     }
                     return Err(e.into());
                 }
-                store.finish_replacement(lock_for(&row.id), self.now_ms())?;
+                store.finish_replacement(lock_for(&row.id), self.source(), self.now_ms())?;
             }
             None => {
                 // At a free position first; it moves once any occupant is gone.

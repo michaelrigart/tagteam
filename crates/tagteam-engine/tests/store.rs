@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::{AccountId, ProviderId};
+use tagteam_engine::EventSource;
 use tagteam_engine::store::{
     Activation, AutoRecord, DisplacedRow, EventRow, JournalRow, LoginMeta, NewAccount, SeedLaunch,
     Store, StoreError,
@@ -124,7 +125,8 @@ fn replacement_markers_move_the_epoch() {
         (1, Some("sha256:x"), "oauth")
     );
     // Finishing installs the recorded metadata, kind included.
-    s.finish_replacement(&held_lock(&env, &a), 0).unwrap();
+    s.finish_replacement(&held_lock(&env, &a), EventSource::Cli, 0)
+        .unwrap();
     let r = s.account(&a).unwrap().unwrap();
     assert_eq!(
         (r.login_epoch, r.replacing_fp, r.kind.as_str()),
@@ -356,7 +358,7 @@ fn finish_replacement_refuses_metadata_missing_required_fields() {
     }
     let s = Store::open(&path).unwrap();
     assert!(matches!(
-        s.finish_replacement(&held_lock(&env, &a), 0),
+        s.finish_replacement(&held_lock(&env, &a), EventSource::Cli, 0),
         Err(StoreError::ReplacementUnreadable(_))
     ));
     // Untouched: the original login and the pending marker are both still there.
@@ -433,7 +435,7 @@ fn a_missing_account_is_reported_by_both_replacement_entry_points() {
         Err(StoreError::NoSuchAccount)
     ));
     assert!(matches!(
-        s.finish_replacement(&held_lock(&env, &missing), 0),
+        s.finish_replacement(&held_lock(&env, &missing), EventSource::Cli, 0),
         Err(StoreError::NoSuchAccount)
     ));
 }
@@ -1026,7 +1028,8 @@ fn a_row_that_already_names_the_account_with_an_epoch_is_kept() {
         false,
     )
     .unwrap();
-    s.finish_replacement(&held_lock(&env, &a), 0).unwrap();
+    s.finish_replacement(&held_lock(&env, &a), EventSource::Cli, 0)
+        .unwrap();
 
     s.begin_replacement(
         &held_lock(&env, &a),
@@ -1095,7 +1098,8 @@ fn finishing_a_replacement_taken_from_the_live_login_records_its_epoch() {
         )
         .unwrap();
 
-        s.finish_replacement(&held_lock(&env, &a), 0).unwrap();
+        s.finish_replacement(&held_lock(&env, &a), EventSource::Cli, 0)
+            .unwrap();
 
         let want = if from_live { 1 } else { 0 };
         assert_eq!(
@@ -1134,7 +1138,8 @@ fn a_finish_never_overwrites_a_switch_committed_since_the_replacer_died() {
     s.commit_switch(&cc(), &b, 0, &switch_event_to(&b), None)
         .unwrap();
 
-    s.finish_replacement(&held_lock(&env, &a), 0).unwrap();
+    s.finish_replacement(&held_lock(&env, &a), EventSource::Cli, 0)
+        .unwrap();
 
     assert_eq!(
         s.activation(&cc()).unwrap(),
@@ -1170,7 +1175,8 @@ fn replacement_metadata_without_from_live_is_not_from_the_live_login() {
         )
         .unwrap();
 
-    s.finish_replacement(&held_lock(&env, &a), 0).unwrap();
+    s.finish_replacement(&held_lock(&env, &a), EventSource::Cli, 0)
+        .unwrap();
 
     assert_eq!(
         s.activation(&cc()).unwrap(),
@@ -1235,7 +1241,8 @@ fn finishing_a_replacement_records_the_quarantine_it_clears() {
         .unwrap();
     s.begin_replacement(&held_lock(&env, &a), "sha256:new", &meta, false)
         .unwrap();
-    s.finish_replacement(&held_lock(&env, &a), 500).unwrap();
+    s.finish_replacement(&held_lock(&env, &a), EventSource::Cli, 500)
+        .unwrap();
     let row = s.account(&a).unwrap().unwrap();
     assert_eq!((row.quarantine_reason, row.replacing_fp), (None, None));
     let events = s.events().unwrap();
@@ -1264,7 +1271,8 @@ fn finishing_a_replacement_records_the_quarantine_it_clears() {
     };
     s.begin_replacement(&held_lock(&env, &b), "sha256:other", &meta, false)
         .unwrap();
-    s.finish_replacement(&held_lock(&env, &b), 600).unwrap();
+    s.finish_replacement(&held_lock(&env, &b), EventSource::Cli, 600)
+        .unwrap();
     assert_eq!(s.events().unwrap().len(), 1);
 }
 

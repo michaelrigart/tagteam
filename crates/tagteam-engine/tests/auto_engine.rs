@@ -13,9 +13,9 @@ use common::{
 use serde_json::{Value, json};
 use tagteam_core::autoswitch::{AutoConfig, AutoState, AutoStrategy, Decision, NoSwitchReason};
 use tagteam_core::{AccountId, ProviderId, Window, WindowKind};
-use tagteam_engine::EngineError;
 use tagteam_engine::auto::{AutoEvent, QuarantineWatch, TickOutcome};
 use tagteam_engine::store::AccountRow;
+use tagteam_engine::{EngineError, EventSource};
 use tagteam_provider::{FlockGuard, ProcessStamp, Provider, Read};
 
 const T0: i64 = 1_790_000_000;
@@ -269,18 +269,17 @@ fn last_event(fx: &Fx) -> (String, String) {
 
 #[test]
 fn a_daemon_engine_records_its_switches_as_the_daemon_s() {
-    // Decision 4: `events.source` reserves `daemon` (§6.1). The engine starts as `auto`.
+    // Decision 4: `events.source` reserves `daemon` (§6.1); the engine's source is the daemon's.
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     let b = fx.add("b@x.co", "rt-b"); // live
     read(&fx, &a, &windows(10.0, 20.0));
     read(&fx, &b, &windows(20.0, 95.0));
-    let mut engine = fx
-        .engine
+    let daemon = fx.engine_as(EventSource::Daemon);
+    let mut engine = daemon
         .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
         .unwrap()
-        .unwrap()
-        .with_source("daemon");
+        .unwrap();
     assert_eq!(engine.provider(), &fx.provider());
     let (outcome, _) = engine.tick(&Recorded::default()).unwrap();
     assert_eq!(outcome, TickOutcome::Switched);
@@ -297,12 +296,11 @@ fn a_daemon_engine_recovers_an_interrupted_switch_as_the_daemon() {
     read(&fx, &b, &windows(10.0, 20.0));
     crashed_switch(&fx, &b, &a);
     write_target_credential(&fx, &a);
-    let mut engine = fx
-        .engine
+    let daemon = fx.engine_as(EventSource::Daemon);
+    let mut engine = daemon
         .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
         .unwrap()
-        .unwrap()
-        .with_source("daemon");
+        .unwrap();
     engine.tick(&Recorded::default()).unwrap();
     assert_eq!(
         last_event(&fx),
@@ -320,12 +318,11 @@ fn a_daemon_engine_releases_an_unbound_quarantine_as_the_daemon() {
     read(&fx, &a, &windows(10.0, 10.0));
     read(&fx, &b, &windows(10.0, 50.0));
     fx.quarantine(&a, "invalid_grant", "sha256:a-generation-long-gone");
-    let mut engine = fx
-        .engine
+    let daemon = fx.engine_as(EventSource::Daemon);
+    let mut engine = daemon
         .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
         .unwrap()
-        .unwrap()
-        .with_source("daemon");
+        .unwrap();
     engine.tick(&Recorded::default()).unwrap();
     assert_eq!(last_event(&fx), ("unquarantine".into(), "daemon".into()));
 }

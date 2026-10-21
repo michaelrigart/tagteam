@@ -18,9 +18,9 @@ use tagteam_core::autoswitch::{
     AutoConfig, AutoState, AutoStrategy, Decision, NoSwitchReason, Outcome, Trigger,
 };
 use tagteam_core::{AccountId, ProviderId, Window, WindowKind};
-use tagteam_engine::Engine;
 use tagteam_engine::auto::{AutoEvent, EventSink, TickOutcome};
 use tagteam_engine::vault::SERVICE;
+use tagteam_engine::{Engine, EventSource};
 use tagteam_fake::FakePaths;
 use tagteam_provider::profile::{SEED_FILE, Seed};
 use tagteam_provider::{Keychain, Provider, Read};
@@ -192,11 +192,8 @@ fn a_proactive_tick_switches_and_records_its_departure() {
         read(&ffx.engine, &t.a, &reading(fake, 10.0, 20.0));
         read(&ffx.engine, &t.b, &reading(fake, 20.0, 95.0));
         let sink = Recorded::default();
-        let mut engine = ffx
-            .engine
-            .auto(&t.provider, t.config, false)
-            .unwrap()
-            .unwrap();
+        let auto = ffx.engine_as(EventSource::Auto);
+        let mut engine = auto.auto(&t.provider, t.config, false).unwrap().unwrap();
         let (outcome, decision) = engine.tick(&sink).unwrap();
         assert_eq!(outcome, TickOutcome::Switched, "fake={fake}");
         assert_eq!(
@@ -1033,8 +1030,8 @@ fn a_tick_recovers_an_interrupted_switch_as_auto_and_goes_on() {
     crashed_switch(&fx, &b, &a);
     write_target_credential(&fx, &a);
     let sink = Recorded::default();
-    let mut engine = fx
-        .engine
+    let auto = fx.engine_as(EventSource::Auto);
+    let mut engine = auto
         .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
         .unwrap()
         .unwrap();
@@ -1079,8 +1076,8 @@ fn quarantines_other_processes_set_or_clear_are_reported_against_the_previous_ti
     let sink = Recorded::default();
     // Set before the engine starts: the first tick has nothing to compare it with.
     fx.quarantine(&a, "invalid_grant", &bound);
-    let mut engine = fx
-        .engine
+    let auto = fx.engine_as(EventSource::Auto);
+    let mut engine = auto
         .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
         .unwrap()
         .unwrap();

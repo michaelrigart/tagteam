@@ -68,7 +68,6 @@ pub struct SwitchRequest {
     pub provider: ProviderId,
     pub target: SwitchTarget,
     pub force: bool,
-    pub source: &'static str,
     /// An automatic switch's preconditions (§11.2 step 11), checked under the locks before the
     /// first write; `None` for every other switch. Its target is a `SwitchTarget::Account`.
     pub auto: Option<AutoPerform>,
@@ -263,10 +262,7 @@ impl Engine {
         let provider = self.provider(&req.provider)?;
         let p = provider.as_ref();
         if !req.force {
-            self.settle_or_refuse(&GuardRequest {
-                source: req.source,
-                ..GuardRequest::refusing_one(&req.provider)
-            })?;
+            self.settle_or_refuse(&GuardRequest::refusing_one(&req.provider))?;
         }
         let Some(store) = self.existing_store()? else {
             return self.without_store(p, &req);
@@ -301,11 +297,7 @@ impl Engine {
         let guard = if req.force {
             self.mutation_guard()?
         } else {
-            self.guard(&GuardRequest {
-                source: req.source,
-                ..GuardRequest::refusing_one(&req.provider)
-            })?
-            .0
+            self.guard_or_refuse(&req.provider)?
         };
         for attempt in 1..=ATTEMPTS {
             if attempt > 1 {

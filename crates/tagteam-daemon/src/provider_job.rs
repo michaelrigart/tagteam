@@ -301,7 +301,7 @@ impl<'e> ProviderJob<'e> {
         if mode != Mode::Auto && with_lock.0 == Mode::Auto {
             match self.engine.auto(&self.provider, self.cfg.clone(), false)? {
                 Some(auto) => {
-                    self.auto = Some(auto.with_source("daemon"));
+                    self.auto = Some(auto);
                     inputs.holds_lock = true;
                 }
                 None => {
