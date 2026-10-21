@@ -75,6 +75,13 @@ impl From<TransientKind> for FailureKind {
     }
 }
 
+/// Compares the stored spelling: `kind == "http-429"` holds for the kind `parse("http-429")` gives.
+impl PartialEq<str> for FailureKind {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tagteam_provider::TransientKind;
@@ -134,5 +141,13 @@ mod tests {
             FailureKind::from(TransientKind::Http(429)),
             FailureKind::Provider(TransientKind::Http(429))
         );
+    }
+
+    #[test]
+    fn a_kind_equals_its_stored_spelling_only() {
+        let kind = &FailureKind::from(TransientKind::Http(429));
+        assert!(kind == "http-429");
+        assert!(kind != "http-401");
+        assert!(&FailureKind::Other("x-new".into()) == "x-new");
     }
 }

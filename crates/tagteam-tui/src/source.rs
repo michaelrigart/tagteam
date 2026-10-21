@@ -219,8 +219,11 @@ fn foreign_engine_holders(
 fn recorded(c: &Collected) -> bool {
     match c {
         Collected::Recorded | Collected::OverBudget { .. } => true,
-        Collected::Failed { kind } => kind != "error",
-        Collected::Ineligible(_) | Collected::Dropped | Collected::Unsupported => false,
+        Collected::Failed { .. } => true,
+        Collected::Ineligible(_)
+        | Collected::Errored
+        | Collected::Dropped
+        | Collected::Unsupported => false,
     }
 }
 

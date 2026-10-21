@@ -367,7 +367,7 @@ fn one_accounts_error_keeps_the_others_outcomes_and_warnings() {
         report.outcomes,
         [
             (a.clone(), Collected::Recorded),
-            (b.clone(), failed("error"))
+            (b.clone(), Collected::Errored)
         ]
     );
     assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
@@ -562,7 +562,7 @@ fn a_lock_file_that_cannot_be_opened_is_the_collections_warning_not_a_silent_dro
         })
         .expect("an account's error is its warning, not the call's");
 
-    assert_eq!(report.outcomes, [(a.clone(), failed("error"))]);
+    assert_eq!(report.outcomes, [(a.clone(), Collected::Errored)]);
     assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
     assert!(
         report.warnings[0].starts_with("usage for a@x.co (position 1) was not collected: "),

@@ -1516,7 +1516,9 @@ pub fn access_fp(fx: &Fx, secret: &[u8]) -> String {
 
 /// A usage collection that recorded `kind` as its failure.
 pub fn failed(kind: &str) -> tagteam_engine::collect::Collected {
-    tagteam_engine::collect::Collected::Failed { kind: kind.into() }
+    tagteam_engine::collect::Collected::Failed {
+        kind: tagteam_engine::failure::FailureKind::parse(kind),
+    }
 }
 
 /// The usage endpoint refusing the token.

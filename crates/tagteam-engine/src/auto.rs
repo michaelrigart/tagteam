@@ -16,7 +16,7 @@ use tagteam_core::usage::headroom;
 use tagteam_core::{AccountId, Fingerprint, ProviderId, Window, WindowKind};
 use tagteam_provider::{Env, FlockGuard, LockError, ProcessStamp, Provider, Read, ReadError};
 
-use crate::collect::{CollectMode, CollectReport, Collected};
+use crate::collect::{CollectMode, CollectReport};
 use crate::engine::{Engine, GuardRequest};
 use crate::error::EngineError;
 use crate::store::{AccountRow, Store, backoff_holds};
@@ -854,14 +854,7 @@ impl AutoEngine<'_> {
         let fetch_errors = report
             .outcomes
             .iter()
-            .filter_map(|(id, collected)| {
-                let kind = match collected {
-                    Collected::Failed { kind } => kind.clone(),
-                    Collected::OverBudget { .. } => "over-budget".to_owned(),
-                    _ => return None,
-                };
-                Some((position(id)?, kind))
-            })
+            .filter_map(|(id, collected)| Some((position(id)?, collected.fetch_error()?)))
             .collect();
         let headroom_pct = accounts
             .iter()

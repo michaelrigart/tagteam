@@ -604,15 +604,10 @@ impl<'e> ProviderJob<'e> {
             let Some(at) = position(id) else {
                 continue;
             };
-            match outcome {
-                Collected::Recorded => updated.push(at),
-                Collected::Failed { kind } => {
-                    fetch_errors.insert(at, kind.clone());
-                }
-                Collected::OverBudget { .. } => {
-                    fetch_errors.insert(at, "over-budget".to_owned());
-                }
-                _ => {}
+            if matches!(outcome, Collected::Recorded) {
+                updated.push(at);
+            } else if let Some(kind) = outcome.fetch_error() {
+                fetch_errors.insert(at, kind);
             }
         }
         updated.sort_unstable();

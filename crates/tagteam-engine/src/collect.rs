@@ -23,6 +23,7 @@ use tagteam_provider::{Credential, LockError, Provenance, Provider, Read, Transi
 use crate::active::{ActiveOutcome, ActiveTrigger};
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::failure::FailureKind;
 use crate::hooks;
 use crate::provenance::identity_drifted;
 use crate::refresh::{GateOutcome, expired};
@@ -68,12 +69,13 @@ pub enum Collected {
     Ineligible(Ineligible),
     /// The identity's hourly budget was spent when reserving: nothing was sent, and the store
     /// recorded the refusal as an `over-budget` failure, backing off and moving the next poll
-    /// to `next_free_at` (§8.6). A refusal at the send itself is `Failed { "over-budget" }`.
+    /// to `next_free_at` (§8.6). A refusal at the send itself is `Failed { kind: OverBudget }`.
     OverBudget { next_free_at: i64 },
-    /// Recorded as a failure; `kind` is its `last_error` token (§8.3, Decision 10). The kind
-    /// `error` is the exception: the collection ended with an error (the store or a hook), so
-    /// nothing was recorded, and the report's warnings say why.
-    Failed { kind: String },
+    /// Recorded as a failure; `kind` is its `last_error` token (§8.3, Decision 10).
+    Failed { kind: FailureKind },
+    /// The collection ended with an error (the store or a hook): nothing was recorded, and the
+    /// report's warnings say why. Not a stored token: reported as `error` (`fetch_error`).
+    Errored,
     /// Nothing was recorded: another process took the lease before this fetch sent or
     /// recorded (the fence failed, §8.3), or the live login moved to another account while
     /// this one's token was being read.
@@ -81,6 +83,22 @@ pub enum Collected {
     /// Nothing to collect: the provider lacks the `usage` capability, or the account is a
     /// managed API key, which has no usage (§13.2 `api_key`).
     Unsupported,
+}
+
+impl Collected {
+    /// What `fetchErrors` and the auto `poll` event report: `Failed`'s token, `over-budget` for
+    /// `OverBudget`, `error` for `Errored`; `None` for the rest.
+    pub fn fetch_error(&self) -> Option<String> {
+        match self {
+            Collected::Failed { kind } => Some(kind.as_str().into_owned()),
+            Collected::OverBudget { .. } => Some(FailureKind::OverBudget.as_str().into_owned()),
+            Collected::Errored => Some("error".to_owned()),
+            Collected::Recorded
+            | Collected::Ineligible(_)
+            | Collected::Dropped
+            | Collected::Unsupported => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -102,14 +120,12 @@ pub struct CollectReport {
 
 impl CollectReport {
     /// Adds each account's result, in order. An error that ended one account's collection is a
-    /// warning naming the account and a `Failed { kind: "error" }` outcome, so one account
-    /// never costs the others theirs.
+    /// warning naming the account and an `Errored` outcome, so one account never costs the
+    /// others theirs.
     fn add(&mut self, results: Vec<(&AccountRow, Result<Outcome, EngineError>)>) {
         for (row, result) in results {
             let outcome = result.unwrap_or_else(|e| Outcome {
-                collected: Collected::Failed {
-                    kind: "error".to_owned(),
-                },
+                collected: Collected::Errored,
                 warnings: vec![format!(
                     "usage for {} (position {}) was not collected: {e}",
                     row.label, row.position
@@ -188,7 +204,7 @@ impl Engine {
     /// owns takes the session branch (§12.5), and the rest are inactive. A usage failure is
     /// never an error here: it is recorded, and reported in the report's outcomes and warnings.
     /// So is an error that ends one account's collection (the store failing under it): every
-    /// thread is joined and kept, and that account's outcome is `Failed { kind: "error" }` with
+    /// thread is joined and kept, and that account's outcome is `Errored` with
     /// one warning naming it, so one account never costs the others' outcomes. A profile that
     /// cannot be read is no such error: it decides a role too (`role_of`). `Err` only for an error outside the threads (opening the
     /// store, reading the accounts, reading each provider's recorded active account and, for
@@ -574,7 +590,7 @@ struct Collection<'a> {
 
 /// A failure for phase 3 to record, with what its backoff needs (§8.5).
 struct Failure {
-    kind: String,
+    kind: FailureKind,
     is_429: bool,
     retry_after_s: Option<f64>,
     /// No retry before this: when an over-budget identity's oldest counted request leaves the
@@ -583,9 +599,9 @@ struct Failure {
 }
 
 impl Failure {
-    fn new(kind: &str) -> Self {
+    fn new(kind: FailureKind) -> Self {
         Failure {
-            kind: kind.to_owned(),
+            kind,
             is_429: false,
             retry_after_s: None,
             not_before: None,
@@ -607,7 +623,7 @@ enum Stop {
     LeaseLost,
     /// The store or a test hook failed: returned, never recorded. The unsent slot goes back,
     /// best effort, so a lasting fault does not spend the hourly budget (§8.6); `collect_usage`
-    /// turns it into a warning and a `Failed { kind: "error" }` outcome.
+    /// turns it into a warning and an `Errored` outcome.
     Error(EngineError),
     /// §14.1: the cancel token was set at a cancellation point, or a lock wait on the way met
     /// it. Not a usage failure: nothing is recorded (no failure count, no backoff), and the
@@ -632,7 +648,7 @@ impl From<StoreError> for Stop {
     }
 }
 
-fn failed(kind: &str) -> Stop {
+fn failed(kind: FailureKind) -> Stop {
     Stop::Failed(Failure::new(kind))
 }
 
@@ -655,14 +671,14 @@ fn give_back(store: &Store, reservation: &Reservation, slot: &Slot, row: &Accoun
 fn windows(result: UsageResult) -> Result<Vec<Window>, Stop> {
     match result {
         UsageResult::Windows(windows) => Ok(windows),
-        UsageResult::NoAccessToken => Err(failed("no-access-token")),
-        UsageResult::Unauthorized => Err(failed("http-401")),
+        UsageResult::NoAccessToken => Err(failed(FailureKind::NoAccessToken)),
+        UsageResult::Unauthorized => Err(failed(FailureKind::Http401)),
         UsageResult::Failed {
             kind,
             retry_after_s,
         } => Err(Stop::Failed(Failure {
             is_429: kind == TransientKind::Http(429),
-            kind: kind.token(),
+            kind: kind.into(),
             retry_after_s,
             not_before: None,
         })),
@@ -693,7 +709,7 @@ impl Collection<'_> {
             Some(signal) => Stop::Interrupted(signal),
             None => {
                 self.warn_refresh(&e);
-                failed("refresh-failed")
+                failed(FailureKind::RefreshFailed)
             }
         }
     }
@@ -709,7 +725,7 @@ impl Collection<'_> {
         }
         self.reject(&sent)?;
         if self.gated || !self.refreshable(&sent) {
-            return Err(failed("http-401"));
+            return Err(failed(FailureKind::Http401));
         }
         let next = self.gate(&sent)?;
         self.retry(&next)
@@ -731,7 +747,7 @@ impl Collection<'_> {
         }
         self.reject(&live)?;
         let Some(trigger) = self.trigger(&live) else {
-            return Err(failed("http-401"));
+            return Err(failed(FailureKind::Http401));
         };
         let next = self.refresh_live(trigger)?;
         self.retry(&next)
@@ -772,19 +788,19 @@ impl Collection<'_> {
                 m.config_dir
             }
             Read::Present(_) | Read::Absent | Read::Unreadable(_) => {
-                return Err(failed("keychain-unavailable"));
+                return Err(failed(FailureKind::KeychainUnavailable));
             }
         };
         match self.p.profile_identity(env, profile) {
             Read::Present(identity) if !identity_drifted(&identity, self.row) => {}
             Read::Present(_) | Read::Absent | Read::Unreadable(_) => {
-                return Err(failed("profile-drifted"));
+                return Err(failed(FailureKind::ProfileDrifted));
             }
         }
         match self.p.read_profile_credential(env, profile, &spelling) {
             Read::Present(c) if !c.is_empty() => Ok(c),
-            Read::Present(_) | Read::Absent => Err(failed("no-access-token")),
-            Read::Unreadable(_) => Err(failed("keychain-unavailable")),
+            Read::Present(_) | Read::Absent => Err(failed(FailureKind::NoAccessToken)),
+            Read::Unreadable(_) => Err(failed(FailureKind::KeychainUnavailable)),
         }
     }
 
@@ -792,12 +808,12 @@ impl Collection<'_> {
     /// `token-expired` when its kind refreshes and someone else refreshes it (§7.5 for the
     /// active account, the agent in the session for a session-owned one), otherwise `http-401`
     /// (Decision 11: a setup token never refreshes).
-    fn refusal_kind(&self) -> &'static str {
+    fn refusal_kind(&self) -> FailureKind {
         let refreshed_elsewhere = matches!(self.role, Role::Active | Role::Session { .. });
         if refreshed_elsewhere && self.p.kind_traits(&self.row.kind).refreshable {
-            "token-expired"
+            FailureKind::TokenExpired
         } else {
-            "http-401"
+            FailureKind::Http401
         }
     }
 
@@ -828,8 +844,8 @@ impl Collection<'_> {
         self.interruption()?;
         if !self.p.kind_traits(&self.row.kind).refreshable {
             return Err(failed(match trigger {
-                ActiveTrigger::Rejected { .. } => "http-401",
-                ActiveTrigger::Expired => "token-expired",
+                ActiveTrigger::Rejected { .. } => FailureKind::Http401,
+                ActiveTrigger::Expired => FailureKind::TokenExpired,
             }));
         }
         match self.engine.refresh_active(&self.row.provider, trigger) {
@@ -839,24 +855,26 @@ impl Collection<'_> {
                 | ActiveOutcome::PersistedNotPublished
                 | ActiveOutcome::PublishedOnly,
             ) => self.live_bytes(),
-            Ok(ActiveOutcome::Dead(_)) => Err(failed("refresh-failed")),
+            Ok(ActiveOutcome::Dead(_)) => Err(failed(FailureKind::RefreshFailed)),
             Ok(ActiveOutcome::Replaced) => {
                 self.warn_replaced();
-                Err(failed("live-replaced"))
+                Err(failed(FailureKind::LiveReplaced))
             }
             Ok(ActiveOutcome::Unpersisted) => {
                 self.warn_lost();
-                Err(failed("refresh-failed"))
+                Err(failed(FailureKind::RefreshFailed))
             }
             Ok(ActiveOutcome::Systemic(detail)) => {
                 self.warn_refresh(&detail);
-                Err(failed("refresh-failed"))
+                Err(failed(FailureKind::RefreshFailed))
             }
             Ok(ActiveOutcome::Transient { kind }) => {
                 self.warn_refresh(&kind);
-                Err(failed("refresh-failed"))
+                Err(failed(FailureKind::RefreshFailed))
             }
-            Err(EngineError::ForeignLiveCredential { .. }) => Err(failed("foreign-credential")),
+            Err(EngineError::ForeignLiveCredential { .. }) => {
+                Err(failed(FailureKind::ForeignCredential))
+            }
             Err(e) => Err(self.refresh_error(e)),
         }
     }
@@ -871,11 +889,12 @@ impl Collection<'_> {
         };
         let bytes = match read {
             Read::Present(b) if !b.is_empty() => b,
-            Read::Present(_) | Read::Absent => return Err(failed("vault-absent")),
+            Read::Present(_) | Read::Absent => return Err(failed(FailureKind::VaultAbsent)),
             Read::Unreadable(e) => {
-                return Err(e
-                    .interruption()
-                    .map_or_else(|| failed("keychain-unavailable"), Stop::Interrupted));
+                return Err(e.interruption().map_or_else(
+                    || failed(FailureKind::KeychainUnavailable),
+                    Stop::Interrupted,
+                ));
             }
         };
         if self.usable(&bytes) {
@@ -883,9 +902,9 @@ impl Collection<'_> {
         }
         if !self.refreshable(&bytes) {
             return Err(failed(if self.is_rejected(&bytes) {
-                "http-401"
+                FailureKind::Http401
             } else {
-                "token-expired"
+                FailureKind::TokenExpired
             }));
         }
         self.gate(&bytes)
@@ -911,7 +930,7 @@ impl Collection<'_> {
             Ok(GateOutcome::AlreadyFresh(bytes)) => Ok(bytes),
             Ok(GateOutcome::Unpersisted) => {
                 self.warn_lost();
-                Err(failed("refresh-failed"))
+                Err(failed(FailureKind::RefreshFailed))
             }
             Ok(
                 GateOutcome::Dead(_)
@@ -920,7 +939,7 @@ impl Collection<'_> {
                 | GateOutcome::Conflict
                 | GateOutcome::Systemic(_)
                 | GateOutcome::Transient { .. },
-            ) => Err(failed("refresh-failed")),
+            ) => Err(failed(FailureKind::RefreshFailed)),
             Err(e) => Err(self.refresh_error(e)),
         }
     }
@@ -972,13 +991,14 @@ impl Collection<'_> {
         drop(guard);
         match credential {
             Read::Present(c) if c.provenance() == Provenance::Degraded => {
-                Err(failed("keychain-unavailable"))
+                Err(failed(FailureKind::KeychainUnavailable))
             }
             Read::Present(c) if !c.is_empty() => Ok(c.bytes().to_vec()),
-            Read::Present(_) | Read::Absent => Err(failed("no-access-token")),
-            Read::Unreadable(e) => Err(e
-                .interruption()
-                .map_or_else(|| failed("keychain-unavailable"), Stop::Interrupted)),
+            Read::Present(_) | Read::Absent => Err(failed(FailureKind::NoAccessToken)),
+            Read::Unreadable(e) => Err(e.interruption().map_or_else(
+                || failed(FailureKind::KeychainUnavailable),
+                Stop::Interrupted,
+            )),
         }
     }
 
@@ -1048,7 +1068,7 @@ impl Collection<'_> {
         // §14.1: every request, the 401 retry included, is preceded by a cancellation point.
         self.interruption()?;
         if !self.usable(bytes) {
-            return Err(failed("token-expired"));
+            return Err(failed(FailureKind::TokenExpired));
         }
         hooks::point(self.engine, "usage-before-send")?;
         let slot = self.authorize(bytes)?;
@@ -1118,7 +1138,7 @@ impl Collection<'_> {
             }
             SendGrant::OverBudget { next_free_at } => Err(Stop::Failed(Failure {
                 not_before: Some(next_free_at),
-                ..Failure::new("over-budget")
+                ..Failure::new(FailureKind::OverBudget)
             })),
         }
     }
@@ -1244,7 +1264,7 @@ impl Collection<'_> {
                 }
                 let recorded = self.store.record_usage_failure(
                     &self.reservation,
-                    &f.kind,
+                    &f.kind.as_str(),
                     now_s,
                     until,
                     f.is_429.then_some(until),
@@ -1284,13 +1304,47 @@ impl Collection<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::jitter;
+    use tagteam_provider::TransientKind;
+
+    use super::{Collected, jitter};
+    use crate::failure::FailureKind;
+    use crate::store::Ineligible;
 
     #[test]
     fn jitter_is_a_fraction_in_the_policy_s_range() {
         for _ in 0..10_000 {
             let j = jitter();
             assert!((-1.0..=1.0).contains(&j), "{j}");
+        }
+    }
+
+    #[test]
+    fn fetch_error_spells_each_reported_outcome() {
+        let failed = |kind| Collected::Failed { kind };
+        assert_eq!(Collected::Errored.fetch_error().as_deref(), Some("error"));
+        assert_eq!(
+            Collected::OverBudget { next_free_at: 1 }
+                .fetch_error()
+                .as_deref(),
+            Some("over-budget")
+        );
+        assert_eq!(
+            failed(FailureKind::Http401).fetch_error().as_deref(),
+            Some("http-401")
+        );
+        assert_eq!(
+            failed(FailureKind::Provider(TransientKind::Http(429)))
+                .fetch_error()
+                .as_deref(),
+            Some("http-429")
+        );
+        for quiet in [
+            Collected::Recorded,
+            Collected::Ineligible(Ineligible::NotDue),
+            Collected::Dropped,
+            Collected::Unsupported,
+        ] {
+            assert_eq!(quiet.fetch_error(), None, "{quiet:?}");
         }
     }
 }
