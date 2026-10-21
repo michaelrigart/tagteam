@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/34
 **Branch:** `refactor-r4d-live-guard-error-kinds`, based on `refactor-r4c-gate-classifier`
 **Goal:** One walk for the never-delete-the-live-login guard, and `--json` error kinds that say what each refusal is, with every message unchanged.
 **Architecture:**
