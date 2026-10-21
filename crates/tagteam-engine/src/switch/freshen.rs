@@ -47,11 +47,11 @@ pub(crate) enum FreshenFailure {
 impl fmt::Display for FreshenFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FreshenFailure::Gate(kind) => f.write_str(&kind.as_str()),
+            FreshenFailure::Gate(kind) => f.pad(&kind.as_str()),
             FreshenFailure::Rescued => {
-                f.write_str("its refreshed token is in rescue/, not yet in the vault")
+                f.pad("its refreshed token is in rescue/, not yet in the vault")
             }
-            FreshenFailure::Text(text) => f.write_str(text),
+            FreshenFailure::Text(text) => f.pad(text),
         }
     }
 }
@@ -238,7 +238,7 @@ impl Engine {
             // (§7.2).
             (
                 GateOutcome::Refreshed(_) | GateOutcome::AlreadyFresh(_) | GateOutcome::Busy,
-                _,
+                GateMode::Manual { .. } | GateMode::Auto | GateMode::Launch,
             ) => GateVerdict::Proceed,
             // The gate found it live where planning did not (it became the live login, or the
             // live identity could not be read): never refreshed here. A manual switch's
@@ -292,7 +292,8 @@ impl Engine {
                 GateVerdict::Refuse(needs_relogin(p, row))
             }
             // The vault's generation is spent and its successor waits in `rescue/`: activating
-            // it would hand the agent a used refresh token. A later tick adopts the rescue.
+            // it would hand the agent a used refresh token. For an automatic switch, a later tick
+            // adopts the rescue.
             (GateOutcome::Transient { rescued: true, .. }, Auto) => {
                 GateVerdict::Failed(FreshenFailure::Rescued)
             }
