@@ -1150,16 +1150,32 @@ mod tests {
         }
         // M-8 governs the table's STATUS only: a disabled account in use still shows its
         // real problem here.
-        let mut state = fresh(Screen::Tokens);
         let mut accounts = alex_and_work();
         accounts[1].usage = unread(UsageStatus::Unavailable, Some("http-429"), Some(120));
         accounts[1].row.disabled = true;
-        state.accounts.apply(snapshot(accounts));
-        let row = &draw(&state, 80, 24)[2];
-        assert!(
-            row.starts_with(" ● 2 work   ! rate-limited · see Accounts"),
-            "{row}"
-        );
+        for theme in TIERS {
+            let mut state = fresh(Screen::Tokens);
+            state.theme = theme;
+            state.accounts.apply(snapshot(accounts.clone()));
+            let (row, letters) = now_row(&state, 80, theme);
+            assert!(
+                row.starts_with(" ● 2 work   ! rate-limited · see Accounts"),
+                "{row}"
+            );
+            let pieces = [
+                (" ", ' '),
+                ("●", 'a'),
+                (" 2 ", 't'),
+                ("work", 'B'),
+                ("   ", ' '),
+                ("! rate-limited", 'w'),
+                (" · see Accounts", 'm'),
+            ];
+            assert!(
+                letters.starts_with(&canon(theme, &spell(&pieces))),
+                "{theme:?}: {letters}"
+            );
+        }
     }
 
     #[test]

@@ -683,8 +683,8 @@ mod tests {
 
     #[test]
     fn a_1000_character_label_leaves_its_window_reachable_at_80x24_under_a_full_banner() {
-        // A label takes two rows at most; under the Now strip, a 3-row banner and a 2-row toast
-        // the panel has 16 rows, and a window at most five (R20).
+        // A label takes two rows at most; under the Now strip, a 3-row banner and a 3-row toast
+        // (the worst live stack) the panel has 15 rows, and a window at most five (R20).
         let mut state = on_history(many(1));
         state.history.select(id(1));
         let long = "Claude ".repeat(143).trim_end().to_owned();
@@ -716,10 +716,12 @@ mod tests {
         );
         state.toast(
             crate::state::ToastKind::Info,
-            ["Switched to a@x.co (position 1)"; 3].join(" "),
+            ["Switched to a@x.co (position 1)"; 8].join(" "),
             NOW_MS,
         );
-        let right: Vec<String> = body_of(&state, 80, 24, NOW_MS)[0..16]
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(body.len(), 15, "{body:?}");
+        let right: Vec<String> = body
             .iter()
             .map(|l| right_of(l).unwrap_or("").trim_end().to_owned())
             .collect();
@@ -753,8 +755,8 @@ mod tests {
             account(1, "a1@x.co", read(60, 1.0, 1.0, false)),
             windows,
         ));
-        // 80×25 and 80×32 give the body the rows 80×24 and 80×30 gave it before the auto line
-        // and the rule. The panel's footer is the body's last row.
+        // 80×25 gives the body 21 rows, and 80×32 27, under the auto line, the Now strip and,
+        // from 30 rows, the rule. The panel's footer is the body's last row.
         state.size = (80, 25);
         let footer = |state: &State, h: u16| {
             right_of(body_of(state, 80, h, NOW_MS).last().unwrap())

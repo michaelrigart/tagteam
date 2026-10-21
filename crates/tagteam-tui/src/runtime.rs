@@ -956,6 +956,71 @@ mod tests {
         })
     }
 
+    /// A source with one account whose `history` read has a sample of each window every 20
+    /// minutes over the last 7 days, by the real clock, at the reading's percentage.
+    struct Carded;
+
+    /// How many samples `Carded` gives each window.
+    const CARD_SAMPLES: usize = 7 * 72;
+
+    impl Source for Carded {
+        fn accounts(
+            &self,
+            _provider: Option<&ProviderId>,
+        ) -> Result<AccountsSnapshot, SourceError> {
+            Ok(crate::testutil::snapshot(crate::testutil::many(1)))
+        }
+
+        fn history(&self, account: &AccountId, _since_s: i64) -> Result<HistoryView, SourceError> {
+            let v = crate::testutil::many(1).remove(0);
+            assert_eq!(&v.row.id, account, "the card's account");
+            let now_s = now_ms().div_euclid(1000);
+            let windows = v
+                .usage
+                .windows
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(w, pace)| {
+                    let samples = (0..CARD_SAMPLES as i64)
+                        .map(|i| tagteam_core::Sample {
+                            fetched_at: now_s - i * 1200 - 600,
+                            pct: w.pct,
+                            resets_at: None,
+                        })
+                        .collect();
+                    crate::testutil::history_window(w, samples, pace)
+                })
+                .collect();
+            Ok(crate::testutil::history_of(v, windows))
+        }
+
+        fn collect_due(&self, _accounts: &[AccountId]) -> Result<CollectSummary, SourceError> {
+            Ok(CollectSummary {
+                fetched: 0,
+                warnings: Vec::new(),
+                updated: 0,
+                rate_limited: vec![],
+            })
+        }
+
+        fn refresh_tokens(
+            &self,
+            _provider: &ProviderId,
+            _progress: &mut dyn FnMut(&IndexProgress),
+        ) -> Result<RefreshOutcome, SourceError> {
+            Ok(RefreshOutcome::Busy)
+        }
+
+        fn token_report(&self, _query: &TokenQuery) -> Result<TokenReport, SourceError> {
+            Err(no_tokens())
+        }
+
+        fn token_index_state(&self, _provider: &ProviderId) -> Result<IndexState, SourceError> {
+            Ok(IndexState::default())
+        }
+    }
+
     /// A source whose `accounts` read finds SIGTERM recorded in `signal` by the time it returns:
     /// the signal arrives while the first frame waits for it.
     fn signalled_during_the_first_read(signal: &Cancel) -> SourceFactory {
@@ -1369,6 +1434,56 @@ mod tests {
             Some(libc::SIGINT),
             "§10.2 step 1: SIGINT for q"
         );
+    }
+
+    #[test]
+    fn the_card_s_history_read_comes_back_from_the_views_lane_and_draws_its_sparklines() {
+        // T3-21: `Cmd::LoadCard` goes to the views lane, whose `Msg::Card` carries the source's
+        // `history` answer for the selected account; the card draws its samples.
+        let sources: SourceFactory = Arc::new(|| Box::new(Carded) as Box<dyn Source>);
+        let fx = Fixture::new(sources, |_| idle());
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            let account = ui.state.accounts.selected().expect("an account").id;
+            let since = now_ms().div_euclid(1000) - crate::screens::accounts::card::CARD_SINCE_S;
+            let load = ui.state.load_card(account.clone(), since);
+            ui.execute(vec![load]);
+            loop {
+                let msg = fx.rx.recv_timeout(Duration::from_secs(5));
+                let msg = msg.expect("the views lane answered");
+                if let Msg::Card {
+                    account: of,
+                    result,
+                    ..
+                } = &msg
+                {
+                    assert_eq!(of, &account);
+                    let view = result.as_ref().expect("the source's history");
+                    assert_eq!(view.windows.len(), 2);
+                    assert!(view.windows.iter().all(|w| w.samples.len() == CARD_SAMPLES));
+                    ui.deliver(msg);
+                    break;
+                }
+                ui.deliver(msg);
+            }
+            ui.draw();
+            let text = ui.tty.text();
+            let rows: Vec<&str> = text
+                .lines()
+                .filter(|l| l.contains(" 24h ") || l.contains(" 7d "))
+                .collect();
+            assert_eq!(rows.len(), 2, "{text}");
+            for row in rows {
+                assert!(
+                    row.chars().any(|c| ('▁'..='█').contains(&c)),
+                    "a sparkline: {text}"
+                );
+            }
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
     }
 
     #[test]
