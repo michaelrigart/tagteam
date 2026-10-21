@@ -1029,6 +1029,41 @@ fn the_earliest_poll_counts_the_live_account_and_a_candidate_planned_ahead() {
 }
 
 #[test]
+fn the_earliest_poll_waits_out_a_failed_accounts_backoff() {
+    // §8.1, §11: a failed fetch leaves the account's plan as it was, in the past, and backs it
+    // off. The backoff is its real deadline: the daemon must not wake every 60 s for a plan
+    // that collection will skip, and it still wakes for the live account's sooner plan.
+    let fx = Fx::new();
+    let cc = ProviderId::new(CLAUDE_CODE);
+    let [a, b, c] = three_accounts(&fx);
+    plan_poll(&fx, &a, NOW_S - 30);
+    plan_poll(&fx, &b, NOW_S + 900);
+    plan_poll(&fx, &c, NOW_S + 1000);
+    fx.script_usage(500, json!({}));
+    let report = fx.collect(&[&a]);
+    assert_eq!(report.outcomes, [(a.clone(), failed("http-500"))]);
+    let s = state(&fx, &a);
+    let backoff = NOW_S + failure_backoff_s(1, false, None);
+    assert_eq!(s.backoff_until, Some(backoff));
+    assert_eq!(
+        s.next_poll_at,
+        Some(NOW_S - 30),
+        "the failure left the plan as it was"
+    );
+
+    assert_eq!(fx.engine.earliest_poll_at(&cc).unwrap(), Some(backoff));
+
+    // The live account's plan comes first once it is sooner than the backoff lifts.
+    plan_poll(&fx, &c, backoff - 5);
+    assert_eq!(fx.engine.earliest_poll_at(&cc).unwrap(), Some(backoff - 5));
+
+    // Once the backoff has lifted the plan stands again: it is due, and in the past.
+    fx.clock.advance_ms((backoff - NOW_S + 1) * 1000);
+    plan_poll(&fx, &c, backoff + 500);
+    assert_eq!(fx.engine.earliest_poll_at(&cc).unwrap(), Some(NOW_S - 30));
+}
+
+#[test]
 fn the_earliest_poll_skips_what_a_round_skips_and_a_round_reads_what_it_counts() {
     // §8.6: `earliest_poll_at` counts exactly the accounts a scheduled round can collect: the
     // live account and the switchable candidates with usage, never a quarantined, a disabled
@@ -1058,7 +1093,7 @@ fn the_earliest_poll_skips_what_a_round_skips_and_a_round_reads_what_it_counts()
             (c.clone(), Collected::Recorded),
             (ok.clone(), Collected::Recorded)
         ],
-        "exactly the accounts the earliest poll counted"
+        "the accounts a round collects"
     );
 
     // A quarantined live account is no longer collected, so its plan no longer counts.
