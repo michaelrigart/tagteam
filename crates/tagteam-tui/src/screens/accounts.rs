@@ -845,9 +845,9 @@ mod tests {
 
     #[test]
     fn the_table_says_what_list_says_at_80_columns() {
-        let lines = draw(&loaded(three()), 80, 24);
+        let body = body_of(&loaded(three()), 80, 24, NOW_MS);
         assert_eq!(
-            &lines[1..5],
+            &body[0..4],
             [
                 "    #  ACCOUNT              5H           7D                   SPEND  AGE",
                 " *  1  michael@example.com    9%  2h40m   77%  3d09h  ▲ pace  —      2m",
@@ -859,9 +859,9 @@ mod tests {
 
     #[test]
     fn a_wider_terminal_adds_a_gauge_per_window() {
-        let lines = draw(&loaded(three()), 120, 40);
+        let body = body_of(&loaded(three()), 120, 40, NOW_MS);
         assert_eq!(
-            &lines[1..5],
+            &body[0..4],
             [
                 "    #  ACCOUNT              5H                  7D                          SPEND  AGE",
                 " *  1  michael@example.com  █░░░░░   9%  2h40m  █████░  77%  3d09h  ▲ pace  —      2m",
@@ -883,10 +883,10 @@ mod tests {
             will_last_to_reset: Some(false),
         };
         accounts[0].row.login_expires_at = Some((NOW_S + 6 * 86_400 + 3 * HOUR) * 1000);
-        let lines = draw(&loaded(accounts), 120, 40);
-        let top = 40 - 1 - 7;
+        let body = body_of(&loaded(accounts), 120, 40, NOW_MS);
+        let top = body.len() - 7;
         assert_eq!(
-            &lines[top..top + 4],
+            &body[top..top + 4],
             [
                 format!("─ 1 michael@example.com · active · oauth {}", "─".repeat(79)),
                 " 5h    9%  resets in 2h40m".to_owned(),
@@ -900,16 +900,16 @@ mod tests {
     fn a_row_without_a_reading_says_why_in_the_detail_pane() {
         let mut state = loaded(three());
         update(&mut state, ch('G'), NOW_MS);
-        let lines = draw(&state, 80, 24);
-        let top = 24 - 1 - 7;
+        let body = body_of(&state, 80, 24, NOW_MS);
+        let top = body.len() - 7;
         assert!(
-            lines[top].starts_with("─ 3 work (w@corp.com) · not active · oauth ──"),
+            body[top].starts_with("─ 3 work (w@corp.com) · not active · oauth ──"),
             "{}",
-            lines[top]
+            body[top]
         );
-        assert_eq!(width_of(&lines[top]), 80);
-        assert_eq!(lines[top + 1], " never fetched");
-        assert_eq!(lines[top + 2], " usage: relogin required");
+        assert_eq!(width_of(&body[top]), 80);
+        assert_eq!(body[top + 1], " never fetched");
+        assert_eq!(body[top + 2], " usage: relogin required");
     }
 
     #[test]
@@ -919,14 +919,14 @@ mod tests {
         accounts[0].usage.next_poll_at = Some(NOW_S + 60);
         accounts[0].row.login_expires_at = Some((NOW_S + 6 * 86_400) * 1000);
         let state = loaded(accounts);
-        let top = 24 - 1 - 7;
+        let top = body_of(&state, 80, 24, NOW_MS).len() - 7;
         assert_eq!(
-            draw(&state, 80, 24)[top + 3],
+            body_of(&state, 80, 24, NOW_MS)[top + 3],
             " fetched 2m ago · next poll in 1m · login expires in 6d00h"
         );
         // Once it has passed, a frame drawn before the next read says nothing of it.
         assert_eq!(
-            draw_at(&state, 80, 24, NOW_MS + 60_000)[top + 3],
+            body_of(&state, 80, 24, NOW_MS + 60_000)[top + 3],
             " fetched 3m ago · login expires in 5d23h"
         );
     }
@@ -1420,9 +1420,9 @@ mod tests {
         snap.this = Some(id(2));
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snap);
-        let lines = draw(&state, 80, 24);
+        let body = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(
-            &lines[1..4],
+            &body[0..3],
             [
                 "    #    ACCOUNT              5H           7D                   SPEND  AGE",
                 " *  1    michael@example.com    9%  2h40m   77%  3d09h  ▲ pace  —      2m",
@@ -1487,19 +1487,20 @@ mod tests {
                 assert!(width_of(line) <= usize::from(w), "{w}: {line}");
             }
             // Every row's window columns still line up with the header's.
-            let col = lines[1].find("5H").unwrap();
-            let head = width_of(&lines[1][..col]);
-            for row in &lines[2..5] {
+            let body = body_of(&loaded(accounts.clone()), w, 24, NOW_MS);
+            let col = body[0].find("5H").unwrap();
+            let head = width_of(&body[0][..col]);
+            for row in &body[1..4] {
                 let pct = row.find("9%").unwrap();
                 assert_eq!(width_of(&row[..pct]), head + 2, "{w}: {row}");
             }
         }
-        let narrow = draw(&loaded(accounts), 80, 24);
-        assert!(narrow[2].contains("aaaa…"), "{}", narrow[2]);
+        let narrow = body_of(&loaded(accounts), 80, 24, NOW_MS);
+        assert!(narrow[1].contains("aaaa…"), "{}", narrow[1]);
         assert!(
-            narrow[3].starts_with("    2  山田さんの仕"),
+            narrow[2].starts_with("    2  山田さんの仕"),
             "{}",
-            narrow[3]
+            narrow[2]
         );
     }
 
@@ -1507,15 +1508,15 @@ mod tests {
     #[test]
     fn no_accounts_shows_the_empty_state() {
         let state = loaded(vec![]);
-        let lines = draw(&state, 80, 24);
+        let body = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(
-            lines[1],
+            body[0],
             " No accounts yet. Log in with claude, then press A to add the login."
         );
         assert_eq!(state.accounts.selected(), None);
         assert!(state.accounts.shown_ids().is_empty());
-        let unloaded = draw(&fresh(Screen::Accounts), 80, 24);
-        assert_eq!(unloaded[1], " loading…");
+        let unloaded = body_of(&fresh(Screen::Accounts), 80, 24, NOW_MS);
+        assert_eq!(unloaded[0], " loading…");
     }
 
     /// Review Focus 4: the table scrolls so the selected row is always visible, and `j`/`k`
@@ -1525,7 +1526,7 @@ mod tests {
         let mut state = loaded(many(30));
         // 80×24: 22 body rows, 7 for the detail, 1 for the header: 14 account rows.
         let shown = |state: &State| {
-            draw(state, 80, 24)[2..16]
+            body_of(state, 80, 24, NOW_MS)[1..15]
                 .iter()
                 .map(|l| {
                     l.split_whitespace()
@@ -1585,7 +1586,7 @@ mod tests {
         let mut state = loaded(many(30));
         update(&mut state, key(KeyCode::End), NOW_MS);
         let first = |state: &State, h: u16| {
-            draw(state, 80, h)[2]
+            body_of(state, 80, h, NOW_MS)[1]
                 .split_whitespace()
                 .find(|w| w.contains('@'))
                 .unwrap()
@@ -1698,13 +1699,13 @@ mod tests {
         });
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snap);
-        let lines = draw(&state, 80, 24);
-        assert_eq!(lines[1], " claude-code");
-        assert!(lines[2].starts_with("    #  ACCOUNT"), "{}", lines[2]);
-        assert!(lines[3].contains("a1@x.co"));
-        assert_eq!(lines[4], " fake-agent");
-        assert!(lines[5].starts_with("    #  ACCOUNT"));
-        assert!(lines[6].contains("o@x.co"));
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(body[0], " claude-code");
+        assert!(body[1].starts_with("    #  ACCOUNT"), "{}", body[1]);
+        assert!(body[2].contains("a1@x.co"));
+        assert_eq!(body[3], " fake-agent");
+        assert!(body[4].starts_with("    #  ACCOUNT"));
+        assert!(body[5].contains("o@x.co"));
         update(&mut state, ch('j'), NOW_MS);
         assert_eq!(
             state.accounts.selected().unwrap().provider,
@@ -1748,7 +1749,8 @@ mod tests {
                 " by tagteam); press A to add it".to_owned(),
             ]
         );
-        assert!(lines[3].starts_with("    #  ACCOUNT"), "{}", lines[3]);
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert!(body[0].starts_with("    #  ACCOUNT"), "{}", body[0]);
     }
 
     #[test]
@@ -1761,9 +1763,9 @@ mod tests {
         key.kind = API_KEY;
         let mut off = account(2, "b@x.co", read(60, 9.0, 12.0, false));
         off.row.disabled = true;
-        let lines = draw(&loaded(vec![key, off]), 80, 24);
-        assert!(lines[2].ends_with("api key"), "{}", lines[2]);
-        assert!(lines[3].ends_with("disabled"), "{}", lines[3]);
+        let body = body_of(&loaded(vec![key, off]), 80, 24, NOW_MS);
+        assert!(body[1].ends_with("api key"), "{}", body[1]);
+        assert!(body[2].ends_with("disabled"), "{}", body[2]);
     }
 
     #[test]
@@ -1774,7 +1776,8 @@ mod tests {
         let mut state = loaded(accounts);
         update(&mut state, ch('G'), NOW_MS);
         let lines = draw(&state, 80, 24);
-        assert_eq!(lines[24 - 1 - 7 + 1], " never fetched");
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(body[body.len() - 7 + 1], " never fetched");
         assert!(!lines.iter().any(|l| l.contains("next poll")), "{lines:?}");
         // A backoff later than the plan: the usage line's retry is the only time given.
         let mut backed_off = read(120, 9.0, 77.0, false);
@@ -1819,29 +1822,30 @@ mod tests {
     fn columns_give_way_to_the_notes_at_80_columns() {
         let lines = draw(&loaded(crowded("http-429")), 80, 24);
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
-        let head = &lines[1];
+        let body = body_of(&loaded(crowded("http-429")), 80, 24, NOW_MS);
+        let head = &body[0];
         assert!(head.contains("5H") && head.contains("7D"), "{head}");
         assert!(head.ends_with("AGE"), "{head}");
         assert!(!head.contains("SONNET"), "{head}");
-        assert!(lines[3].ends_with("disabled"), "{}", lines[3]);
+        assert!(body[2].ends_with("disabled"), "{}", body[2]);
         assert!(
-            lines[4].ends_with("unavailable (http-429, retry 15m)"),
+            body[3].ends_with("unavailable (http-429, retry 15m)"),
             "{}",
-            lines[4]
+            body[3]
         );
         // At 120 columns every column and every note fit.
-        let wide = draw(&loaded(crowded("http-429")), 120, 40);
-        assert!(wide[1].contains("CLAUDE SONNET 4.5"), "{}", wide[1]);
+        let wide = body_of(&loaded(crowded("http-429")), 120, 40, NOW_MS);
+        assert!(wide[0].contains("CLAUDE SONNET 4.5"), "{}", wide[0]);
         assert!(
-            wide[1].contains("SPEND") && wide[1].ends_with("AGE"),
+            wide[0].contains("SPEND") && wide[0].ends_with("AGE"),
             "{}",
-            wide[1]
+            wide[0]
         );
-        assert!(wide[3].ends_with("disabled"), "{}", wide[3]);
+        assert!(wide[2].ends_with("disabled"), "{}", wide[2]);
         assert!(
-            wide[4].ends_with("unavailable (http-429, retry 15m)"),
+            wide[3].ends_with("unavailable (http-429, retry 15m)"),
             "{}",
-            wide[4]
+            wide[3]
         );
     }
 
@@ -1850,7 +1854,8 @@ mod tests {
         let long = "x".repeat(70);
         let lines = draw(&loaded(crowded(&long)), 80, 24);
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
-        assert!(lines[4].ends_with('…'), "{}", lines[4]);
-        assert!(lines[4].contains("unavailable (xxx"), "{}", lines[4]);
+        let body = body_of(&loaded(crowded(&long)), 80, 24, NOW_MS);
+        assert!(body[3].ends_with('…'), "{}", body[3]);
+        assert!(body[3].contains("unavailable (xxx"), "{}", body[3]);
     }
 }

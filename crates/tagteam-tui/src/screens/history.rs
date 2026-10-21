@@ -506,10 +506,10 @@ mod tests {
         state
             .history
             .apply(view_of(account(1, "a1@x.co", read(60, 9.0, 95.0, false))));
-        let lines = draw(&state, 80, 24);
-        assert!(lines[1].starts_with(" ACCOUNTS "), "{}", lines[1]);
-        assert!(lines[2].starts_with("   1 a1@x.co"), "{}", lines[2]);
-        let right: Vec<&str> = lines[1..7]
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert!(lines[0].starts_with(" ACCOUNTS "), "{}", lines[0]);
+        assert!(lines[1].starts_with("   1 a1@x.co"), "{}", lines[1]);
+        let right: Vec<&str> = lines[0..6]
             .iter()
             .map(|l| l.get(27..).unwrap_or(""))
             .collect();
@@ -525,7 +525,7 @@ mod tests {
         assert_eq!(right[1], "    no rate yet");
         assert!(right[2].ends_with("   95%"), "{:?}", right[2]);
         assert_eq!(right[3], "    +5.0 pts/h · runs out in 12h00m (regression)");
-        assert_eq!(lines[22].get(27..).unwrap_or(""), "7 days  [ ] range");
+        assert_eq!(lines[21].get(27..).unwrap_or(""), "7 days  [ ] range");
     }
 
     #[test]
@@ -554,7 +554,7 @@ mod tests {
             vec![history_window(w, vec![sample(HOUR, 95.0)], pace)],
         ));
         let right = |width: u16| -> Vec<String> {
-            draw(&state, width, 24)[1..5]
+            body_of(&state, width, 24, NOW_MS)[0..4]
                 .iter()
                 .map(|l| l.get(27..).unwrap_or("").trim_end().to_owned())
                 .collect()
@@ -611,7 +611,7 @@ mod tests {
                 history_window(wide, vec![sample(HOUR, 95.0)], pace),
             ],
         ));
-        let right: Vec<String> = draw(&state, 80, 24)[1..8]
+        let right: Vec<String> = body_of(&state, 80, 24, NOW_MS)[0..7]
             .iter()
             .map(|l| l.get(27..).unwrap_or("").trim_end().to_owned())
             .collect();
@@ -667,8 +667,7 @@ mod tests {
             ["the store could not be read"; 12].join("; "),
         );
         state.toast(["Switched to a@x.co (position 1)"; 8].join(" "), NOW_MS);
-        let lines = draw(&state, 80, 24);
-        let right: Vec<String> = lines[4..20]
+        let right: Vec<String> = body_of(&state, 80, 24, NOW_MS)[0..16]
             .iter()
             .map(|l| l.get(27..).unwrap_or("").trim_end().to_owned())
             .collect();
@@ -706,7 +705,7 @@ mod tests {
             windows,
         ));
         let footer = |state: &State, h: u16| {
-            draw(state, 80, h)[usize::from(h) - 2]
+            body_of(state, 80, h, NOW_MS)[usize::from(h) - 3]
                 .get(27..)
                 .unwrap()
                 .to_owned()
@@ -754,14 +753,19 @@ mod tests {
         };
         state.history.apply(twelve(1));
         let labels = |state: &State| -> Vec<String> {
-            draw(state, 80, 24)[1..22]
+            body_of(state, 80, 24, NOW_MS)[0..21]
                 .iter()
                 .filter_map(|l| l.get(27..))
                 .filter(|r| r.starts_with('M'))
                 .map(|r| r.split_whitespace().next().unwrap().to_owned())
                 .collect()
         };
-        let footer = |state: &State| draw(state, 80, 24)[22].get(27..).unwrap().to_owned();
+        let footer = |state: &State| {
+            body_of(state, 80, 24, NOW_MS)[21]
+                .get(27..)
+                .unwrap()
+                .to_owned()
+        };
         let first: Vec<String> = (1..=10).map(|i| format!("M{i}")).collect();
         assert_eq!(labels(&state), first);
         assert_eq!(footer(&state), "7 days  [ ] range  J K: windows 1–10 of 12");
@@ -781,7 +785,7 @@ mod tests {
         state.history.apply(twelve(2));
         assert_eq!(labels(&state), first);
         // A taller terminal shows them all.
-        assert!(draw(&state, 80, 40)[38].get(27..).unwrap() == "7 days  [ ] range");
+        assert!(body_of(&state, 80, 40, NOW_MS)[37].get(27..).unwrap() == "7 days  [ ] range");
         // Help lists the keys.
         update(&mut state, ch('?'), NOW_MS);
         let help = draw(&state, 80, 24);
@@ -876,7 +880,7 @@ mod tests {
         let mut state = fresh(Screen::History);
         state.accounts.apply(snap);
         let left = |state: &State| -> Vec<String> {
-            draw(state, 80, 24)[1..23]
+            body_of(state, 80, 24, NOW_MS)[0..22]
                 .iter()
                 .map(|l| l.chars().take(26).collect::<String>().trim_end().to_owned())
                 .collect()
@@ -901,32 +905,32 @@ mod tests {
     #[test]
     fn both_panels_say_loading_until_the_first_accounts_read() {
         let mut state = fresh(Screen::History);
-        let lines = draw(&state, 80, 24);
-        assert_eq!(lines[1].trim_end(), " ACCOUNTS                  loading…");
-        assert_eq!(lines[2], " loading…");
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(lines[0].trim_end(), " ACCOUNTS                  loading…");
+        assert_eq!(lines[1], " loading…");
         state.accounts.apply(snapshot(vec![]));
-        let lines = draw(&state, 80, 24);
-        assert!(lines[1].ends_with(NO_HISTORY), "{lines:?}");
-        assert_eq!(lines[2], " No accounts yet.");
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert!(lines[0].ends_with(NO_HISTORY), "{lines:?}");
+        assert_eq!(lines[1], " No accounts yet.");
     }
 
     #[test]
     fn the_empty_states_say_so() {
         let state = on_history(vec![]);
-        let lines = draw(&state, 80, 24);
+        let lines = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(
-            lines[1].trim_end(),
+            lines[0].trim_end(),
             " ACCOUNTS                  No usage history."
         );
-        assert_eq!(lines[2], " No accounts yet.");
+        assert_eq!(lines[1], " No accounts yet.");
         let mut read = on_history(many(1));
         read.history.select(id(1));
-        assert!(draw(&read, 80, 24)[1].ends_with(LOADING));
+        assert!(body_of(&read, 80, 24, NOW_MS)[0].ends_with(LOADING));
         read.history.apply(history_of(
             account(1, "a1@x.co", unread(UsageStatus::Unavailable, None, None)),
             vec![],
         ));
-        assert!(draw(&read, 80, 24)[1].ends_with(NO_HISTORY));
+        assert!(body_of(&read, 80, 24, NOW_MS)[0].ends_with(NO_HISTORY));
     }
 
     #[test]

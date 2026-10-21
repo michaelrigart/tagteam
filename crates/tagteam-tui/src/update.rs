@@ -513,7 +513,7 @@ mod tests {
         );
         update(&mut state, ch('3'), NOW_MS);
         assert!(
-            draw(&state, 80, 24)[1].ends_with("loading…"),
+            body_of(&state, 80, 24, NOW_MS)[0].ends_with("loading…"),
             "the stale history was dropped"
         );
 
@@ -680,7 +680,8 @@ mod tests {
         assert_eq!(state.accounts.shown_ids(), [id(1), id(2)]);
         let drawn = draw(&state, 80, 24);
         assert_eq!(drawn[1], " the store is locked");
-        assert!(drawn[3].contains("a1@x.co"), "{drawn:?}");
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert!(body[1].contains("a1@x.co"), "{body:?}");
         // The next good read clears it.
         update(&mut state, accounts_msg(r#gen, 2), NOW_MS);
         assert!(state.banner.is_none());
@@ -782,7 +783,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(shown, format!("usage was not collected: {message}"));
-        assert_eq!(lines[3], " loading…");
+        assert_eq!(body_of(&state, 80, 24, NOW_MS)[0], " loading…");
     }
 
     #[test]

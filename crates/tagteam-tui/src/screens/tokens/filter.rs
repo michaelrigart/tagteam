@@ -559,10 +559,11 @@ mod tests {
         assert_eq!(shown(&state), expected);
         let lines = draw(&state, 120, 40);
         assert!(lines.iter().any(|l| l.contains("[ ] claude-sonnet-5-5")));
+        let body = body_of(&state, 120, 40, NOW_MS);
         assert!(
-            lines[1].contains("filter: all accounts · claude-opus-5-5"),
+            body[0].contains("filter: all accounts · claude-opus-5-5"),
             "the header names the one model: {}",
-            lines[1]
+            body[0]
         );
     }
 

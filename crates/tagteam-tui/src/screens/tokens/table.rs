@@ -1388,9 +1388,9 @@ mod tests {
     fn a_day_report_at_80_columns() {
         // Spec §5.3: period, account, input, output, total and cost; the period once per day.
         let state = showing(days(), |_| {});
-        let lines = draw(&state, 80, 24);
+        let lines = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(
-            lines[1..12],
+            lines[0..11],
             [
                 " [Day] Month Session Block  30 days  group: account",
                 " filter: all accounts · all models",
@@ -1405,9 +1405,9 @@ mod tests {
                 " Output is a lower bound for 2 subagent responses.",
             ]
         );
-        assert_eq!(lines[12], " API cost at list prices as of 2026-10-01.");
+        assert_eq!(lines[11], " API cost at list prices as of 2026-10-01.");
         assert_eq!(
-            lines[23],
+            draw(&state, 80, 24)[23],
             "Enter sessions  p period  g group  f filter  [ ] range  r refresh"
         );
     }
@@ -1415,13 +1415,13 @@ mod tests {
     #[test]
     fn from_120_columns_the_cache_the_responses_and_a_cost_bar_join_them() {
         let state = showing(days(), |_| {});
-        let lines = draw(&state, 120, 40);
+        let lines = body_of(&state, 120, 40, NOW_MS);
         assert_eq!(
-            lines[1],
+            lines[0],
             " [Day] Month Session Block  30 days  group: account  filter: all accounts · all models"
         );
         assert_eq!(
-            lines[3..8],
+            lines[2..7],
             [
                 " DAY         ACCOUNT        INPUT   OUTPUT  CW 5M  CW 1H  CACHE R   TOTAL  RESP    COST",
                 " 2026-09-20  1 a1@x.co       1.2M  ≥310.0K   3.0M   1.1M    88.0M   93.6M   412  $41.20  ████████",
@@ -1486,9 +1486,9 @@ mod tests {
                 session("88aa", spare()),
             ],
         );
-        let lines = draw(&sessions, 80, 24);
+        let lines = body_of(&sessions, 80, 24, NOW_MS);
         assert_eq!(
-            lines[1..12],
+            lines[0..11],
             [
                 " Day Month [Session] Block  30 days  group: account",
                 " filter: all accounts · all models",
@@ -1517,13 +1517,13 @@ mod tests {
                 None,
             )],
         );
-        let lines = draw(&months, 80, 24);
+        let lines = body_of(&months, 80, 24, NOW_MS);
         assert_eq!(
-            lines[1],
+            lines[0],
             " Day [Month] Session Block  12 months  group: account"
         );
-        assert_eq!(lines[4], " MONTH    ACCOUNT    INPUT  OUTPUT  TOTAL  COST");
-        assert_eq!(lines[5], " 2026-09  1 a1@x.co      1       2      6     —");
+        assert_eq!(lines[3], " MONTH    ACCOUNT    INPUT  OUTPUT  TOTAL  COST");
+        assert_eq!(lines[4], " 2026-09  1 a1@x.co      1       2      6     —");
     }
 
     #[test]
@@ -1534,9 +1534,9 @@ mod tests {
             "pppggg",
             vec![block(NOON, true), block(NOON - 5 * HOUR_MS, false)],
         );
-        let lines = draw(&blocks, 80, 24);
+        let lines = body_of(&blocks, 80, 24, NOW_MS);
         assert_eq!(
-            lines[1..10],
+            lines[0..9],
             [
                 " Day Month Session [Block]  30 days  group: account",
                 " filter: all accounts · all models",
@@ -1555,7 +1555,7 @@ mod tests {
     #[test]
     fn the_active_block_counts_down_between_queries_and_is_no_longer_active_at_its_end() {
         let blocks = showing_after("ppp", vec![block(NOON, true)]);
-        let figures = |at: i64| draw_at(&blocks, 80, 24, at)[6].clone();
+        let figures = |at: i64| body_of(&blocks, 80, 24, at)[5].clone();
         assert!(figures(NOW_MS).starts_with("   active · 2h13m elapsed · 2h46m left"));
         assert!(
             figures(NOW_MS + 61_000).starts_with("   active · 2h14m elapsed · 2h45m left"),
@@ -1595,25 +1595,25 @@ mod tests {
         let mut opus = token_row(day(1), None, Some("claude-opus-5-5"), counts(1, 2, 3), None);
         opus.accounts = vec![row_account(1), spare()];
         let models = showing_after("g", vec![opus.clone()]);
-        let lines = draw(&models, 80, 24);
+        let lines = body_of(&models, 80, 24, NOW_MS);
         assert_eq!(
-            lines[1],
+            lines[0],
             " [Day] Month Session Block  30 days  group: model"
         );
         assert_eq!(
-            lines[4],
+            lines[3],
             " DAY         ACCOUNT             MODEL            INPUT  OUTPUT  TOTAL  COST"
         );
         assert_eq!(
-            lines[5],
+            lines[4],
             " 2026-09-20  1 a1@x.co, 2 spare  claude-opus-5-5      1       2      6     —"
         );
         opus.model = None;
         let none = showing_after("ggg", vec![opus]);
-        let lines = draw(&none, 80, 24);
-        assert_eq!(lines[1], " [Day] Month Session Block  30 days  group: none");
+        let lines = body_of(&none, 80, 24, NOW_MS);
+        assert_eq!(lines[0], " [Day] Month Session Block  30 days  group: none");
         assert_eq!(
-            lines[4],
+            lines[3],
             " DAY         ACCOUNT             INPUT  OUTPUT  TOTAL  COST"
         );
     }
@@ -1631,12 +1631,12 @@ mod tests {
             let mut state = showing(rows.clone(), |_| {});
             state.theme = Theme::new(color);
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
-            let lines = text_of(&buf);
+            let lines = body_of(&state, 80, 24, NOW_MS);
             assert_eq!(
-                lines[6],
+                lines[5],
                 "             2 spare       300.0K    80.0K   20.5M   ≥$9.75"
             );
-            assert!(lines[7].ends_with("       —"), "{}", lines[7]);
+            assert!(lines[6].ends_with("       —"), "{}", lines[6]);
             for needle in ["≥310.0K", "≥$9.75"] {
                 let (x, y) = locate(&buf, needle).unwrap();
                 let cell = &buf[(x, y)];
@@ -1661,9 +1661,9 @@ mod tests {
             r.index.unreadable_files = 3;
             r.price_overrides = vec!["claude-opus-5-5".into()];
         });
-        let lines = draw(&state, 80, 24);
+        let lines = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(
-            lines[11..17],
+            lines[10..16],
             [
                 " No price for claude-test-9: counted without cost (≥ marks a partial cost).",
                 " Output is a lower bound for 2 subagent responses.",
@@ -1681,7 +1681,10 @@ mod tests {
         let mut state = showing(days(), |_| {});
         assert_eq!(state.tokens.watch().refreshing(), None);
         assert!(crate::update::drawn(&mut state).contains(&Cmd::RefreshIndex { provider: cc() }));
-        assert_eq!(draw(&state, 80, 24)[3], " UTC · indexing transcripts…");
+        assert_eq!(
+            body_of(&state, 80, 24, NOW_MS)[2],
+            " UTC · indexing transcripts…"
+        );
         let progress = IndexProgress {
             bytes_done: 1_200_000_000,
             bytes_total: 3_300_000_000,
@@ -1689,7 +1692,7 @@ mod tests {
         };
         update(&mut state, Msg::IndexProgress(progress), NOW_MS);
         assert_eq!(
-            draw(&state, 80, 24)[3],
+            body_of(&state, 80, 24, NOW_MS)[2],
             " UTC · indexing transcripts 1.2 GB / 3.3 GB"
         );
         update(
@@ -1699,21 +1702,30 @@ mod tests {
             },
             NOW_MS,
         );
-        assert_eq!(draw(&state, 80, 24)[3], " UTC · catching up elsewhere");
+        assert_eq!(
+            body_of(&state, 80, 24, NOW_MS)[2],
+            " UTC · catching up elsewhere"
+        );
         // A report of an index that has never completed a refresh (token report §14).
         let partial = IndexState {
             refreshed_at_ms: None,
             ..IndexState::default()
         };
         let mut state = showing(days(), |r| r.index = partial);
-        assert_eq!(draw(&state, 80, 24)[3], " UTC · catching up");
+        assert_eq!(body_of(&state, 80, 24, NOW_MS)[2], " UTC · catching up");
         crate::screens::tokens::requery(&mut state, NOW_MS);
-        assert_eq!(draw(&state, 80, 24)[3], " UTC · catching up · updating…");
+        assert_eq!(
+            body_of(&state, 80, 24, NOW_MS)[2],
+            " UTC · catching up · updating…"
+        );
         // Refreshed on another day: its date.
         let state = showing(days(), |r| {
             r.index.refreshed_at_ms = Some(YESTERDAY + HOUR_MS)
         });
-        assert_eq!(draw(&state, 80, 24)[3], " UTC · refreshed 2026-09-20 01:00");
+        assert_eq!(
+            body_of(&state, 80, 24, NOW_MS)[2],
+            " UTC · refreshed 2026-09-20 01:00"
+        );
     }
 
     #[test]
@@ -1739,7 +1751,10 @@ mod tests {
             },
             NOW_MS,
         );
-        assert_eq!(draw(&state, 80, 24)[3], " Europe/Brussels · catching up");
+        assert_eq!(
+            body_of(&state, 80, 24, NOW_MS)[2],
+            " Europe/Brussels · catching up"
+        );
         crate::update::drawn(&mut state);
         let progress = IndexProgress {
             bytes_done: 12_300_000_000,
@@ -1749,7 +1764,7 @@ mod tests {
         update(&mut state, Msg::IndexProgress(progress), NOW_MS);
         crate::screens::tokens::requery(&mut state, NOW_MS);
         assert_eq!(
-            draw(&state, 80, 24)[3],
+            body_of(&state, 80, 24, NOW_MS)[2],
             " Europe/Brussels · indexing transcripts 12.3 GB / 33.3 GB · updating…"
         );
     }
@@ -1758,11 +1773,11 @@ mod tests {
     fn loading_and_an_empty_report_say_so() {
         let mut state = fresh(Screen::Tokens);
         state.start();
-        assert_eq!(draw(&state, 80, 24)[4], " loading…");
+        assert_eq!(body_of(&state, 80, 24, NOW_MS)[3], " loading…");
         let empty = showing(vec![], |_| {});
-        let lines = draw(&empty, 80, 24);
-        assert_eq!(lines[4], " No token usage in this range.");
-        assert_eq!(lines[5], "");
+        let lines = body_of(&empty, 80, 24, NOW_MS);
+        assert_eq!(lines[3], " No token usage in this range.");
+        assert_eq!(lines[4], "");
     }
 
     #[test]
@@ -1772,12 +1787,15 @@ mod tests {
             ..IndexState::default()
         };
         let state = showing(vec![], |r| r.index = unbuilt);
-        let lines = draw(&state, 80, 24);
-        assert_eq!(lines[3], " UTC · catching up");
-        assert_eq!(lines[4], " No token usage indexed yet.");
-        assert_eq!(lines[5], "");
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(lines[2], " UTC · catching up");
+        assert_eq!(lines[3], " No token usage indexed yet.");
+        assert_eq!(lines[4], "");
         let built = showing(vec![], |_| {});
-        assert_eq!(draw(&built, 80, 24)[4], " No token usage in this range.");
+        assert_eq!(
+            body_of(&built, 80, 24, NOW_MS)[3],
+            " No token usage in this range."
+        );
     }
 
     #[test]
@@ -1786,24 +1804,24 @@ mod tests {
             r.index.skipped_lines = 12;
             r.index.unreadable_files = 3;
         });
-        let lines = draw(&state, 80, 24);
-        assert_eq!(lines[4], " No token usage in this range.");
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(lines[3], " No token usage in this range.");
         assert_eq!(
-            lines[5..7],
+            lines[4..6],
             [
                 " 12 transcript lines could not be read, so these totals may be low.",
                 " 3 transcript files could not be read; the next refresh tries again.",
             ]
         );
-        assert_eq!(lines[7], "");
+        assert_eq!(lines[6], "");
     }
 
     #[test]
     fn an_empty_report_without_warnings_shows_only_the_empty_message() {
         let state = showing(vec![], |_| {});
-        let lines = draw(&state, 80, 24);
-        assert_eq!(lines[4], " No token usage in this range.");
-        assert!(lines[5..23].iter().all(|l| l.is_empty()), "{lines:?}");
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(lines[3], " No token usage in this range.");
+        assert!(lines[4..22].iter().all(|l| l.is_empty()), "{lines:?}");
     }
 
     #[test]
@@ -1823,13 +1841,13 @@ mod tests {
             },
             NOW_MS,
         );
-        let lines = draw(&state, 80, 24);
+        let lines = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(
-            lines[1],
+            lines[0],
             " [Day] Month Session Block  30 days  group: account"
         );
         assert_eq!(
-            lines[2],
+            lines[1],
             " filter: all accounts · all models  › 2026-09-20 1 a1@x.co"
         );
     }
@@ -1839,7 +1857,7 @@ mod tests {
         // `g` changes the top level's grouping; a drilled level's own is not what it sets.
         let mut state = showing_after("g", days());
         assert_eq!(
-            draw(&state, 80, 24)[1],
+            body_of(&state, 80, 24, NOW_MS)[0],
             " [Day] Month Session Block  30 days  group: model"
         );
         for rows in [
@@ -1866,7 +1884,7 @@ mod tests {
             Some(TokenGrouping::AccountModel)
         );
         assert_eq!(
-            draw(&state, 80, 24)[1],
+            body_of(&state, 80, 24, NOW_MS)[0],
             " [Day] Month Session Block  30 days  group: model"
         );
     }
@@ -1942,9 +1960,9 @@ mod tests {
             answer_with(&mut state, &down, rows);
         }
         assert_eq!(state.tokens.depth(), 2);
-        let lines = draw(&state, 80, 24);
+        let lines = body_of(&state, 80, 24, NOW_MS);
         assert!(
-            lines[4].starts_with(" ACCOUNT"),
+            lines[3].starts_with(" ACCOUNT"),
             "the period and the project are the same on every row: {lines:?}"
         );
         for model in MODELS {
@@ -1953,8 +1971,8 @@ mod tests {
                 "{model} whole: {lines:?}"
             );
         }
-        assert!(lines[8].starts_with(" TOTAL"), "{lines:?}");
-        assert!(lines[8].contains("1.2M"), "{lines:?}");
+        assert!(lines[7].starts_with(" TOTAL"), "{lines:?}");
+        assert!(lines[7].contains("1.2M"), "{lines:?}");
     }
 
     #[test]
@@ -1967,18 +1985,18 @@ mod tests {
             last = update(&mut state, ch(c), NOW_MS);
         }
         answer_with(&mut state, &last, work_models());
-        let lines = draw(&state, 80, 24);
+        let lines = body_of(&state, 80, 24, NOW_MS);
         assert!(
-            !lines[4].contains("PROJECT"),
+            !lines[3].contains("PROJECT"),
             "the project gave way first: {lines:?}"
         );
         for model in MODELS {
             assert!(
-                lines[5..8].iter().any(|l| l.contains(model)),
+                lines[4..7].iter().any(|l| l.contains(model)),
                 "{model} whole: {lines:?}"
             );
         }
-        assert!(lines[5].contains(" 1 mich…  "), "{lines:?}");
+        assert!(lines[4].contains(" 1 mich…  "), "{lines:?}");
     }
 
     #[test]
@@ -1988,12 +2006,12 @@ mod tests {
             *alias = Some("an-alias-thirty-five-characters-long".into());
         }
         let state = showing(rows, |_| {});
-        let lines = draw(&state, 120, 40);
-        assert!(lines[3].contains("  CACHE W  CACHE R  "), "{}", lines[3]);
+        let lines = body_of(&state, 120, 40, NOW_MS);
+        assert!(lines[2].contains("  CACHE W  CACHE R  "), "{}", lines[2]);
         assert!(
-            lines[5].contains("2 an-alias-thirty-five-characters-long  "),
+            lines[4].contains("2 an-alias-thirty-five-characters-long  "),
             "{}",
-            lines[5]
+            lines[4]
         );
     }
 
@@ -2032,7 +2050,7 @@ mod tests {
         }
         update(&mut state, key(KeyCode::Home), NOW_MS);
         assert_eq!(
-            draw(&state, 100, 30)[4],
+            body_of(&state, 100, 30, NOW_MS)[3],
             " 2026-09-21  1 a1@x.co      1       2      6  $0.01"
         );
         update(&mut state, key(KeyCode::PageDown), NOW_MS);
@@ -2297,19 +2315,19 @@ mod tests {
             ..IndexProgress::default()
         };
         update(&mut state, Msg::IndexProgress(progress), NOW_MS);
-        let lines = draw(&state, 80, 24);
+        let lines = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(
-            lines[1],
+            lines[0],
             " [Day] Month Session Block  30 days  group: account"
         );
         assert!(
-            lines[2].starts_with(&format!(" filter: 2 {alias} (avery")),
+            lines[1].starts_with(&format!(" filter: 2 {alias} (avery")),
             "{lines:?}"
         );
-        assert!(lines[2].ends_with('…'), "{lines:?}");
-        assert!(width_of(&lines[2]) <= 80, "{lines:?}");
-        assert_eq!(lines[3], " UTC · indexing transcripts 1.2 GB / 3.3 GB");
-        assert!(lines[4].starts_with(" DAY"), "{lines:?}");
+        assert!(lines[1].ends_with('…'), "{lines:?}");
+        assert!(width_of(&lines[1]) <= 80, "{lines:?}");
+        assert_eq!(lines[2], " UTC · indexing transcripts 1.2 GB / 3.3 GB");
+        assert!(lines[3].starts_with(" DAY"), "{lines:?}");
     }
 
     #[test]
@@ -2332,9 +2350,9 @@ mod tests {
             },
             NOW_MS,
         );
-        let lines = draw(&state, 80, 24);
+        let lines = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(
-            lines[1..4],
+            lines[0..3],
             [
                 " Day Month [Session] Block  all  group: account, model",
                 " filter: all account…  › session 3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c 3 山田太…",
@@ -2342,7 +2360,7 @@ mod tests {
             ]
         );
         assert!(
-            lines[4].starts_with(" ACCOUNT"),
+            lines[3].starts_with(" ACCOUNT"),
             "one session's models share the period and the project, which the rows leave out: {lines:?}"
         );
     }
@@ -2633,7 +2651,7 @@ mod tests {
         let base = NOW_MS - NOW_MS.rem_euclid(1000);
         let fresh = || showing_after("ppp", vec![block(base - 17_940_000, true)]);
         let state = fresh();
-        let figures = |at: i64| draw_at(&state, 80, 24, at)[6].clone();
+        let figures = |at: i64| body_of(&state, 80, 24, at)[5].clone();
         for (at, builds_so_far) in [
             (base, 1),
             (base + 100, 2),
