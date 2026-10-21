@@ -15,7 +15,7 @@ use crate::host::AccountRef;
 use crate::msg::Cmd;
 use crate::source::AccountsSnapshot;
 use crate::state::{Screen, State};
-use crate::theme::Theme;
+use crate::theme::{Role, Theme};
 use crate::update;
 use crate::view::{
     fit, flow, furthest_scroll, keep_visible, pad, scrolled_windows, select, width_of, wrap_rows,
@@ -508,7 +508,7 @@ impl<'a> Table<'a> {
         let marker = if v.active { "*" } else { " " };
         let mut spans = vec![
             Span::raw(" "),
-            Span::styled(marker, theme.strong()),
+            Span::styled(marker, theme.role(Role::Accent)),
             Span::raw(format!(" {:>2}{session}  ", v.row.position)),
             Span::raw(pad(&words::account_cell(&v.row), self.account_w)),
         ];
@@ -1502,6 +1502,42 @@ mod tests {
                 assert_eq!(buf[(x, y)].bg, tint, "{theme:?} {x}");
                 assert_eq!(buf[(x, y + 1)].bg, Color::Reset, "{theme:?} {x}");
             }
+        }
+    }
+
+    #[test]
+    fn a_selected_active_row_bolds_its_name_alone_and_draws_the_marker_in_accent() {
+        for theme in TIERS {
+            let mut state = loaded(three());
+            state.theme = theme;
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            let y = crate::view::areas(&state, buf.area).body.y + 1;
+            assert_eq!(buf[(1, y)].symbol(), "*", "{theme:?}");
+            let accent = theme.role(Role::Accent);
+            assert_eq!(
+                buf[(1, y)].fg,
+                accent.fg.unwrap_or(Color::Reset),
+                "{theme:?}"
+            );
+            let (name, _) = locate(&buf, "michael@example.com").unwrap();
+            // Without colour, accent is bold, so the marker is the one other bold cell there.
+            let marker_bold = theme == TIERS[0];
+            assert_eq!(
+                buf[(1, y)].modifier.contains(Modifier::BOLD),
+                marker_bold,
+                "{theme:?}"
+            );
+            // Past the marker, the name's cells are the one bold run on the row. Without colour a
+            // warn percentage is bold as well, so the row is read up to the window columns.
+            let end = if theme == TIERS[0] { 30 } else { 80 };
+            let runs: Vec<u16> = (2..end)
+                .filter(|x| buf[(*x, y)].modifier.contains(Modifier::BOLD))
+                .collect();
+            assert_eq!(runs.first(), Some(&name), "{theme:?} {runs:?}");
+            assert!(
+                runs.windows(2).all(|p| p[1] == p[0] + 1),
+                "{theme:?} {runs:?}"
+            );
         }
     }
 
