@@ -71,6 +71,10 @@ struct Level {
     /// range rolls with the clock; a drilled level's is `TokenQuery::drill`'s, fixed.
     query: Option<TokenQuery>,
     report: Option<TokenReport>,
+    /// The words of this level's last report query, when it failed: its report is the last one
+    /// read, drawn DIM under them (T2-22). A good report clears them, and so does leaving the
+    /// level.
+    failed: Option<String>,
     selected: Option<RowKey>,
     /// The first table line shown; clamped where it is used (R22).
     offset: usize,
@@ -90,6 +94,7 @@ impl Level {
         Level {
             query,
             report: None,
+            failed: None,
             selected: None,
             offset: 0,
             widths: table::Widths::default(),
@@ -118,8 +123,6 @@ pub struct TokensState {
     again: bool,
     /// A failed read's words, the banner while Tokens is open (spec §10.4, B12).
     error: Option<String>,
-    /// The last report query failed: its report is drawn DIM (T2-22).
-    stale: bool,
     /// The index's state, its refresh, and the timers that read the report again (§6.4).
     watch: IndexWatch,
     /// How far what lies below the total is scrolled (`J`/`K`, B25), and for which row: another
@@ -144,7 +147,6 @@ impl TokensState {
             pending: false,
             again: false,
             error: None,
-            stale: false,
             watch: IndexWatch::default(),
             below_from: 0,
             below_for: None,
@@ -190,10 +192,19 @@ impl TokensState {
         self.pending
     }
 
-    /// A failed read's words, for the banner (B12): a report's or a check's, else the last
-    /// refresh's.
+    /// Whether the shown report is the last one read, the query after it having failed
+    /// (T2-22).
+    fn stale(&self) -> bool {
+        self.level().failed.is_some()
+    }
+
+    /// A failed read's words, for the banner (B12): the shown report's first, so the DIM report
+    /// never loses them to a check, then a check's, else the last refresh's.
     pub fn error(&self) -> Option<&str> {
-        self.error.as_deref().or_else(|| self.watch.error())
+        let failed = self.level().failed.as_deref();
+        failed
+            .or(self.error.as_deref())
+            .or_else(|| self.watch.error())
     }
 
     /// The index's state and the TUI's refresh of it.
@@ -278,6 +289,7 @@ impl TokensState {
             level.selected = Some(report.rows[at].key.clone());
         }
         level.report = Some(report);
+        level.failed = None;
         level.widths = table::Widths::default();
         level.layout = table::Layout::default();
     }
@@ -349,21 +361,20 @@ pub(crate) fn on_report(
     }
     let t = &mut state.tokens;
     t.pending = false;
+    let read = result.is_ok();
     match result {
         Ok(report) => {
             t.error = None;
-            t.stale = false;
             t.apply(report);
         }
         Err(e) => {
-            t.error = Some(format!(
+            t.level_mut().failed = Some(format!(
                 "couldn't read the token index ({}) · r retries",
                 e.message
             ));
-            t.stale = true;
         }
     }
-    index::on_report(state, now_ms);
+    index::on_report(state, now_ms, read);
     if state.screen == Screen::Tokens {
         state.dirty = true;
     }
@@ -848,6 +859,39 @@ mod tests {
         let again = update(&mut state, ch('2'), NOW_MS);
         answer(&mut state, &again, vec![row(day(1), 1)]);
         assert_eq!(state.tokens.error(), None, "the next good read clears it");
+    }
+
+    #[test]
+    fn a_failed_drilled_query_is_that_level_s_and_going_back_clears_it() {
+        // T2-22: the report and its words belong to the level whose query failed.
+        let mut state = showing_days();
+        let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
+        let (r#gen, _) = asked(&down);
+        let failed = Err(SourceError {
+            kind: "store".into(),
+            message: "the index is locked".into(),
+        });
+        update(
+            &mut state,
+            Msg::TokenReport {
+                r#gen,
+                result: failed,
+            },
+            NOW_MS,
+        );
+        assert_eq!(
+            state.tokens.error(),
+            Some("couldn't read the token index (the index is locked) · r retries")
+        );
+        update(&mut state, key(KeyCode::Esc), NOW_MS);
+        assert_eq!(state.tokens.depth(), 0);
+        assert_eq!(state.tokens.error(), None);
+        let buf = draw_buffer(&state, 80, 24, NOW_MS);
+        let (x, y) = locate(&buf, "TOTAL").unwrap();
+        assert!(
+            (x..x + 5).all(|x| !buf[(x, y)].modifier.contains(ratatui::style::Modifier::DIM)),
+            "the top report is plain"
+        );
     }
 
     #[test]
