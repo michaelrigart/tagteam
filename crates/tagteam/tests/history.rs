@@ -216,12 +216,20 @@ fn the_text_shows_sparklines_rates_and_projections() {
     assert!(
         text.starts_with(concat!(
             "b@x.co (position 2), last 7d\n\n",
-            "5h  9%  resets in 2h40m\n  ▁▁▂  3 samples\n  +1.0 pts/h · lasts to reset (regression)\n\n",
-            "7d  30%  resets in 3d00h\n  ▂▂▃  3 samples\n  +5.0 pts/h · runs out in ",
+            "5h  9%  resets in 2h40m\n  ▁▁▂  3 samples\n  +1.0%/h · lasts until it resets\n\n",
+            "7d  30%  resets in 3d00h\n  ▂▂▃  3 samples\n  +5.0%/h · full in ",
         )),
         "{text}"
     );
-    assert!(text.ends_with(" (regression)\n"), "{text}");
+    // Full 12 hours after the seed's clock, read a second or so later.
+    assert!(
+        text.ends_with(" · full in 12h00m\n") || text.ends_with(" · full in 11h59m\n"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("regression"),
+        "the method is the help's: {text}"
+    );
     assert_eq!(
         text.matches(" samples\n").count(),
         2,

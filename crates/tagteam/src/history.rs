@@ -293,15 +293,15 @@ mod tests {
                 "\n",
                 "5h  9%  resets in 2h40m\n",
                 "  ▁▁▂  3 samples\n",
-                "  no rate yet\n",
+                "  not enough data yet\n",
                 "\n",
                 "7d  30%  resets in 3d02h\n",
                 "  ▂▂▃  3 samples\n",
-                "  +5.0 pts/h · runs out in 12h00m (regression)\n",
+                "  +5.0%/h · full in 12h00m\n",
                 "\n",
                 "Fable  2%  resets in 3d02h\n",
                 "  no samples\n",
-                "  +0.3 pts/h · lasts to reset (average)\n",
+                "  +0.3%/h · lasts until it resets\n",
             )
         );
     }

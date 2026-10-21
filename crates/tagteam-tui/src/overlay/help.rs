@@ -40,6 +40,13 @@ pub(crate) const MARKS: &[(&str, Role, &str)] = &[
     ("⠋", Role::Accent, "spinner"),
 ];
 
+/// How a rate is measured (T3-9): the projections no longer name their method, so the help does.
+const RATE: (&str, &str) = (
+    "%/h",
+    "how fast a window fills: a fit through its last two days of readings, or its average so \
+     far when there are too few",
+);
+
 pub(super) fn key(state: &State, scroll: &mut u16, key: KeyEvent) -> KeyOutcome {
     match key.code {
         KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter => KeyOutcome::Close,
@@ -96,6 +103,14 @@ pub(super) fn rows(state: &State, width: u16) -> Vec<Line<'static>> {
         lines
     };
     let mut marks = vec![title("Marks")];
+    let (rate, words) = RATE;
+    marks.extend(entry(
+        rate,
+        theme.role(Role::Muted),
+        words,
+        width_of(rate),
+        column,
+    ));
     for (glyph, role, words) in MARKS {
         marks.extend(entry(glyph, theme.role(*role), words, 1, column));
     }
@@ -168,7 +183,9 @@ fn entry(
 mod tests {
     use crossterm::event::KeyCode;
 
-    use super::{KEYS, MARKS, Screen, State, rows, width_of};
+    use ratatui::text::Line;
+
+    use super::{KEYS, MARKS, Role, Screen, State, rows, width_of};
     use crate::overlay::Overlay;
     use crate::testutil::*;
     use crate::update::update;
@@ -343,6 +360,40 @@ mod tests {
             assert!(state.overlay.is_none());
             assert_eq!(state.quitting, None);
         }
+    }
+
+    #[test]
+    fn help_names_how_the_rate_is_measured() {
+        // T3-9: the projection no longer names its method; the help says it once, under Marks.
+        let state = open(Screen::Accounts);
+        let rows = rows(&state, 80);
+        let text = |line: &Line<'_>| -> Vec<String> {
+            line.spans.iter().map(|s| s.content.to_string()).collect()
+        };
+        let marks = rows
+            .iter()
+            .position(|l| text(l).concat() == "Marks")
+            .unwrap();
+        let at = marks
+            + rows[marks..]
+                .iter()
+                .position(|l| text(l).get(1).is_some_and(|lead| lead == "%/h"))
+                .unwrap_or_else(|| panic!("{rows:?}"));
+        assert_eq!(rows[at].spans[1].style, state.theme.role(Role::Muted));
+        // The entry's continuation rows have a blank lead.
+        let said: Vec<String> = std::iter::once(&rows[at])
+            .chain(
+                rows[at + 1..]
+                    .iter()
+                    .take_while(|l| text(l).get(1).is_some_and(|lead| lead.trim().is_empty())),
+            )
+            .map(|l| text(l)[3].clone())
+            .collect();
+        assert_eq!(
+            said.join(" "),
+            "how fast a window fills: a fit through its last two days of readings, or its \
+             average so far when there are too few"
+        );
     }
 
     #[test]

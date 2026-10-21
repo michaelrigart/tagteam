@@ -42,6 +42,19 @@ pub enum UsageStatus {
 }
 
 impl UsageStatus {
+    /// Every status once, in declaration order.
+    pub const ALL: [UsageStatus; 9] = [
+        UsageStatus::Ok,
+        UsageStatus::TokenExpired,
+        UsageStatus::ApiKey,
+        UsageStatus::KeychainUnavailable,
+        UsageStatus::ReloginRequired,
+        UsageStatus::ForeignCredential,
+        UsageStatus::NoCredentials,
+        UsageStatus::Unavailable,
+        UsageStatus::Unsupported,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             UsageStatus::Ok => "ok",

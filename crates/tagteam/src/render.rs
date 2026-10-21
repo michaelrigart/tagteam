@@ -7,8 +7,8 @@ use tagteam_engine::views::{
     AccountView, ProviderAccounts, ShellAccount, StatusView, UsageStatus, UsageView,
 };
 use tagteam_engine::words::{
-    AHEAD, IN_SESSION, Severity, WindowColumn, account_cell, countdown, row_notes, severity,
-    spend_text, usage_words, window_columns,
+    AHEAD, IN_SESSION, Severity, UPDATED_HEAD, WindowColumn, account_cell, countdown, row_notes,
+    severity, spend_text, usage_words, window_columns,
 };
 // `app` and `transfer_cmd` still spell these `render::email` and `render::name`.
 pub use tagteam_engine::words::{email, name};
@@ -187,7 +187,7 @@ fn pct_cell(pct: f64, color: bool) -> Cell {
 }
 
 /// A window as `list` shows it: its pct (a spend window's amounts), the countdown to its
-/// reset, and `▲ pace` when it is ahead of pace.
+/// reset, and `▲ fast` when it is ahead of pace.
 fn window_cell(w: &Window, p: &Pace, now_s: i64, color: bool) -> Cell {
     let mut c = spend_cell(w, color).unwrap_or_else(|| pct_cell(w.pct, color));
     if let Some(at) = w.resets_at {
@@ -208,7 +208,7 @@ fn missing_cell(col: &WindowColumn) -> Cell {
     }
 }
 
-/// One account's line before alignment: its cells (the window columns and AGE) when it has a
+/// One account's line before alignment: its cells (the window columns and UPDATED) when it has a
 /// reading, and the notes that follow: its status in words, its kind, `disabled`, `this`.
 struct Row {
     marker: char,
@@ -267,7 +267,7 @@ fn table(accounts: &[AccountView], this: Option<&AccountId>, now_s: i64, color: 
     let heads: Vec<&str> = cols
         .iter()
         .map(|c| c.head.as_str())
-        .chain((!cols.is_empty()).then_some("AGE"))
+        .chain((!cols.is_empty()).then_some(UPDATED_HEAD))
         .collect();
     let widths: Vec<usize> = heads
         .iter()
@@ -431,7 +431,7 @@ pub fn status_human(
         }
         StatusView::Managed { account, total } => {
             let marker = if account.row.quarantine_reason.is_some() {
-                ", relogin required"
+                ", needs a new login"
             } else {
                 ""
             };
@@ -976,7 +976,7 @@ mod tests {
 
     #[test]
     fn the_list_is_a_table_of_windows_countdowns_pace_and_age() {
-        // §13.1's layout: a column per window some reading has (SPEND always), `▲ pace`, the
+        // §13.1's layout: a column per window some reading has (SPEND always), `▲ fast`, the
         // reading's age, and the status in words for a row with no reading.
         let mut live = view(
             1,
@@ -1015,10 +1015,10 @@ mod tests {
                 false
             ),
             concat!(
-                "    #  ACCOUNT                5H           7D                   SPEND      FABLE        AGE\n",
-                " *  1  michael@example.com      9%  2h40m   77%  3d09h  ▲ pace  €0 of €20    0%  3d09h  2m\n",
+                "    #  ACCOUNT                5H           7D                   SPEND      FABLE        UPDATED\n",
+                " *  1  michael@example.com      9%  2h40m   77%  3d09h  ▲ fast  €0 of €20    0%  3d09h  2m\n",
                 "    2  spare@example.com       31%  2h40m   12%  3d09h          —             —         14m\n",
-                "    3  work (w@corp.com)      relogin required\n",
+                "    3  work (w@corp.com)      needs a new login\n",
                 "    4  api-key-4@token.local  api key\n",
             )
         );
@@ -1051,11 +1051,11 @@ mod tests {
         assert_eq!(
             list_human(&one(rows), None, &names, "claude", NOW, false),
             concat!(
-                "    #  ACCOUNT                    5H           7D           SPEND  AGE\n",
-                "    1  a@x.co                      50%  reset   60%  3d09h  —      1h06m  unavailable (http-429, retry 5m)\n",
-                "    2  b@x.co                     no data yet\n",
-                "    3  c@x.co                     over budget (retry 10m)\n",
-                "    4  setup-token-4@token.local  unavailable (pre-send, retry <1m)  setup token  disabled\n",
+                "    #  ACCOUNT                    5H           7D           SPEND  UPDATED\n",
+                "    1  a@x.co                      50%  reset   60%  3d09h  —      1h06m    rate-limited (retry 5m)\n",
+                "    2  b@x.co                     not checked yet\n",
+                "    3  c@x.co                     paused to stay within the request budget (retry 10m)\n",
+                "    4  setup-token-4@token.local  usage check failed (pre-send, retry <1m)  setup token  disabled\n",
             )
         );
     }
@@ -1075,8 +1075,8 @@ mod tests {
                 false
             ),
             concat!(
-                "    #  ACCOUNT  5H           7D           SPEND  AGE\n",
-                "    1  a@x.co    31%  2h40m   12%  3d09h  —      15m  keychain unavailable (retry 2m)\n",
+                "    #  ACCOUNT  5H           7D           SPEND  UPDATED\n",
+                "    1  a@x.co    31%  2h40m   12%  3d09h  —      15m      can't read the Keychain (retry 2m)\n",
             )
         );
     }
@@ -1133,7 +1133,7 @@ mod tests {
         assert_eq!(
             out,
             concat!(
-                "    #  ACCOUNT        5H           7D           SPEND  AGE\n",
+                "    #  ACCOUNT        5H           7D           SPEND  UPDATED\n",
                 "    1  a@x.co           9%  2h40m   12%  3d09h  —      <1m\n",
                 "    2  山田太郎@x.co    9%  2h40m   12%  3d09h  —      <1m\n",
                 "    3  😀@x.co          9%  2h40m   12%  3d09h  —      <1m\n",
@@ -1155,7 +1155,7 @@ mod tests {
         assert_eq!(
             list_human(&rows(), None, &names, "claude", NOW, true),
             concat!(
-                "    #  ACCOUNT  5H           7D           SPEND  AGE\n",
+                "    #  ACCOUNT  5H           7D           SPEND  UPDATED\n",
                 "    1  a@x.co    \x1b[31m95%\x1b[0m  2h40m   \x1b[33m77%\x1b[0m  3d09h  —      <1m\n",
             )
         );
@@ -1182,7 +1182,7 @@ mod tests {
                 NOW,
                 false
             ),
-            "Live: a@x.co (position 1 of 1)\n  5h 9% (2h40m) · 7d 77% (3d09h) ▲ pace · spend €0 of €20 · Fable 0% (3d09h) · 2m old\n"
+            "Live: a@x.co (position 1 of 1)\n  5h 9% (2h40m) · 7d 77% (3d09h) ▲ fast · spend €0 of €20 · Fable 0% (3d09h) · 2m old\n"
         );
         let failing = view(
             1,
@@ -1201,7 +1201,7 @@ mod tests {
                 NOW,
                 false
             ),
-            "Live: a@x.co (position 1 of 2)\n  unavailable (pre-send, retry <1m)\n"
+            "Live: a@x.co (position 1 of 2)\n  usage check failed (pre-send, retry <1m)\n"
         );
         assert_eq!(
             status_human(
@@ -1239,7 +1239,7 @@ mod tests {
         a.row.quarantine_reason = Some("invalid_grant".into());
         assert_eq!(
             list_human(&one(vec![a.clone()]), None, &names, "claude", NOW, false),
-            "    #  ACCOUNT\n *  1  a@x.co   relogin required\n"
+            "    #  ACCOUNT\n *  1  a@x.co   needs a new login\n"
         );
         assert_eq!(
             status_human(
@@ -1252,7 +1252,7 @@ mod tests {
                 NOW,
                 false
             ),
-            "Live: a@x.co (position 1 of 1), relogin required\n"
+            "Live: a@x.co (position 1 of 1), needs a new login\n"
         );
     }
 
@@ -1435,10 +1435,10 @@ mod tests {
     }
 
     const PINNED: &str = concat!(
-        "    #  ACCOUNT                5H           7D                   SPEND      FABLE        AGE\n",
-        " *  1  michael@example.com      9%  2h40m   77%  3d09h  ▲ pace  €0 of €20    0%  3d09h  2m\n",
+        "    #  ACCOUNT                5H           7D                   SPEND      FABLE        UPDATED\n",
+        " *  1  michael@example.com      9%  2h40m   77%  3d09h  ▲ fast  €0 of €20    0%  3d09h  2m\n",
         "    2  spare@example.com       31%  2h40m   12%  3d09h          —             —         14m\n",
-        "    3  work (w@corp.com)      relogin required\n",
+        "    3  work (w@corp.com)      needs a new login\n",
         "    4  api-key-4@token.local  api key\n",
     );
 
@@ -1472,10 +1472,10 @@ mod tests {
                 false
             ),
             concat!(
-                "    #    ACCOUNT                5H           7D                   SPEND      FABLE        AGE\n",
-                " *  1    michael@example.com      9%  2h40m   77%  3d09h  ▲ pace  €0 of €20    0%  3d09h  2m\n",
-                "    2 ▶  spare@example.com       31%  2h40m   12%  3d09h          —             —         14m  this\n",
-                "    3    work (w@corp.com)      relogin required\n",
+                "    #    ACCOUNT                5H           7D                   SPEND      FABLE        UPDATED\n",
+                " *  1    michael@example.com      9%  2h40m   77%  3d09h  ▲ fast  €0 of €20    0%  3d09h  2m\n",
+                "    2 ▶  spare@example.com       31%  2h40m   12%  3d09h          —             —         14m      this\n",
+                "    3    work (w@corp.com)      needs a new login\n",
                 "    4    api-key-4@token.local  api key\n",
             )
         );
@@ -1483,10 +1483,10 @@ mod tests {
         assert_eq!(
             list_human(&one(rows), None, &names, "claude", NOW, false),
             concat!(
-                "    #    ACCOUNT                5H           7D                   SPEND      FABLE        AGE\n",
-                " *  1    michael@example.com      9%  2h40m   77%  3d09h  ▲ pace  €0 of €20    0%  3d09h  2m\n",
+                "    #    ACCOUNT                5H           7D                   SPEND      FABLE        UPDATED\n",
+                " *  1    michael@example.com      9%  2h40m   77%  3d09h  ▲ fast  €0 of €20    0%  3d09h  2m\n",
                 "    2 ▶  spare@example.com       31%  2h40m   12%  3d09h          —             —         14m\n",
-                "    3    work (w@corp.com)      relogin required\n",
+                "    3    work (w@corp.com)      needs a new login\n",
                 "    4    api-key-4@token.local  api key\n",
             )
         );
@@ -1577,7 +1577,7 @@ mod tests {
         };
         assert_eq!(
             status_human(&managed, &session, None, NOW, false),
-            "Live: a@x.co (position 1 of 3)\n  unavailable (pre-send, retry <1m)\nThis session: work (w@corp.com) (position 3)\n"
+            "Live: a@x.co (position 1 of 3)\n  usage check failed (pre-send, retry <1m)\nThis session: work (w@corp.com) (position 3)\n"
         );
         assert_eq!(
             status_human(&StatusView::NoLogin, &session, None, NOW, false),
@@ -1614,7 +1614,7 @@ mod tests {
                 NOW,
                 false
             ),
-            "Live: a@x.co (position 1 of 3)\n  unavailable (pre-send, retry <1m)\n",
+            "Live: a@x.co (position 1 of 3)\n  usage check failed (pre-send, retry <1m)\n",
             "outside a run shell, as before"
         );
     }

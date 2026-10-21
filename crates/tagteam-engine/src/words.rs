@@ -5,6 +5,7 @@
 
 use tagteam_core::autoswitch::{NoSwitchReason, Trigger};
 use tagteam_core::{Window, WindowKind};
+use tagteam_provider::TransientKind;
 
 use crate::failure::FailureKind;
 use crate::store::AccountRow;
@@ -13,8 +14,12 @@ use crate::views::{AccountView, HistoryWindow, NO_DATA, UsageStatus, UsageView};
 
 /// A window a reading does not have, or an age that is not known.
 pub const MISSING: &str = "—";
-/// §8.7's marker for a window ahead of pace.
-pub const AHEAD: &str = "▲ pace";
+/// §8.7's marker in `list` and `status` (§11.1): was `▲ pace`.
+pub const AHEAD: &str = "▲ fast";
+/// `list`'s head for a reading's age (§11.1): was `AGE`.
+pub const UPDATED_HEAD: &str = "UPDATED";
+/// An account never read (§11.1): was `no data yet`, and `never fetched` in the TUI.
+pub const NOT_CHECKED: &str = "not checked yet";
 /// §13.1's marker of a session-owned account, in a one-column field after the position
 /// (Decision 11).
 pub const IN_SESSION: &str = "▶";
@@ -109,37 +114,55 @@ pub fn spend_text(w: &Window) -> Option<String> {
     ))
 }
 
-/// A usage status in words (§13.1): in place of a row's windows when it has no reading, and
-/// beside them when its status is not `ok`. Whatever the status, a retry still ahead is said:
-/// `keychain unavailable (retry 2m)`, `unavailable (http-429, retry 5m)`.
-pub fn usage_words(u: &UsageView, now_s: i64) -> String {
-    let (head, why) = match u.status {
+/// A usage status's head and, for a failure said by its token, that token (T3-8).
+fn status_parts(u: &UsageView) -> (&'static str, Option<String>) {
+    match u.status {
         UsageStatus::Ok => ("no usage reported", None),
-        UsageStatus::TokenExpired => ("token expired", None),
+        UsageStatus::TokenExpired => ("login expired", None),
         UsageStatus::ApiKey => ("api key", None),
-        UsageStatus::KeychainUnavailable => ("keychain unavailable", None),
-        UsageStatus::ReloginRequired => ("relogin required", None),
-        UsageStatus::ForeignCredential => ("foreign credential", None),
-        UsageStatus::NoCredentials => ("no credentials", None),
+        UsageStatus::KeychainUnavailable => ("can't read the Keychain", None),
+        UsageStatus::ReloginRequired => ("needs a new login", None),
+        UsageStatus::ForeignCredential => ("logged in as another account", None),
+        UsageStatus::NoCredentials => ("no stored login", None),
         UsageStatus::Unsupported => ("usage unsupported", None),
         UsageStatus::Unavailable => match u.error.as_deref() {
-            None | Some(NO_DATA) => ("no data yet", None),
+            None | Some(NO_DATA) => (NOT_CHECKED, None),
             Some(e) => match FailureKind::parse(e) {
-                FailureKind::OverBudget => ("over budget", None),
-                _ => ("unavailable", Some(e.to_owned())),
+                FailureKind::Provider(TransientKind::Http(429)) => ("rate-limited", None),
+                FailureKind::OverBudget => ("paused to stay within the request budget", None),
+                _ => ("usage check failed", Some(e.to_owned())),
             },
         },
-    };
-    let retry = u
-        .retry_at
-        .filter(|&at| at > now_s)
-        .map(|at| format!("retry {}", duration(at - now_s)));
-    let detail: Vec<String> = why.into_iter().chain(retry).collect();
+    }
+}
+
+/// `head`, and `detail` in brackets when there is any.
+fn with_detail(head: &str, detail: Vec<String>) -> String {
     if detail.is_empty() {
         head.to_owned()
     } else {
         format!("{head} ({})", detail.join(", "))
     }
+}
+
+/// A usage status in words without its retry (§11.1, T3-8): `needs a new login`,
+/// `rate-limited`, `usage check failed (refresh-failed)`, `not checked yet`.
+pub fn status_words(u: &UsageView) -> String {
+    let (head, why) = status_parts(u);
+    with_detail(head, why.into_iter().collect())
+}
+
+/// A usage status in words (§13.1): in place of a row's windows when it has no reading, and
+/// beside them when its status is not `ok`. Whatever the status, a retry still ahead is said:
+/// `can't read the Keychain (retry 2m)`, `rate-limited (retry 5m)`,
+/// `usage check failed (refresh-failed, retry 5m)`.
+pub fn usage_words(u: &UsageView, now_s: i64) -> String {
+    let (head, why) = status_parts(u);
+    let retry = u
+        .retry_at
+        .filter(|&at| at > now_s)
+        .map(|at| format!("retry {}", duration(at - now_s)));
+    with_detail(head, why.into_iter().chain(retry).collect())
 }
 
 /// One of `list`'s window columns: the window key it shows (`None` for the spend column when
@@ -235,37 +258,77 @@ pub fn rate_signed(rate: f64) -> String {
     }
 }
 
-/// The burn rate and where it leads (§8.7): `lasts to reset` when the window will, else when it
-/// runs out (or `should have run out` when that time has passed, `won't run out within a year`
-/// when it is further off than that), with the method that measured the rate.
-pub fn projection_text(hw: &HistoryWindow, now_s: i64) -> String {
+/// A projection's clause (§11.1): `lasts until it resets` (`lasts` when `short`),
+/// `full in 2d04h`, `should have been full 3h ago`, `won't fill within a year`,
+/// `at the limit`, `not enough data yet`, `no projection`.
+pub fn projection_clause(hw: &HistoryWindow, now_s: i64, short: bool) -> String {
     let p = &hw.pace;
-    let method = p
-        .method
-        .map_or_else(String::new, |m| format!(" ({})", m.as_str()));
     // An exhausted window ran out when it was read, which may be long ago: no countdown applies.
     if hw.window.pct >= 100.0 {
-        return match p.rate_per_hour {
-            Some(rate) => format!("{} pts/h · at the limit{method}", rate_signed(rate)),
-            None => "at the limit".to_owned(),
-        };
+        return "at the limit".to_owned();
     }
-    let Some(rate) = p.rate_per_hour else {
-        return "no rate yet".to_owned();
-    };
-    let eta = match (p.will_last_to_reset, p.exhaustion_at) {
-        (Some(true), _) => "lasts to reset".to_owned(),
+    if p.rate_per_hour.is_none() {
+        return "not enough data yet".to_owned();
+    }
+    match (p.will_last_to_reset, p.exhaustion_at) {
+        (Some(true), _) if short => "lasts".to_owned(),
+        (Some(true), _) => "lasts until it resets".to_owned(),
         (_, Some(at)) if at <= now_s => format!(
-            "should have run out {} ago",
+            "should have been full {} ago",
             duration(now_s.saturating_sub(at))
         ),
         (_, Some(at)) if at.saturating_sub(now_s) > A_YEAR_S => {
-            "won't run out within a year".to_owned()
+            "won't fill within a year".to_owned()
         }
-        (_, Some(at)) => format!("runs out in {}", duration(at - now_s)),
+        (_, Some(at)) => format!("full in {}", duration(at - now_s)),
         _ => "no projection".to_owned(),
-    };
-    format!("{} pts/h · {eta}{method}", rate_signed(rate))
+    }
+}
+
+/// The burn rate and where it leads (§8.7): `+1.2%/h · lasts until it resets`, or the clause
+/// alone without a rate. The method that measured the rate is the help's to name (T3-9).
+pub fn projection_text(hw: &HistoryWindow, now_s: i64) -> String {
+    let clause = projection_clause(hw, now_s, false);
+    match hw.pace.rate_per_hour {
+        Some(rate) => format!("{}%/h · {clause}", rate_signed(rate)),
+        None => clause,
+    }
+}
+
+/// `▲ faster than an even pace (62% expected by now)`, or without the parenthesis.
+pub fn ahead_words(expected_pct: Option<f64>) -> String {
+    match expected_pct {
+        Some(e) => format!(
+            "▲ faster than an even pace ({}% expected by now)",
+            e.round() as i64
+        ),
+        None => "▲ faster than an even pace".to_owned(),
+    }
+}
+
+/// `updated 2m ago`.
+pub fn updated(age_s: i64) -> String {
+    format!("updated {} ago", duration(age_s))
+}
+
+/// `next update in 1m`.
+pub fn next_update(at: i64, now_s: i64) -> String {
+    format!("next update in {}", countdown(at, now_s))
+}
+
+/// T3-10: `login valid 6 more days`, `… 1 more day`, `… 5h20m more`, `login expired`.
+pub fn login_valid(expires_at_ms: i64, now_s: i64) -> String {
+    const DAY: i64 = 86_400;
+    let left = expires_at_ms.div_euclid(1000).saturating_sub(now_s);
+    if left <= 0 {
+        "login expired".to_owned()
+    } else if left < DAY {
+        format!("login valid {} more", duration(left))
+    } else if left < 2 * DAY {
+        "login valid 1 more day".to_owned()
+    } else {
+        format!("login valid {} more days", left / DAY)
+    }
 }
 
 /// What a token report with no rows says (token report §11.2).
@@ -712,17 +775,92 @@ mod tests {
     }
 
     #[test]
+    fn every_usage_status_has_its_words() {
+        use UsageStatus::*;
+        let expected = [
+            (Ok, "no usage reported"),
+            (TokenExpired, "login expired"),
+            (ApiKey, "api key"),
+            (KeychainUnavailable, "can't read the Keychain"),
+            (ReloginRequired, "needs a new login"),
+            (ForeignCredential, "logged in as another account"),
+            (NoCredentials, "no stored login"),
+            (Unavailable, "not checked yet"),
+            (Unsupported, "usage unsupported"),
+        ];
+        assert_eq!(expected.len(), UsageStatus::ALL.len());
+        for status in UsageStatus::ALL {
+            let want = expected.iter().find(|(s, _)| *s == status).unwrap().1;
+            assert_eq!(
+                status_words(&unread(status, None, None)),
+                want,
+                "{status:?}"
+            );
+        }
+        assert_eq!(NOT_CHECKED, "not checked yet");
+    }
+
+    #[test]
+    fn the_status_list_is_every_status_once() {
+        use UsageStatus::*;
+        fn index(s: UsageStatus) -> usize {
+            match s {
+                Ok => 0,
+                TokenExpired => 1,
+                ApiKey => 2,
+                KeychainUnavailable => 3,
+                ReloginRequired => 4,
+                ForeignCredential => 5,
+                NoCredentials => 6,
+                Unavailable => 7,
+                Unsupported => 8,
+            }
+        }
+        assert_eq!(UsageStatus::ALL.map(index), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn a_failure_token_is_said_in_its_kind_s_words() {
+        let words_of = |error: &str, retry_in: Option<i64>| {
+            usage_words(
+                &unread(UsageStatus::Unavailable, Some(error), retry_in),
+                NOW,
+            )
+        };
+        assert_eq!(words_of("http-429", Some(300)), "rate-limited (retry 5m)");
+        assert_eq!(
+            words_of("refresh-failed", Some(300)),
+            "usage check failed (refresh-failed, retry 5m)"
+        );
+        assert_eq!(words_of("pre-send", None), "usage check failed (pre-send)");
+        assert_eq!(
+            words_of("over-budget", Some(720)),
+            "paused to stay within the request budget (retry 12m)"
+        );
+        assert_eq!(words_of("http-503", None), "usage check failed (http-503)");
+        assert_eq!(words_of(NO_DATA, None), "not checked yet");
+        // Without its retry, as the TUI's card says it.
+        let failed = unread(UsageStatus::Unavailable, Some("refresh-failed"), Some(300));
+        assert_eq!(status_words(&failed), "usage check failed (refresh-failed)");
+        let limited = unread(UsageStatus::Unavailable, Some("http-429"), Some(300));
+        assert_eq!(status_words(&limited), "rate-limited");
+    }
+
+    #[test]
     fn every_status_says_when_it_is_retried_while_that_is_ahead() {
         let words_of = |status, error: Option<&str>, retry_in: Option<i64>| {
             usage_words(&unread(status, error, retry_in), NOW)
         };
         for (status, text) in [
             (UsageStatus::Ok, "no usage reported"),
-            (UsageStatus::KeychainUnavailable, "keychain unavailable"),
-            (UsageStatus::TokenExpired, "token expired"),
-            (UsageStatus::NoCredentials, "no credentials"),
-            (UsageStatus::ForeignCredential, "foreign credential"),
-            (UsageStatus::ReloginRequired, "relogin required"),
+            (UsageStatus::KeychainUnavailable, "can't read the Keychain"),
+            (UsageStatus::TokenExpired, "login expired"),
+            (UsageStatus::NoCredentials, "no stored login"),
+            (
+                UsageStatus::ForeignCredential,
+                "logged in as another account",
+            ),
+            (UsageStatus::ReloginRequired, "needs a new login"),
             (UsageStatus::ApiKey, "api key"),
             (UsageStatus::Unsupported, "usage unsupported"),
         ] {
@@ -744,27 +882,27 @@ mod tests {
         }
         assert_eq!(
             words_of(UsageStatus::Unavailable, Some("over-budget"), Some(2_400)),
-            "over budget (retry 40m)"
+            "paused to stay within the request budget (retry 40m)"
         );
         assert_eq!(
             words_of(UsageStatus::Unavailable, Some("over-budget"), None),
-            "over budget"
+            "paused to stay within the request budget"
         );
         assert_eq!(
             words_of(UsageStatus::Unavailable, Some(NO_DATA), Some(30)),
-            "no data yet (retry <1m)"
+            "not checked yet (retry <1m)"
         );
         assert_eq!(
             words_of(UsageStatus::Unavailable, None, None),
-            "no data yet"
+            "not checked yet"
         );
         assert_eq!(
             words_of(UsageStatus::Unavailable, Some("http-429"), Some(330)),
-            "unavailable (http-429, retry 5m)"
+            "rate-limited (retry 5m)"
         );
         assert_eq!(
             words_of(UsageStatus::Unavailable, Some("http-429"), None),
-            "unavailable (http-429)"
+            "rate-limited"
         );
     }
 
@@ -779,7 +917,7 @@ mod tests {
                 ),
                 NOW
             ),
-            "unavailable (a-token-from-a-newer-build)"
+            "usage check failed (a-token-from-a-newer-build)"
         );
     }
 
@@ -857,7 +995,7 @@ mod tests {
         let beside = view(1, "a@x.co", OAUTH, locked);
         assert_eq!(
             row_notes(&beside, false, NOW),
-            ["keychain unavailable (retry 2m)"]
+            ["can't read the Keychain (retry 2m)"]
         );
         // No reading: the words stand in for the windows, the kind follows, then the marks.
         let mut setup = view(
@@ -870,7 +1008,7 @@ mod tests {
         assert_eq!(
             row_notes(&setup, true, NOW),
             [
-                "unavailable (pre-send, retry <1m)",
+                "usage check failed (pre-send, retry <1m)",
                 "setup token",
                 "disabled",
                 "this"
@@ -911,77 +1049,120 @@ mod tests {
     }
 
     #[test]
-    fn a_projection_lasts_runs_out_or_is_missing() {
-        let with = |pace: Pace| {
-            let w = window("7d", "7d", WindowKind::Long, 30.0, None);
+    fn a_projection_says_how_fast_and_when_the_window_is_full() {
+        let with = |pace: Pace, pct: f64, reset: Option<i64>| {
+            let w = window("7d", "7d", WindowKind::Long, pct, reset);
             projection_text(&history_window(w, pace), NOW)
         };
-        assert_eq!(with(Pace::default()), "no rate yet");
-        let past = Pace {
-            rate_per_hour: Some(5.0),
-            method: Some(ProjectionMethod::Regression),
-            exhaustion_at: Some(NOW - 60),
-            ..Pace::default()
-        };
-        assert_eq!(
-            with(past),
-            "+5.0 pts/h · should have run out 1m ago (regression)"
-        );
-        let just_past = Pace {
-            exhaustion_at: Some(NOW),
-            ..past
-        };
-        assert_eq!(
-            with(just_past),
-            "+5.0 pts/h · should have run out <1m ago (regression)"
-        );
-        let soon = Pace {
-            exhaustion_at: Some(NOW + 60),
-            ..past
-        };
-        assert_eq!(with(soon), "+5.0 pts/h · runs out in 1m (regression)");
-        let lasts = Pace {
-            will_last_to_reset: Some(true),
-            ..soon
-        };
-        assert_eq!(with(lasts), "+5.0 pts/h · lasts to reset (regression)");
-        let flat = Pace {
-            rate_per_hour: Some(0.0),
-            method: Some(ProjectionMethod::Average),
-            ..Pace::default()
-        };
-        assert_eq!(with(flat), "+0.0 pts/h · no projection (average)");
+        let texts = [
+            (Pace::default(), 30.0, None, "not enough data yet"),
+            (
+                Pace {
+                    rate_per_hour: Some(1.2),
+                    method: Some(ProjectionMethod::Regression),
+                    exhaustion_at: Some(NOW + 50 * HOUR),
+                    will_last_to_reset: Some(true),
+                    ..Pace::default()
+                },
+                30.0,
+                Some(HOUR),
+                "+1.2%/h · lasts until it resets",
+            ),
+            (
+                Pace {
+                    rate_per_hour: Some(5.0),
+                    method: Some(ProjectionMethod::Regression),
+                    exhaustion_at: Some(NOW + 12 * HOUR),
+                    will_last_to_reset: Some(false),
+                    ..Pace::default()
+                },
+                30.0,
+                None,
+                "+5.0%/h · full in 12h00m",
+            ),
+            (
+                Pace {
+                    rate_per_hour: Some(5.0),
+                    method: Some(ProjectionMethod::Regression),
+                    exhaustion_at: Some(NOW - 3 * HOUR),
+                    ..Pace::default()
+                },
+                30.0,
+                None,
+                "+5.0%/h · should have been full 3h00m ago",
+            ),
+            (
+                Pace {
+                    rate_per_hour: Some(0.03),
+                    method: Some(ProjectionMethod::Average),
+                    exhaustion_at: Some(NOW + 2 * A_YEAR_S),
+                    ..Pace::default()
+                },
+                30.0,
+                None,
+                "+0.03%/h · won't fill within a year",
+            ),
+            // An exhausted window ran out when it was read, which may be long ago: no
+            // countdown, with or without a rate.
+            (
+                Pace {
+                    rate_per_hour: Some(1.0),
+                    method: Some(ProjectionMethod::Average),
+                    exhaustion_at: Some(NOW - 2 * HOUR),
+                    will_last_to_reset: Some(false),
+                    ..Pace::default()
+                },
+                100.0,
+                Some(HOUR),
+                "+1.0%/h · at the limit",
+            ),
+            (
+                Pace {
+                    exhaustion_at: Some(NOW - 2 * HOUR),
+                    ..Pace::default()
+                },
+                100.0,
+                Some(HOUR),
+                "at the limit",
+            ),
+            (
+                Pace {
+                    rate_per_hour: Some(0.0),
+                    method: Some(ProjectionMethod::Average),
+                    ..Pace::default()
+                },
+                30.0,
+                None,
+                "+0.0%/h · no projection",
+            ),
+        ];
+        for (pace, pct, reset, text) in texts {
+            let said = with(pace, pct, reset);
+            assert_eq!(said, text);
+            for gone in ["regression", "average", "pts/h"] {
+                assert!(!said.contains(gone), "{said}");
+            }
+        }
     }
 
     #[test]
-    fn an_exhausted_window_is_at_the_limit_with_or_without_a_rate() {
-        let exhausted = |pace: Pace| {
-            let w = window("5h", "5h", WindowKind::Short, 100.0, Some(HOUR));
-            projection_text(&history_window(w, pace), NOW)
-        };
-        // Read 100, 100, 100: no slope, no average for a Short window, but exhausted at the read.
-        let no_rate = Pace {
-            exhaustion_at: Some(NOW - 2 * HOUR),
-            ..Pace::default()
-        };
-        assert_eq!(exhausted(no_rate), "at the limit");
-        // With a rate the exhaustion time is the read's, hours ago: no countdown.
-        let with_rate = Pace {
-            rate_per_hour: Some(5.0),
-            method: Some(ProjectionMethod::Average),
-            exhaustion_at: Some(NOW - 2 * HOUR),
-            will_last_to_reset: Some(false),
-            ..Pace::default()
-        };
-        assert_eq!(exhausted(with_rate), "+5.0 pts/h · at the limit (average)");
-    }
-
-    #[test]
-    fn a_projection_beyond_a_year_says_it_will_not_run_out() {
+    fn a_projection_s_edges_keep_their_countdowns() {
         let with = |pace: Pace, reset: Option<i64>| {
             let w = window("7d", "7d", WindowKind::Long, 30.0, reset);
             projection_text(&history_window(w, pace), NOW)
         };
+        let past = Pace {
+            rate_per_hour: Some(5.0),
+            method: Some(ProjectionMethod::Regression),
+            exhaustion_at: Some(NOW),
+            ..Pace::default()
+        };
+        assert_eq!(with(past, None), "+5.0%/h · should have been full <1m ago");
+        let soon = Pace {
+            exhaustion_at: Some(NOW + 60),
+            ..past
+        };
+        assert_eq!(with(soon, None), "+5.0%/h · full in 1m");
         // A quiet window: 70 points to go at 0.006 an hour is well over a year.
         let tiny = Pace {
             rate_per_hour: Some(0.006),
@@ -990,51 +1171,98 @@ mod tests {
             will_last_to_reset: None,
             ..Pace::default()
         };
-        assert_eq!(
-            with(tiny, None),
-            "+0.01 pts/h · won't run out within a year (regression)"
-        );
+        assert_eq!(with(tiny, None), "+0.01%/h · won't fill within a year");
         // With a reset it will not reach, the reset is what counts (§8.7).
         let lasts = Pace {
             will_last_to_reset: Some(true),
             ..tiny
         };
-        assert_eq!(
-            with(lasts, Some(HOUR)),
-            "+0.01 pts/h · lasts to reset (regression)"
-        );
+        assert_eq!(with(lasts, Some(HOUR)), "+0.01%/h · lasts until it resets");
         // 70 points at 0.01 an hour is 291 days: a countdown still.
         let slow = Pace {
             rate_per_hour: Some(0.01),
             exhaustion_at: Some(NOW + 25_200_000),
             ..tiny
         };
-        assert_eq!(
-            with(slow, None),
-            "+0.01 pts/h · runs out in 291d16h (regression)"
-        );
+        assert_eq!(with(slow, None), "+0.01%/h · full in 291d16h");
         // The year itself is still a countdown; a second more is not.
         let year = |s| Pace {
             exhaustion_at: Some(NOW + 365 * 86_400 + s),
             ..tiny
         };
-        assert_eq!(
-            with(year(0), None),
-            "+0.01 pts/h · runs out in 365d00h (regression)"
-        );
-        assert_eq!(
-            with(year(1), None),
-            "+0.01 pts/h · won't run out within a year (regression)"
-        );
+        assert_eq!(with(year(0), None), "+0.01%/h · full in 365d00h");
+        assert_eq!(with(year(1), None), "+0.01%/h · won't fill within a year");
         // A saturated time must not overflow.
         let saturated = Pace {
             exhaustion_at: Some(i64::MAX),
             ..tiny
         };
+        assert_eq!(with(saturated, None), "+0.01%/h · won't fill within a year");
+    }
+
+    #[test]
+    fn the_short_clause_is_lasts_or_the_full_time() {
+        let clause = |pace: Pace, short: bool| {
+            let w = window("7d", "7d", WindowKind::Long, 30.0, Some(HOUR));
+            projection_clause(&history_window(w, pace), NOW, short)
+        };
+        let lasts = Pace {
+            rate_per_hour: Some(1.2),
+            method: Some(ProjectionMethod::Regression),
+            exhaustion_at: Some(NOW + 50 * HOUR),
+            will_last_to_reset: Some(true),
+            ..Pace::default()
+        };
+        assert_eq!(clause(lasts, false), "lasts until it resets");
+        assert_eq!(clause(lasts, true), "lasts");
+        let full = Pace {
+            rate_per_hour: Some(5.0),
+            exhaustion_at: Some(NOW + 12 * HOUR),
+            will_last_to_reset: Some(false),
+            ..lasts
+        };
+        assert_eq!(clause(full, false), "full in 12h00m");
+        assert_eq!(clause(full, true), "full in 12h00m");
+    }
+
+    #[test]
+    fn ahead_words_say_the_expected_share() {
+        assert_eq!(AHEAD, "▲ fast");
         assert_eq!(
-            with(saturated, None),
-            "+0.01 pts/h · won't run out within a year (regression)"
+            ahead_words(Some(62.0)),
+            "▲ faster than an even pace (62% expected by now)"
         );
+        assert_eq!(
+            ahead_words(Some(61.6)),
+            "▲ faster than an even pace (62% expected by now)"
+        );
+        assert_eq!(ahead_words(None), "▲ faster than an even pace");
+    }
+
+    #[test]
+    fn updated_next_update_and_login_valid_read_as_the_tui_shows_them() {
+        assert_eq!(UPDATED_HEAD, "UPDATED");
+        assert_eq!(updated(120), "updated 2m ago");
+        assert_eq!(next_update(NOW + 60, NOW), "next update in 1m");
+        let ms = |s: i64| s * 1_000;
+        let day = 86_400;
+        assert_eq!(
+            login_valid(ms(NOW + 6 * day + 3 * HOUR), NOW),
+            "login valid 6 more days"
+        );
+        assert_eq!(
+            login_valid(ms(NOW + 2 * day), NOW),
+            "login valid 2 more days"
+        );
+        assert_eq!(
+            login_valid(ms(NOW + day + 2 * HOUR), NOW),
+            "login valid 1 more day"
+        );
+        assert_eq!(
+            login_valid(ms(NOW + 5 * HOUR + 20 * 60), NOW),
+            "login valid 5h20m more"
+        );
+        assert_eq!(login_valid(ms(NOW - 1), NOW), "login expired");
     }
 
     #[test]

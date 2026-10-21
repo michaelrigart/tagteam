@@ -376,13 +376,13 @@ fn add_list_status_and_switch_read_like_this() {
         h.ok(&["list"]),
         concat!(
             "    #  ACCOUNT\n",
-            "    1  work (a@x.co)  unavailable (pre-send, retry <1m)\n",
-            " *  2  b@x.co         unavailable (pre-send, retry <1m)\n",
+            "    1  work (a@x.co)  usage check failed (pre-send, retry <1m)\n",
+            " *  2  b@x.co         usage check failed (pre-send, retry <1m)\n",
         )
     );
     assert_eq!(
         h.ok(&["status"]),
-        "Live: b@x.co (position 2 of 2)\n  unavailable (pre-send, retry <1m)\n"
+        "Live: b@x.co (position 2 of 2)\n  usage check failed (pre-send, retry <1m)\n"
     );
     assert_eq!(
         h.ok(&["switch", "work"]),
@@ -394,8 +394,8 @@ fn add_list_status_and_switch_read_like_this() {
         h.ok(&["ls"]),
         concat!(
             "    #  ACCOUNT\n",
-            " *  1  work (a@x.co)  unavailable (pre-send, retry <1m)\n",
-            "    2  b@x.co         unavailable (pre-send, retry <1m)\n",
+            " *  1  work (a@x.co)  usage check failed (pre-send, retry <1m)\n",
+            "    2  b@x.co         usage check failed (pre-send, retry <1m)\n",
         )
     );
     assert_eq!(
@@ -614,7 +614,7 @@ fn declining_the_unmanaged_login_offer_cancels_and_adds_nothing() {
     assert_eq!(no.asked, [ADD_STRANGER_FIRST]);
     assert_eq!(
         h.ok(&["list"]),
-        "    #  ACCOUNT\n    1  a@x.co   unavailable (pre-send, retry <1m)\n"
+        "    #  ACCOUNT\n    1  a@x.co   usage check failed (pre-send, retry <1m)\n"
     );
     assert_eq!(
         h.ok(&["status"]),
@@ -647,7 +647,7 @@ fn prompts_never_block_a_non_interactive_caller() {
     assert_eq!(code, 0);
     assert_eq!(
         h.ok(&["list"]),
-        "    #  ACCOUNT\n *  1  stranger@x.co  unavailable (pre-send, retry <1m)\n"
+        "    #  ACCOUNT\n *  1  stranger@x.co  usage check failed (pre-send, retry <1m)\n"
     );
     let (code, _, err) = h.run(&["add-token"], &mut Scripted::none());
     assert_eq!(code, 1);
@@ -657,7 +657,8 @@ fn prompts_never_block_a_non_interactive_caller() {
 const REPLACE_A: &str = "Position 1 holds a@x.co. Replace it?";
 
 /// `list` with `a@x.co` alone and live, its fetch failed offline.
-const LIVE_A_OFFLINE: &str = "    #  ACCOUNT\n *  1  a@x.co   unavailable (pre-send, retry <1m)\n";
+const LIVE_A_OFFLINE: &str =
+    "    #  ACCOUNT\n *  1  a@x.co   usage check failed (pre-send, retry <1m)\n";
 
 /// `a@x.co` stored at position 1, and live.
 fn with_one_login() -> H {
@@ -1037,7 +1038,7 @@ fn token_accounts_list_their_kind_from_the_provider() {
         h.ok(&["list"]),
         concat!(
             "    #  ACCOUNT\n",
-            "    1  setup-token-1@token.local  unavailable (pre-send, retry <1m)  setup token\n",
+            "    1  setup-token-1@token.local  usage check failed (pre-send, retry <1m)  setup token\n",
             "    2  api-key-2@token.local      api key\n",
         )
     );

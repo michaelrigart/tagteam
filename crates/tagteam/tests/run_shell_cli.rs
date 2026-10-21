@@ -262,7 +262,7 @@ mod sessions_in_list_and_status {
 
     /// The table with no account in a session: today's layout.
     const QUIET: &str = concat!(
-        "    #  ACCOUNT  5H    7D    SPEND  AGE\n",
+        "    #  ACCOUNT  5H    7D    SPEND  UPDATED\n",
         "    1  a@x.co     9%   77%  —      <1m\n",
         " *  2  b@x.co     9%   77%  —      <1m\n",
     );
@@ -282,8 +282,8 @@ mod sessions_in_list_and_status {
         assert_eq!(
             run(d.path(), Some(&shell), &["list"]),
             concat!(
-                "    #    ACCOUNT  5H    7D    SPEND  AGE\n",
-                "    1 ▶  a@x.co     9%   77%  —      <1m  this\n",
+                "    #    ACCOUNT  5H    7D    SPEND  UPDATED\n",
+                "    1 ▶  a@x.co     9%   77%  —      <1m      this\n",
                 " *  2    b@x.co     9%   77%  —      <1m\n",
             )
         );
@@ -368,7 +368,7 @@ mod sessions_in_list_and_status {
         assert_eq!(
             run(d.path(), None, &["list"]),
             concat!(
-                "    #    ACCOUNT  5H    7D    SPEND  AGE\n",
+                "    #    ACCOUNT  5H    7D    SPEND  UPDATED\n",
                 "    1 ▶  a@x.co     9%   77%  —      <1m\n",
                 " *  2    b@x.co     9%   77%  —      <1m\n",
             )

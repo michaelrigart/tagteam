@@ -80,9 +80,9 @@ fn json_of(root: &Path, server: &MockServer, args: &[&str]) -> Value {
 }
 
 const TABLE: &str = concat!(
-    "    #  ACCOUNT  5H           7D                   SPEND  FABLE        AGE\n",
-    "    1  a@x.co     9%  2h40m   77%  3d09h  ▲ pace  —        0%  3d09h  <1m\n",
-    " *  2  b@x.co     9%  2h40m   77%  3d09h  ▲ pace  —        0%  3d09h  <1m\n",
+    "    #  ACCOUNT  5H           7D                   SPEND  FABLE        UPDATED\n",
+    "    1  a@x.co     9%  2h40m   77%  3d09h  ▲ fast  —        0%  3d09h  <1m\n",
+    " *  2  b@x.co     9%  2h40m   77%  3d09h  ▲ fast  —        0%  3d09h  <1m\n",
 );
 
 #[test]
@@ -195,7 +195,7 @@ fn a_429_is_a_row_that_says_when_it_is_retried_never_a_command_error() {
     let (out, _) = run(d.path(), &server, &["list"]);
     assert_eq!(
         out,
-        "    #  ACCOUNT\n *  1  a@x.co   unavailable (http-429, retry 5m)\n"
+        "    #  ACCOUNT\n *  1  a@x.co   rate-limited (retry 5m)\n"
     );
     // In backoff: the next list sends nothing and reports the same.
     let v = json_of(d.path(), &server, &["list", "--json"]);
@@ -223,7 +223,7 @@ fn a_429_is_a_row_that_says_when_it_is_retried_never_a_command_error() {
 fn an_unread_account_over_its_hourly_budget_reads_as_over_budget_not_no_data() {
     // §8.6, Review Focus 4: an account removed and re-added within the hour has no reading,
     // but its identity's budget is spent. The fetch is refused before anything is sent, and
-    // its row says so, with when a slot frees, instead of "no data yet".
+    // its row says so, with when a slot frees, instead of "not checked yet".
     let d = tempfile::tempdir().unwrap();
     accounts(d.path(), &["a@x.co"]);
     let spent_at = now_epoch_s() - 100;
@@ -252,7 +252,7 @@ fn an_unread_account_over_its_hourly_budget_reads_as_over_budget_not_no_data() {
     let (out, _) = run(d.path(), &server, &["list"]);
     assert_eq!(
         out,
-        "    #  ACCOUNT\n *  1  a@x.co   over budget (retry 59m)\n"
+        "    #  ACCOUNT\n *  1  a@x.co   paused to stay within the request budget (retry 59m)\n"
     );
     let v = json_of(d.path(), &server, &["list", "--json"]);
     let row = &v["accounts"][0];
@@ -281,7 +281,7 @@ fn status_collects_the_live_account_only_and_shows_its_usage() {
     let (out, _) = run(d.path(), &server, &["status"]);
     assert_eq!(
         out,
-        "Live: b@x.co (position 2 of 2)\n  5h 9% (2h40m) · 7d 77% (3d09h) ▲ pace · Fable 0% (3d09h) · <1m old\n"
+        "Live: b@x.co (position 2 of 2)\n  5h 9% (2h40m) · 7d 77% (3d09h) ▲ fast · Fable 0% (3d09h) · <1m old\n"
     );
     assert_eq!(server.hits("GET", USAGE), 1, "b only");
     run(d.path(), &server, &["list"]);
@@ -369,8 +369,8 @@ fn a_locked_keychain_row_says_when_it_is_retried_in_words_and_in_json() {
         out,
         concat!(
             "    #  ACCOUNT\n",
-            "    1  a@x.co   keychain unavailable (retry <1m)\n",
-            " *  2  b@x.co   keychain unavailable (retry <1m)\n",
+            "    1  a@x.co   can't read the Keychain (retry <1m)\n",
+            " *  2  b@x.co   can't read the Keychain (retry <1m)\n",
         )
     );
     let v = json_of(d.path(), &server, &["list", "--json"]);
