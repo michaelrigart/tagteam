@@ -10,7 +10,7 @@ use crate::chrome;
 use crate::overlay;
 use crate::screens;
 use crate::state::{Screen, State};
-use crate::theme::Theme;
+use crate::theme::{Role, Theme};
 
 /// Below this the body is replaced by `TOO_SMALL` (spec §5.1).
 pub const MIN_WIDTH: u16 = 80;
@@ -389,12 +389,39 @@ pub(crate) fn keep_visible(
     offset.min(lines.saturating_sub(rows))
 }
 
-/// The selected row in reverse video across the whole width.
-pub(crate) fn highlight(row: Line<'static>, width: usize, theme: Theme) -> Line<'static> {
+/// `row` over `width` columns on `sel-bg` (tier 2 only; elsewhere it is padded and unstyled).
+pub(crate) fn tint(row: Line<'static>, width: usize, theme: Theme) -> Line<'static> {
     let used: usize = row.spans.iter().map(|s| width_of(&s.content)).sum();
     let mut spans = row.spans;
     spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-    Line::from(spans).style(theme.selection())
+    Line::from(spans).style(theme.sel_bg())
+}
+
+/// The selected row (spec §4.3): `▌` in accent over column 0, which `row`'s first span gives up
+/// the first cell of, its span `name` bold, and `sel-bg` across `width`. Data is never inverted.
+pub(crate) fn select(
+    mut row: Line<'static>,
+    name: Option<usize>,
+    width: usize,
+    theme: Theme,
+) -> Line<'static> {
+    if let Some(span) = name.and_then(|i| row.spans.get_mut(i)) {
+        span.style = span.style.patch(theme.strong());
+    }
+    if let Some(first) = row.spans.first_mut() {
+        let mut chars = first.content.chars();
+        if chars.next().is_some() {
+            let rest: String = chars.collect();
+            let bar = Span::styled("▌", theme.role(Role::Accent));
+            if rest.is_empty() {
+                *first = bar;
+            } else {
+                first.content = rest.into();
+                row.spans.insert(0, bar);
+            }
+        }
+    }
+    tint(row, width, theme)
 }
 
 #[cfg(test)]
@@ -409,6 +436,57 @@ mod tests {
     use crate::testutil::*;
     use crate::theme::Role;
     use crate::update::update;
+
+    #[test]
+    fn select_puts_the_bar_in_column_0_bolds_the_name_and_tints_only_in_tier_2() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::style::{Color, Modifier};
+        use ratatui::widgets::Widget;
+
+        let width = 30;
+        for theme in TIERS {
+            let row = Line::from(vec![
+                Span::raw(" "),
+                Span::raw("1 "),
+                Span::raw("alex@example.com"),
+                Span::styled(" 95%", theme.role(Role::Crit)),
+            ]);
+            let mut buf = Buffer::empty(Rect::new(0, 0, width as u16, 1));
+            Paragraph::new(select(row, Some(2), width, theme)).render(buf.area, &mut buf);
+            assert_eq!(buf[(0, 0)].symbol(), "▌", "{theme:?}");
+            assert_eq!(
+                roles(&buf, theme, 0).chars().next(),
+                canon(theme, "a").chars().next(),
+                "{theme:?}"
+            );
+            // The name (columns 3 to 18) is bold; the number before it is not.
+            for x in 3..19 {
+                assert!(
+                    buf[(x, 0)].modifier.contains(Modifier::BOLD),
+                    "{theme:?} {x}"
+                );
+            }
+            assert!(!buf[(1, 0)].modifier.contains(Modifier::BOLD), "{theme:?}");
+            assert_eq!(text_of(&buf)[0], "▌1 alex@example.com 95%", "{theme:?}");
+            for x in 0..width as u16 {
+                let cell = &buf[(x, 0)];
+                assert!(!cell.modifier.contains(Modifier::REVERSED), "{theme:?} {x}");
+                assert_eq!(
+                    cell.bg,
+                    theme.sel_bg().bg.unwrap_or(Color::Reset),
+                    "{theme:?} {x}"
+                );
+            }
+        }
+        let dark = Theme::new(true).truecolor(crate::theme::Background::Dark);
+        let light = Theme::new(true).truecolor(crate::theme::Background::Light);
+        let tint = |theme: Theme| select(Line::from(" x"), None, 4, theme).style.bg;
+        assert_eq!(tint(dark), Some(Color::Rgb(0x2f, 0x35, 0x42)));
+        assert_eq!(tint(light), Some(Color::Rgb(0xe8, 0xed, 0xf2)));
+        assert_eq!(tint(Theme::new(true)), None);
+        assert_eq!(tint(Theme::new(false)), None);
+    }
 
     #[test]
     fn keep_visible_shows_the_whole_item_and_moves_as_little_as_it_can() {

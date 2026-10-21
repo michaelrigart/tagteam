@@ -14,7 +14,7 @@ use tagteam_engine::tokens::{
 use super::table::account_name;
 use super::{TokensState, load};
 use crate::msg::Cmd;
-use crate::overlay::{CHOICE_ROWS, KeyOutcome, Overlay, boxed};
+use crate::overlay::{CHOICE_ROWS, GUTTER, KeyOutcome, Overlay, boxed, gutter_rows};
 use crate::source::SourceError;
 use crate::state::State;
 use crate::view::{scrolled_windows, wrap_rows};
@@ -317,18 +317,19 @@ pub(crate) fn render(state: &State, dialog: &FilterDialog, frame: &mut Frame) {
             block.push(Line::from(Span::styled(heading, state.theme.strong())));
         }
         let mark = if c.on { "[x] " } else { "[ ] " };
-        for (n, row) in wrap_rows(&c.label, inner.saturating_sub(4).max(1), CHOICE_ROWS)
-            .into_iter()
-            .enumerate()
-        {
+        let rows = wrap_rows(
+            &c.label,
+            inner.saturating_sub(GUTTER + 4).max(1),
+            CHOICE_ROWS,
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(n, row)| {
             let lead = if n == 0 { mark } else { "    " };
-            let line = Line::from(format!("{lead}{row}"));
-            block.push(if i == dialog.cursor {
-                line.style(state.theme.selection())
-            } else {
-                line
-            });
-        }
+            format!("{lead}{row}")
+        })
+        .collect();
+        block.extend(gutter_rows(rows, i == dialog.cursor, inner, state.theme));
         if i == dialog.cursor {
             at = blocks.len();
         }
@@ -868,11 +869,21 @@ mod tests {
         let lines = inside(&draw(&state, 80, 24));
         let at = lines
             .iter()
-            .position(|l| l.starts_with(" [x] claude-xxx"))
+            .position(|l| l.starts_with(" ▌ [x] claude-xxx"))
             .unwrap_or_else(|| panic!("{lines:?}"));
         assert!(lines[at + 1].contains(&"x".repeat(40)), "{lines:?}");
         assert!(lines[at + 2].ends_with('…'), "{lines:?}");
         assert!(lines[at + 3].contains(KEYS), "{lines:?}");
+        // The gutter's `▌` is on the choice's first row only; its text is bold on all three.
+        let buf = draw_buffer(&state, 80, 24, NOW_MS);
+        let (x, y) = locate(&buf, "▌ [x] claude-xxx").unwrap();
+        for row in 0..3 {
+            let bold = ratatui::style::Modifier::BOLD;
+            assert!(buf[(x + 2, y + row)].modifier.contains(bold), "row {row}");
+            assert!(buf[(x + 6, y + row)].modifier.contains(bold), "row {row}");
+        }
+        assert_eq!(buf[(x, y + 1)].symbol(), " ");
+        assert_eq!(buf[(x, y + 2)].symbol(), " ");
         // A long failure takes three rows too, and the dialog's own line still shows.
         let mut state = fresh(Screen::Tokens);
         state.start();

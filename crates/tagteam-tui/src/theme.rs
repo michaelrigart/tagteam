@@ -103,9 +103,31 @@ impl Theme {
         Style::new().add_modifier(Modifier::BOLD)
     }
 
-    /// The selection: reverse video, which reads on any terminal, coloured or not (spec §5.1).
-    pub(crate) fn selection(self) -> Style {
-        Style::new().add_modifier(Modifier::REVERSED)
+    /// §4.1's `sel-bg`: the selected row's background in tier 2, nothing otherwise.
+    pub(crate) fn sel_bg(self) -> Style {
+        match self.tier {
+            Tier::True(Background::Dark) => Style::new().bg(Color::Rgb(0x2f, 0x35, 0x42)),
+            Tier::True(Background::Light) => Style::new().bg(Color::Rgb(0xe8, 0xed, 0xf2)),
+            Tier::NoColor | Tier::Ansi => Style::new(),
+        }
+    }
+
+    /// A focused button or the text cursor (§4.3, §9.1): an accent fill in tiers 1 and 2 (the
+    /// text in the tier's background: black in tier 1, `surface`'s hex in tier 2), REVERSED in
+    /// tier 0.
+    pub(crate) fn focus(self) -> Style {
+        match self.tier {
+            Tier::NoColor => Style::new().add_modifier(Modifier::REVERSED),
+            Tier::Ansi => Style::new().fg(Color::Black).bg(Color::Cyan),
+            Tier::True(background) => {
+                let text = match background {
+                    Background::Dark => Color::Rgb(0x1f, 0x23, 0x29),
+                    Background::Light => Color::Rgb(0xf6, 0xf8, 0xfa),
+                };
+                let fill = self.role(Role::Accent).fg.unwrap_or(text);
+                Style::new().fg(text).bg(fill)
+            }
+        }
     }
 }
 
@@ -186,7 +208,31 @@ mod tests {
             assert_eq!(theme.severity(Severity::Warning), theme.role(Role::Warn));
             assert_eq!(theme.severity(Severity::Critical), theme.role(Role::Crit));
             assert_eq!(theme.strong(), bold, "{theme:?}");
-            assert_eq!(theme.selection(), modifier(Modifier::REVERSED));
+        }
+    }
+
+    #[test]
+    fn sel_bg_tints_only_in_tier_2_and_focus_fills_with_the_accent() {
+        let rgb = |r, g, b| Color::Rgb(r, g, b);
+        let sel = [
+            Style::new(),
+            Style::new(),
+            Style::new().bg(rgb(0x2f, 0x35, 0x42)),
+            Style::new().bg(rgb(0xe8, 0xed, 0xf2)),
+        ];
+        let focus = [
+            Style::new().add_modifier(Modifier::REVERSED),
+            Style::new().fg(Color::Black).bg(Color::Cyan),
+            Style::new()
+                .fg(rgb(0x1f, 0x23, 0x29))
+                .bg(rgb(0x56, 0xb6, 0xc2)),
+            Style::new()
+                .fg(rgb(0xf6, 0xf8, 0xfa))
+                .bg(rgb(0x0a, 0x7d, 0x8c)),
+        ];
+        for ((theme, sel), focus) in TIERS.into_iter().zip(sel).zip(focus) {
+            assert_eq!(theme.sel_bg(), sel, "{theme:?}");
+            assert_eq!(theme.focus(), focus, "{theme:?}");
         }
     }
 
@@ -201,7 +247,6 @@ mod tests {
         assert_eq!(light.role(Role::Crit).fg, rgb(0xcf, 0x22, 0x2e));
         for theme in [dark, light] {
             assert_eq!(theme.strong(), Theme::new(true).strong());
-            assert_eq!(theme.selection(), Theme::new(true).selection());
         }
     }
 

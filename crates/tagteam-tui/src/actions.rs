@@ -1097,16 +1097,32 @@ mod tests {
         assert_eq!(
             [text(at), text(at + 1), text(at + 2)],
             [
-                "2. claude-code #2",
-                "   averyveryverylongname.with.a.long.tail@example.com",
-                "   [Example Org]",
+                "▌ 2. claude-code #2",
+                "     averyveryverylongname.with.a.long.tail@example.com",
+                "     [Example Org]",
             ]
         );
+        // The gutter's `▌` is on the first row only; the text is bold on all three rows, and
+        // nothing is reversed.
+        let (bold, reversed) = (
+            ratatui::style::Modifier::BOLD,
+            ratatui::style::Modifier::REVERSED,
+        );
         for y in at..at + 3 {
-            let cell = &buf[(10, u16::try_from(y).unwrap())];
-            let reversed = ratatui::style::Modifier::REVERSED;
-            assert!(cell.modifier.contains(reversed), "row {y}");
+            let y = u16::try_from(y).unwrap();
+            let bar = if y as usize == at { "▌" } else { " " };
+            assert_eq!(buf[(10, y)].symbol(), bar, "row {y}");
+            for x in 12..20 {
+                assert!(buf[(x, y)].modifier.contains(bold), "{x},{y}");
+            }
+            for x in 10..70 {
+                assert!(!buf[(x, y)].modifier.contains(reversed), "{x},{y}");
+            }
         }
+        // The first choice is not selected: no bar, no bold.
+        let first = u16::try_from(at - 1).unwrap();
+        assert_eq!(buf[(10, first)].symbol(), " ");
+        assert!(!buf[(12, first)].modifier.contains(bold));
     }
 
     #[test]
@@ -1126,6 +1142,8 @@ mod tests {
             }),
             NOW_MS,
         );
+        // The box's content starts at column 10. A choice's two-column gutter (`▌ ` on the
+        // selected one) comes first, so `choices` drops it to read the choices' own text.
         let text = |state: &State| -> Vec<String> {
             draw(state, 80, 24)
                 .iter()
@@ -1139,7 +1157,13 @@ mod tests {
                 })
                 .collect()
         };
-        let shown = text(&state);
+        let choices = |state: &State| -> Vec<String> {
+            text(state)
+                .iter()
+                .map(|l| l.chars().skip(2).collect())
+                .collect()
+        };
+        let shown = choices(&state);
         let first = shown
             .iter()
             .position(|l| l.starts_with("1. Claude"))
@@ -1149,16 +1173,24 @@ mod tests {
             shown[first + 3].starts_with("2. claude-code #2"),
             "{shown:?}"
         );
-        assert!(shown.iter().any(|l| l == "↑ ↓ choose · Enter · Esc cancel"));
+        assert!(
+            text(&state)
+                .iter()
+                .any(|l| l == "↑ ↓ choose · Enter · Esc cancel")
+        );
         for _ in 0..19 {
             update(&mut state, key(KeyCode::Down), NOW_MS);
         }
-        let shown = text(&state);
+        let shown = choices(&state);
         assert!(
             shown.iter().any(|l| l.starts_with("20. claude-code #20")),
             "{shown:?}"
         );
-        assert!(shown.iter().any(|l| l == "↑ ↓ choose · Enter · Esc cancel"));
+        assert!(
+            text(&state)
+                .iter()
+                .any(|l| l == "↑ ↓ choose · Enter · Esc cancel")
+        );
     }
 
     #[test]

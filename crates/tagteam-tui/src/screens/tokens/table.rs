@@ -20,7 +20,7 @@ use tagteam_engine::words::{self, Severity};
 use super::TokensState;
 use crate::state::State;
 use crate::theme::Theme;
-use crate::view::{fit, highlight, keep_visible, width_of, wrap};
+use crate::view::{fit, keep_visible, select, width_of, wrap};
 
 /// From this width the table adds the cache, the response count and a cost bar (spec §5.3).
 pub const WIDE: usize = 120;
@@ -1268,7 +1268,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
             Item::Row { repeat } => {
                 let row = table.row(&report.rows[*index], *repeat && n > 0);
                 if Some(*index) == selected_at {
-                    highlight(row, width, state.theme)
+                    select(row, Some(1), width, state.theme)
                 } else {
                     row
                 }
@@ -1396,7 +1396,7 @@ mod tests {
                 " filter: all accounts · all models",
                 " UTC · refreshed 14:12",
                 " DAY         ACCOUNT        INPUT   OUTPUT   TOTAL    COST",
-                " 2026-09-20  1 a1@x.co       1.2M  ≥310.0K   93.6M  $41.20",
+                "▌2026-09-20  1 a1@x.co       1.2M  ≥310.0K   93.6M  $41.20",
                 "             2 spare       300.0K    80.0K   20.5M   $9.75",
                 " 2026-09-19  unattributed    5.0K      900  105.9K       —",
                 " TOTAL                       1.5M  ≥390.9K  114.2M  $50.95",
@@ -1424,7 +1424,7 @@ mod tests {
             lines[2..7],
             [
                 " DAY         ACCOUNT        INPUT   OUTPUT  CW 5M  CW 1H  CACHE R   TOTAL  RESP    COST",
-                " 2026-09-20  1 a1@x.co       1.2M  ≥310.0K   3.0M   1.1M    88.0M   93.6M   412  $41.20  ████████",
+                "▌2026-09-20  1 a1@x.co       1.2M  ≥310.0K   3.0M   1.1M    88.0M   93.6M   412  $41.20  ████████",
                 "             2 spare       300.0K    80.0K      0      0    20.1M   20.5M     1   $9.75  ██",
                 " 2026-09-19  unattributed    5.0K      900      0      0   100.0K  105.9K     1       —",
                 " TOTAL                       1.5M  ≥390.9K   3.0M   1.1M   108.2M  114.2M   414  $50.95",
@@ -1494,7 +1494,7 @@ mod tests {
                 " filter: all accounts · all models",
                 " UTC · refreshed 14:12",
                 " SESSION            PROJECT              ACCOUNT    INPUT  OUTPUT   TOTAL   COST",
-                " 09-20 09:12–11:40  …chael/Code/tagteam  1 a1@x.co  20.0K    3.0K  923.0K  $1.23",
+                "▌09-20 09:12–11:40  …chael/Code/tagteam  1 a1@x.co  20.0K    3.0K  923.0K  $1.23",
                 " 09-20 09:12–11:40  …chael/Code/tagteam  2 spare    20.0K    3.0K  923.0K  $1.23",
                 " TOTAL                                              40.0K    6.0K    1.8M  $2.46",
                 " 1 response · cache write 0 (5m 0, 1h 0) · cache read 900.0K",
@@ -1523,7 +1523,7 @@ mod tests {
             " Day [Month] Session Block  12 months  group: account"
         );
         assert_eq!(lines[3], " MONTH    ACCOUNT    INPUT  OUTPUT  TOTAL  COST");
-        assert_eq!(lines[4], " 2026-09  1 a1@x.co      1       2      6     —");
+        assert_eq!(lines[4], "▌2026-09  1 a1@x.co      1       2      6     —");
     }
 
     #[test]
@@ -1542,7 +1542,7 @@ mod tests {
                 " filter: all accounts · all models",
                 " UTC · refreshed 14:12",
                 " BLOCK                        ACCOUNT     INPUT  OUTPUT  TOTAL    COST",
-                " 09-21 12:00–17:00  observed  1 a1@x.co  400.0K   50.0K   5.5M   $5.00",
+                "▌09-21 12:00–17:00  observed  1 a1@x.co  400.0K   50.0K   5.5M   $5.00",
                 "   active · 2h13m elapsed · 2h46m left · 41.2K tokens/min · $3.20/h",
                 "   projected 9.8M tokens, —",
                 " 09-21 07:00–12:00  inferred  1 a1@x.co  400.0K   50.0K   5.5M   $5.00",
@@ -1606,7 +1606,7 @@ mod tests {
         );
         assert_eq!(
             lines[4],
-            " 2026-09-20  1 a1@x.co, 2 spare  claude-opus-5-5      1       2      6     —"
+            "▌2026-09-20  1 a1@x.co, 2 spare  claude-opus-5-5      1       2      6     —"
         );
         opus.model = None;
         let none = showing_after("ggg", vec![opus]);
@@ -2035,27 +2035,65 @@ mod tests {
     }
 
     #[test]
+    fn the_selected_row_has_the_bar_and_a_bold_first_column_and_no_reverse_video() {
+        for theme in TIERS {
+            let mut state = showing(many_days(3), |_| {});
+            state.theme = theme;
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            let (x, y) = locate(&buf, "▌2026-09-21").unwrap();
+            assert_eq!(x, 0);
+            for i in 1..11 {
+                assert!(
+                    buf[(i, y)].modifier.contains(Modifier::BOLD),
+                    "{theme:?} {i}"
+                );
+            }
+            let (_, other) = locate(&buf, " 2026-09-20").unwrap();
+            for i in 0..80 {
+                assert!(
+                    !buf[(i, y)].modifier.contains(Modifier::REVERSED),
+                    "{theme:?} {i}"
+                );
+                assert!(
+                    !buf[(i, other)].modifier.contains(Modifier::BOLD),
+                    "{theme:?} {i}"
+                );
+                assert_eq!(
+                    buf[(i, y)].bg,
+                    theme.sel_bg().bg.unwrap_or(Color::Reset),
+                    "{theme:?} {i}"
+                );
+                assert_eq!(buf[(i, other)].bg, Color::Reset, "{theme:?} {i}");
+            }
+        }
+    }
+
+    #[test]
     fn a_long_report_scrolls_to_keep_the_selection_in_view_and_a_resize_keeps_it_there() {
         // R22: the stored scroll is clamped where it is used.
         let mut state = showing(many_days(30), |_| {});
         state.size = (120, 40);
         update(&mut state, key(KeyCode::End), NOW_MS);
         let lines = draw(&state, 120, 40);
+        // Column 0 is the selection column, so a row starts at column 1.
+        let from_1 = |l: &String| l.chars().skip(1).collect::<String>();
         assert!(
-            lines.iter().any(|l| l.starts_with(" 2026-08-23")),
+            lines.iter().any(|l| from_1(l).starts_with("2026-08-23")),
             "the last row shows"
         );
         for (w, h) in [(80, 24), (100, 30)] {
             state.size = (w, h);
             let lines = draw(&state, w, h);
-            let last = lines.iter().position(|l| l.starts_with(" 2026-08-23"));
+            let last = lines
+                .iter()
+                .position(|l| from_1(l).starts_with("2026-08-23"));
             assert!(last.is_some(), "{w}x{h}: {lines:?}");
             assert!(lines[last.unwrap() + 1].starts_with(" TOTAL"), "{w}x{h}");
         }
         update(&mut state, key(KeyCode::Home), NOW_MS);
         assert_eq!(
             body_of(&state, 100, 30, NOW_MS)[3],
-            " 2026-09-21  1 a1@x.co      1       2      6  $0.01"
+            "▌2026-09-21  1 a1@x.co      1       2      6  $0.01"
         );
         update(&mut state, key(KeyCode::PageDown), NOW_MS);
         let page = page(&state, crate::view::body_at(&state), NOW_MS);
@@ -2159,7 +2197,7 @@ mod tests {
         assert!(
             at_120
                 .iter()
-                .any(|l| l.contains(" 09-20 09:12  3 ")
+                .any(|l| l.contains("09-20 09:12  3 ")
                     && l.contains("claude-opus-5-5-with-a-very-l…")),
             "{at_120:?}"
         );
@@ -2182,7 +2220,7 @@ mod tests {
             )],
         );
         let lines = body_of(&day, 80, 24, NOW_MS);
-        assert!(lines[4].starts_with(" 2026-09-20  3 山田"), "{}", lines[4]);
+        assert!(lines[4].starts_with("▌2026-09-20  3 山田"), "{}", lines[4]);
     }
 
     /// A session as the engine gives one: a UUID, a long project, two models and the cache.

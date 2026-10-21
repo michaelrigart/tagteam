@@ -11,14 +11,15 @@ mod text;
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::host::{AccountRef, Action};
 use crate::msg::{Answer, AnswerTo, Cmd};
 use crate::screens::tokens::filter::{self, FilterDialog};
 use crate::state::State;
-use crate::view::{centered, wrap_rows};
+use crate::theme::Theme;
+use crate::view::{centered, select, tint, wrap_rows};
 
 #[derive(Debug)]
 pub enum Overlay {
@@ -99,6 +100,35 @@ pub enum TextThen {
 
 /// The rows a choice takes, at most (R21): a CLI's `<provider> #<n> <name> [<org>]` fits.
 pub(crate) const CHOICE_ROWS: usize = 3;
+
+/// The two columns a dialog list keeps before its text (spec §4.3): the selected choice's `▌`
+/// goes in the first.
+pub(crate) const GUTTER: usize = 2;
+
+/// One choice's `rows` (its text, `width - GUTTER` columns each) behind the gutter. The selected
+/// choice has `▌` on its first row, its text bold and `sel-bg` on every row.
+pub(crate) fn gutter_rows(
+    rows: Vec<String>,
+    selected: bool,
+    width: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(n, text)| {
+            let line = Line::from(vec![Span::raw(" ".repeat(GUTTER)), Span::raw(text)]);
+            match (selected, n) {
+                (false, _) => line,
+                (true, 0) => select(line, Some(1), width, theme),
+                (true, _) => {
+                    let mut line = line;
+                    line.spans[1].style = line.spans[1].style.patch(theme.strong());
+                    tint(line, width, theme)
+                }
+            }
+        })
+        .collect()
+}
 
 /// The rows a dialog's question takes on a terminal `height` rows tall: a third of it at most,
 /// so its buttons, choices or input always show (R21).

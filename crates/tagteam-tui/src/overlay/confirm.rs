@@ -49,7 +49,7 @@ pub(super) fn render(state: &State, frame: &mut Frame, area: Rect, question: &st
     let button = |label: &str, on: bool| {
         let text = format!("[ {label} ]");
         if on {
-            Span::styled(text, state.theme.selection())
+            Span::styled(text, state.theme.focus())
         } else {
             Span::raw(text)
         }
@@ -72,5 +72,47 @@ fn confirmed(state: &mut State, then: &ConfirmThen, yes: bool, now_ms: i64) -> V
         }],
         ConfirmThen::Run(action) if yes => start(state, action.clone(), now_ms),
         ConfirmThen::Run(_) => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::{Color, Modifier};
+
+    use crate::msg::AnswerTo;
+    use crate::overlay::{ConfirmThen, Overlay};
+    use crate::state::Screen;
+    use crate::testutil::*;
+
+    #[test]
+    fn a_focused_button_is_filled_and_reversed_only_without_colour() {
+        for theme in TIERS {
+            let mut state = fresh(Screen::Accounts);
+            state.theme = theme;
+            state.overlay = Some(Overlay::Confirm {
+                question: "Remove a1@x.co?".into(),
+                choice: true,
+                then: ConfirmThen::Reply(AnswerTo(1)),
+            });
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            let focus = theme.focus();
+            let (x, y) = locate(&buf, "[ Yes ]").unwrap();
+            let (nx, ny) = locate(&buf, "[ No ]").unwrap();
+            for i in 0..7 {
+                let cell = &buf[(x + i, y)];
+                assert_eq!(cell.bg, focus.bg.unwrap_or(Color::Reset), "{theme:?} {i}");
+                assert_eq!(cell.fg, focus.fg.unwrap_or(Color::Reset), "{theme:?} {i}");
+                assert_eq!(
+                    cell.modifier.contains(Modifier::REVERSED),
+                    theme == TIERS[0],
+                    "{theme:?} {i}"
+                );
+            }
+            for i in 0..6 {
+                let cell = &buf[(nx + i, ny)];
+                assert_eq!(cell.bg, Color::Reset, "{theme:?} {i}");
+                assert!(!cell.modifier.contains(Modifier::REVERSED), "{theme:?} {i}");
+            }
+        }
     }
 }

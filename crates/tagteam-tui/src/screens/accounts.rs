@@ -18,7 +18,7 @@ use crate::state::{Screen, State};
 use crate::theme::Theme;
 use crate::update;
 use crate::view::{
-    fit, flow, furthest_scroll, highlight, keep_visible, pad, scrolled_windows, width_of, wrap_rows,
+    fit, flow, furthest_scroll, keep_visible, pad, scrolled_windows, select, width_of, wrap_rows,
 };
 
 /// Spec §10.4's empty state: no store, or no accounts.
@@ -28,6 +28,9 @@ pub const LOADING: &str = "loading…";
 /// The banners the accounts view raises (spec §5.1).
 pub const RUN_SHELL: &str = "inside a `tagteam run` session: account changes are refused here";
 /// A gauge's width, in cells, and the narrowest the ACCOUNT column is cut to.
+/// The account cell's place among a row's spans (`Table::row`): the selection bolds it.
+const NAME_SPAN: usize = 3;
+
 const GAUGE: usize = 6;
 const ACCOUNT_MIN: usize = 12;
 /// The room the notes after a row's cells are given at least, when columns or the ACCOUNT
@@ -580,7 +583,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
             TableLine::Account(i, v) => {
                 let row = tables[*i].row(v, now_s, state.theme);
                 if st.selected.as_ref() == Some(&v.row.id) {
-                    highlight(row, width, state.theme)
+                    select(row, Some(NAME_SPAN), width, state.theme)
                 } else {
                     row
                 }
@@ -850,7 +853,7 @@ mod tests {
             &body[0..4],
             [
                 "    #  ACCOUNT              5H           7D                   SPEND  AGE",
-                " *  1  michael@example.com    9%  2h40m   77%  3d09h  ▲ pace  —      2m",
+                "▌*  1  michael@example.com    9%  2h40m   77%  3d09h  ▲ pace  —      2m",
                 "    2  spare@example.com     31%  2h40m   12%  3d09h          —      14m",
                 "    3  work (w@corp.com)    relogin required",
             ]
@@ -864,7 +867,7 @@ mod tests {
             &body[0..4],
             [
                 "    #  ACCOUNT              5H                  7D                          SPEND  AGE",
-                " *  1  michael@example.com  █░░░░░   9%  2h40m  █████░  77%  3d09h  ▲ pace  —      2m",
+                "▌*  1  michael@example.com  █░░░░░   9%  2h40m  █████░  77%  3d09h  ▲ pace  —      2m",
                 "    2  spare@example.com    ██░░░░  31%  2h40m  █░░░░░  12%  3d09h          —      14m",
                 "    3  work (w@corp.com)    relogin required",
             ]
@@ -1427,7 +1430,7 @@ mod tests {
             &body[0..3],
             [
                 "    #    ACCOUNT              5H           7D                   SPEND  AGE",
-                " *  1    michael@example.com    9%  2h40m   77%  3d09h  ▲ pace  —      2m",
+                "▌*  1    michael@example.com    9%  2h40m   77%  3d09h  ▲ pace  —      2m",
                 "    2 ▶  spare@example.com     31%  2h40m   12%  3d09h          —      14m  this",
             ]
         );
@@ -1462,17 +1465,43 @@ mod tests {
     }
 
     #[test]
-    fn the_selected_row_is_reverse_video_across_the_width() {
-        let state = loaded(three());
-        let buf = draw_buffer(&state, 80, 24, NOW_MS);
-        // The body's first row is the column heads, its second the selected account.
-        let y = crate::view::areas(&state, buf.area).body.y + 1;
-        for x in [0, 10, 79] {
-            assert!(buf[(x, y)].modifier.contains(Modifier::REVERSED), "{x}");
+    fn the_selected_row_has_the_bar_and_a_bold_name_and_no_reverse_video() {
+        for theme in TIERS {
+            let mut state = loaded(three());
+            state.theme = theme;
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            // The body's first row is the column heads, its second the selected account.
+            let y = crate::view::areas(&state, buf.area).body.y + 1;
             assert!(
-                !buf[(x, y + 1)].modifier.contains(Modifier::REVERSED),
-                "{x}"
+                roles(&buf, theme, y).starts_with(&canon(theme, "a")),
+                "{theme:?}"
             );
+            assert_eq!(buf[(0, y)].symbol(), "▌", "{theme:?}");
+            assert_eq!(buf[(0, y + 1)].symbol(), " ", "{theme:?}");
+            let (x, ny) = locate(&buf, "michael@example.com").unwrap();
+            assert_eq!(ny, y);
+            let (ox, oy) = locate(&buf, "spare@example.com").unwrap();
+            for i in 0..19 {
+                assert!(
+                    buf[(x + i, y)].modifier.contains(Modifier::BOLD),
+                    "{theme:?}"
+                );
+            }
+            assert!(
+                !buf[(ox, oy)].modifier.contains(Modifier::BOLD),
+                "{theme:?}"
+            );
+            for x in 0..80 {
+                for row in [y, y + 1] {
+                    assert!(
+                        !buf[(x, row)].modifier.contains(Modifier::REVERSED),
+                        "{theme:?} {x},{row}"
+                    );
+                }
+                let tint = theme.sel_bg().bg.unwrap_or(Color::Reset);
+                assert_eq!(buf[(x, y)].bg, tint, "{theme:?} {x}");
+                assert_eq!(buf[(x, y + 1)].bg, Color::Reset, "{theme:?} {x}");
+            }
         }
     }
 
