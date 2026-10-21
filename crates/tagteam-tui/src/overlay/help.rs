@@ -1,104 +1,332 @@
+//! The help panel (spec §9.2): the current screen's keys, then every screen's, then what the
+//! marks mean, as a scrolling panel. The keys come from the key table, the same one the footer
+//! is drawn from.
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::{KeyOutcome, boxed};
+use super::KeyOutcome;
+use super::panel::{panel, panel_width, scrolled};
+use crate::keys::KEYS;
 use crate::state::{Screen, State};
-use crate::view::pad;
+use crate::theme::Role;
+use crate::view::{pad, width_of, wrap};
 
-/// The help panel's keys (spec §5.6): everywhere, then the current screen's.
-const HELP_GLOBAL: [(&str, &str); 8] = [
-    ("1 2 3  Tab Shift-Tab", "screens"),
-    ("j k  ↑ ↓", "move"),
-    ("A", "add the current login"),
-    ("D", "doctor"),
-    ("P", "pause or resume auto-switch"),
-    ("?", "help"),
-    ("q  Ctrl-C", "quit"),
-    ("Ctrl-Z", "suspend"),
-];
-const HELP_ACCOUNTS: [(&str, &str); 11] = [
-    ("s", "switch to the selected account"),
-    ("b", "switch to the best account"),
-    ("n", "switch to the next available account"),
-    ("e", "enable or disable"),
-    ("a", "set or clear the alias"),
-    ("m", "move to another position"),
-    ("x", "remove"),
-    ("R", "run a session on the account"),
-    ("r", "refresh"),
-    ("Enter", "history of the account"),
-    ("J K", "scroll the detail's windows"),
-];
-const HELP_TOKENS: [(&str, &str); 8] = [
-    ("p", "period: day, month, session or block"),
-    ("g", "group: none, account, model, or both"),
-    ("f", "filter accounts and models"),
-    ("[ ]", "range: 7, 30 or 90 days, or all"),
-    ("Enter", "drill down: sessions, then models"),
-    ("Esc  Backspace", "back up a level"),
-    ("r", "refresh the token index"),
-    ("J K", "scroll the detail and the notes"),
-];
-const HELP_HISTORY: [(&str, &str); 3] = [
-    ("[ ]", "range: 1, 7, 14 or 30 days"),
-    ("r", "refresh"),
-    ("J K", "scroll the windows"),
+/// From this many columns wide the help runs in two columns (§9.2).
+const TWO_COLUMNS: u16 = 100;
+/// The columns between the two.
+const COLUMN_GAP: usize = 3;
+
+/// §4.4's marks, each with the role it is drawn in and its words (T2-25). `✓` is `Ok` in
+/// §4.1; there is no such role yet, so it takes `Text` until Task 10 adds it. Every glyph is one
+/// column wide.
+pub(crate) const MARKS: &[(&str, Role, &str)] = &[
+    ("●", Role::Accent, "in use"),
+    ("▶", Role::Accent, "in a session"),
+    ("○", Role::Muted, "disabled"),
+    ("▲", Role::Warn, "faster than an even pace"),
+    ("✕", Role::Crit, "needs you"),
+    ("!", Role::Warn, "tagteam retries"),
+    ("✓", Role::Text, "done"),
+    ("≥", Role::Text, "at least"),
+    ("~", Role::Text, "estimated"),
+    ("›", Role::Muted, "breadcrumb"),
+    ("·", Role::Muted, "separator"),
+    ("⏎", Role::Accent, "Enter"),
+    ("⇄", Role::Accent, "switch"),
+    ("‖", Role::Warn, "pause"),
+    ("⠋", Role::Accent, "spinner"),
 ];
 
-pub(super) fn key(key: KeyEvent) -> KeyOutcome {
+pub(super) fn key(state: &State, scroll: &mut u16, key: KeyEvent) -> KeyOutcome {
     match key.code {
-        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter => KeyOutcome::Close,
-        _ => KeyOutcome::Keep,
+        KeyCode::Char('?' | 'q') | KeyCode::Esc | KeyCode::Enter => KeyOutcome::Close,
+        code => {
+            let (width, height) = state.size;
+            *scroll = scrolled(*scroll, code, rows(state, width).len(), height);
+            KeyOutcome::Keep
+        }
     }
 }
 
-pub(super) fn render(state: &State, frame: &mut Frame, area: Rect) {
-    let keys: &[(&str, &str)] = match state.screen {
-        Screen::Accounts => &HELP_ACCOUNTS,
-        Screen::Tokens => &HELP_TOKENS,
-        Screen::History => &HELP_HISTORY,
-    };
-    let mut lines = vec![Line::from(Span::styled("Everywhere", state.theme.strong()))];
-    lines.extend(HELP_GLOBAL.iter().map(|(k, what)| help_line(k, what)));
-    let title = match state.screen {
+pub(super) fn render(state: &State, frame: &mut Frame, area: Rect, scroll: u16) {
+    let lines = rows(state, area.width);
+    panel(
+        frame,
+        area,
+        " Help ",
+        lines,
+        scroll,
+        "Esc close · ↑ ↓ scroll",
+    );
+}
+
+fn screen_name(screen: Screen) -> &'static str {
+    match screen {
         Screen::Accounts => "Accounts",
         Screen::Tokens => "Tokens",
         Screen::History => "History",
-    };
-    lines.push(Line::from(Span::styled(title, state.theme.strong())));
-    lines.extend(keys.iter().map(|(k, what)| help_line(k, what)));
-    boxed(frame, area, " Help ", lines, 64);
+    }
 }
 
-fn help_line(key: &str, what: &str) -> Line<'static> {
-    Line::from(format!("  {}  {what}", pad(key, 20)))
+/// The help's rows on a terminal `width` wide: three sections, in one column, or from
+/// `TWO_COLUMNS` in two, split between sections where that balances them best, the left one
+/// first. A row of the panel is a row of the left column and one of the right.
+pub(super) fn rows(state: &State, width: u16) -> Vec<Line<'static>> {
+    let two = width >= TWO_COLUMNS;
+    let inner = panel_width(width);
+    let column = if two {
+        inner.saturating_sub(COLUMN_GAP) / 2
+    } else {
+        inner
+    };
+    // Wide enough for the longest key, but never more than half a column: a longer one wraps.
+    let widest = KEYS.iter().map(|row| width_of(row.keys)).max().unwrap_or(1);
+    let keys_width = widest.min(column.saturating_sub(4) / 2).max(1);
+    let theme = state.theme;
+    let title = |name: &str| Line::from(Span::styled(name.to_owned(), theme.strong()));
+    let keys_of = |screen: Option<Screen>| {
+        let mut lines = vec![title(screen.map_or("Everywhere", screen_name))];
+        for row in KEYS.iter().filter(|row| row.screen == screen) {
+            let accent = theme.role(Role::Accent);
+            lines.extend(entry(row.keys, accent, row.does, keys_width, column));
+        }
+        lines
+    };
+    let mut marks = vec![title("Marks")];
+    for (glyph, role, words) in MARKS {
+        marks.extend(entry(glyph, theme.role(*role), words, 1, column));
+    }
+    let sections = [keys_of(Some(state.screen)), keys_of(None), marks];
+    if !two {
+        return join(&sections);
+    }
+    // Rows count a blank one between sections.
+    let at = (1..sections.len())
+        .min_by_key(|at| {
+            let (left, right) = sections.split_at(*at);
+            join(left).len().abs_diff(join(right).len())
+        })
+        .unwrap_or(1);
+    let (left, right) = sections.split_at(at);
+    let (left, right) = (join(left), join(right));
+    (0..left.len().max(right.len()))
+        .map(|i| {
+            let mut spans = left.get(i).map(|l| l.spans.clone()).unwrap_or_default();
+            let used: usize = spans.iter().map(|s| width_of(&s.content)).sum();
+            spans.push(Span::raw(
+                " ".repeat(column.saturating_sub(used) + COLUMN_GAP),
+            ));
+            spans.extend(right.get(i).map(|l| l.spans.clone()).unwrap_or_default());
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// `sections` one under another, a blank row between.
+fn join(sections: &[Vec<Line<'static>>]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (n, section) in sections.iter().enumerate() {
+        if n > 0 {
+            lines.push(Line::default());
+        }
+        lines.extend(section.iter().cloned());
+    }
+    lines
+}
+
+/// One entry, indented two columns: `lead` in `style` in a column `lead_width` wide, two
+/// columns, then `words`, both wrapped to what a `column`-wide column leaves them. A wrapped
+/// entry's continuation rows stay under their own part.
+fn entry(
+    lead: &str,
+    style: Style,
+    words: &str,
+    lead_width: usize,
+    column: usize,
+) -> Vec<Line<'static>> {
+    let words_width = column.saturating_sub(2 + lead_width + 2).max(1);
+    let leads = wrap(lead, lead_width);
+    let words = wrap(words, words_width);
+    (0..leads.len().max(words.len()))
+        .map(|i| {
+            let lead = leads.get(i).map_or("", String::as_str);
+            let words = words.get(i).map_or("", String::as_str);
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(pad(lead, lead_width), style),
+                Span::raw("  "),
+                Span::raw(words.to_owned()),
+            ])
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HELP_ACCOUNTS, HELP_GLOBAL, HELP_HISTORY, HELP_TOKENS};
-    use crate::state::Screen;
+    use crossterm::event::KeyCode;
+
+    use super::{KEYS, MARKS, Screen, State, rows, width_of};
+    use crate::overlay::Overlay;
     use crate::testutil::*;
     use crate::update::update;
 
+    /// A row of the drawn panel between its borders, trimmed.
+    fn inner(line: &str) -> &str {
+        line.split('│').nth(1).unwrap_or(line).trim()
+    }
+
+    fn open(screen: Screen) -> State {
+        let mut state = fresh(screen);
+        update(&mut state, ch('?'), NOW_MS);
+        state
+    }
+
     #[test]
     fn every_help_line_shows_whole_on_every_screen_at_80_columns() {
-        // R21: the key column and the description both fit the help box.
-        for (screen, keys) in [
-            (Screen::Accounts, &HELP_ACCOUNTS[..]),
-            (Screen::Tokens, &HELP_TOKENS[..]),
-            (Screen::History, &HELP_HISTORY[..]),
-        ] {
-            let mut state = fresh(screen);
-            update(&mut state, ch('?'), NOW_MS);
-            let lines = draw(&state, 80, 24);
-            for (key, what) in HELP_GLOBAL.iter().chain(keys) {
+        // R21: the key column and the description both fit the help box, whichever the screen.
+        // The panel is tall enough to show every row; scrolling is the next test's.
+        for screen in [Screen::Accounts, Screen::Tokens, Screen::History] {
+            let lines = draw(&open(screen), 80, 70);
+            for row in KEYS.iter().filter(|r| r.screen.is_none_or(|s| s == screen)) {
                 assert!(
-                    lines.iter().any(|l| l.contains(key) && l.contains(what)),
-                    "{screen:?}: {key} {what}: {lines:?}"
+                    lines
+                        .iter()
+                        .any(|l| l.contains(row.keys) && l.contains(row.does)),
+                    "{screen:?}: {} {}: {lines:?}",
+                    row.keys,
+                    row.does
                 );
+            }
+            assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn help_lists_this_screen_then_every_screen_then_the_marks() {
+        let lines = draw(&open(Screen::Accounts), 80, 70);
+        let at = |name: &str| {
+            lines
+                .iter()
+                .position(|l| inner(l) == name)
+                .unwrap_or_else(|| panic!("{name}: {lines:?}"))
+        };
+        let (screen, everywhere, marks) = (at("Accounts"), at("Everywhere"), at("Marks"));
+        assert!(screen < everywhere && everywhere < marks, "{lines:?}");
+        for row in KEYS {
+            let section = match row.screen {
+                Some(Screen::Accounts) => screen..everywhere,
+                None => everywhere..marks,
+                Some(_) => continue,
+            };
+            assert!(
+                lines[section]
+                    .iter()
+                    .any(|l| l.contains(row.keys) && l.contains(row.does)),
+                "{} {}: {lines:?}",
+                row.keys,
+                row.does
+            );
+        }
+        assert!(
+            !lines.iter().any(|l| l.contains("drill down")),
+            "another screen's keys are not listed: {lines:?}"
+        );
+        for (glyph, _, words) in MARKS {
+            assert!(
+                lines[marks..]
+                    .iter()
+                    .any(|l| l.contains(glyph) && l.contains(words)),
+                "{glyph} {words}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_has_two_columns_from_100_columns_and_scrolls_to_its_end() {
+        let state = open(Screen::Accounts);
+        let buf = draw_buffer(&state, 120, 40, NOW_MS);
+        let (marks_x, _) = locate(&buf, "Marks").unwrap();
+        let (screen_x, _) = locate(&buf, "Accounts").unwrap();
+        assert!(screen_x < 60 && marks_x > 60, "{screen_x} {marks_x}");
+        assert!(
+            draw(&state, 99, 40).iter().all(|l| width_of(l) <= 99),
+            "one column below 100"
+        );
+        let one = draw_buffer(&state, 99, 40, NOW_MS);
+        let (marks_x, marks_y) = locate(&one, "Marks").unwrap();
+        let (_, everywhere_y) = locate(&one, "Everywhere").unwrap();
+        assert!(
+            marks_x < 60 && marks_y > everywhere_y,
+            "{marks_x} {marks_y}"
+        );
+
+        let mut state = open(Screen::Accounts);
+        let last = MARKS.last().unwrap();
+        assert!(
+            !draw(&state, 80, 24).iter().any(|l| l.contains(last.2)),
+            "the last mark is below the first page"
+        );
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        let end = draw(&state, 80, 24);
+        let at = end.iter().position(|l| l.contains(last.2)).unwrap();
+        assert!(inner(&end[at]).starts_with(last.0), "{end:?}");
+        assert!(
+            end[at + 1].trim_start().starts_with('└'),
+            "the last row ends the panel: {end:?}"
+        );
+        update(&mut state, key(KeyCode::Home), NOW_MS);
+        assert!(inner(&draw(&state, 80, 24)[2]).starts_with("Accounts"));
+        update(&mut state, key(KeyCode::PageDown), NOW_MS);
+        let after = draw(&state, 80, 24);
+        assert!(!inner(&after[2]).starts_with("Accounts"), "{after:?}");
+        update(&mut state, key(KeyCode::PageUp), NOW_MS);
+        assert!(inner(&draw(&state, 80, 24)[2]).starts_with("Accounts"));
+    }
+
+    #[test]
+    fn help_scrolls_with_the_move_keys_and_four_keys_close_it() {
+        let mut state = open(Screen::Accounts);
+        for c in ['j', 'j'] {
+            update(&mut state, ch(c), NOW_MS);
+        }
+        assert!(matches!(state.overlay, Some(Overlay::Help { scroll: 2 })));
+        update(&mut state, ch('k'), NOW_MS);
+        assert!(matches!(state.overlay, Some(Overlay::Help { scroll: 1 })));
+        for close in [ch('?'), ch('q'), key(KeyCode::Esc), key(KeyCode::Enter)] {
+            let mut state = open(Screen::Tokens);
+            assert!(update(&mut state, close, NOW_MS).is_empty());
+            assert!(state.overlay.is_none());
+            assert_eq!(state.quitting, None);
+        }
+    }
+
+    #[test]
+    fn every_mark_is_one_column_wide() {
+        // §4.4: all glyphs are one column wide under `unicode-width`.
+        for (glyph, _, words) in MARKS {
+            assert_eq!(width_of(glyph), 1, "{glyph} {words}");
+        }
+    }
+
+    #[test]
+    fn every_mark_is_drawn_in_its_role() {
+        for theme in TIERS {
+            let mut state = open(Screen::Accounts);
+            state.theme = theme;
+            for width in [80, 120] {
+                let rows = rows(&state, width);
+                for (glyph, role, words) in MARKS {
+                    let span = rows
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .find(|span| span.content == *glyph)
+                        .unwrap_or_else(|| panic!("{glyph} {words} at {width}"));
+                    assert_eq!(span.style, theme.role(*role), "{glyph} {words} {theme:?}");
+                }
             }
         }
     }

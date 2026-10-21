@@ -1,10 +1,11 @@
 //! The rows around the body (redesign §5.1): the header (§5.2), the auto line (§5.3), the faint
-//! rule under them from 30 rows (§4.3), and the banner (§5.6).
+//! rule under them from 30 rows (§4.3), the banner (§5.6), and the footer's keys (§5.5).
 
 use ratatui::text::{Line, Span};
 
 use crate::autoline;
 use crate::daemon::words::auto_state;
+use crate::keys;
 use crate::screens;
 use crate::state::{BannerKind, Screen, State};
 use crate::theme::Role;
@@ -99,6 +100,38 @@ pub(crate) fn rule(state: &State, width: u16) -> Line<'static> {
         "─".repeat(usize::from(width)),
         state.theme.role(Role::Faint),
     ))
+}
+
+/// The footer's keys (§5.5): the screen's items from column 0 (`keys::footer_items`), each key
+/// in accent and its label muted, two spaces apart, and `? keys  q quit` on the right, one
+/// column in. The items give way from the end; the pinned ones stay.
+pub(crate) fn footer(state: &State, width: u16) -> Line<'static> {
+    let theme = state.theme;
+    let item = |key: &str, label: &str| {
+        [
+            Span::styled(key.to_owned(), theme.role(Role::Accent)),
+            Span::styled(format!(" {label}"), theme.role(Role::Muted)),
+        ]
+    };
+    let mut spans = Vec::new();
+    for (n, (key, label)) in keys::footer_items(state, width).into_iter().enumerate() {
+        if n > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.extend(item(key, label));
+    }
+    let mut pinned = Vec::new();
+    for (n, (key, label)) in keys::PINNED.into_iter().enumerate() {
+        if n > 0 {
+            pinned.push(Span::raw("  "));
+        }
+        pinned.extend(item(key, label));
+    }
+    let gap = usize::from(width)
+        .saturating_sub(spans_width(&spans) + spans_width(&pinned) + keys::RIGHT_INSET);
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(pinned);
+    Line::from(spans)
 }
 
 /// The banner's words and role (T2-14), its rows as `banner_rows` wraps them. One shows at a
@@ -811,6 +844,87 @@ mod tests {
             Rect::new(0, 5, 80, 18),
             "three rows at most"
         );
+    }
+
+    /// Accounts with `n` accounts read, on a terminal tall enough for `w` columns.
+    fn accounts_of(n: u32) -> State {
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(many(n)));
+        state
+    }
+
+    /// The footer's own row of a screen drawn at `w` columns: the last one.
+    fn last(state: &State, w: u16) -> String {
+        drawn(state, w).pop().unwrap()
+    }
+
+    const ACCOUNTS_80: &str = "s switch  b best  n next  ⏎ history  P pause auto  r refresh";
+
+    #[test]
+    fn the_footer_pins_keys_and_quit_on_every_screen_at_80_columns() {
+        for theme in TIERS {
+            for screen in [Screen::Accounts, Screen::Tokens, Screen::History] {
+                let mut state = fresh(screen);
+                state.theme = theme;
+                state.accounts.apply(snapshot(many(2)));
+                let buf = draw_buffer(&state, 80, 24, NOW_MS);
+                let row = &text_of(&buf)[23];
+                assert!(row.ends_with("? keys  q quit"), "{screen:?}: {row}");
+                assert!(!row.starts_with(' '), "{screen:?}: from column 0 (T2-28)");
+                let letters = roles(&buf, theme, 23);
+                assert!(
+                    letters
+                        .trim_end()
+                        .ends_with(&canon(theme, "a mmmm  a mmmm")),
+                    "{theme:?} {screen:?}: {letters}"
+                );
+                if screen == Screen::Accounts {
+                    assert!(
+                        letters.starts_with(&canon(theme, "a mmmmmm  a mmmm")),
+                        "{theme:?}: keys in accent, labels muted: {letters}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn accounts_footer_order_at_80_and_120() {
+        let state = accounts_of(2);
+        assert_eq!(last(&state, 80), footer_row(ACCOUNTS_80, 80));
+        assert_eq!(
+            last(&state, 120),
+            footer_row(&format!("{ACCOUNTS_80}  e disable  a alias  x remove"), 120)
+        );
+    }
+
+    #[test]
+    fn e_s_label_follows_the_selected_row() {
+        let mut state = fresh(Screen::Accounts);
+        let mut accounts = many(2);
+        accounts[1].row.disabled = true;
+        state.accounts.apply(snapshot(accounts));
+        assert!(
+            last(&state, 120).contains("e disable  a alias"),
+            "{}",
+            last(&state, 120)
+        );
+        update(&mut state, ch('j'), NOW_MS);
+        let row = last(&state, 120);
+        assert!(row.contains("e enable  a alias  x remove"), "{row}");
+        assert!(!row.contains("e disable"), "{row}");
+    }
+
+    #[test]
+    fn with_no_accounts_the_footer_hides_the_account_keys() {
+        let state = accounts_of(0);
+        for w in [80, 120] {
+            assert_eq!(
+                last(&state, w),
+                footer_row("r refresh", usize::from(w)),
+                "{w}"
+            );
+        }
     }
 
     #[test]

@@ -157,8 +157,8 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
         KeyCode::Char('k') | KeyCode::Up => state.accounts.step(-1),
         KeyCode::PageDown => state.accounts.step(page),
         KeyCode::PageUp => state.accounts.step(-page),
-        KeyCode::Home | KeyCode::Char('g') => state.accounts.step(isize::MIN / 2),
-        KeyCode::End | KeyCode::Char('G') => state.accounts.step(isize::MAX / 2),
+        KeyCode::Home => state.accounts.step(isize::MIN / 2),
+        KeyCode::End => state.accounts.step(isize::MAX / 2),
         KeyCode::Char('J') => {
             scroll_detail(state, body, now_s, 1);
             return vec![];
@@ -817,6 +817,26 @@ mod tests {
     }
 
     #[test]
+    fn g_does_nothing_on_accounts() {
+        // §10 lists Home and End for the first and last row, and no `g` or `G` (UX-7).
+        let mut state = loaded(three());
+        update(&mut state, ch('j'), NOW_MS);
+        let before = (draw(&state, 80, 24), state.accounts.selected());
+        for c in ['g', 'G'] {
+            assert!(update(&mut state, ch(c), NOW_MS).is_empty(), "{c}");
+            assert_eq!(
+                (draw(&state, 80, 24), state.accounts.selected()),
+                before,
+                "{c}"
+            );
+        }
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        assert_eq!(state.accounts.selected().map(|a| a.position), Some(3));
+        update(&mut state, key(KeyCode::Home), NOW_MS);
+        assert_eq!(state.accounts.selected().map(|a| a.position), Some(1));
+    }
+
+    #[test]
     fn a_readings_age_advances_with_the_clock_between_reads() {
         let state = loaded(three());
         let at = |seconds: i64| draw_at(&state, 120, 24, NOW_MS + seconds * 1000);
@@ -902,7 +922,7 @@ mod tests {
     #[test]
     fn a_row_without_a_reading_says_why_in_the_detail_pane() {
         let mut state = loaded(three());
-        update(&mut state, ch('G'), NOW_MS);
+        update(&mut state, key(KeyCode::End), NOW_MS);
         let body = body_of(&state, 80, 24, NOW_MS);
         let top = body.len() - 7;
         assert!(
@@ -1412,7 +1432,7 @@ mod tests {
         let help = draw(&state, 80, 24);
         assert!(
             help.iter()
-                .any(|l| l.contains("J K") && l.contains("scroll the detail's windows")),
+                .any(|l| l.contains("J K") && l.contains("scroll the selected card")),
             "{help:?}"
         );
     }
@@ -1855,7 +1875,7 @@ mod tests {
         let mut accounts = three();
         accounts[2].usage.next_poll_at = Some(NOW_S + 180);
         let mut state = loaded(accounts);
-        update(&mut state, ch('G'), NOW_MS);
+        update(&mut state, key(KeyCode::End), NOW_MS);
         let lines = draw(&state, 80, 24);
         let body = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(body[body.len() - 7 + 1], " never fetched");

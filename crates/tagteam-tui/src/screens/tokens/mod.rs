@@ -364,28 +364,6 @@ pub(crate) fn on_report(
     vec![]
 }
 
-/// The footer's keys (spec §5.6), in the order they give way at the end of a narrow line.
-/// `Enter` names what the selected row opens, and is left out where it opens nothing; `Esc` is
-/// left out at the top, where it does nothing.
-pub fn footer_keys(state: &TokensState) -> Vec<(&'static str, &'static str)> {
-    let mut keys: Vec<(&'static str, &'static str)> = state
-        .drill_to()
-        .map(|next| ("Enter", next))
-        .into_iter()
-        .collect();
-    keys.extend([
-        ("p", "period"),
-        ("g", "group"),
-        ("f", "filter"),
-        ("[ ]", "range"),
-    ]);
-    if state.depth() > 0 {
-        keys.push(("Esc", "back"));
-    }
-    keys.push(("r", "refresh"));
-    keys
-}
-
 /// The Tokens screen's keys (spec §5.6): `p` period, `g` group, `f` filter, `[` `]` range,
 /// `Enter` down a level, `Esc`/`Backspace` up one, the rows, which keep the selected one in view,
 /// and `J`/`K`, which scroll what lies below the total (B25).
@@ -840,21 +818,23 @@ mod tests {
 
     #[test]
     fn help_on_tokens_shows_each_key_whole_at_80_columns() {
-        // R21: the help box is 60 columns inside at 80; no description runs past it.
+        // R21: the help box is 72 columns inside at 80; no key or description runs past it. The
+        // panel is tall enough here to show every row: its scrolling is `help`'s own test.
         let mut state = showing_days();
         update(&mut state, ch('?'), NOW_MS);
-        let lines = draw(&state, 80, 24);
-        for what in [
-            "period: day, month, session or block",
-            "group: none, account, model, or both",
-            "range: 7, 30 or 90 days, or all",
-            "drill down: sessions, then models",
-            "back up a level",
-            "refresh the token index",
-            "scroll the detail and the notes",
-            "filter accounts and models",
-        ] {
-            assert!(lines.iter().any(|l| l.contains(what)), "{what}: {lines:?}");
+        let lines = draw(&state, 80, 60);
+        let rows = crate::keys::KEYS
+            .iter()
+            .filter(|row| row.screen.is_none_or(|s| s == Screen::Tokens));
+        for row in rows {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains(row.keys) && l.contains(row.does)),
+                "{} {}: {lines:?}",
+                row.keys,
+                row.does
+            );
         }
     }
 
@@ -863,21 +843,31 @@ mod tests {
         let mut state = showing_days();
         assert_eq!(
             draw(&state, 80, 24)[23],
-            "Enter sessions  p period  g group  f filter  [ ] range  r refresh",
+            footer_row(
+                "⏎ sessions  p period  g group  f filter  [ ] range  r refresh",
+                80
+            ),
             "Esc does nothing at the top, so the footer leaves it out"
         );
         let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
         answer(&mut state, &down, vec![session("s1", 1)]);
         assert_eq!(
             draw(&state, 80, 24)[23],
-            "Enter models  p period  g group  f filter  [ ] range  Esc back  r refresh"
+            footer_row(
+                "⏎ models  p period  g group  f filter  [ ] range  Esc back",
+                80
+            ),
+            "`r refresh` gives way: the pinned two keep their room"
         );
         let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
         answer(&mut state, &down, vec![session("s1", 1)]);
         assert_eq!(state.tokens.depth(), 2);
         assert_eq!(
             draw(&state, 80, 24)[23],
-            "p period  g group  f filter  [ ] range  Esc back  r refresh"
+            footer_row(
+                "p period  g group  f filter  [ ] range  Esc back  r refresh",
+                80
+            )
         );
     }
 }

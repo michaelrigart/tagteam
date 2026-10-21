@@ -19,27 +19,6 @@ pub const TOO_SMALL: &str = "terminal too small (80×24 needed)";
 /// The spinner's frames, one per tick while an action runs.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// The footer's keys for each screen, in the order they are dropped from the end when the
-/// line is too narrow (spec §5.6). Help lists every key.
-const ACCOUNTS_KEYS: [(&str, &str); 10] = [
-    ("s", "switch"),
-    ("b", "best"),
-    ("n", "next"),
-    ("e", "enable/disable"),
-    ("a", "alias"),
-    ("m", "move"),
-    ("x", "remove"),
-    ("r", "refresh"),
-    ("R", "run"),
-    ("Enter", "history"),
-];
-const HISTORY_KEYS: [(&str, &str); 4] = [
-    ("j/k", "account"),
-    ("[ ]", "range"),
-    ("r", "refresh"),
-    ("1", "accounts"),
-];
-
 /// Where each part of the screen goes (redesign §5.1).
 pub(crate) struct Areas {
     pub(crate) header: Rect,
@@ -245,7 +224,7 @@ pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
 
 /// The footer: `finishing <action>…` once the shutdown has begun, else the toast (on as many
 /// rows as it needs, `WRAP_ROWS` at most), else the running action's spinner, else the screen's
-/// keys (spec §5.1, §10.2 step 4).
+/// keys and the pinned two (spec §5.1, §5.5, §10.2 step 4).
 fn footer(state: &State, width: u16, now_ms: i64) -> Vec<Line<'static>> {
     if state.quitting.is_some() {
         let text = match &state.running {
@@ -264,20 +243,7 @@ fn footer(state: &State, width: u16, now_ms: i64) -> Vec<Line<'static>> {
         let frame = SPINNER[(now_ms.div_euclid(250)).rem_euclid(10) as usize];
         return vec![Line::from(format!("{frame} {}…", action.name()))];
     }
-    let keys: Vec<(&str, &str)> = match state.screen {
-        Screen::Accounts => ACCOUNTS_KEYS.to_vec(),
-        Screen::Tokens => screens::tokens::footer_keys(&state.tokens),
-        Screen::History => HISTORY_KEYS.to_vec(),
-    };
-    let mut text = String::new();
-    for (key, what) in keys {
-        let item = format!("{}{key} {what}", if text.is_empty() { "" } else { "  " });
-        if width_of(&text) + width_of(&item) > usize::from(width) {
-            break;
-        }
-        text.push_str(&item);
-    }
-    vec![Line::from(text)]
+    vec![chrome::footer(state, width)]
 }
 
 /// The columns `s` takes on a terminal: a CJK character or an emoji takes two.
@@ -510,25 +476,25 @@ mod tests {
     }
 
     #[test]
-    fn the_header_shows_the_tabs_and_the_mode_and_the_footer_the_screens_keys() {
-        // The footer half; the header half is `chrome`'s, in the redesign's header.
-        let state = fresh(Screen::Accounts);
-        let lines = draw(&state, 80, 24);
+    fn the_footer_shows_each_screen_s_keys_then_the_pinned_two() {
+        // The footer half of the old header-and-footer test; the header half is `chrome`'s.
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(many(2)));
+        let order = "s switch  b best  n next  ⏎ history  P pause auto  r refresh";
+        assert_eq!(draw(&state, 80, 24)[23], footer_row(order, 80));
         assert_eq!(
-            lines[23],
-            "s switch  b best  n next  e enable/disable  a alias  m move  x remove  r refresh"
-        );
-        let wide = draw(&state, 120, 40);
-        assert_eq!(
-            wide[39],
-            "s switch  b best  n next  e enable/disable  a alias  m move  x remove  r refresh  R run  Enter history"
+            draw(&state, 120, 40)[39],
+            footer_row(&format!("{order}  e disable  a alias  x remove"), 120)
         );
         let history = draw(&fresh(Screen::History), 80, 24);
-        assert_eq!(history[23], "j/k account  [ ] range  r refresh  1 accounts");
+        assert_eq!(
+            history[23],
+            footer_row("j/k account  [ ] range  r refresh", 80)
+        );
         let tokens = draw(&fresh(Screen::Tokens), 80, 24);
         assert_eq!(
             tokens[23],
-            "p period  g group  f filter  [ ] range  r refresh"
+            footer_row("p period  g group  f filter  [ ] range  r refresh", 80)
         );
     }
 

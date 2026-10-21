@@ -14,7 +14,7 @@ pub(super) fn result_key(state: &State, text: &str, scroll: &mut u16, key: KeyEv
     match key.code {
         KeyCode::Esc | KeyCode::Enter => KeyOutcome::Close,
         code => {
-            *scroll = scrolled(*scroll, code, text, state.size);
+            *scroll = scrolled(*scroll, code, text_rows(text, state.size.0), state.size.1);
             KeyOutcome::Keep
         }
     }
@@ -38,7 +38,7 @@ pub(super) fn doctor_key(
             KeyOutcome::KeepWith(start(state, action, now_ms))
         }
         code => {
-            *scroll = scrolled(*scroll, code, text, state.size);
+            *scroll = scrolled(*scroll, code, text_rows(text, state.size.0), state.size.1);
             KeyOutcome::Keep
         }
     }
@@ -49,7 +49,7 @@ pub(super) fn render_result(frame: &mut Frame, area: Rect, title: &str, text: &s
         frame,
         area,
         &format!(" {title} "),
-        text,
+        text_lines(text, area.width),
         *scroll,
         "Esc close · ↑ ↓ scroll",
     );
@@ -71,17 +71,17 @@ pub(super) fn render_doctor(
         frame,
         area,
         title,
-        text,
+        text_lines(text, area.width),
         *scroll,
         "o online · Esc close · ↑ ↓ scroll",
     );
 }
 
-/// A panel's scroll after `code`, never past its last full page on a `size` terminal: rows,
-/// not lines, as the panel wraps them. It moves from the row that shows, which a resize may
-/// have brought nearer than the stored scroll.
-fn scrolled(scroll: u16, code: KeyCode, text: &str, (width, height): (u16, u16)) -> u16 {
-    let last = furthest(text, width, height);
+/// A panel's scroll after `code`, never past its last full page on a terminal `height` rows
+/// tall: `rows` is how many rows the panel has, as it draws them. It moves from the row that
+/// shows, which a resize may have brought nearer than the stored scroll.
+pub(super) fn scrolled(scroll: u16, code: KeyCode, rows: usize, height: u16) -> u16 {
+    let last = furthest(rows, height);
     let scroll = scroll.min(last);
     let to = match code {
         KeyCode::Down | KeyCode::Char('j') => scroll.saturating_add(1),
@@ -101,17 +101,16 @@ fn panel_height(height: u16) -> usize {
     usize::from(height.saturating_sub(4)).max(1)
 }
 
-/// The furthest a panel's text can be scrolled on a `width` by `height` terminal: to the top of
-/// its last full page, so the last row ends the panel and never sits alone at its top. Text
-/// shorter than the panel does not scroll.
-fn furthest(text: &str, width: u16, height: u16) -> u16 {
-    let rows = panel_rows(text, panel_width(width)).len();
+/// The furthest a panel of `rows` rows can be scrolled on a terminal `height` rows tall: to the
+/// top of its last full page, so the last row ends the panel and never sits alone at its top. A
+/// panel shorter than the screen does not scroll.
+fn furthest(rows: usize, height: u16) -> u16 {
     u16::try_from(rows.saturating_sub(panel_height(height))).unwrap_or(u16::MAX)
 }
 
 /// The width of a panel's text on a terminal `width` wide: two columns of margin, a border and
 /// a column of padding on either side.
-fn panel_width(width: u16) -> usize {
+pub(super) fn panel_width(width: u16) -> usize {
     usize::from(width.saturating_sub(8))
 }
 
@@ -137,10 +136,31 @@ fn panel_rows(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// A scrollable panel over most of `area`, its keys on its last line. Its text wraps at the
-/// panel's width (`panel_rows`), and its scroll stops at its last full page at that width and height.
-fn panel(frame: &mut Frame, area: Rect, title: &str, text: &str, scroll: u16, keys: &str) {
-    let scroll = scroll.min(furthest(text, area.width, area.height));
+/// How many rows `text` takes in a panel on a terminal `width` wide.
+fn text_rows(text: &str, width: u16) -> usize {
+    panel_rows(text, panel_width(width)).len()
+}
+
+/// `text` as the lines of a panel on a terminal `width` wide (`panel_rows`).
+fn text_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    panel_rows(text, panel_width(width))
+        .into_iter()
+        .map(Line::from)
+        .collect()
+}
+
+/// A scrollable panel over most of `area`, its keys on its last line. Its `lines` are already
+/// as wide as the panel's text (`panel_width`), and its scroll stops at its last full page at
+/// that height.
+pub(super) fn panel(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    lines: Vec<Line<'static>>,
+    scroll: u16,
+    keys: &str,
+) {
+    let scroll = scroll.min(furthest(lines.len(), area.height));
     let rect = Rect::new(
         area.x + 2,
         area.y + 1,
@@ -152,9 +172,5 @@ fn panel(frame: &mut Frame, area: Rect, title: &str, text: &str, scroll: u16, ke
         .title(title.to_owned())
         .title_bottom(Line::from(format!(" {keys} ")))
         .padding(ratatui::widgets::Padding::horizontal(1));
-    let lines: Vec<Line<'static>> = panel_rows(text, panel_width(area.width))
-        .into_iter()
-        .map(Line::from)
-        .collect();
     frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), rect);
 }

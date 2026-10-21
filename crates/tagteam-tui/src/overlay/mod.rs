@@ -23,7 +23,8 @@ use crate::view::{centered, select, tint, wrap_rows};
 
 #[derive(Debug)]
 pub enum Overlay {
-    Help,
+    /// The key table and the marks (§9.2), scrolled `scroll` rows.
+    Help { scroll: u16 },
     Confirm {
         question: String,
         choice: bool,
@@ -74,7 +75,7 @@ impl Overlay {
                 then: ConfirmThen::Run(_),
                 ..
             }
-            | Overlay::Help
+            | Overlay::Help { .. }
             | Overlay::Text { .. }
             | Overlay::Result { .. }
             | Overlay::Doctor { .. }
@@ -155,7 +156,7 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
         return vec![];
     };
     let outcome = match &mut overlay {
-        Overlay::Help => help::key(key),
+        Overlay::Help { scroll } => help::key(state, scroll, key),
         Overlay::Confirm { choice, then, .. } => confirm::key(state, choice, then, key, now_ms),
         Overlay::Choose {
             options,
@@ -194,7 +195,7 @@ pub fn render(state: &State, frame: &mut Frame) {
     };
     let area = frame.area();
     match overlay {
-        Overlay::Help => help::render(state, frame, area),
+        Overlay::Help { scroll } => help::render(state, frame, area, *scroll),
         Overlay::Confirm {
             question, choice, ..
         } => confirm::render(state, frame, area, question, choice),

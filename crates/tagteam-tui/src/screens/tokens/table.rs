@@ -1408,7 +1408,10 @@ mod tests {
         assert_eq!(lines[11], " API cost at list prices as of 2026-10-01.");
         assert_eq!(
             draw(&state, 80, 24)[23],
-            "Enter sessions  p period  g group  f filter  [ ] range  r refresh"
+            footer_row(
+                "⏎ sessions  p period  g group  f filter  [ ] range  r refresh",
+                80
+            )
         );
     }
 
