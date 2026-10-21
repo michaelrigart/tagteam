@@ -1161,3 +1161,51 @@ fn an_unreadable_live_login_falls_back_to_the_stored_active_account() {
         forecast_of(&view.accounts, &LiveLogin::None, &view.models)
     );
 }
+
+#[test]
+fn every_view_judges_trust_under_the_provider_s_settings_as_they_are_now() {
+    // The controller's ruling on §12.1: `history` and `account_view` judge a reading under the
+    // provider's `models` as `config.toml` has them now, as the list row does, not under the
+    // engine's start-up snapshot. a was read 4000 s ago and refused since, so it is trusted only
+    // until its earliest relevant reset; its Fable window has reset already.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let windows = vec![
+        window("5h", "5h", WindowKind::Short, 10.0, T0 + 9_630),
+        window("7d", "7d", WindowKind::Long, 10.0, T0 + 291_630),
+        window("scoped:Fable", "Fable", WindowKind::Scoped, 10.0, T0 - 100),
+    ];
+    record(&fx, &a, &windows, T0 - 4_000, T0 - 3_500);
+    fail(&fx, &a, "http-429", T0 - 3_000, T0 + 600, Some(T0 + 600));
+    let trust = |fx: &Fx| {
+        let row = fx
+            .engine
+            .accounts(None)
+            .unwrap()
+            .remove(0)
+            .accounts
+            .remove(0);
+        let history = fx.engine.history(&a, None, 0).unwrap().account;
+        let stored = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
+        let view = fx.engine.account_view(stored, false);
+        (
+            row.usage.decision_grade,
+            history.usage.decision_grade,
+            view.usage.decision_grade,
+        )
+    };
+    assert_eq!(trust(&fx), (true, true, true), "under the start-up models");
+    // Written mid-run, with no reload: every view reads it.
+    fs::create_dir_all(fx.env.config_dir()).unwrap();
+    fs::write(
+        fx.env.config_dir().join("config.toml"),
+        "[autoswitch]\nmodels = [\"Fable\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        trust(&fx),
+        (false, false, false),
+        "under the models as written"
+    );
+}

@@ -663,6 +663,8 @@ impl Engine {
             .as_ref()
             .map_or(UNREGISTERED, |p| p.kind_traits(&row.kind));
         let supported = provider.is_some_and(|p| p.capabilities().usage);
+        // Trust under the provider's settings as they are now, as the list row judges it.
+        let (settings, _) = Settings::load(&self.env, &row.provider);
         let usage = self
             .existing_store()
             .and_then(|s| {
@@ -672,7 +674,7 @@ impl Engine {
                     &kind,
                     supported,
                     with_pace,
-                    &self.settings().models,
+                    &settings.models,
                 )
             })
             .unwrap_or_else(|e| {
@@ -809,13 +811,15 @@ impl Engine {
         let row = store.account(account)?.ok_or_else(missing)?;
         let p = self.provider(&row.provider)?;
         let live = self.liveness(p.as_ref(), Some(&store), &row.provider)?;
+        // Trust under the provider's settings as they are now, as the list row judges it.
+        let (own, _) = Settings::load(&self.env, &row.provider);
         let view = self.account_view_of(
             p.as_ref(),
             Some(&store),
             row.clone(),
             live.is_active(&row),
             p.capabilities().usage,
-            &self.settings().models,
+            &own.models,
         )?;
         // Each window with the time its `pct` is as of, and its pace when the view has it: the
         // last good reading's own windows are the view's, as read then.
