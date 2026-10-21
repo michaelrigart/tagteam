@@ -189,10 +189,17 @@ pub(crate) fn furthest_scroll(heights: &[usize], rows: usize) -> usize {
     from.min(heights.len().saturating_sub(1))
 }
 
-/// The banner's text, and whether it is an error: a failed read (spec §10.4) first, then on
-/// Tokens a failed token read (B12), else what the accounts view has to say (a run shell, an
-/// unmanaged live login).
+/// What the banner says while the input thread drops every key (spec §4.2, T2-14).
+const KEYS_HELD: &str =
+    "the terminal sent an unfinished colour report · keys resume when it ends · Ctrl-C quits";
+
+/// The banner's text, and whether it is an error: held keys first, the keyboard being unusable
+/// meanwhile; a failed read (spec §10.4); then on Tokens a failed token read (B12), else what the
+/// accounts view has to say (a run shell, an unmanaged live login).
 pub(crate) fn banner(state: &State) -> Option<(String, bool)> {
+    if state.keys_held {
+        return Some((KEYS_HELD.to_owned(), false));
+    }
     let tokens = (state.screen == Screen::Tokens)
         .then(|| state.tokens.error())
         .flatten();
@@ -638,6 +645,26 @@ mod tests {
             areas(&state, Rect::new(0, 0, 80, 24)).body,
             Rect::new(0, 4, 80, 19),
             "three rows at most"
+        );
+    }
+
+    #[test]
+    fn held_keys_are_the_first_banner_and_go_when_released() {
+        let mut state = fresh(Screen::Accounts);
+        state.raise_banner(BannerKind::Refusal, "the store is locked");
+        update(&mut state, Msg::KeysHeld { held: true }, NOW_MS);
+        assert_eq!(
+            banner(&state),
+            Some((
+                "the terminal sent an unfinished colour report · keys resume when it ends · Ctrl-C quits"
+                    .to_owned(),
+                false
+            ))
+        );
+        update(&mut state, Msg::KeysHeld { held: false }, NOW_MS);
+        assert_eq!(
+            banner(&state),
+            Some(("the store is locked".to_owned(), true))
         );
     }
 

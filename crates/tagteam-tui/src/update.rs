@@ -151,6 +151,11 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
             }
             vec![]
         }
+        Msg::KeysHeld { held } => {
+            state.keys_held = held;
+            state.dirty = true;
+            vec![]
+        }
     }
 }
 

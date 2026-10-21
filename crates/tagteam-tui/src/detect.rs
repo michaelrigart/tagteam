@@ -34,6 +34,23 @@ pub(crate) enum Control {
     Suspend,
 }
 
+/// Where a reply stood when detection stopped (spec §4.2): the filter's start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Handoff {
+    /// Between replies: no byte of one is in hand.
+    None,
+    /// `ESC`, nothing after it.
+    Esc,
+    /// `ESC [`, nothing after it.
+    Csi,
+    /// `ESC [ ?` and perhaps parameters: a DA1 answer without its `c`.
+    Da1,
+    /// `ESC ]` and perhaps a body: an OSC without its end.
+    Osc,
+    /// An OSC body and its `ESC`.
+    OscEsc,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Ground,
@@ -57,6 +74,8 @@ pub(crate) struct Replies {
     overlong: bool,
     background: Option<Background>,
     control: Option<Control>,
+    /// The DA1 answer has ended.
+    answered: bool,
 }
 
 impl Replies {
@@ -67,6 +86,7 @@ impl Replies {
             overlong: false,
             background: None,
             control: None,
+            answered: false,
         }
     }
 
@@ -95,7 +115,9 @@ impl Replies {
             State::Csi { private, first } => match byte {
                 0x40..=0x7e => {
                     self.state = State::Ground;
-                    return private && byte == b'c';
+                    let end = private && byte == b'c';
+                    self.answered |= end;
+                    return end;
                 }
                 b'?' if first => {
                     self.state = State::Csi {
@@ -161,6 +183,33 @@ impl Replies {
     /// Ctrl-C (0x03) or Ctrl-Z (0x1a), if one was read: it ends detection at once.
     pub(crate) fn control(&self) -> Option<Control> {
         self.control
+    }
+
+    /// Whether the read ended at the DA1 answer: every reply asked for has then ended.
+    pub(crate) fn answered(&self) -> bool {
+        self.answered
+    }
+
+    /// Where the parser stands, however the read ended (the DA1 answer, the quiet or the limit,
+    /// a stop, Ctrl-C or Ctrl-Z, which leave it as it was): the filter's start.
+    pub(crate) fn handoff(&self) -> Handoff {
+        match self.state {
+            State::Ground => Handoff::None,
+            State::Esc => Handoff::Esc,
+            State::Csi { private: true, .. } => Handoff::Da1,
+            State::Csi {
+                private: false,
+                first: true,
+            } => Handoff::Csi,
+            // A CSI that is no DA1 answer (a cursor position, say) has no `?`, and none was
+            // asked for.
+            State::Csi {
+                private: false,
+                first: false,
+            } => Handoff::None,
+            State::Osc => Handoff::Osc,
+            State::OscEsc => Handoff::OscEsc,
+        }
     }
 }
 
@@ -460,5 +509,120 @@ mod tests {
             assert!(!replies.push(*byte));
         }
         assert!(replies.push(b'c'));
+    }
+
+    /// Bytes a read can end after, and where the parser then stands.
+    const CUTS: [(&[u8], Handoff); 8] = [
+        (b"", Handoff::None),
+        (b"j\x1b]11;rgb:ffff/ffff/ffff\x07k", Handoff::None),
+        (b"\x1b[1;1", Handoff::None),
+        (b"j\x1b", Handoff::Esc),
+        (b"\x1b[", Handoff::Csi),
+        (b"\x1b[?62;2", Handoff::Da1),
+        (b"\x1b]11;rgb:28", Handoff::Osc),
+        (b"\x1b]11;rgb:28\x1b", Handoff::OscEsc),
+    ];
+
+    #[test]
+    fn the_hand_off_is_where_the_parser_stands() {
+        for (bytes, handoff) in CUTS {
+            let mut replies = Replies::new();
+            for byte in bytes {
+                assert!(!replies.push(*byte));
+            }
+            assert_eq!(replies.handoff(), handoff, "{bytes:?}");
+            assert!(!replies.answered(), "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn the_hand_off_survives_a_control_byte() {
+        for (bytes, handoff) in CUTS {
+            for (typed, control) in [(CTRL_C, Control::Interrupt), (CTRL_Z, Control::Suspend)] {
+                let (replies, _) = answered(&[bytes, &[typed][..]].concat());
+                assert_eq!(replies.control(), Some(control), "{bytes:?}");
+                assert_eq!(replies.handoff(), handoff, "{bytes:?} then {typed:#x}");
+                assert!(!replies.answered());
+            }
+        }
+    }
+
+    #[test]
+    fn the_hand_off_after_a_quiet_second_is_where_the_parser_stood() {
+        thread::scope(|scope| {
+            let reads: Vec<_> = CUTS
+                .iter()
+                .map(|(bytes, handoff)| {
+                    scope.spawn(move || {
+                        let (ours, mut theirs) = UnixStream::pair().unwrap();
+                        theirs.write_all(bytes).unwrap();
+                        let (replies, took) = read_from(&ours);
+                        assert_within(took, QUIET, QUIET + Duration::from_millis(300));
+                        assert_eq!(replies.handoff(), *handoff, "{bytes:?}");
+                        assert!(!replies.answered(), "{bytes:?}");
+                    })
+                })
+                .collect();
+            for read in reads {
+                read.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn the_hand_off_after_the_limit_is_where_the_parser_stood() {
+        // An OSC body that never ends, a byte every 300 ms: the limit ends the read, not the
+        // quiet second.
+        let (replies, took) = trickled(&|| false, |mut theirs| {
+            if theirs.write_all(b"\x1b]11;").is_err() {
+                return;
+            }
+            for _ in 0..8 {
+                thread::sleep(Duration::from_millis(300));
+                if theirs.write_all(b"0").is_err() {
+                    break;
+                }
+            }
+        });
+        assert_within(took, LIMIT, LIMIT + Duration::from_millis(300));
+        assert_eq!(replies.handoff(), Handoff::Osc);
+        assert!(!replies.answered());
+    }
+
+    #[test]
+    fn the_hand_off_after_a_stop_is_where_the_parser_stood() {
+        for (bytes, handoff) in CUTS {
+            let stopped = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stopped);
+            let stop = move || stopped.load(Ordering::SeqCst);
+            let (replies, _) = trickled(&stop, move |mut theirs| {
+                theirs.write_all(bytes).unwrap();
+                thread::sleep(Duration::from_millis(100));
+                flag.store(true, Ordering::SeqCst);
+            });
+            assert_eq!(replies.handoff(), handoff, "{bytes:?}");
+            assert!(!replies.answered(), "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_da1_answer_is_answered() {
+        for bytes in [
+            &b"\x1b[?62;22c"[..],
+            b"\x1b]11;rgb:28\x1b\\\x1b[?c",
+            b"j\x1b[?1u\x1b[?6c",
+        ] {
+            let (replies, took) = answered(bytes);
+            assert!(replies.answered(), "{bytes:?}");
+            assert_eq!(replies.handoff(), Handoff::None, "{bytes:?}");
+            assert!(took < Duration::from_millis(100), "{took:?}");
+        }
+        for bytes in [&b"\x1b[1;1R"[..], b"\x1b[?1u", b"\x1b]11;?\x07"] {
+            let mut replies = Replies::new();
+            for byte in bytes {
+                replies.push(*byte);
+            }
+            assert!(!replies.answered(), "{bytes:?}");
+        }
     }
 }
