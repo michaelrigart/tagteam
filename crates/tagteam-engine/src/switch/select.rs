@@ -82,6 +82,128 @@ fn nothing_to_activate(live_row: Option<&AccountRow>) -> Ranked {
     }
 }
 
+/// A provider's live login, as `best_candidate` reads it (§12.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveLogin {
+    None,
+    /// A login tagteam does not manage: its email, else its label.
+    Unmanaged {
+        email: String,
+    },
+    /// The stored account at `position`.
+    Managed {
+        position: u32,
+    },
+}
+
+/// What `best_candidate` decides from (§12.1): the live login, `--force`, and every account of
+/// the provider, the live one included.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PickInput {
+    pub live: LiveLogin,
+    pub force: bool,
+    pub rows: Vec<PickRow>,
+}
+
+/// An account as `best_candidate` ranks it: `candidate` is `switch_candidate`'s two layers
+/// (`is_candidate`, and not session-owned), and `headroom` comes from its decision-grade,
+/// relevant windows only (`None`: unknown).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PickRow {
+    pub position: u32,
+    pub candidate: bool,
+    pub headroom: Option<f64>,
+}
+
+/// `switch --strategy best`'s pick before any vault is read (§12.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BestForecast {
+    /// Most headroom first: the first is the pick, the rest are what the vault walk tries next.
+    Pick {
+        order: Vec<u32>,
+    },
+    /// The account in use has the most headroom.
+    AlreadyBest,
+    None(NoPick),
+}
+
+/// Why `best_candidate` has no pick (§12.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoPick {
+    /// The live login is not managed, and `--force` was not given.
+    UnmanagedLogin,
+    /// Fewer than two candidates with a managed live login, the live one counted (§9.2); no
+    /// candidate at all without one.
+    TooFewCandidates,
+    /// No candidate has a decision-grade reading (§8.4).
+    UsageUnknown,
+    /// The managed live login's headroom is unknown, and every known candidate is at its limit.
+    CandidatesExhausted,
+}
+
+/// §12.1: `switch --strategy best`'s rule up to the vault walk, in the switch's order. An
+/// unmanaged live login is no pick unless forced, and is then no live login. With a managed
+/// one, fewer than two candidates are no pick (§9.2). The candidates other than the live
+/// account are ranked by `best_order` against the live headroom, and with a managed live login
+/// of unknown headroom one known to be at its limit is never picked (§9.3). No I/O: the switch
+/// and the accounts view both call it.
+pub fn best_candidate(input: &PickInput) -> BestForecast {
+    let live = match &input.live {
+        LiveLogin::Unmanaged { .. } if !input.force => {
+            return BestForecast::None(NoPick::UnmanagedLogin);
+        }
+        LiveLogin::Managed { position } => Some(*position),
+        LiveLogin::Unmanaged { .. } | LiveLogin::None => None,
+    };
+    let candidates: Vec<&PickRow> = input.rows.iter().filter(|r| r.candidate).collect();
+    if live.is_some() && candidates.len() < 2 {
+        return BestForecast::None(NoPick::TooFewCandidates);
+    }
+    let ranked: Vec<Candidate> = candidates
+        .iter()
+        .filter(|r| Some(r.position) != live)
+        .map(|r| Candidate {
+            position: r.position,
+            headroom: r.headroom,
+        })
+        .collect();
+    // Only without a managed live login: with one, a second candidate is left to rank.
+    if ranked.is_empty() {
+        return BestForecast::None(NoPick::TooFewCandidates);
+    }
+    let live_headroom = live
+        .and_then(|at| input.rows.iter().find(|r| r.position == at))
+        .and_then(|r| r.headroom);
+    match best_order(live_headroom, &ranked) {
+        BestOrder::UsageUnavailable => BestForecast::None(NoPick::UsageUnknown),
+        BestOrder::AlreadyBest => BestForecast::AlreadyBest,
+        BestOrder::Try(order) => {
+            // §9.3: a managed live login of unknown usage is switched away from, but never to
+            // a candidate known to be at its limit. With no live login at all, the best known
+            // is picked as it is.
+            let order: Vec<u32> = if live.is_some() && live_headroom.is_none() {
+                order
+                    .into_iter()
+                    .filter(|position| {
+                        ranked
+                            .iter()
+                            .find(|c| c.position == *position)
+                            .and_then(|c| c.headroom)
+                            .is_none_or(|h| h > 0.0)
+                    })
+                    .collect()
+            } else {
+                order
+            };
+            if order.is_empty() {
+                BestForecast::None(NoPick::CandidatesExhausted)
+            } else {
+                BestForecast::Pick { order }
+            }
+        }
+    }
+}
+
 impl Engine {
     /// §9.3: a candidate for every strategy. `is_poll_candidate`, and not session-owned (§12.5): a
     /// live reservation, or a live or unreadable session record. The vault is not read.
@@ -238,7 +360,7 @@ impl Engine {
             })
             .collect::<Result<Vec<_>, EngineError>>()?;
         match strategy {
-            UsageStrategy::Best => self.best_pick(&rated, live_row, models),
+            UsageStrategy::Best => self.best_pick(p, &rated, live_row, models),
             UsageStrategy::NextAvailable => self.next_available_pick(&rated, live_row, models),
         }
     }
@@ -247,12 +369,14 @@ impl Engine {
     /// account's; every known one, with a warning, when the live headroom is unknown or there
     /// is no managed live login, but with a managed live login of unknown headroom never one
     /// known to be at its limit (`candidates-exhausted` when all are). A candidate whose
-    /// headroom is unknown is never picked, and a warning counts them. A better candidate whose vault holds nothing is not switchable, so
-    /// a walk that finds none to activate is `already-best`; with the live headroom unknown, it
-    /// is `candidates-exhausted` when candidates known to be at their limit were left out, and
-    /// `usage-unavailable` otherwise.
+    /// headroom is unknown is never picked, and a warning counts them. The pick before the vault
+    /// walk is `best_candidate`'s (§12.1), over `rated` and the live row. A better candidate
+    /// whose vault holds nothing is not switchable, so a walk that finds none to activate is
+    /// `already-best`; with the live headroom unknown, it is `candidates-exhausted` when
+    /// candidates known to be at their limit were left out, and `usage-unavailable` otherwise.
     fn best_pick(
         &self,
+        p: &dyn Provider,
         rated: &[Rated],
         live_row: Option<&AccountRow>,
         models: &[String],
@@ -274,13 +398,53 @@ impl Engine {
                 "{n} candidates have no usage reading recent enough to rank by; they were not considered"
             )],
         };
-        Ok(match best_order(live_headroom, &candidates) {
-            BestOrder::UsageUnavailable => Ranked::Stay(
+        let mut rows: Vec<PickRow> = candidates
+            .iter()
+            .map(|c| PickRow {
+                position: c.position,
+                candidate: true,
+                headroom: c.headroom,
+            })
+            .collect();
+        if let Some(live) = &live {
+            rows.push(PickRow {
+                position: live.row.position,
+                candidate: self.switch_candidate(p, &live.row)?,
+                headroom: live_headroom,
+            });
+        }
+        let input = PickInput {
+            live: match live_row {
+                Some(row) => LiveLogin::Managed {
+                    position: row.position,
+                },
+                None => LiveLogin::None,
+            },
+            force: false,
+            rows,
+        };
+        // The candidates `best_order` ranked and the forecast left out of `order`: those known
+        // to be at their limit, when a managed live login's headroom is unknown (§9.3).
+        let left_out = |order: &[u32]| -> Vec<&Rated> {
+            match best_order(live_headroom, &candidates) {
+                BestOrder::Try(ranked) => ranked
+                    .iter()
+                    .filter(|position| !order.contains(position))
+                    .filter_map(at)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        Ok(match best_candidate(&input) {
+            BestForecast::None(NoPick::UnmanagedLogin | NoPick::TooFewCandidates) => {
+                nothing_to_activate(live_row)
+            }
+            BestForecast::None(NoPick::UsageUnknown) => Ranked::Stay(
                 SwitchReason::UsageUnavailable,
                 USAGE_UNAVAILABLE.into(),
                 Vec::new(),
             ),
-            BestOrder::AlreadyBest => {
+            BestForecast::AlreadyBest => {
                 let leader = match best_order(None, &candidates) {
                     BestOrder::Try(order) => order.first().and_then(at),
                     _ => None,
@@ -296,28 +460,12 @@ impl Engine {
                 };
                 Ranked::Stay(SwitchReason::AlreadyBest, message, notes)
             }
-            BestOrder::Try(order) => {
-                // §9.3: a managed live login of unknown usage is switched away from, but never
-                // to a candidate known to be at its limit. With no live login at all, the best
-                // known is picked as it is.
-                let (order, exhausted): (Vec<u32>, Vec<u32>) =
-                    if live_row.is_some() && live_headroom.is_none() {
-                        order.into_iter().partition(|position| {
-                            at(position)
-                                .and_then(|r| r.headroom(models))
-                                .is_none_or(|h| h > 0.0)
-                        })
-                    } else {
-                        (order, Vec::new())
-                    };
-                if order.is_empty() {
-                    let exhausted: Vec<&Rated> = exhausted.iter().filter_map(at).collect();
-                    return Ok(Ranked::Stay(
-                        SwitchReason::CandidatesExhausted,
-                        self.exhausted_message(&exhausted, models),
-                        notes,
-                    ));
-                }
+            BestForecast::None(NoPick::CandidatesExhausted) => Ranked::Stay(
+                SwitchReason::CandidatesExhausted,
+                self.exhausted_message(&left_out(&[]), models),
+                notes,
+            ),
+            BestForecast::Pick { order } => {
                 match self.walk(order.iter().filter_map(at).map(|r| r.row.clone()))? {
                     Some((pick, _)) => {
                         if live_headroom.is_none() {
@@ -330,33 +478,33 @@ impl Engine {
                         }
                         Ranked::To(pick, notes)
                     }
-                    None => match &live {
-                        Some(live) if live_headroom.is_some() => Ranked::Stay(
-                            SwitchReason::AlreadyBest,
-                            format!(
-                                "no candidate with more headroom than {} holds a stored credential",
-                                live.described(models)
+                    None => {
+                        let exhausted = left_out(&order);
+                        match &live {
+                            Some(live) if live_headroom.is_some() => Ranked::Stay(
+                                SwitchReason::AlreadyBest,
+                                format!(
+                                    "no candidate with more headroom than {} holds a stored credential",
+                                    live.described(models)
+                                ),
+                                notes,
                             ),
-                            notes,
-                        ),
-                        // §9.3: no candidate that beat the exhausted ones holds a stored
-                        // credential, so none of them is switchable; what is left is known to
-                        // be at its limit, as `next-available` reports it.
-                        _ if !exhausted.is_empty() => {
-                            let exhausted: Vec<&Rated> = exhausted.iter().filter_map(at).collect();
-                            Ranked::Stay(
+                            // §9.3: no candidate that beat the exhausted ones holds a stored
+                            // credential, so none of them is switchable; what is left is known
+                            // to be at its limit, as `next-available` reports it.
+                            _ if !exhausted.is_empty() => Ranked::Stay(
                                 SwitchReason::CandidatesExhausted,
                                 self.exhausted_message(&exhausted, models),
                                 notes,
-                            )
+                            ),
+                            _ => Ranked::Stay(
+                                SwitchReason::UsageUnavailable,
+                                "no candidate with a known usage reading holds a stored credential"
+                                    .into(),
+                                notes,
+                            ),
                         }
-                        _ => Ranked::Stay(
-                            SwitchReason::UsageUnavailable,
-                            "no candidate with a known usage reading holds a stored credential"
-                                .into(),
-                            notes,
-                        ),
-                    },
+                    }
                 }
             }
         })
@@ -534,6 +682,156 @@ impl Engine {
                 ),
             ),
             None => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BestForecast, LiveLogin, NoPick, PickInput, PickRow, best_candidate};
+
+    fn row(position: u32, candidate: bool, headroom: Option<f64>) -> PickRow {
+        PickRow {
+            position,
+            candidate,
+            headroom,
+        }
+    }
+
+    fn input(live: LiveLogin, force: bool, rows: &[PickRow]) -> PickInput {
+        PickInput {
+            live,
+            force,
+            rows: rows.to_vec(),
+        }
+    }
+
+    #[test]
+    fn best_candidate_follows_the_switch_s_rules_in_order() {
+        let unmanaged = || LiveLogin::Unmanaged {
+            email: "alex@example.com".into(),
+        };
+        let managed = || LiveLogin::Managed { position: 1 };
+        let pick = |order: &[u32]| BestForecast::Pick {
+            order: order.to_vec(),
+        };
+        let none = BestForecast::None;
+        let cases = [
+            (
+                "unmanaged live, no force",
+                input(
+                    unmanaged(),
+                    false,
+                    &[row(1, true, Some(40.0)), row(2, true, Some(10.0))],
+                ),
+                none(NoPick::UnmanagedLogin),
+            ),
+            (
+                "unmanaged live, forced",
+                input(
+                    unmanaged(),
+                    true,
+                    &[row(1, true, Some(40.0)), row(2, true, Some(10.0))],
+                ),
+                pick(&[1, 2]),
+            ),
+            (
+                "managed live not a candidate, one other candidate",
+                input(
+                    managed(),
+                    false,
+                    &[row(1, false, Some(20.0)), row(2, true, Some(40.0))],
+                ),
+                none(NoPick::TooFewCandidates),
+            ),
+            (
+                "managed live a candidate, one other candidate",
+                input(
+                    managed(),
+                    false,
+                    &[row(1, true, Some(20.0)), row(2, true, Some(40.0))],
+                ),
+                pick(&[2]),
+            ),
+            (
+                "no live login, no candidate",
+                input(LiveLogin::None, false, &[row(1, false, Some(40.0))]),
+                none(NoPick::TooFewCandidates),
+            ),
+            (
+                "no live login, a candidate at negative headroom",
+                input(LiveLogin::None, false, &[row(2, true, Some(-5.0))]),
+                pick(&[2]),
+            ),
+            (
+                "managed live unknown, one candidate known to be at its limit",
+                input(
+                    managed(),
+                    false,
+                    &[
+                        row(1, true, None),
+                        row(2, true, Some(10.0)),
+                        row(3, true, Some(-5.0)),
+                    ],
+                ),
+                pick(&[2]),
+            ),
+            (
+                "managed live unknown, every known candidate at its limit",
+                input(
+                    managed(),
+                    false,
+                    &[
+                        row(1, true, None),
+                        row(2, true, Some(-5.0)),
+                        row(3, true, Some(0.0)),
+                    ],
+                ),
+                none(NoPick::CandidatesExhausted),
+            ),
+            (
+                "managed live known, no candidate known",
+                input(
+                    managed(),
+                    false,
+                    &[
+                        row(1, true, Some(30.0)),
+                        row(2, true, None),
+                        row(3, true, None),
+                    ],
+                ),
+                none(NoPick::UsageUnknown),
+            ),
+            (
+                "managed live ahead of every candidate",
+                input(
+                    managed(),
+                    false,
+                    &[row(1, true, Some(47.0)), row(2, true, Some(46.0))],
+                ),
+                BestForecast::AlreadyBest,
+            ),
+            (
+                "a NaN headroom is unknown",
+                input(
+                    managed(),
+                    false,
+                    &[row(1, true, Some(47.0)), row(2, true, Some(f64::NAN))],
+                ),
+                none(NoPick::UsageUnknown),
+            ),
+            (
+                "a tie goes to the lower position",
+                input(
+                    LiveLogin::None,
+                    false,
+                    &[row(3, true, Some(40.0)), row(1, true, Some(40.0))],
+                ),
+                pick(&[1, 3]),
+            ),
+        ];
+        for (case, input, forecast) in cases {
+            assert_eq!(best_candidate(&input), forecast, "{case}");
         }
     }
 }

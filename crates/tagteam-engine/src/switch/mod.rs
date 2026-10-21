@@ -20,6 +20,7 @@ mod support;
 mod transact;
 
 pub(crate) use freshen::{AutoFreshened, FreshenFailure, GateMode, GateVerdict};
+pub use select::{BestForecast, LiveLogin, NoPick, PickInput, PickRow, best_candidate};
 pub(crate) use support::{
     Axis, OracleHint, Settle, answer_for, needs_relogin, profile_conflict, refuse_unreadable,
     refuse_unsafe_live_reads, works_until_expiry,
