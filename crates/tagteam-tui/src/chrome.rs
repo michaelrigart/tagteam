@@ -355,7 +355,7 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
 
 /// `spans` cut to `width` columns by display width, as `fit` cuts one string: the span at the
 /// edge ends in `…`, and those after it are dropped.
-fn fit_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+pub(crate) fn fit_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
     if spans_width(&spans) <= width {
         return spans;
     }
