@@ -117,7 +117,7 @@ pub fn spend_text(w: &Window) -> Option<String> {
 // The status heads a problem's sentence restates (§11.1, T3-12).
 const LOGIN_EXPIRED: &str = "login expired";
 const KEYCHAIN: &str = "can't read the Keychain";
-const NEEDS_LOGIN: &str = "needs a new login";
+pub const NEEDS_LOGIN: &str = "needs a new login";
 const OTHER_ACCOUNT: &str = "logged in as another account";
 const NO_LOGIN: &str = "no stored login";
 /// A usage check the provider turned away for now (§11.1); also the TUI's STATUS phrase.

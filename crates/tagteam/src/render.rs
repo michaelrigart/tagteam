@@ -7,8 +7,8 @@ use tagteam_engine::views::{
     AccountView, ProviderAccounts, ShellAccount, StatusView, UsageStatus, UsageView,
 };
 use tagteam_engine::words::{
-    AHEAD, IN_SESSION, Severity, UPDATED_HEAD, WindowColumn, account_cell, countdown, row_notes,
-    severity, spend_text, usage_words, window_columns,
+    AHEAD, IN_SESSION, NEEDS_LOGIN, Severity, UPDATED_HEAD, WindowColumn, account_cell, countdown,
+    row_notes, severity, spend_text, usage_words, window_columns,
 };
 // `app` and `transfer_cmd` still spell these `render::email` and `render::name`.
 pub use tagteam_engine::words::{email, name};
@@ -431,9 +431,9 @@ pub fn status_human(
         }
         StatusView::Managed { account, total } => {
             let marker = if account.row.quarantine_reason.is_some() {
-                ", needs a new login"
+                format!(", {NEEDS_LOGIN}")
             } else {
-                ""
+                String::new()
             };
             let mut out = format!(
                 "Live: {} (position {} of {total}){marker}\n",

@@ -8,7 +8,7 @@ use tagteam_engine::views::AccountView;
 use tagteam_engine::words;
 
 use super::status;
-use crate::chrome::fit_spans;
+use crate::chrome::{WIDE, fit_spans};
 use crate::gauge::line_gauge;
 use crate::theme::{Role, Theme};
 use crate::view::{fit, pad, width_of};
@@ -20,8 +20,7 @@ pub(crate) const EXTRA_FROM: u16 = 160;
 /// The span `select` bolds from: the name's first span.
 pub(crate) const NAME_SPAN: usize = 4;
 
-/// The width from which gauges take `GAUGE_WIDE` cells (§4.5).
-const WIDE_FROM: usize = 120;
+/// The gauges' cells from `WIDE` columns (§4.5), and below.
 const GAUGE_WIDE: usize = 14;
 const GAUGE: usize = 9;
 /// What a gauge shrinks to before it goes (T3-15).
@@ -136,7 +135,7 @@ impl<'a> Table<'a> {
         } else {
             Status::None
         };
-        let gauge = if width >= WIDE_FROM {
+        let gauge = if width >= usize::from(WIDE) {
             GAUGE_WIDE
         } else {
             GAUGE

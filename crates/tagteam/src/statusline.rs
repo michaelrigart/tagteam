@@ -221,7 +221,7 @@ pub(crate) fn resolve_provider(
 /// which reads the marker file alone, and the provider is resolved in Decision 13's order by
 /// `resolve_provider`, whose last step is the default `app::command_settings` chooses:
 /// `default_provider` when this build has it, else the registry's first provider. This is not
-/// `app::locate`, which serves the other commands over the full registry; the variables
+/// `app::locate_run_shell`, which serves the other commands over the full registry; the variables
 /// Decision 13's third step reads were captured into `ctx.env` by `Context::from_process`. The
 /// settings are that provider's, and their warnings are dropped, since a status bar has nowhere
 /// to show them. Returns the engine and the provider.

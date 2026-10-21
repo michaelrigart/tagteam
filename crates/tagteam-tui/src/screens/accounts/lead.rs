@@ -7,35 +7,29 @@ use tagteam_engine::switch::{BestForecast, NoPick};
 use tagteam_engine::views::{AccountView, ProviderAccounts};
 use tagteam_engine::words;
 
-use super::card;
+use super::card::{self, AHEAD_MARK, FACT_SEP, GAP, INDENT};
+use super::status::IN_USE_WORDS;
 use super::table::IN_USE;
-use crate::chrome::fit_spans;
+use crate::chrome::{WIDE, fit_spans};
 use crate::daemon;
 use crate::gauge::lead_bar;
 use crate::state::State;
 use crate::theme::{Role, Theme};
 use crate::view::{fit, pad, width_of};
 
-/// The width from which the bars take `BAR_WIDE` cells, the title its org, and the card every
-/// window (§6.2).
-const WIDE_FROM: u16 = 120;
+/// The bars' cells from `WIDE` columns, where the title takes its org and the card every
+/// window (§6.2), and below.
 const BAR_WIDE: usize = 52;
 const BAR: usize = 30;
-/// The title starts this far in, the bars and the fold line further.
+/// The title starts this far in, the bars and the fold line `card::INDENT`.
 const TITLE_INDENT: &str = "  ";
-const INDENT: &str = "    ";
-/// Between a row's parts (§4.3).
-const GAP: &str = "  ";
 /// The least room between the title's left part and the best pick (§4.3's group gap).
 pub(crate) const PICK_GAP: usize = 3;
 /// The left part keeps this much room at least, or the best pick is dropped (T3-19).
 pub(crate) const LEFT_LEAST: usize = 16;
-const FACT_SEP: &str = " · ";
 /// A login valid for less than this is warn, and says to log in again (§6.2, T3-10).
 const SOON_S: i64 = 7 * 86_400;
 const LOG_IN_AGAIN: &str = "log in again before then";
-/// The ahead-of-pace mark.
-const AHEAD: &str = "▲";
 /// A percentage is bold from here (T3-18).
 const BOLD_FROM: i64 = 70;
 /// What the card says with no account in use (§6.2).
@@ -227,7 +221,7 @@ fn title(
 /// (T3-10); once passed it is `login expired`, warn, alone.
 fn facts_of(v: &AccountView, provider: Option<&str>, now_ms: i64) -> Vec<(String, Role)> {
     let now_s = now_ms.div_euclid(1000);
-    let mut facts = vec![("in use".to_owned(), Role::Muted)];
+    let mut facts = vec![(IN_USE_WORDS.to_owned(), Role::Muted)];
     facts.extend(provider.map(|name| (name.to_owned(), Role::Muted)));
     facts.extend(v.kind.display.map(|d| (d.to_owned(), Role::Muted)));
     if v.in_session {
@@ -265,7 +259,7 @@ fn bar_rows(
         .filter(|(w, _)| keys.contains(&w.key))
         .collect();
     let label_w = card::label_width(windows.iter().map(|(w, _)| w), width);
-    let wide = width >= WIDE_FROM;
+    let wide = width >= WIDE;
     let cells = if wide { BAR_WIDE } else { BAR };
     let now_s = now_ms.div_euclid(1000);
     windows
@@ -276,11 +270,9 @@ fn bar_rows(
                 WindowKind::Long | WindowKind::Scoped => p.expected_pct,
                 WindowKind::Short | WindowKind::Spend => None,
             };
-            let pct = w.pct.round() as i64;
-            let value = words::spend_text(w).unwrap_or_else(|| format!("{:>4}", format!("{pct}%")));
-            let mut style = theme.severity(words::severity(pct));
-            if pct >= BOLD_FROM {
-                style = style.patch(theme.strong());
+            let mut value = card::value_cell(w, theme);
+            if w.pct.round() as i64 >= BOLD_FROM {
+                value.style = value.style.patch(theme.strong());
             }
             let mut spans = vec![Span::raw(format!(
                 "{INDENT}{}{GAP}",
@@ -288,10 +280,10 @@ fn bar_rows(
             ))];
             spans.extend(lead_bar(w.pct, expected, cells, theme));
             spans.push(Span::raw(GAP));
-            spans.push(Span::styled(value, style));
+            spans.push(value);
             if p.ahead == Some(true) {
                 spans.push(Span::raw(" "));
-                spans.push(Span::styled(AHEAD, theme.role(Role::Warn)));
+                spans.push(Span::styled(AHEAD_MARK, theme.role(Role::Warn)));
             }
             spans.extend(card::reset_tail(w, p, wide, now_s, theme));
             Line::from(fit_spans(spans, usize::from(width)))
