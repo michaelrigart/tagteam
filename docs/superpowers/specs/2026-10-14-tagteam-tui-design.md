@@ -268,9 +268,10 @@ selected account's card.
 - **The table** has a row per account: the marker (`●` in use, `▶` in a session, `○` disabled),
   the name, 5H and 7D as gauges with `▲`, UPDATED and STATUS. STATUS is one short phrase, the
   first that applies: a `✕` login problem, `○ disabled`, a `!` problem (`! rate-limited`,
-  `! old reading`, …), `in use`, `best` or `api key`. A disabled account says `○ disabled` over
-  every `!` problem; a `✕` problem still shows. Scoped and spend windows stay on the cards below
-  160 columns.
+  `! old reading`, …), `▶ this session` (a run shell's own account), `in use`, `best` or
+  `api key`. A disabled account says `○ disabled` over every `!` problem; a `✕` problem still
+  shows. Below 100 columns there is no STATUS column: only the phrase's glyph shows, after
+  UPDATED. Scoped and spend windows stay on the cards below 160 columns.
 - **The words** are the same as `list`'s (core §13.1, the redesign spec's §11.1). That means the
   same words, not the same columns.
 - **The selected card** shows every window with a sparkline, its percentage, `▲`, the reset and
@@ -347,8 +348,8 @@ selected account's card.
 ### 5.4 History
 
 ```
- ACCOUNTS               5h   ▁▂▃▅▇█▁▁▂▃▅▆▁▂▃     9%  +4.1 pts/h  lasts to reset
- * 1 michael@…          7d   ▂▂▃▃▄▄▅▅▆▆▆▇▇▇█    77%  +1.2 pts/h  runs out ~2d04h (regression)
+ ACCOUNTS               5h   ▁▂▃▅▇█▁▁▂▃▅▆▁▂▃     9%  +4.1%/h · lasts until it resets
+ * 1 alex@…             7d   ▂▂▃▃▄▄▅▅▆▆▆▇▇▇█    77%  +1.2%/h · full in 2d04h
    2 spare@…            Fable ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁     0%
                         7 days  [ ] range
 ```

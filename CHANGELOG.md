@@ -75,6 +75,8 @@ with the one before, so any release may contain breaking changes. Each section s
   sparklines, what is wrong and how to fix it.
 - `tagteam tui` shows the account in use on Tokens and History, and `A` adds the login of the
   provider the screen follows.
+- `tagteam tui`'s selection starts on the account in use. The banner and the one-account hint
+  follow the selected account's provider.
 
 ### Security
 
