@@ -57,14 +57,12 @@ with the one before, so any release may contain breaking changes. Each section s
   collect.
 - When `tagteam run` cannot refresh an account's token because a pending rescue cannot be read,
   it now names the damaged files; it said only that a pending rescue could not be adopted.
-- `--json` error types now say what each refusal is; none was renamed or removed. A deletion
-  refused to keep the live login or a stored account's Keychain item reports `deletion-refused`,
-  and any `purge` error that names its entry reports the type of the error behind it (both were
-  `io`).
-- A session profile without its marker reports `profile-marker-missing`, an account with no stored
-  credential `relogin-required`, and an active-token refresh of an unmanaged live login
-  `unmanaged-account` (all were `invalid-input`). A lock failure under a provider reports `lock`
-  (it was `provider`).
+- `--json` error types now say what each refusal is; none was renamed or removed. `remove` or
+  `purge` refusing to delete the live login reports `deletion-refused`, and a `purge` error that
+  names its entry reports the type of the error behind it (both were `io`).
+- A session profile without its marker reports `profile-marker-missing`, and an account with no
+  stored credential `relogin-required` (both were `invalid-input`). A broken or unreadable
+  provider lock reports `lock` (it was `provider`).
 
 ### Security
 
