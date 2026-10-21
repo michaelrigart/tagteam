@@ -1465,7 +1465,7 @@ mod hooks {
     }
 
     fn assert_errored(report: &tagteam_engine::collect::CollectReport, a: &AccountId, why: &str) {
-        assert_eq!(report.outcomes, [(a.clone(), failed("error"))]);
+        assert_eq!(report.outcomes, [(a.clone(), Collected::Errored)]);
         assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
         let prefix = "usage for a@x.co (position 1) was not collected: ";
         assert!(

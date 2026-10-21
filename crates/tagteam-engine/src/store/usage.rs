@@ -13,6 +13,7 @@ use tagteam_core::usage::{windows_from_json, windows_to_json};
 use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Sample, Window};
 
 use super::{AccountRow, Store, StoreError};
+use crate::failure::FailureKind;
 
 /// A usage lease lives 90 s (§8.3).
 const USAGE_LEASE_MS: i64 = 90_000;
@@ -46,9 +47,6 @@ const DAY_S: i64 = 86_400;
 /// ahead than this plus `FUTURE_STAMP_SLACK_S` was written under a clock that ran ahead, so no
 /// legal schedule reaches it: reserving ignores it (§8.4).
 const MAX_BACKOFF_S: i64 = CAP_429_S;
-
-/// §8.3's `last_error` token for a request the hourly budget refused (§8.6).
-const OVER_BUDGET: &str = "over-budget";
 
 /// §6.1's lease statement. The lease is held when it changes one row: it was free, or its
 /// holder's expiry (`?4`, now in ms) has passed.
@@ -455,7 +453,13 @@ impl Store {
                 "UPDATE usage_state SET consecutive_failures = consecutive_failures + 1, \
                  last_error = ?2, last_attempt_at = ?3, backoff_until = ?4, next_poll_at = ?5 \
                  WHERE account_id = ?1",
-                params![id.as_str(), OVER_BUDGET, now_s, until, next_free_at],
+                params![
+                    id.as_str(),
+                    FailureKind::OverBudget.as_str(),
+                    now_s,
+                    until,
+                    next_free_at
+                ],
             )?;
             tx.commit()?;
             return Ok(Reserve::OverBudget { next_free_at });
