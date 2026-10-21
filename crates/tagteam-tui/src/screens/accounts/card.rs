@@ -51,13 +51,28 @@ fn windows_of(v: &AccountView) -> &[(Window, Pace)] {
     v.usage.windows.as_deref().unwrap_or_default()
 }
 
+/// Whether `v` is the account in use, whose card leaves to the lead card what it shows: the
+/// reset and projection of the windows it draws (T3-32), and the problem and its remedy (M-9).
+/// The lead card shows focus's account in use, and focus is the selected account's provider.
+pub(crate) fn on_lead(v: &AccountView) -> bool {
+    v.active
+}
+
+/// The card's problem rows: none for the account in use, whose lead card shows them (M-9).
+fn own_problem_rows(state: &State, v: &AccountView, width: u16, now_ms: i64) -> Vec<Line<'static>> {
+    if on_lead(v) {
+        return vec![];
+    }
+    problem_rows(state, v, width, now_ms)
+}
+
 /// The card's lines at `width`, its windows from `from` on, in at most `rows` (T3-20, T3-22).
 /// When `rows` is less than `min_height`, it returns `min_height` lines all the same: the
 /// title, one window, the problem rows and the keys row are never dropped. When not every
 /// window fits and two rows or more are left for them, the last of those says which show and
 /// how to scroll (`J K: windows 3–9 of 24`, muted). `on_lead` names the windows the lead card
 /// shows for the account in use (T3-32): those rows leave out their reset and projection. It
-/// is empty for any other account.
+/// is empty for any other account. The account in use has no problem rows (M-9).
 pub(crate) fn lines(
     state: &State,
     v: &AccountView,
@@ -67,7 +82,7 @@ pub(crate) fn lines(
     on_lead: &[String],
     now_ms: i64,
 ) -> Vec<Line<'static>> {
-    let problems = problem_rows(state, v, width, now_ms);
+    let problems = own_problem_rows(state, v, width, now_ms);
     let keys = keys_row(v, width, state.theme);
     let n = windows_of(v).len();
     let shown = Shown::of(rows, 1 + problems.len() + keys.len(), n);
@@ -158,10 +173,10 @@ pub(crate) fn height(state: &State, v: &AccountView, width: u16, now_ms: i64) ->
 }
 
 /// The fewest lines the card is drawn in (T3-22): its title, one window row when it has
-/// windows, its problem rows and its keys row.
+/// windows, its problem rows (none for the account in use, M-9) and its keys row.
 pub(crate) fn min_height(state: &State, v: &AccountView, width: u16, now_ms: i64) -> usize {
     1 + usize::from(!windows_of(v).is_empty())
-        + problem_rows(state, v, width, now_ms).len()
+        + own_problem_rows(state, v, width, now_ms).len()
         + usize::from(width >= WIDE)
 }
 

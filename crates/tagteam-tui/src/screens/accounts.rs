@@ -463,8 +463,8 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     }
     frame.render_widget(Paragraph::new(shown), table_area);
     if let Some(v) = st.selected_view() {
-        // The account in use leaves out what the lead card shows of it (§6.4, T3-32).
-        let on_lead = if v.active { lead.shown } else { vec![] };
+        // The account in use leaves out what the lead card shows of it (§6.4, T3-32, M-9).
+        let on_lead = if card::on_lead(v) { lead.shown } else { vec![] };
         let rows = usize::from(parts.card.height);
         let lines = card::lines(state, v, area.width, rows, st.card_from, &on_lead, now_ms);
         frame.render_widget(Paragraph::new(lines), parts.card);
@@ -3896,35 +3896,117 @@ mod tests {
         let body = body_of(&state, 120, 24, NOW_MS);
         assert_eq!(body.len(), 21, "{body:?}");
         assert!(body[0].starts_with("  ● 2 work"), "{body:?}");
+        // The card leaves the problem to the lead card (M-9), which takes the rows it frees.
         let mut bars = vec!["5h".to_owned(), "7d".to_owned()];
-        bars.extend(m(1..=4));
-        assert_eq!(labels(&body[1..7]), bars, "{body:?}");
+        bars.extend(m(1..=6));
+        assert_eq!(labels(&body[1..9]), bars, "{body:?}");
         assert_eq!(
-            body[7], "    +14 more windows · in the card below",
+            body[9], "    +12 more windows · in the card below",
             "{body:?}"
         );
-        assert_eq!(body[8..10], NEEDS_LOGIN_ROWS, "{body:?}");
+        assert_eq!(body[10..12], NEEDS_LOGIN_ROWS, "{body:?}");
         let y = body_y(&state, 120, 24);
         let buf = draw_buffer(&state, 120, 24, NOW_MS);
-        let (got, want) = role_of(&buf, state.theme, y + 8, &NEEDS_LOGIN_ROWS[0][4..], 'c');
+        let (got, want) = role_of(&buf, state.theme, y + 10, &NEEDS_LOGIN_ROWS[0][4..], 'c');
         assert_eq!(got, want);
-        assert_eq!(body[10], "", "{body:?}");
-        assert!(body[11].starts_with("    #   ACCOUNT"), "{body:?}");
-        assert!(body[13].contains("sam@corp.example"), "{body:?}");
-        assert!(body[13].ends_with("  ✕ new login"), "{body:?}");
-        assert_eq!(body[15], "", "{body:?}");
-        let card = &body[16..];
+        assert_eq!(body[12], "", "{body:?}");
+        assert!(body[13].starts_with("    #   ACCOUNT"), "{body:?}");
+        assert!(body[15].contains("sam@corp.example"), "{body:?}");
+        assert!(body[15].ends_with("  ✕ new login"), "{body:?}");
+        assert_eq!(body[17], "", "{body:?}");
+        let card = &body[18..];
         assert!(
             card[0].starts_with("    2 work  sam@corp.example"),
             "{card:?}"
         );
         assert!(card[1].starts_with("    5h "), "{card:?}");
-        assert_eq!(card[2..4], NEEDS_LOGIN_ROWS, "{card:?}");
-        assert!(card[4].starts_with("    ⏎ history of work"), "{card:?}");
+        assert!(card[2].starts_with("    ⏎ history of work"), "{card:?}");
         // Two windows only: the title, both bars, then the problem.
         let lead = lead_rows(&loaded(quarantined_in_use(three())), 120, 40).1;
         assert_eq!(labels(&lead[1..3]), ["5h", "7d"], "{lead:?}");
         assert_eq!(lead[3..], NEEDS_LOGIN_ROWS, "{lead:?}");
+    }
+
+    #[test]
+    fn the_in_use_card_leaves_its_problem_to_the_lead_card() {
+        // M-9 (§6.4): the lead card shows the problem of the account in use, so its card does
+        // not; any other account's card keeps its own.
+        let mut accounts = quarantined_in_use(three());
+        accounts[2].usage = unread(UsageStatus::ReloginRequired, None, None);
+        accounts[2].row.quarantine_reason = Some("invalid_grant".into());
+        let mut state = loaded(accounts);
+        for (w, h) in [(120, 40), (80, 24)] {
+            let lead = lead_rows(&state, w, h).1;
+            assert!(
+                lead.contains(&NEEDS_LOGIN_ROWS[0].to_owned()),
+                "{w}: {lead:?}"
+            );
+            let card = card_rows(&state, w, h).1;
+            assert!(
+                card[0].starts_with("    2 work  sam@corp.example"),
+                "{w}: {card:?}"
+            );
+            assert!(
+                !card
+                    .iter()
+                    .any(|l| l.contains("Needs a new login") || l.contains("Log in to")),
+                "{w}: {card:?}"
+            );
+        }
+        let card = card_rows(&state, 120, 40).1;
+        assert_eq!(labels(&card[1..3]), ["5h", "7d"], "{card:?}");
+        assert!(card[3].starts_with("    ⏎ history of work"), "{card:?}");
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        let card = card_rows(&state, 120, 40).1;
+        assert_eq!(
+            card[1..3],
+            [
+                "    ✕ Needs a new login: its stored login was refused (invalid_grant).",
+                "      Log in to Claude Code as alex@personal.example, then press A here.",
+            ],
+            "{card:?}"
+        );
+    }
+
+    #[test]
+    fn at_80_by_24_under_a_full_banner_and_toast_the_in_use_problem_leaves_room_for_both_bars() {
+        // M-9: the card no longer reserves the rows the lead card's problem takes, so a 16-row
+        // body keeps the lead card's 5h and 7d bars and its 2-row remedy, and the 7d window
+        // shows.
+        let mut accounts = quarantined_in_use(three());
+        accounts[1].row.alias = None;
+        let email = "sam+a-much-longer-mailbox@corp.example";
+        accounts[1].row.email = Some(email.into());
+        accounts[1].row.label = email.into();
+        let mut state = loaded(accounts);
+        state.raise_banner(
+            BannerKind::Refusal,
+            ["the store could not be read"; 12].join("; "),
+        );
+        state.toast(
+            crate::state::ToastKind::Info,
+            ["Switched to alex@example.com (position 1)"; 8].join(" "),
+            NOW_MS,
+        );
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(body.len(), 16, "{body:?}");
+        let lead = lead_rows(&state, 80, 24).1;
+        assert_eq!(labels(&lead[1..3]), ["5h", "7d"], "{lead:?}");
+        assert!(!lead.iter().any(|l| l.contains("more windows")), "{lead:?}");
+        assert!(lead[3].starts_with("    ✕ Needs a new login"), "{lead:?}");
+        assert_eq!(lead.len(), 6, "a 2-row remedy: {lead:?}");
+        assert!(
+            lead[4].starts_with("      Log in to Claude Code as"),
+            "{lead:?}"
+        );
+        assert!(lead[5].starts_with("      "), "{lead:?}");
+        let lines = draw(&state, 80, 24);
+        assert!(
+            lines.iter().filter(|l| l.starts_with("    7d ")).count() >= 1,
+            "{lines:?}"
+        );
+        let card = card_rows(&state, 80, 24).1;
+        assert_eq!(labels(&card[1..]), ["5h", "7d"], "{card:?}");
     }
 
     #[test]
