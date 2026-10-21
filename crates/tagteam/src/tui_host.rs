@@ -30,48 +30,26 @@ pub struct CliHost {
     foreground: Context,
     /// The binary `Run` spawns (§7.3 step 3).
     exe: PathBuf,
-    /// The settings warnings printed at start-up. Each action reads the settings afresh and
-    /// says them again; the captured output leaves out those words, so only a warning that is
-    /// new or changed since then opens the result panel.
-    startup_warnings: Vec<String>,
 }
 
 impl CliHost {
     /// `ctx` is the process's context, whose token is the signal token. `exe` is the binary
     /// that `Run` spawns as `<exe> --provider P --expect-account ID run N`:
-    /// `std::env::current_exe()` in production.
-    pub fn new(ctx: &Context, shutdown: Cancel, exe: PathBuf) -> CliHost {
+    /// `std::env::current_exe()` in production. `shown` are the settings warnings the TUI
+    /// printed at start-up: each in-TUI action reads the settings afresh and leaves these out
+    /// (redesign §13), so only a warning that is new or changed since then opens the result
+    /// panel. A foreground action's terminal shows its warnings as the CLI does.
+    pub fn new(ctx: &Context, shutdown: Cancel, exe: PathBuf, shown: Vec<String>) -> CliHost {
         let mut inside = ctx.clone();
         inside.env.cancel = shutdown;
         // Captured, so never a terminal; `--no-color` keeps it plain either way.
         inside.stdout_terminal = false;
-        // The settings warnings the TUI prints before the alternate screen, as `tui_cmd` reads
-        // them for the default provider.
-        let registry = app::build_registry(&inside);
-        let (run_shell, env) = app::locate(inside.env.clone(), &registry);
-        let (_, startup_warnings) =
-            app::build_engine(inside.clone(), registry, run_shell, env, None);
+        inside.shown_warnings = shown.into();
         CliHost {
             inside,
             foreground: ctx.clone(),
             exe,
-            startup_warnings,
         }
-    }
-
-    /// The settings warnings the TUI already printed, for a start-up that read them for another
-    /// provider than the default (`--provider`). An action's output leaves out exactly these.
-    pub fn with_startup_warnings(mut self, warnings: Vec<String>) -> CliHost {
-        self.startup_warnings = warnings;
-        self
-    }
-
-    /// `err` without the lines that repeat the start-up warnings, each once.
-    fn without_startup_warnings(&self, mut err: String) -> String {
-        for w in &self.startup_warnings {
-            err = err.replacen(&format!("warning: {w}\n"), "", 1);
-        }
-        err
     }
 
     /// The signal token (§2).
@@ -195,7 +173,7 @@ impl Host for CliHost {
         ActionOutcome::Done {
             exit,
             out: String::from_utf8_lossy(&out).into_owned(),
-            err: self.without_startup_warnings(String::from_utf8_lossy(&err).into_owned()),
+            err: String::from_utf8_lossy(&err).into_owned(),
         }
     }
 
@@ -244,8 +222,8 @@ fn wait_for_enter(signal: &Cancel) {
 
 /// §4.5: the CLI's prompts, sent to the TUI's dialogs. A person answers there, so the command
 /// prompts as it would on a terminal. The keychain unlock is the exception (Appendix A.3): macOS
-/// asks for the password on the terminal itself, so the question is declined unasked and
-/// noted, the command fails before touching anything, and `act` hands the action to the
+/// asks for the password on the terminal itself, so `confirm_unlock` declines unasked and
+/// notes it, the command fails before touching anything, and `act` hands the action to the
 /// terminal. No action asks for a secret; one that did is declined.
 struct Bridge<'a> {
     ask: &'a mut dyn Ask,
@@ -262,11 +240,12 @@ impl Prompter for Bridge<'_> {
     }
 
     fn confirm(&mut self, question: &str, default_yes: bool) -> bool {
-        if question == app::UNLOCK_QUESTION {
-            self.needs_terminal = true;
-            return false;
-        }
         self.ask.confirm(question, default_yes)
+    }
+
+    fn confirm_unlock(&mut self) -> bool {
+        self.needs_terminal = true;
+        false
     }
 
     fn choose(&mut self, question: &str, options: &[String]) -> Option<usize> {
@@ -275,5 +254,46 @@ impl Prompter for Bridge<'_> {
 
     fn secret(&mut self, _question: &str) -> Option<String> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The TUI's dialogs, recording each confirm's question and default and answering yes.
+    #[derive(Default)]
+    struct Recording {
+        asked: Vec<(String, bool)>,
+    }
+
+    impl Ask for Recording {
+        fn confirm(&mut self, question: &str, default_yes: bool) -> bool {
+            self.asked.push((question.to_owned(), default_yes));
+            true
+        }
+        fn choose(&mut self, question: &str, _options: &[String]) -> Option<usize> {
+            panic!("unexpected choice: {question}")
+        }
+    }
+
+    #[test]
+    fn the_bridge_hands_the_unlock_over_and_forwards_every_confirm() {
+        let mut ask = Recording::default();
+        let mut bridge = Bridge {
+            ask: &mut ask,
+            needs_terminal: false,
+        };
+        assert!(!bridge.confirm_unlock());
+        assert!(bridge.needs_terminal);
+        assert!(ask.asked.is_empty(), "{:?}", ask.asked);
+
+        let mut bridge = Bridge {
+            ask: &mut ask,
+            needs_terminal: false,
+        };
+        assert!(bridge.confirm(app::UNLOCK_QUESTION, true));
+        assert!(!bridge.needs_terminal);
+        assert_eq!(ask.asked, [(app::UNLOCK_QUESTION.to_owned(), true)]);
     }
 }

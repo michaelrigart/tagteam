@@ -165,12 +165,15 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     let platform = ctx.platform;
     let color = ColorEnv::of(&ctx, cli.no_color);
     let provider_flag = cli.provider.map(ProviderId::new);
+    let shown = Arc::clone(&ctx.shown_warnings);
     // §12.8: under a marker that cannot be read the outer home is unknown, and nothing runs.
     let (engine, warnings) = match engine_for(ctx, provider_flag.as_ref()) {
         Ok(built) => built,
         Err(e) => return Ended::Code(io.fail(json, e.kind(), &e.to_string())),
     };
-    for w in &warnings {
+    // Redesign §13: a warning the host already showed (the TUI's, at start-up) is not printed
+    // again.
+    for w in warnings.iter().filter(|w| !shown.contains(w)) {
         io.warn(w);
     }
     let mut app = App {
@@ -337,7 +340,7 @@ impl App<'_, '_> {
             return Ok(());
         }
         if self.can_prompt() {
-            let yes = self.io.prompter.confirm(UNLOCK_QUESTION, true);
+            let yes = self.io.prompter.confirm_unlock();
             self.after_prompt()?;
             // macOS asks for the password on the terminal: a Ctrl-C there ends `security`,
             // which shares tagteam's process group (§14.1), and the command with it.
