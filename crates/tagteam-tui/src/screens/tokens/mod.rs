@@ -825,10 +825,12 @@ mod tests {
             NOW_MS,
         );
         assert_eq!(state.tokens.report().map(|r| r.rows.len()), Some(3));
-        assert_eq!(draw(&state, 80, 24)[1], " the store is locked");
+        assert_eq!(draw(&state, 80, 24)[2], " ! the store is locked");
         update(&mut state, ch('1'), NOW_MS);
         assert!(
-            !draw(&state, 80, 24)[1].contains("the store is locked"),
+            !draw(&state, 80, 24)
+                .iter()
+                .any(|l| l.contains("the store is locked")),
             "a token read's failure is Tokens' own"
         );
         let again = update(&mut state, ch('2'), NOW_MS);

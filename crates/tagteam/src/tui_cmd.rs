@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tagteam_core::ProviderId;
 use tagteam_engine::EngineError;
 use tagteam_engine::daemon::daemon_socket_path;
+use tagteam_engine::views::ProviderNames;
 use tagteam_provider::Cancel;
 use tagteam_provider::profile::RunShell;
 use tagteam_tui::source::{EngineSource, Source, SourceFactory};
@@ -78,6 +79,15 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
     let tokens_provider = provider
         .clone()
         .unwrap_or_else(|| probe.default_provider().clone());
+    // Redesign §12.2: the default provider's names, for a provider the accounts view does not
+    // list.
+    let names = match probe.provider(&tokens_provider) {
+        Ok(p) => ProviderNames::of(&*p),
+        Err(e) => {
+            let _ = writeln!(err, "tagteam: {e}");
+            return app::EXIT_ERROR;
+        }
+    };
     // Spec §8: the daemon of the store the TUI reads, found from the environment alone (D5.1).
     let daemon = daemon_socket_path(probe.env());
     drop(probe);
@@ -114,6 +124,7 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
         signal: ctx.env.cancel.clone(),
         shutdown,
         daemon: Some(daemon),
+        names,
     };
     let exit = tagteam_tui::run(opts, sources(inside, provider), host);
     if let Some(report) = &exit.report {

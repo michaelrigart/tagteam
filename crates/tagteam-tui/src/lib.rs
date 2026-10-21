@@ -5,6 +5,8 @@
 
 pub(crate) mod actions;
 mod ask;
+mod autoline;
+mod chrome;
 pub(crate) mod daemon;
 mod detect;
 pub mod host;

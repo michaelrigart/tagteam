@@ -867,8 +867,8 @@ mod tests {
         });
         update(&mut state, Msg::Refreshed { result: failed }, NOW_MS);
         assert_eq!(
-            draw(&state, 80, 24)[1],
-            " the token index was not refreshed: the store is locked"
+            draw(&state, 80, 24)[2],
+            " ! the token index was not refreshed: the store is locked"
         );
         update(&mut state, ch('r'), NOW_MS);
         update(&mut state, Msg::Refreshed { result: done() }, NOW_MS);

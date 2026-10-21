@@ -1,6 +1,7 @@
 //! Everything on screen (spec §4.2). `update` changes it, `view` draws it.
 
 use tagteam_core::{AccountId, ProviderId};
+use tagteam_engine::views::{ProviderAccounts, ProviderNames};
 
 use crate::daemon::DaemonState;
 use crate::host::Action;
@@ -72,6 +73,8 @@ pub struct State {
     pub(crate) shown_s: i64,
     /// When the state was made: the time the first reads are asked for at (`start`).
     pub(crate) started_ms: i64,
+    /// The default provider's names (§12.2), for a provider the accounts view does not list.
+    pub(crate) fallback_names: ProviderNames,
 }
 
 /// A banner's words, and what raised them: a success of that same kind clears it, and a refusal
@@ -118,6 +121,7 @@ impl State {
         theme: Theme,
         provider: Option<ProviderId>,
         tokens: TokensState,
+        names: ProviderNames,
         now_ms: i64,
     ) -> State {
         State {
@@ -142,7 +146,24 @@ impl State {
             dirty: true,
             shown_s: now_ms.div_euclid(1000),
             started_ms: now_ms,
+            fallback_names: names,
         }
+    }
+
+    /// `provider`'s names: from the accounts view, else the default provider's
+    /// (`TuiOptions.names`).
+    pub(crate) fn names_of(&self, provider: &ProviderId) -> ProviderNames {
+        self.view_of(provider)
+            .map_or(self.fallback_names, |p| p.names)
+    }
+
+    /// `provider`'s part of the last accounts view, when it lists the provider.
+    pub(crate) fn view_of(&self, provider: &ProviderId) -> Option<&ProviderAccounts> {
+        self.accounts
+            .snapshot()?
+            .providers
+            .iter()
+            .find(|p| &p.provider == provider)
     }
 
     /// The first `Cmd`s: load `accounts` (gen 1), and on Tokens its report. History needs an
@@ -213,6 +234,7 @@ impl State {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn banner_text(&self) -> Option<&str> {
         self.banner.as_ref().map(|b| b.text.as_str())
     }

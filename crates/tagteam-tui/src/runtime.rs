@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jiff::tz::TimeZone;
 use tagteam_core::ProviderId;
+use tagteam_engine::views::ProviderNames;
 use tagteam_provider::Cancel;
 
 use crate::ask::Answers;
@@ -59,6 +60,9 @@ pub struct TuiOptions {
     /// The socket of the daemon of the store the TUI reads (`daemon_socket_path`, D5.1), which
     /// it follows (spec §8); `None` for timer mode alone.
     pub daemon: Option<PathBuf>,
+    /// The default provider's names (redesign §12.2): the screens' words for a provider the
+    /// accounts view does not list, as before its first read.
+    pub names: ProviderNames,
 }
 
 /// How the TUI ended.
@@ -276,6 +280,7 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
             Theme::new(opts.color),
             opts.provider.clone(),
             tokens,
+            opts.names,
             now,
         );
         if opts.daemon.is_some() {
@@ -673,6 +678,7 @@ mod tests {
     use crate::source::{AccountsSnapshot, CollectSummary, Source, SourceError};
     use crate::state::BannerKind;
     use crate::term::repaint;
+    use crate::testutil::CC_NAMES;
     use crate::theme::Background;
 
     /// What the fake terminal and input were asked to do, in order.
@@ -1076,6 +1082,7 @@ mod tests {
             signal: Cancel::new(),
             shutdown: Cancel::new(),
             daemon: None,
+            names: CC_NAMES,
         }
     }
 

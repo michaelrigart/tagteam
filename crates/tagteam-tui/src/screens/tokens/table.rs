@@ -1645,6 +1645,10 @@ mod tests {
                 } else {
                     assert_eq!(cell.fg, Color::Reset, "{needle}");
                     assert!(cell.modifier.contains(Modifier::BOLD), "{needle}");
+                    assert!(
+                        !cell.modifier.contains(Modifier::UNDERLINED),
+                        "warn, not crit: {needle}"
+                    );
                 }
             }
             let (x, y) = locate(&buf, "$41.20").unwrap();
@@ -1821,7 +1825,7 @@ mod tests {
         let state = showing(vec![], |_| {});
         let lines = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(lines[3], " No token usage in this range.");
-        assert!(lines[4..22].iter().all(|l| l.is_empty()), "{lines:?}");
+        assert!(lines[4..].iter().all(|l| l.is_empty()), "{lines:?}");
     }
 
     #[test]
@@ -2236,8 +2240,9 @@ mod tests {
 
     #[test]
     fn under_a_full_banner_and_toast_j_and_k_reach_every_value_of_the_detail_and_the_notes() {
-        // R21 at 80×24: a three-row banner and a three-row toast leave the body 17 rows. The
-        // table keeps three rows; the detail and the notes below it scroll (B25).
+        // R21 at 80×24: the auto line, a three-row banner and a three-row toast leave the body
+        // 16 rows, from row 5. The table keeps three rows; the detail and the notes below it
+        // scroll (B25).
         let mut rows = vec![realistic()];
         rows.extend((1..=9).map(|n| session(&format!("s-{n}"), row_account(1))));
         rows[0].unfinalized = 1;
@@ -2260,7 +2265,7 @@ mod tests {
         ];
         let lines = draw(&state, 80, 24);
         let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
-        assert!(total >= 4 + 1 + 3, "the table keeps three rows: {lines:?}");
+        assert!(total >= 5 + 1 + 3, "the table keeps three rows: {lines:?}");
         assert_eq!(
             lines[total + 1],
             format!(" {}", DETAIL[0]),
@@ -2367,8 +2372,8 @@ mod tests {
 
     #[test]
     fn at_80x24_a_2000_column_model_leaves_the_table_three_rows_and_the_detail_reachable() {
-        // B29, by construction: under a full banner and toast the body is 17 rows. The header
-        // takes three at most; the table's heading and total two; what lies below the total
+        // B29, by construction: under a full banner and toast the body is 16 rows, from row 5.
+        // The header takes three at most; the table's heading and total two; what lies below the total
         // half the body at most and never the table's last three. Below the total nothing is
         // cut: it scrolls, and J reaches every line of it.
         let long = format!("claude-{}", "x".repeat(1993));
@@ -2391,18 +2396,18 @@ mod tests {
         let lines = draw(&state, 80, 24);
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
         assert_eq!(
-            lines[4],
+            lines[5],
             " Day Month [Session] Block  30 days  group: account"
         );
         assert!(
-            lines[5].starts_with(" filter: all accounts · claude-xxxx"),
+            lines[6].starts_with(" filter: all accounts · claude-xxxx"),
             "{lines:?}"
         );
-        assert!(lines[5].ends_with('…'), "{lines:?}");
-        assert!(lines[6].starts_with(" UTC · "), "{lines:?}");
-        assert!(lines[7].starts_with(" SESSION"), "{lines:?}");
+        assert!(lines[6].ends_with('…'), "{lines:?}");
+        assert!(lines[7].starts_with(" UTC · "), "{lines:?}");
+        assert!(lines[8].starts_with(" SESSION"), "{lines:?}");
         let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
-        assert!(total >= 8 + 3, "the table keeps three rows: {lines:?}");
+        assert!(total >= 9 + 3, "the table keeps three rows: {lines:?}");
         assert_eq!(lines[total + 1], format!(" {}", DETAIL[0]), "{lines:?}");
         assert!(lines[20].starts_with(" J K: lines 1–"), "{lines:?}");
         assert!(lines[21].starts_with("the store could not"), "{lines:?}");
@@ -2421,7 +2426,7 @@ mod tests {
         let lines = draw(&state, 80, 24);
         let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
         assert!(
-            total >= 8 + 3,
+            total >= 9 + 3,
             "scrolled, the table keeps three rows: {lines:?}"
         );
     }
@@ -2429,8 +2434,8 @@ mod tests {
     #[test]
     fn the_worst_live_stack_at_80_by_24_keeps_three_table_rows_and_scrolls_to_a_2000_column_model_line()
      {
-        // A 2-row header, the activity line, a 3-row banner and a 3-row toast leave a 15-row
-        // body; the table keeps three rows, and J/K reach the model line, the footnote's last.
+        // The header, the auto line, a 3-row banner and a 3-row toast leave a 16-row body; the
+        // table keeps three rows, and J/K reach the model line, the footnote's last.
         let long = format!("claude-{}", "x".repeat(1993));
         let mut big = realistic();
         big.models = vec![long.clone(), "claude-sonnet-5-5".into()];
@@ -2459,11 +2464,13 @@ mod tests {
         let lines = draw(&state, 80, 24);
         assert_eq!(lines.len(), 24, "{lines:?}");
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
-        // The stack: header (2 rows), banner (3), a 15-row body, the activity line, the toast (3).
+        // The stack: the header, the auto line, the banner (3), a 16-row body, the toast (3).
         assert!(
-            lines[1].contains("● live · auto on · keychain locked until 15:05"),
+            lines[0].ends_with("! keychain locked 15:05   ? keys"),
             "{lines:?}"
         );
+        assert!(lines[1].starts_with(" ! 14:04  xxx"), "{lines:?}");
+        assert!(lines[1].ends_with('…'), "{lines:?}");
         assert!(
             lines[2..5]
                 .iter()
@@ -2475,7 +2482,6 @@ mod tests {
             lines[5].starts_with(" Day Month"),
             "the body starts at row 5: {lines:?}"
         );
-        assert!(lines[20].starts_with(" 14:04 error: xxx"), "{lines:?}");
         assert!(
             lines[21..]
                 .iter()

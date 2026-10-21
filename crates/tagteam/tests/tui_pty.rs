@@ -127,6 +127,14 @@ fn asked(output: &[u8]) -> usize {
     output.windows(QUERY.len()).filter(|w| *w == QUERY).count()
 }
 
+/// A 24-bit foreground colour (`ESC [ 38;2;r;g;b m`): tier 2 draws one, the header's accent among
+/// them; tier 1 never does.
+const TRUECOLOR: &[u8] = b"38;2;";
+
+fn truecolor(output: &[u8]) -> bool {
+    output.windows(TRUECOLOR.len()).any(|w| w == TRUECOLOR)
+}
+
 fn history(s: &Screen) -> bool {
     s.on_alt() && s.contains("No usage history.")
 }
@@ -177,7 +185,7 @@ fn token_report(s: &Screen) -> bool {
 
 /// The accounts table, with the TUI following the daemon, which switches automatically.
 fn live(s: &Screen) -> bool {
-    accounts(s) && s.contains("● live · auto on")
+    accounts(s) && s.contains("● auto on")
 }
 
 /// SIGTERM, and the daemon's exit 0 (D4.6).
@@ -348,6 +356,7 @@ fn the_colour_query_is_asked_once_and_an_answer_lets_the_keys_through() {
     let home = Home::new();
     let mut tui = asking(&home);
     tui.wait_for_output(LONG, "the query", QUERY);
+    let answered = tui.output().len();
     tui.type_keys(&[OSC_ANSWER, DA1_ANSWER].concat());
     tui.type_keys(b"3");
     tui.wait_for(Duration::from_secs(2), "History", history);
@@ -355,6 +364,10 @@ fn the_colour_query_is_asked_once_and_an_answer_lets_the_keys_through() {
     let f = tui.finish(LONG);
     assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
     assert_eq!(asked(&f.output), 1, "asked once");
+    assert!(
+        truecolor(&f.output[answered..]),
+        "drawn in tier 2 after the answer"
+    );
     assert_restored(&f);
 }
 
@@ -367,7 +380,31 @@ fn a_terminal_that_answers_only_da1_keeps_the_keys_working() {
     tui.type_keys(b"3");
     tui.wait_for(Duration::from_secs(2), "History", history);
     tui.type_keys(b"q");
-    assert_eq!(tui.finish(LONG).status.code(), Some(0));
+    let f = tui.finish(LONG);
+    assert_eq!(f.status.code(), Some(0));
+    assert!(!truecolor(&f.output), "tier 1 throughout");
+}
+
+#[test]
+fn the_first_frame_draws_before_a_late_answer_and_the_next_in_truecolor() {
+    // Spec §4.2: the first frame never waits for detection; once the background is reported,
+    // the next frame is tier 2's.
+    let home = Home::new();
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    tui.wait_for(LONG, "the accounts table", accounts);
+    thread::sleep(Duration::from_millis(300));
+    let answered = tui.output().len();
+    assert!(
+        !truecolor(&tui.output()[..answered]),
+        "tier 1 until the answer"
+    );
+    tui.type_keys(&[OSC_ANSWER, DA1_ANSWER].concat());
+    tui.wait_for_output(Duration::from_secs(2), "a truecolor frame", TRUECOLOR);
+    tui.type_keys(b"q");
+    let f = tui.finish(LONG);
+    assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+    assert!(!truecolor(&f.output[..answered]), "only after the answer");
 }
 
 #[test]
@@ -1055,7 +1092,7 @@ fn p_pauses_the_daemon_s_auto_switch_and_resumes_it() {
         s.contains("Pause auto-switch for claude-code?")
     });
     tui.type_keys(b"y");
-    tui.wait_for(LONG, "the pause", |s| s.contains("● live · auto paused"));
+    tui.wait_for(LONG, "the pause", |s| s.contains("‖ auto paused"));
     let config = fs::read_to_string(home.root().join("home/.config/tagteam/config.toml")).unwrap();
     assert!(config.contains("autoswitch = false"), "{config}");
     tui.type_keys(b"P");
@@ -1080,7 +1117,7 @@ fn a_daemon_that_stops_leaves_the_tui_on_its_timer_until_the_next_one_answers() 
     tui.wait_for(LONG, "live mode", live);
     stop(daemon);
     tui.wait_for(LONG, "timer mode", |s| {
-        accounts(s) && s.contains("○ daemon stopping (signal)")
+        accounts(s) && s.contains("! daemon stopping (signal)")
     });
     let daemon = home.daemon();
     tui.wait_for(LONG, "live mode again", live);

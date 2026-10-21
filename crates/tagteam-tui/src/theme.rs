@@ -4,9 +4,17 @@
 use ratatui::style::{Color, Modifier, Style};
 use tagteam_engine::words::Severity;
 
-/// What a span means, not how it looks.
+/// What a span means, not how it looks (spec §4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {
+    /// Values and names.
+    Text,
+    /// Labels, units, countdowns, secondary columns, key labels and hints.
+    Muted,
+    /// Rules, tracks, separators and borders; never text that must be read.
+    Faint,
+    /// The current tab, the selection, `●`, key letters and normal fills.
+    Accent,
     Warn,
     Crit,
 }
@@ -31,14 +39,14 @@ pub(crate) struct Theme {
 }
 
 impl Theme {
-    pub(crate) fn new(color: bool) -> Theme {
+    pub(crate) const fn new(color: bool) -> Theme {
         Theme {
             tier: if color { Tier::Ansi } else { Tier::NoColor },
         }
     }
 
     /// Tier 2 on a terminal whose background is `background`; tier 0 stays tier 0 (spec §4.2).
-    pub(crate) fn truecolor(self, background: Background) -> Theme {
+    pub(crate) const fn truecolor(self, background: Background) -> Theme {
         match self.tier {
             Tier::NoColor => self,
             Tier::Ansi | Tier::True(_) => Theme {
@@ -47,24 +55,39 @@ impl Theme {
         }
     }
 
-    /// Core §13.5's severities: yellow and red with colour, bold without (spec §5.1).
+    /// §4.1's style for `role` in this tier: tier 0 by modifiers alone, tier 1 by the terminal's
+    /// own ANSI colours, tier 2 by the background's hues.
     pub(crate) fn role(self, role: Role) -> Style {
-        match (self.tier, role) {
-            (Tier::Ansi, Role::Warn) => Style::new().fg(Color::Yellow),
-            (Tier::Ansi, Role::Crit) => Style::new().fg(Color::Red),
-            (Tier::True(Background::Dark), Role::Warn) => {
-                Style::new().fg(Color::Rgb(0xe5, 0xc0, 0x7b))
+        match self.tier {
+            Tier::NoColor => match role {
+                Role::Text => Style::new(),
+                Role::Muted | Role::Faint => Style::new().add_modifier(Modifier::DIM),
+                Role::Accent | Role::Warn => Style::new().add_modifier(Modifier::BOLD),
+                Role::Crit => Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            },
+            Tier::Ansi => match role {
+                Role::Text => Style::new(),
+                Role::Muted => Style::new().add_modifier(Modifier::DIM),
+                Role::Faint => Style::new().fg(Color::DarkGray),
+                Role::Accent => Style::new().fg(Color::Cyan),
+                Role::Warn => Style::new().fg(Color::Yellow),
+                Role::Crit => Style::new().fg(Color::Red),
+            },
+            Tier::True(background) => {
+                let (dark, light) = match role {
+                    Role::Text => return Style::new(),
+                    Role::Muted => ((0x9d, 0xa5, 0xb4), (0x57, 0x60, 0x6a)),
+                    Role::Faint => ((0x4b, 0x52, 0x63), (0xc4, 0xc9, 0xcf)),
+                    Role::Accent => ((0x56, 0xb6, 0xc2), (0x0a, 0x7d, 0x8c)),
+                    Role::Warn => ((0xe5, 0xc0, 0x7b), (0x9a, 0x67, 0x00)),
+                    Role::Crit => ((0xf0, 0x71, 0x78), (0xcf, 0x22, 0x2e)),
+                };
+                let (r, g, b) = match background {
+                    Background::Dark => dark,
+                    Background::Light => light,
+                };
+                Style::new().fg(Color::Rgb(r, g, b))
             }
-            (Tier::True(Background::Light), Role::Warn) => {
-                Style::new().fg(Color::Rgb(0x9a, 0x67, 0x00))
-            }
-            (Tier::True(Background::Dark), Role::Crit) => {
-                Style::new().fg(Color::Rgb(0xf0, 0x71, 0x78))
-            }
-            (Tier::True(Background::Light), Role::Crit) => {
-                Style::new().fg(Color::Rgb(0xcf, 0x22, 0x2e))
-            }
-            (Tier::NoColor, Role::Warn | Role::Crit) => self.strong(),
         }
     }
 
@@ -95,29 +118,75 @@ mod tests {
     use tagteam_engine::words::Severity;
 
     use super::*;
+    use crate::testutil::TIERS;
 
     #[test]
-    fn tier_1_and_no_colour_draw_today_s_styles() {
-        let (ansi, plain) = (Theme::new(true), Theme::new(false));
-        let bold = Style::new().add_modifier(Modifier::BOLD);
-        assert_eq!(ansi.severity(Severity::Normal), Style::new());
-        assert_eq!(
-            ansi.severity(Severity::Warning),
-            Style::new().fg(Color::Yellow)
-        );
-        assert_eq!(
-            ansi.severity(Severity::Critical),
-            Style::new().fg(Color::Red)
-        );
-        assert_eq!(plain.severity(Severity::Normal), Style::new());
-        assert_eq!(plain.severity(Severity::Warning), bold);
-        assert_eq!(plain.severity(Severity::Critical), bold);
-        for theme in [ansi, plain] {
-            assert_eq!(theme.strong(), bold);
-            assert_eq!(
-                theme.selection(),
-                Style::new().add_modifier(Modifier::REVERSED)
-            );
+    fn every_role_has_section_4_1_s_style_in_every_tier() {
+        // §4.1's table, row by row, in `TIERS`' order: tier 0, tier 1, tier 2 dark and light.
+        let none = Style::new();
+        let modifier = |m| Style::new().add_modifier(m);
+        let fg = |c| Style::new().fg(c);
+        let rgb = |r, g, b| Style::new().fg(Color::Rgb(r, g, b));
+        let table = [
+            (Role::Text, [none, none, none, none]),
+            (
+                Role::Muted,
+                [
+                    modifier(Modifier::DIM),
+                    modifier(Modifier::DIM),
+                    rgb(0x9d, 0xa5, 0xb4),
+                    rgb(0x57, 0x60, 0x6a),
+                ],
+            ),
+            (
+                Role::Faint,
+                [
+                    modifier(Modifier::DIM),
+                    fg(Color::DarkGray),
+                    rgb(0x4b, 0x52, 0x63),
+                    rgb(0xc4, 0xc9, 0xcf),
+                ],
+            ),
+            (
+                Role::Accent,
+                [
+                    modifier(Modifier::BOLD),
+                    fg(Color::Cyan),
+                    rgb(0x56, 0xb6, 0xc2),
+                    rgb(0x0a, 0x7d, 0x8c),
+                ],
+            ),
+            (
+                Role::Warn,
+                [
+                    modifier(Modifier::BOLD),
+                    fg(Color::Yellow),
+                    rgb(0xe5, 0xc0, 0x7b),
+                    rgb(0x9a, 0x67, 0x00),
+                ],
+            ),
+            (
+                Role::Crit,
+                [
+                    modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    fg(Color::Red),
+                    rgb(0xf0, 0x71, 0x78),
+                    rgb(0xcf, 0x22, 0x2e),
+                ],
+            ),
+        ];
+        for (role, styles) in table {
+            for (theme, style) in TIERS.into_iter().zip(styles) {
+                assert_eq!(theme.role(role), style, "{role:?} in {theme:?}");
+            }
+        }
+        let bold = modifier(Modifier::BOLD);
+        for theme in TIERS {
+            assert_eq!(theme.severity(Severity::Normal), none, "{theme:?}");
+            assert_eq!(theme.severity(Severity::Warning), theme.role(Role::Warn));
+            assert_eq!(theme.severity(Severity::Critical), theme.role(Role::Crit));
+            assert_eq!(theme.strong(), bold, "{theme:?}");
+            assert_eq!(theme.selection(), modifier(Modifier::REVERSED));
         }
     }
 

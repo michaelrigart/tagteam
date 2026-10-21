@@ -8,7 +8,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use jiff::tz::TimeZone;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::buffer::{Buffer, CellWidth};
+use ratatui::buffer::{Buffer, Cell, CellWidth};
+use ratatui::layout::Rect;
+use ratatui::style::Style;
 use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Sample, Window, WindowKind};
 use tagteam_daemon::protocol::{
     Status, StatusDaemon, StatusJob, StatusNotifications, StatusProvider,
@@ -29,7 +31,7 @@ use crate::msg::{Cmd, Msg};
 use crate::screens::tokens::TokensState;
 use crate::source::AccountsSnapshot;
 use crate::state::{Screen, State};
-use crate::theme::Theme;
+use crate::theme::{Background, Role, Theme};
 
 /// Any fixed instant: every reading, reset and sample below is placed relative to it.
 pub(crate) const NOW_S: i64 = 1_790_000_000;
@@ -40,6 +42,14 @@ pub(crate) const CC_NAMES: ProviderNames = ProviderNames {
     display_name: "Claude Code",
     launch_command: "claude",
 };
+
+/// Tiers 0, 1 and 2 (dark, then light), as the redesign's tests go through them.
+pub(crate) const TIERS: [Theme; 4] = [
+    Theme::new(false),
+    Theme::new(true),
+    Theme::new(true).truecolor(Background::Dark),
+    Theme::new(true).truecolor(Background::Light),
+];
 
 pub(crate) const OAUTH: KindTraits = KindTraits {
     refreshable: true,
@@ -184,7 +194,7 @@ pub(crate) fn many(n: u32) -> Vec<AccountView> {
 /// Code in UTC.
 pub(crate) fn fresh(screen: Screen) -> State {
     let tokens = TokensState::new(cc(), TimeZone::UTC);
-    let mut state = State::new(screen, Theme::new(false), None, tokens, NOW_MS);
+    let mut state = State::new(screen, Theme::new(false), None, tokens, CC_NAMES, NOW_MS);
     state.size = (80, 24);
     state
 }
@@ -262,6 +272,71 @@ fn row(buf: &Buffer, y: u16) -> (String, Vec<(usize, u16)>) {
         hidden = hidden.max(cell.cell_width()).saturating_sub(1);
     }
     (text, starts)
+}
+
+/// The letters `roles` reads, in the order it tries them.
+const LETTERS: [(char, Role); 5] = [
+    ('c', Role::Crit),
+    ('w', Role::Warn),
+    ('a', Role::Accent),
+    ('f', Role::Faint),
+    ('m', Role::Muted),
+];
+
+/// Row `y` of `buf` as role letters: `c w a f m` (crit, warn, accent, faint, muted), the first
+/// whose non-empty style the cell's contains (fg equal where the role sets one, its modifiers
+/// present), else `t`; a space cell is ` `. A cell a wide character covers is skipped, as
+/// `text_of` skips it.
+pub(crate) fn roles(buf: &Buffer, theme: Theme, y: u16) -> String {
+    let mut letters = String::new();
+    let mut hidden = 0u16;
+    for x in 0..buf.area.width {
+        let cell = &buf[(x, y)];
+        if hidden == 0 {
+            letters.push(letter(cell, theme));
+        }
+        hidden = hidden.max(cell.cell_width()).saturating_sub(1);
+    }
+    letters
+}
+
+fn letter(cell: &Cell, theme: Theme) -> char {
+    if cell.symbol() == " " {
+        return ' ';
+    }
+    let shows = |style: Style| {
+        style != Style::new()
+            && style.fg.is_none_or(|fg| cell.fg == fg)
+            && cell.modifier.contains(style.add_modifier)
+    };
+    LETTERS
+        .into_iter()
+        .find(|(_, role)| shows(theme.role(*role)))
+        .map_or('t', |(letter, _)| letter)
+}
+
+/// An expected row in the same letters, collapsed as `theme` draws them (tier 0 shares
+/// styles): each letter's role drawn in one cell and read back by `roles`; `B` is bold text.
+pub(crate) fn canon(theme: Theme, row: &str) -> String {
+    row.chars()
+        .map(|c| {
+            let style = match c {
+                ' ' => return ' ',
+                't' => Style::new(),
+                'B' => theme.strong(),
+                _ => {
+                    let (_, role) = LETTERS
+                        .into_iter()
+                        .find(|(letter, _)| *letter == c)
+                        .unwrap_or_else(|| panic!("{c:?} is no role letter"));
+                    theme.role(role)
+                }
+            };
+            let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+            buf[(0, 0)].set_symbol("x").set_style(style);
+            letter(&buf[(0, 0)], theme)
+        })
+        .collect()
 }
 
 /// Where `needle` first appears in `buf`: its column and row.

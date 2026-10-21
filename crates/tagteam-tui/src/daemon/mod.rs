@@ -1,17 +1,19 @@
 //! Live mode (spec §6.3, §8): the daemon's link as the state machine sees it. What the live
 //! thread learns, and the daemon lane's `status` replies, arrive as messages; what they ask for
 //! leaves as commands. The store stays the source of truth: an event is a reason to read the
-//! views again, and only `status` says what the daemon does (§7.4, §8). An event's words show
-//! on the activity line (§5.1).
+//! views again, and only `status` says what the daemon does (§7.4, §8). Auto's decisions show
+//! on the auto line (redesign §5.3).
 
 pub mod words;
 
 use std::collections::BTreeMap;
 
 use serde_json::Value;
+use tagteam_core::autoswitch::NoSwitchReason;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_daemon::protocol::{Event, Status, StatusProvider};
 use tagteam_daemon::tokens::TOKEN_INDEX;
+use tagteam_engine::words::NO_SWITCH_REASONS;
 
 use crate::live::{Live, StatusError};
 use crate::msg::Cmd;
@@ -44,12 +46,27 @@ const VIEW_KINDS: [&str; 4] = [
     "account-unquarantined",
 ];
 
-/// The activity line (spec §5.1): the daemon's latest event, when it happened, and whose.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Activity {
-    pub at_ms: i64,
-    pub provider: Option<String>,
-    pub text: String,
+/// The daemon's latest decision for a provider on this link (spec §5.3's rank 2).
+#[derive(Debug, Clone)]
+pub(crate) struct Noted {
+    pub(crate) at_ms: i64,
+    pub(crate) what: NotedWhat,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum NotedWhat {
+    /// A `no-switch`, with the usage of the account in use at the link's last `poll`, and for
+    /// `all-exhausted` the earliest reset its `all-exhausted` event names.
+    NoSwitch {
+        reason: NoSwitchReason,
+        detail: String,
+        used_pct: Option<f64>,
+        frees_at_ms: Option<i64>,
+    },
+    /// An `error`'s message.
+    Error(String),
+    /// A `config-warning`'s message.
+    Warning(String),
 }
 
 /// The daemon as the TUI knows it (spec §8).
@@ -87,10 +104,10 @@ pub struct DaemonState {
     /// C-R20: until when the first collection waits to know who collects: no daemon, or the
     /// daemon's first `status`. `None` once known, and for a TUI that follows no daemon.
     unsettled_until: Option<i64>,
-    /// The latest event the activity line shows.
-    activity: Option<Activity>,
-    /// Each provider's last `poll` on this link, whose windows a `switch` of the same tick
-    /// names. A link can miss events before it, so a new one starts with none (C-R21).
+    /// Each provider's latest decision on this link (spec §5.3's rank 2).
+    noted: BTreeMap<String, Noted>,
+    /// Each provider's last `poll` on this link, whose usage a `no-switch` of the same tick
+    /// reads. A link can miss events before it, so a new one starts with none (C-R21).
     polls: BTreeMap<String, Value>,
 }
 
@@ -135,9 +152,9 @@ impl DaemonState {
         self.unsettled_until = Some(now_ms + SETTLE_MS);
     }
 
-    /// The daemon's latest event, for the activity line, which only live mode shows (§5.1).
-    pub fn activity(&self) -> Option<&Activity> {
-        self.activity.as_ref()
+    /// The daemon's latest decision for `provider` on this link (spec §5.3's rank 2).
+    pub(crate) fn noted(&self, provider: &str) -> Option<&Noted> {
+        self.noted.get(provider)
     }
 }
 
@@ -181,6 +198,7 @@ fn up(state: &mut State, link: u64, now_ms: i64) -> Vec<Cmd> {
     d.status_due_ms = None;
     d.status_again = false;
     d.polls.clear();
+    d.noted.clear();
     d.stopping = None;
     d.mismatch = None;
     d.next_poll_ms = now_ms + POLL_MS;
@@ -213,6 +231,7 @@ fn down(state: &mut State) {
     d.status = None;
     d.status_due_ms = None;
     d.status_again = false;
+    d.noted.clear();
     d.reread_ms = None;
     d.reread_views = false;
     d.reread_all = false;
@@ -282,37 +301,71 @@ fn on_event(state: &mut State, event: Event, now_ms: i64) -> Vec<Cmd> {
     vec![]
 }
 
-/// The activity line's record of `event` (spec §5.1): its words, and its `ts`, or now for a kind
-/// whose typed form carries none. A `poll` is kept for the `switch` of its tick.
+/// Auto's decisions, for the auto line (spec §5.3): a `no-switch`, `error` or `config-warning`
+/// at its `ts`, or now when it has none. A `poll` is kept for the `no-switch` of its tick, and an
+/// `all-exhausted` gives the `no-switch all-exhausted` before it its earliest reset.
 fn note(state: &mut State, event: &Event, now_ms: i64) {
-    let (provider, raw) = match event {
-        Event::Auto { provider, raw, .. } | Event::TokenIndex { provider, raw } => {
-            (Some(provider.clone()), Some(raw))
-        }
-        Event::Usage { provider, .. } => (Some(provider.clone()), None),
-        _ => (None, None),
-    };
-    let d = &mut state.daemon;
-    let poll = provider.as_ref().and_then(|p| d.polls.get(p));
-    if let Some(text) = words::activity(event, poll, state.tokens.tz()) {
-        let ts = raw.and_then(|r| r["ts"].as_str()).and_then(words::iso_ms);
-        d.activity = Some(Activity {
-            at_ms: ts.unwrap_or(now_ms),
-            provider,
-            text,
-        });
-        state.dirty = true;
-    }
-    if let Event::Auto {
+    let Event::Auto {
         kind,
         provider,
         raw,
     } = event
-    {
-        if kind == "poll" {
+    else {
+        return;
+    };
+    let d = &mut state.daemon;
+    let text = |field: &str| raw[field].as_str().unwrap_or_default().to_owned();
+    let what = match kind.as_str() {
+        "poll" => {
             d.polls.insert(provider.clone(), raw.clone());
+            return;
         }
-    }
+        "no-switch" => {
+            let Some(reason) = raw["reason"].as_str().and_then(no_switch_reason) else {
+                return;
+            };
+            NotedWhat::NoSwitch {
+                reason,
+                detail: text("detail"),
+                used_pct: d.polls.get(provider).and_then(used_pct),
+                frees_at_ms: None,
+            }
+        }
+        "all-exhausted" => {
+            if let Some(Noted {
+                what:
+                    NotedWhat::NoSwitch {
+                        reason: NoSwitchReason::AllExhausted,
+                        frees_at_ms,
+                        ..
+                    },
+                ..
+            }) = d.noted.get_mut(provider)
+            {
+                *frees_at_ms = raw["earliestResetAt"].as_str().and_then(words::iso_ms);
+                state.dirty = true;
+            }
+            return;
+        }
+        "error" => NotedWhat::Error(text("message")),
+        "config-warning" => NotedWhat::Warning(text("message")),
+        _ => return,
+    };
+    let at_ms = raw["ts"].as_str().and_then(words::iso_ms).unwrap_or(now_ms);
+    d.noted.insert(provider.clone(), Noted { at_ms, what });
+    state.dirty = true;
+}
+
+/// The reason a `no-switch` spells `code` (T2-27); none for one this TUI does not know.
+pub(crate) fn no_switch_reason(code: &str) -> Option<NoSwitchReason> {
+    NO_SWITCH_REASONS.into_iter().find(|r| r.as_str() == code)
+}
+
+/// The usage of the account in use at `poll`: 100 less its `headroomPct`.
+fn used_pct(poll: &Value) -> Option<f64> {
+    let active = poll["active"]["number"].as_u64()?;
+    let headroom = poll["headroomPct"][active.to_string()].as_f64()?;
+    Some(100.0 - headroom)
 }
 
 /// What an event asks for is read `REREAD_MS` from the first event that asks, once for every
