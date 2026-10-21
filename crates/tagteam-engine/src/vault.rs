@@ -5,16 +5,28 @@ use std::sync::Arc;
 
 use tagteam_core::AccountId;
 use tagteam_provider::atomic::{ensure_private_dir, write_atomic_private};
-use tagteam_provider::{Keychain, Provider, Read, ReadError};
+use tagteam_provider::{Keychain, KeychainError, Provider, Read, ReadError};
 
 use crate::account_lock::AccountLock;
+
+/// What a vault write or delete failed on (§8.5): the Keychain's own error, the file backend's
+/// I/O error, or one of the vault's own checks.
+#[derive(Debug, thiserror::Error)]
+pub enum VaultCause {
+    #[error(transparent)]
+    Keychain(#[from] KeychainError),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("{0}")]
+    Check(String),
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
     #[error("vault write failed: {0}")]
-    Write(String),
+    Write(#[source] VaultCause),
     #[error("vault delete failed: {0}")]
-    Delete(String),
+    Delete(#[source] VaultCause),
     #[error("{0}")]
     Unreadable(ReadError),
     #[error("the vault entry did not read back as written")]
@@ -71,12 +83,12 @@ impl VaultBackend for KeychainVault {
     fn write(&self, key: &str, bytes: &[u8]) -> Result<(), VaultError> {
         self.keychain
             .upsert(SERVICE, key, bytes)
-            .map_err(|e| VaultError::Write(e.to_string()))
+            .map_err(|e| VaultError::Write(e.into()))
     }
     fn delete(&self, key: &str) -> Result<(), VaultError> {
         self.keychain
             .delete(SERVICE, key)
-            .map_err(|e| VaultError::Delete(e.to_string()))
+            .map_err(|e| VaultError::Delete(e.into()))
     }
     fn keychain(&self) -> Option<&dyn Keychain> {
         Some(self.keychain.as_ref())
@@ -108,13 +120,13 @@ impl VaultBackend for FileVault {
     fn write(&self, key: &str, bytes: &[u8]) -> Result<(), VaultError> {
         ensure_private_dir(&self.dir)
             .and_then(|()| write_atomic_private(&self.path(key), bytes, 0o600))
-            .map_err(|e| VaultError::Write(e.to_string()))
+            .map_err(|e| VaultError::Write(e.into()))
     }
     fn delete(&self, key: &str) -> Result<(), VaultError> {
         match fs::remove_file(self.path(key)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(VaultError::Delete(e.to_string())),
+            Err(e) => Err(VaultError::Delete(e.into())),
         }
     }
     fn dir(&self) -> Option<&Path> {
@@ -205,7 +217,7 @@ impl Vault {
             if shared_too {
                 keychain
                     .delete_service(SERVICE)
-                    .map_err(|e| VaultError::Delete(e.to_string()))?;
+                    .map_err(|e| VaultError::Delete(e.into()))?;
                 return Ok(Leftovers::None);
             }
             return Ok(match keychain.service_has_items(SERVICE) {
@@ -215,7 +227,9 @@ impl Vault {
             });
         }
         let Some(dir) = self.dir() else {
-            return Err(VaultError::Delete("this vault cannot be swept".into()));
+            return Err(VaultError::Delete(VaultCause::Check(
+                "this vault cannot be swept".into(),
+            )));
         };
         let removed = match fs::symlink_metadata(dir) {
             Ok(m) if m.is_dir() => fs::remove_dir_all(dir),
@@ -225,7 +239,7 @@ impl Vault {
         match removed {
             Ok(()) => Ok(Leftovers::None),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Leftovers::None),
-            Err(e) => Err(VaultError::Delete(e.to_string())),
+            Err(e) => Err(VaultError::Delete(e.into())),
         }
     }
 
@@ -240,10 +254,14 @@ impl Vault {
             match self.backend.read(&key) {
                 Read::Absent => {}
                 Read::Present(_) => {
-                    return Err(VaultError::Delete(format!("{key} is still present")));
+                    return Err(VaultError::Delete(VaultCause::Check(format!(
+                        "{key} is still present"
+                    ))));
                 }
                 Read::Unreadable(e) => {
-                    return Err(VaultError::Delete(format!("could not verify {key}: {e}")));
+                    return Err(VaultError::Delete(VaultCause::Check(format!(
+                        "could not verify {key}: {e}"
+                    ))));
                 }
             }
         }

@@ -562,16 +562,15 @@ fn session_owned_message(position: u32, label: &str, owner: &SessionOwner) -> St
 impl EngineError {
     /// Stable `error.type` for `--json` output (§14).
     pub fn kind(&self) -> &'static str {
+        if let Some(e) = self.lock_error() {
+            return lock_kind(e);
+        }
         match self {
             EngineError::Store(_) => "store",
             EngineError::Provider(ProviderError::ConfigUnsplicable { .. }) => "config-unsplicable",
-            EngineError::Provider(ProviderError::Lock(LockError::Timeout(_))) => "lock-timeout",
-            EngineError::Provider(ProviderError::Lock(LockError::Interrupted { .. })) => {
-                "interrupted"
-            }
             EngineError::Provider(ProviderError::RestoreFailed { .. }) => "rollback-failed",
             EngineError::Provider(_) => "provider",
-            EngineError::Lock(e) | EngineError::Settings(SettingsError::Lock(e)) => lock_kind(e),
+            EngineError::Lock(_) | EngineError::Settings(SettingsError::Lock(_)) => "lock",
             EngineError::Vault(_) => "vault",
             EngineError::Unreadable(_) => "unreadable",
             EngineError::UnreadableAccount { .. } => "unreadable",
@@ -640,17 +639,25 @@ impl EngineError {
         }
     }
 
-    /// The signal behind an interruption, whichever carrier holds it: `Interrupted`,
-    /// `Lock(LockError::Interrupted)`, `Provider(ProviderError::Lock(LockError::Interrupted))`,
-    /// or the settings lock's `Settings(SettingsError::Lock(LockError::Interrupted))` (§14.1).
-    /// `None` for every other error.
+    /// The signal behind an interruption, whichever carrier holds it: `Interrupted`, or a lock
+    /// failure's `LockError::Interrupted` (§14.1). `None` for every other error.
     pub fn signal(&self) -> Option<i32> {
         match self {
             EngineError::Interrupted(signal) => Some(*signal),
+            EngineError::AtPath { source, .. } => source.signal(),
+            _ => self.lock_error().and_then(LockError::signal),
+        }
+    }
+
+    /// The lock failure behind this error, whichever carrier holds it: `Lock`,
+    /// `Provider(ProviderError::Lock)` or `Settings(SettingsError::Lock)` (§8.5). `kind()` and
+    /// `signal()` both read it, so a carrier cannot be read one way by one and another by the
+    /// other.
+    fn lock_error(&self) -> Option<&LockError> {
+        match self {
             EngineError::Lock(e)
             | EngineError::Provider(ProviderError::Lock(e))
-            | EngineError::Settings(SettingsError::Lock(e)) => e.signal(),
-            EngineError::AtPath { source, .. } => source.signal(),
+            | EngineError::Settings(SettingsError::Lock(e)) => Some(e),
             _ => None,
         }
     }
@@ -714,6 +721,16 @@ mod tests {
             ),
             (
                 EngineError::Lock(LockError::Compromised(PathBuf::from("x"))),
+                "lock",
+            ),
+            (
+                EngineError::Provider(ProviderError::Lock(LockError::Compromised(PathBuf::from(
+                    "x",
+                )))),
+                "lock",
+            ),
+            (
+                EngineError::Provider(ProviderError::Lock(LockError::Io(io::Error::other("x")))),
                 "lock",
             ),
             (EngineError::Vault(VaultError::Verify), "vault"),
@@ -1131,6 +1148,31 @@ mod tests {
                 EngineError::Settings(SettingsError::Lock(settings)).kind(),
                 EngineError::Lock(engine).kind()
             );
+        }
+    }
+
+    /// §8.5: a lock failure reads the same whichever error carries it, kind and signal alike.
+    #[test]
+    fn a_lock_failure_reads_alike_whichever_carrier_holds_it() {
+        let failures = || {
+            vec![
+                LockError::Timeout(PathBuf::from("x").into()),
+                LockError::Compromised(PathBuf::from("x")),
+                LockError::Io(io::Error::other("x")),
+                LockError::Interrupted {
+                    path: PathBuf::from("x"),
+                    signal: 2,
+                },
+            ]
+        };
+        for ((a, b), c) in failures().into_iter().zip(failures()).zip(failures()) {
+            let engine = EngineError::Lock(a);
+            let provider = EngineError::Provider(ProviderError::Lock(b));
+            let settings = EngineError::Settings(SettingsError::Lock(c));
+            assert_eq!(engine.kind(), provider.kind());
+            assert_eq!(engine.kind(), settings.kind());
+            assert_eq!(engine.signal(), provider.signal());
+            assert_eq!(engine.signal(), settings.signal());
         }
     }
 
