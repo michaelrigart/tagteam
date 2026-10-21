@@ -135,13 +135,25 @@ fn status_parts(u: &UsageView) -> (&'static str, Option<String>) {
         UsageStatus::ForeignCredential => (OTHER_ACCOUNT, None),
         UsageStatus::NoCredentials => (NO_LOGIN, None),
         UsageStatus::Unsupported => ("usage unsupported", None),
-        UsageStatus::Unavailable => match u.error.as_deref() {
-            None | Some(NO_DATA) => (NOT_CHECKED, None),
-            Some(e) => match FailureKind::parse(e) {
-                FailureKind::Provider(TransientKind::Http(429)) => (RATE_LIMITED, None),
-                FailureKind::OverBudget => (BUDGET, None),
-                _ => (CHECK_FAILED, Some(e.to_owned())),
-            },
+        UsageStatus::Unavailable => match failed_check(u) {
+            Problem::NotChecked => (NOT_CHECKED, None),
+            Problem::RateLimited => (RATE_LIMITED, None),
+            Problem::Budget => (BUDGET, None),
+            // `Retrying`, the only other answer, always has its token.
+            _ => (CHECK_FAILED, u.error.clone()),
+        },
+    }
+}
+
+/// What an `Unavailable` usage's failure is: never checked, rate-limited, over the budget, or
+/// any other failure, retried. The status words and the problem both read it.
+fn failed_check(u: &UsageView) -> Problem {
+    match u.error.as_deref() {
+        None | Some(NO_DATA) => Problem::NotChecked,
+        Some(e) => match FailureKind::parse(e) {
+            FailureKind::Provider(TransientKind::Http(429)) => Problem::RateLimited,
+            FailureKind::OverBudget => Problem::Budget,
+            _ => Problem::Retrying,
         },
     }
 }
@@ -563,15 +575,12 @@ pub fn problem(v: &AccountView) -> Option<Problem> {
         UsageStatus::NoCredentials => Some(Problem::NoLogin),
         UsageStatus::KeychainUnavailable => Some(Problem::Keychain),
         UsageStatus::ForeignCredential => Some(Problem::OtherAccount),
-        UsageStatus::Unavailable => Some(match u.error.as_deref() {
-            None | Some(NO_DATA) => Problem::NotChecked,
-            Some(e) => match FailureKind::parse(e) {
-                FailureKind::Provider(TransientKind::Http(429)) => Problem::RateLimited,
-                FailureKind::OverBudget => Problem::Budget,
-                _ => Problem::Retrying,
-            },
-        }),
-        UsageStatus::Ok if u.windows.is_some() && !u.decision_grade => Some(Problem::OldReading),
+        UsageStatus::Unavailable => Some(failed_check(u)),
+        UsageStatus::Ok
+            if u.windows.as_deref().is_some_and(|ws| !ws.is_empty()) && !u.decision_grade =>
+        {
+            Some(Problem::OldReading)
+        }
         UsageStatus::Ok | UsageStatus::ApiKey | UsageStatus::Unsupported => None,
     }
 }
@@ -1855,6 +1864,21 @@ mod tests {
             (unavailable(Some("refresh-failed")), Some(Problem::Retrying)),
             (unavailable(Some("http-503")), Some(Problem::Retrying)),
             (old, Some(Problem::OldReading)),
+            (
+                UsageView {
+                    windows: None,
+                    decision_grade: false,
+                    ..read(vec![])
+                },
+                None,
+            ),
+            (
+                UsageView {
+                    decision_grade: false,
+                    ..read(vec![])
+                },
+                None,
+            ),
             (read(vec![five_hour(), seven_day()]), None),
             (unread(UsageStatus::ApiKey, None, None), None),
             (unread(UsageStatus::Unsupported, None, None), None),
