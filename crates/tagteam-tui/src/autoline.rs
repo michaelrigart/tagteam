@@ -1,7 +1,7 @@
 //! What the auto line says (redesign §5.3, T2-7). Before T4 the store's events are not read:
 //! a switch comes from the daemon's `status.lastSwitch`, worded from its trigger, and auto's
 //! other decisions from this link's events, or `status.lastOutcome` until one arrives. Timer
-//! mode has rank 4 alone.
+//! mode says nothing (M-7): without the store it cannot know there were no switches.
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -44,9 +44,10 @@ pub(crate) struct Said {
 }
 
 /// What the line says for the focus provider (`daemon::focus`), first match: a switch of the
-/// last 30 minutes; the daemon's latest decision; a switch of the last 30 days; else that there
-/// was none.
-pub(crate) fn said(state: &State, width: u16, now_ms: i64) -> Said {
+/// last 30 minutes; the daemon's latest decision; a switch of the last 30 days; else, in live
+/// mode, that there was none. Timer mode reaches none of them, and until T4 reads the store its
+/// line stays empty (M-7).
+pub(crate) fn said(state: &State, width: u16, now_ms: i64) -> Option<Said> {
     let provider = daemon::focus(state);
     let job = state.daemon.job(&provider);
     let tz = state.tokens.tz();
@@ -67,22 +68,26 @@ pub(crate) fn said(state: &State, width: u16, now_ms: i64) -> Said {
         .and_then(|j| j.last_switch.as_ref())
         .and_then(|s| Some((iso_ms(&s.at)?, s)));
     if let Some((at, s)) = switch.filter(|(at, _)| now_ms - at <= RECENT_MS) {
-        return said(Some(SWITCH), Some(when(at, now_ms, tz)), switched(view, s));
+        return Some(said(
+            Some(SWITCH),
+            Some(when(at, now_ms, tz)),
+            switched(view, s),
+        ));
     }
     if let Some(noted) = decision(state, &provider, job) {
         let (mark, text) = decided(state, &provider, &noted);
-        return said(mark, Some(when(noted.at_ms, now_ms, tz)), text);
+        return Some(said(mark, Some(when(noted.at_ms, now_ms, tz)), text));
     }
     if let Some((at, s)) = switch.filter(|(at, _)| now_ms - at <= MONTH_MS) {
-        return Said {
+        return Some(Said {
             lead: Some(format!("last switch {} · ", when(at, now_ms, tz))),
             ..said(Some(SWITCH), None, switched(view, s))
-        };
+        });
     }
-    Said {
+    state.daemon.live().then(|| Said {
         muted: true,
         ..said(None, None, NO_SWITCHES.to_owned())
-    }
+    })
 }
 
 /// §5.3's time form in `tz` (T2-24): `HH:MM` on today's date, `Fri 15:38` within the six days
@@ -465,14 +470,18 @@ mod tests {
     }
 
     #[test]
-    fn with_nothing_it_says_no_switches_in_the_last_30_days() {
+    fn with_nothing_live_mode_says_no_switches_in_the_last_30_days_and_timer_mode_nothing() {
+        // M-7: without the store, timer mode cannot know there were none, so rank 4's place
+        // stays empty there until T4; the row itself stays (UX-5).
         let mut timer = fresh(Screen::Accounts);
         timer.accounts.apply(snapshot(many(3)));
-        let month_old = with_switch("2026-08-21T14:00:00Z", 1, 2);
-        for mut state in [timer, live_with(month_old)] {
-            assert_eq!(line(&state, 80), "   no switches in the last 30 days");
-            assert_eq!(letters(&mut state), format!("   {}", all(NO_SWITCHES, 'm')));
+        for w in [80, 120] {
+            assert_eq!(line(&timer, w), "", "timer mode at {w}");
         }
+        assert_eq!(letters(&mut timer), "");
+        let mut live = live_with(with_switch("2026-08-21T14:00:00Z", 1, 2));
+        assert_eq!(line(&live, 80), "   no switches in the last 30 days");
+        assert_eq!(letters(&mut live), format!("   {}", all(NO_SWITCHES, 'm')));
     }
 
     #[test]
@@ -619,7 +628,7 @@ mod tests {
         update(&mut state, untimed, NOW_MS);
         assert_eq!(line(&state, 80), " ! 14:13  x", "now, without a ts");
         update(&mut state, Msg::Live(Live::Down), NOW_MS);
-        assert_eq!(line(&state, 80), "   no switches in the last 30 days");
+        assert_eq!(line(&state, 80), "", "timer mode: empty until T4 (M-7)");
         go_live(&mut state, daemon_status(vec![auto_on()], vec![]));
         update(&mut state, no_switch("cooldown", "4m"), NOW_MS);
         go_live(&mut state, daemon_status(vec![auto_on()], vec![]));
