@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tagteam_core::ProviderId;
 use tagteam_daemon::client::ClientError;
 use tagteam_daemon::events::{DaemonEvent, DaemonSink, Mode, StopReason};
-use tagteam_daemon::protocol::Event;
+use tagteam_daemon::protocol::{Event, Wire};
 use tagteam_daemon::server::Server;
 use tagteam_daemon::status::{DaemonInfo, NotifyInfo, ProviderStatus, StatusBoard};
 use tagteam_engine::tokens::IndexState;
@@ -295,7 +295,7 @@ fn stopping_comes_through_then_the_link_goes_down_and_comes_back_with_the_next_d
     assert_eq!(
         next(&rx).1,
         Live::Event(Event::Stopping {
-            reason: "upgrade".into()
+            reason: Wire::from_wire("upgrade")
         })
     );
     assert_eq!(next(&rx).1, Live::Down);
@@ -321,7 +321,7 @@ fn stopping_ends_the_link_at_once_though_the_daemon_keeps_its_socket_open() {
     assert_eq!(
         stopping,
         Live::Event(Event::Stopping {
-            reason: "signal".into()
+            reason: Wire::from_wire("signal")
         })
     );
     let (down, l) = next(&rx);

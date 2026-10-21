@@ -434,7 +434,7 @@ fn subscribe_yields_typed_events_in_order_until_the_daemon_stops() {
     assert_eq!(
         next(),
         Event::Stopping {
-            reason: "signal".into()
+            reason: Wire::from_wire("signal")
         }
     );
     assert!(

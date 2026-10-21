@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 
 use tagteam_core::autoswitch::NoSwitchReason;
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_daemon::protocol::{Event, PollPayload, Status, StatusProvider, parse_token_index};
+use tagteam_daemon::events::StopReason;
+use tagteam_daemon::protocol::{
+    Event, PollPayload, Status, StatusProvider, Wire, parse_token_index,
+};
 use tagteam_daemon::tokens::TOKEN_INDEX;
 
 use crate::live::{Live, StatusError};
@@ -68,7 +71,7 @@ pub struct DaemonState {
     /// This link's last `status`. Live mode is a link with one (spec §8).
     status: Option<Status>,
     /// `stopping`'s reason, and until when the header names it.
-    stopping: Option<(String, i64)>,
+    stopping: Option<(Wire<StopReason>, i64)>,
     /// The protocol of a daemon this TUI does not speak.
     mismatch: Option<u32>,
     /// When the next 60 s fetch of `status` is due.
@@ -527,7 +530,6 @@ mod tests {
 
     use serde_json::json;
     use tagteam_daemon::client::ClientError;
-    use tagteam_daemon::protocol::Wire;
     use tagteam_engine::views::ProviderAccounts;
 
     use super::*;
@@ -1164,7 +1166,7 @@ mod tests {
         let mut state = fresh(Screen::Accounts);
         go_live(&mut state, auto_on());
         let stopping = Event::Stopping {
-            reason: "upgrade".into(),
+            reason: Wire::from_wire("upgrade"),
         };
         assert!(update(&mut state, event(stopping.clone()), NOW_MS).is_empty());
         assert!(!state.daemon.live() && state.daemon.status().is_none());

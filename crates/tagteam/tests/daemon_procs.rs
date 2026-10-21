@@ -753,7 +753,7 @@ fn a_signal_stops_the_daemon_with_exit_0_and_leaves_no_socket_or_lock_record() {
         assert_eq!(
             last,
             Event::Stopping {
-                reason: "signal".into()
+                reason: Wire::from_wire("signal")
             },
             "{signal}"
         );

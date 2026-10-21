@@ -83,6 +83,12 @@ impl StopReason {
             StopReason::Schema => "schema",
         }
     }
+
+    pub const ALL: [Self; 3] = [StopReason::Signal, StopReason::Upgrade, StopReason::Schema];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
 }
 
 /// One event the daemon emits (D5.5).
@@ -254,7 +260,7 @@ mod tests {
             ["engine-lock", "schema"]
         );
         assert_eq!(
-            [StopReason::Signal, StopReason::Upgrade, StopReason::Schema].map(StopReason::as_str),
+            StopReason::ALL.map(StopReason::as_str),
             ["signal", "upgrade", "schema"]
         );
     }
@@ -303,6 +309,29 @@ mod tests {
         }
         listed(WaitingFor::EngineLock);
         listed(WaitingFor::Schema);
+    }
+
+    #[test]
+    fn every_stop_reason_parses_from_its_own_spelling() {
+        for reason in StopReason::ALL {
+            assert_eq!(StopReason::parse(reason.as_str()), Some(reason));
+        }
+        assert_eq!(StopReason::parse("Signal"), None, "case-sensitive");
+        assert_eq!(StopReason::parse("power"), None);
+    }
+
+    #[test]
+    fn every_stop_reason_is_listed_in_all() {
+        fn listed(v: StopReason) {
+            match v {
+                StopReason::Signal | StopReason::Upgrade | StopReason::Schema => {
+                    assert!(StopReason::ALL.contains(&v), "{v:?} is missing from ALL")
+                }
+            }
+        }
+        listed(StopReason::Signal);
+        listed(StopReason::Upgrade);
+        listed(StopReason::Schema);
     }
 
     #[test]

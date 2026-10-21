@@ -482,7 +482,7 @@ mod tests {
         let stopping = || {
             let mut state = live(one_job("auto", true));
             let stopping = Event::Stopping {
-                reason: "upgrade".into(),
+                reason: Wire::from_wire("upgrade"),
             };
             update(&mut state, live_event(stopping), NOW_MS);
             state
@@ -823,7 +823,7 @@ mod tests {
         let mut state = fresh(Screen::Accounts);
         go_live(&mut state, one_job("auto", true));
         let stopping = Event::Stopping {
-            reason: "upgrade".into(),
+            reason: Wire::from_wire("upgrade"),
         };
         update(&mut state, live_event(stopping), NOW_MS);
         update(&mut state, Msg::Live(Live::Down), NOW_MS);
