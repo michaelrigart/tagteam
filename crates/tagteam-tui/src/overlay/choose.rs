@@ -3,7 +3,9 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
-use super::{CHOICE_ROWS, GUTTER, KeyOutcome, boxed, gutter_rows, question_rows};
+use super::{
+    BOX_COLS, BoxSpec, CHOICE_ROWS, GUTTER, KeyOutcome, boxed, gutter_rows, question_rows,
+};
 use crate::msg::{Answer, AnswerTo, Cmd};
 use crate::state::State;
 use crate::view::{scrolled_windows, width_of, wrap_rows};
@@ -45,10 +47,10 @@ pub(super) fn render(
     at: &usize,
 ) {
     let w = 64u16.min(area.width.saturating_sub(4));
-    let inner = usize::from(w) - 4;
+    let inner = usize::from(w).saturating_sub(BOX_COLS).max(1);
     let asked = question_rows(question, inner, area.height);
-    // The box: the question, a blank row, the choices, the keys, the border, and a
-    // row's margin above and below.
+    // The box: the question, a blank row, the choices, the border and padding, and a row's
+    // margin above and below. The keys are in the border.
     let room = usize::from(area.height)
         .saturating_sub(asked.len() + 7)
         .max(CHOICE_ROWS);
@@ -74,8 +76,13 @@ pub(super) fn render(
         }
         lines.extend(gutter_rows(block, i == *at, inner, state.theme));
     }
-    lines.push(Line::from("↑ ↓ choose · Enter · Esc cancel"));
-    boxed(frame, area, " Choose ", lines, w);
+    let spec = BoxSpec {
+        title: "Choose".to_owned(),
+        keys: "↑ ↓ choose · Enter · Esc cancel",
+        destructive: false,
+        width: w,
+    };
+    boxed(frame, state.theme, spec, lines);
 }
 
 /// Choice `i`'s rows, `w` columns at most each: `N. ` and its text, which wraps at word boundaries under

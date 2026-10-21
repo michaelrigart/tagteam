@@ -3,7 +3,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
-use super::{KeyOutcome, TextThen, boxed, question_rows};
+use super::{BOX_COLS, BoxSpec, KeyOutcome, TextThen, boxed, question_rows};
 use crate::actions::start;
 use crate::host::Action;
 use crate::state::State;
@@ -46,7 +46,7 @@ pub(super) fn key(
 
 pub(super) fn render(state: &State, frame: &mut Frame, area: Rect, prompt: &str, input: &str) {
     let w = 64u16.min(area.width.saturating_sub(4));
-    let inner = usize::from(w) - 4;
+    let inner = usize::from(w).saturating_sub(BOX_COLS).max(1);
     let mut lines: Vec<Line<'static>> = question_rows(prompt, inner, area.height)
         .into_iter()
         .map(Line::from)
@@ -56,8 +56,13 @@ pub(super) fn render(state: &State, frame: &mut Frame, area: Rect, prompt: &str,
         Span::raw(shown),
         Span::styled(" ", state.theme.focus()),
     ]));
-    lines.push(Line::from("Enter · Esc cancel"));
-    boxed(frame, area, " Input ", lines, w);
+    let spec = BoxSpec {
+        title: "Input".to_owned(),
+        keys: "Enter · Esc cancel",
+        destructive: false,
+        width: w,
+    };
+    boxed(frame, state.theme, spec, lines);
 }
 
 /// The action a text dialog's input asks for: an empty alias clears it (spec §7.1), and a
