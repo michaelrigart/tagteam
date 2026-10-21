@@ -1,16 +1,20 @@
-//! The Accounts screen (spec §5.2): `list`'s table, in `list`'s words, with a gauge per window
-//! when the terminal is wide enough, and the selected account's detail below it.
+//! The Accounts screen (redesign §6): the table of accounts (§6.3), and the selected account's
+//! detail below it.
+
+mod status;
+mod table;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind};
+use tagteam_core::{AccountId, Pace, Window};
 use tagteam_engine::switch::LiveLogin;
-use tagteam_engine::views::{AccountView, HistoryWindow, UsageStatus};
-use tagteam_engine::words::{self, WindowColumn};
+use tagteam_engine::views::{AccountView, HistoryWindow, ProviderAccounts, UsageStatus};
+use tagteam_engine::words;
+
+use self::table::{NAME_SPAN, Table, age_now};
 
 use crate::daemon;
 use crate::host::AccountRef;
@@ -30,15 +34,6 @@ const LOADING: &str = "Loading accounts…";
 const NO_ACCOUNTS: &str = "No accounts yet";
 /// The banners the accounts view raises (spec §5.1).
 pub const RUN_SHELL: &str = "inside a `tagteam run` session: account changes are refused here";
-/// The account cell's place among a row's spans (`Table::row`): the selection bolds it.
-const NAME_SPAN: usize = 3;
-/// A gauge's width, in cells.
-const GAUGE: usize = 6;
-/// The narrowest the ACCOUNT column is cut to.
-const ACCOUNT_MIN: usize = 12;
-/// The room the notes after a row's cells are given at least, when columns or the ACCOUNT
-/// column give way for them: the longest note, up to this many columns.
-const NOTES_ROOM: usize = 36;
 /// The detail pane's least height: a rule, four windows, the reading's age, and its trouble.
 const DETAIL_MIN: u16 = 7;
 /// The detail pane's lines besides its windows' own: the rule, the reading's age, and its
@@ -252,15 +247,15 @@ fn visible_rows(state: &AccountsState, body: Rect, now_s: i64) -> usize {
 
 /// One line of the scrolling part of the table.
 enum TableLine<'a> {
-    /// A provider's name, when there is more than one (spec §5.1, "Providers").
-    Provider(&'a ProviderId),
+    /// A provider's display name, when there is more than one (§6.3).
+    Provider(&'a str),
     /// A provider's column header, below its name; one provider's is pinned instead.
     Header(usize),
     Account(usize, &'a AccountView),
 }
 
 /// The sections shown: one per provider with accounts.
-fn sections(state: &AccountsState) -> Vec<(&ProviderId, &[AccountView])> {
+fn sections(state: &AccountsState) -> Vec<&ProviderAccounts> {
     state
         .snapshot
         .as_ref()
@@ -268,7 +263,6 @@ fn sections(state: &AccountsState) -> Vec<(&ProviderId, &[AccountView])> {
             s.providers
                 .iter()
                 .filter(|p| !p.accounts.is_empty())
-                .map(|p| (&p.provider, p.accounts.as_slice()))
                 .collect()
         })
         .unwrap_or_default()
@@ -279,12 +273,12 @@ fn layout(state: &AccountsState) -> Vec<TableLine<'_>> {
     let sections = sections(state);
     let several = sections.len() > 1;
     let mut lines = Vec::new();
-    for (i, (provider, accounts)) in sections.into_iter().enumerate() {
+    for (i, provider) in sections.into_iter().enumerate() {
         if several {
-            lines.push(TableLine::Provider(provider));
+            lines.push(TableLine::Provider(provider.names.display_name));
             lines.push(TableLine::Header(i));
         }
-        lines.extend(accounts.iter().map(|v| TableLine::Account(i, v)));
+        lines.extend(provider.accounts.iter().map(|v| TableLine::Account(i, v)));
     }
     lines
 }
@@ -298,260 +292,6 @@ fn line_of(state: &AccountsState) -> usize {
         .iter()
         .position(|l| matches!(l, TableLine::Account(_, v) if &v.row.id == id))
         .unwrap_or(0)
-}
-
-/// A cell: its text, and its parts with their styles.
-struct Cell {
-    spans: Vec<Span<'static>>,
-}
-
-impl Cell {
-    fn plain(text: impl Into<String>) -> Self {
-        Cell {
-            spans: vec![Span::raw(text.into())],
-        }
-    }
-
-    fn push(&mut self, text: impl Into<String>, style: Style) {
-        self.spans.push(Span::styled(text.into(), style));
-    }
-
-    fn width(&self) -> usize {
-        self.spans.iter().map(|s| width_of(&s.content)).sum()
-    }
-}
-
-/// One provider's table, laid out for the width it has.
-struct Table<'a> {
-    cols: Vec<WindowColumn>,
-    widths: Vec<usize>,
-    account_w: usize,
-    gauges: bool,
-    sessions: bool,
-    this: Option<&'a AccountId>,
-    width: usize,
-    /// When the accounts were read: a reading's age grows from it (`age_now`).
-    read_at_s: i64,
-}
-
-/// A reading's age at `now_s`: its age when the accounts were read at `read_at_s`, and the
-/// time since. Never less than the age it had.
-fn age_now(age_s: i64, read_at_s: i64, now_s: i64) -> i64 {
-    age_s + (now_s - read_at_s).max(0)
-}
-
-impl<'a> Table<'a> {
-    /// `list`'s columns for `accounts`, with gauges when the whole of every row still fits
-    /// beside them, and the ACCOUNT column cut by display width when even `list`'s line does
-    /// not (Review Focus 2).
-    fn new(
-        accounts: &[AccountView],
-        this: Option<&'a AccountId>,
-        width: usize,
-        read_at_s: i64,
-        now_s: i64,
-        theme: Theme,
-    ) -> Self {
-        let cols = words::window_columns(accounts);
-        let sessions = accounts.iter().any(|v| v.in_session);
-        let mut table = Table {
-            widths: vec![],
-            cols,
-            account_w: 0,
-            gauges: false,
-            sessions,
-            this,
-            width,
-            read_at_s,
-        };
-        let heads: Vec<usize> = table.heads().iter().map(|h| width_of(h)).collect();
-        let widths: Vec<usize> = heads
-            .iter()
-            .enumerate()
-            .map(|(i, head)| {
-                accounts
-                    .iter()
-                    .filter_map(|v| table.cells(v, now_s, theme))
-                    .map(|cells| cells[i].width())
-                    .fold(*head, usize::max)
-            })
-            .collect();
-        let account_w = accounts
-            .iter()
-            .map(|v| width_of(&words::account_cell(&v.row)))
-            .fold(width_of("ACCOUNT"), usize::max);
-        let mut widths = widths;
-        let base = 5 + if sessions { 2 } else { 0 } + 2;
-        // The notes after a row's cells (its status in words, `disabled`, `this`) must still
-        // fit beside the gauges: they say more than a gauge does.
-        let notes_w = accounts
-            .iter()
-            .filter(|v| table.cells(v, now_s, theme).is_some())
-            .map(|v| {
-                words::row_notes(v, this == Some(&v.row.id), now_s)
-                    .iter()
-                    .map(|n| 2 + width_of(n))
-                    .sum::<usize>()
-            })
-            .max()
-            .unwrap_or(0);
-        // Notes get room of their own: when even a minimal ACCOUNT column leaves them too
-        // little, window columns give way, scoped ones first, then spend; 5H and 7D stay. The
-        // dropped windows stay in the detail pane.
-        let room = notes_w.min(NOTES_ROOM);
-        loop {
-            let fixed = base + widths.iter().map(|w| w + 2).sum::<usize>();
-            if fixed + account_w.min(ACCOUNT_MIN) + room <= width {
-                break;
-            }
-            let kind = |k| table.cols.iter().rposition(|c| c.kind == k);
-            let Some(i) = kind(WindowKind::Scoped).or_else(|| kind(WindowKind::Spend)) else {
-                break;
-            };
-            table.cols.remove(i);
-            widths.remove(i);
-        }
-        let fixed = base + widths.iter().map(|w| w + 2).sum::<usize>();
-        let gauge_w = table.gauge_columns() * (GAUGE + 1);
-        table.widths = widths;
-        if fixed + account_w + gauge_w + notes_w <= width {
-            table.gauges = true;
-            table.account_w = account_w;
-            for (i, col) in table.cols.iter().enumerate() {
-                if col.kind != WindowKind::Spend {
-                    table.widths[i] += GAUGE + 1;
-                }
-            }
-        } else {
-            table.account_w = account_w.min(width.saturating_sub(fixed + room).max(ACCOUNT_MIN));
-        }
-        table
-    }
-
-    /// The window columns that take a gauge: every one but spend.
-    fn gauge_columns(&self) -> usize {
-        self.cols
-            .iter()
-            .filter(|c| c.kind != WindowKind::Spend)
-            .count()
-    }
-
-    fn heads(&self) -> Vec<String> {
-        self.cols
-            .iter()
-            .map(|c| c.head.clone())
-            .chain((!self.cols.is_empty()).then(|| "AGE".to_owned()))
-            .collect()
-    }
-
-    fn header(&self, theme: Theme) -> Line<'static> {
-        let gap = if self.sessions { "    " } else { "  " };
-        let mut text = format!("    #{gap}{}", pad("ACCOUNT", self.account_w));
-        for (head, w) in self.heads().iter().zip(&self.widths) {
-            text.push_str("  ");
-            text.push_str(&pad(head, *w));
-        }
-        Line::from(Span::styled(text.trim_end().to_owned(), theme.strong()))
-    }
-
-    /// A row's window cells and AGE, when it has a reading with windows.
-    fn cells(&self, v: &AccountView, now_s: i64, theme: Theme) -> Option<Vec<Cell>> {
-        let ws = v.usage.windows.as_deref().filter(|ws| !ws.is_empty())?;
-        let mut cells: Vec<Cell> = self
-            .cols
-            .iter()
-            .map(|c| {
-                match ws
-                    .iter()
-                    .find(|(w, _)| c.key.as_deref() == Some(w.key.as_str()))
-                {
-                    Some((w, p)) => self.window_cell(w, p, now_s, theme),
-                    None => self.missing(c),
-                }
-            })
-            .collect();
-        cells.push(Cell::plain(v.usage.age_s.map_or_else(
-            || words::MISSING.to_owned(),
-            |age| words::duration(age_now(age, self.read_at_s, now_s)),
-        )));
-        Some(cells)
-    }
-
-    /// `list`'s cell (`  9%  2h40m  ▲ pace`, or the spend amounts), after a gauge.
-    fn window_cell(&self, w: &Window, p: &Pace, now_s: i64, theme: Theme) -> Cell {
-        let style = theme.severity(words::severity(w.pct.round() as i64));
-        let mut cell = Cell { spans: vec![] };
-        match words::spend_text(w) {
-            Some(spend) => cell.push(spend, style),
-            None => {
-                if self.gauges {
-                    cell.push(gauge(w.pct), style);
-                    cell.push(" ", Style::new());
-                }
-                cell.push(
-                    format!("{:>4}", format!("{}%", w.pct.round() as i64)),
-                    style,
-                );
-            }
-        }
-        if let Some(at) = w.resets_at {
-            cell.push(format!("  {}", words::countdown(at, now_s)), Style::new());
-        }
-        if p.ahead == Some(true) {
-            cell.push(format!("  {}", words::AHEAD), Style::new());
-        }
-        cell
-    }
-
-    /// A window this row's reading lacks: `—` under the `%`, or at the start of spend.
-    fn missing(&self, c: &WindowColumn) -> Cell {
-        match c.kind {
-            WindowKind::Spend => Cell::plain(words::MISSING),
-            _ if self.gauges => {
-                Cell::plain(format!("{}{:>4}", " ".repeat(GAUGE + 1), words::MISSING))
-            }
-            _ => Cell::plain(format!("{:>4}", words::MISSING)),
-        }
-    }
-
-    fn row(&self, v: &AccountView, now_s: i64, theme: Theme) -> Line<'static> {
-        let session = match (self.sessions, v.in_session) {
-            (false, _) => String::new(),
-            (true, true) => format!(" {}", words::IN_SESSION),
-            (true, false) => "  ".to_owned(),
-        };
-        let marker = if v.active { "*" } else { " " };
-        let mut spans = vec![
-            Span::raw(" "),
-            Span::styled(marker, theme.role(Role::Accent)),
-            Span::raw(format!(" {:>2}{session}  ", v.row.position)),
-            Span::raw(pad(&words::account_cell(&v.row), self.account_w)),
-        ];
-        if let Some(cells) = self.cells(v, now_s, theme) {
-            for (cell, w) in cells.into_iter().zip(&self.widths) {
-                let fill = w.saturating_sub(cell.width());
-                spans.push(Span::raw("  "));
-                spans.extend(cell.spans);
-                spans.push(Span::raw(" ".repeat(fill)));
-            }
-        }
-        let this = self.this == Some(&v.row.id);
-        let notes: String = words::row_notes(v, this, now_s)
-            .iter()
-            .map(|note| format!("  {note}"))
-            .collect();
-        if !notes.is_empty() {
-            let used: usize = spans.iter().map(|s| width_of(&s.content)).sum();
-            spans.push(Span::raw(fit(&notes, self.width.saturating_sub(used))));
-        }
-        Line::from(spans)
-    }
-}
-
-/// A gauge of `GAUGE` cells, filled in proportion to `pct`.
-fn gauge(pct: f64) -> String {
-    let filled = ((pct.clamp(0.0, 100.0) / 100.0) * GAUGE as f64).round() as usize;
-    format!("{}{}", "█".repeat(filled), "░".repeat(GAUGE - filled))
 }
 
 pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
@@ -572,14 +312,14 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     let sections = sections(st);
     let tables: Vec<Table<'_>> = sections
         .iter()
-        .map(|(_, accounts)| {
+        .map(|p| {
             Table::new(
-                accounts,
+                &p.accounts,
+                &p.forecast,
                 snap.this.as_ref(),
                 width,
                 snap.read_at_s,
                 now_s,
-                state.theme,
             )
         })
         .collect();
@@ -593,12 +333,17 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     let offset = keep_visible(st.offset, at, at, rows, lines.len());
     for line in lines.iter().skip(offset).take(rows) {
         shown.push(match line {
-            TableLine::Provider(p) => {
-                Line::from(Span::styled(format!(" {p}"), state.theme.strong()))
-            }
+            TableLine::Provider(name) => Line::from(Span::styled(
+                format!(" {name}"),
+                state.theme.role(Role::Muted),
+            )),
             TableLine::Header(i) => tables[*i].header(state.theme),
             TableLine::Account(i, v) => {
-                let row = tables[*i].row(v, now_s, state.theme);
+                let mut row = tables[*i].row(v, now_s, state.theme);
+                // §4.3: a disabled row is DIM throughout, selected or not.
+                if v.row.disabled {
+                    row = row.style(state.theme.dim());
+                }
                 if st.selected.as_ref() == Some(&v.row.id) {
                     select(row, Some(NAME_SPAN), width, state.theme)
                 } else {
@@ -819,7 +564,7 @@ fn detail(
 mod tests {
     use crossterm::event::KeyCode;
     use ratatui::style::{Color, Modifier};
-    use tagteam_core::Pace;
+    use tagteam_core::{Pace, ProviderId, WindowKind};
     use tagteam_engine::switch::LiveLogin;
     use tagteam_engine::views::{ProviderAccounts, UsageStatus, UsageView};
 
@@ -830,8 +575,9 @@ mod tests {
     use crate::theme::Theme;
     use crate::update::update;
 
-    /// §13.1's fixture: an active account ahead of pace, a stale spare, a quarantined alias.
-    fn three() -> Vec<AccountView> {
+    /// The detail pane's fixture, until Task 12 replaces the pane: an active account ahead of
+    /// pace, a stale spare, a quarantined alias.
+    fn detail_three() -> Vec<AccountView> {
         let mut live = account(1, "michael@example.com", read(120, 9.0, 77.0, true));
         live.active = true;
         let spare = account(2, "spare@example.com", read(840, 31.0, 12.0, false));
@@ -845,10 +591,73 @@ mod tests {
         vec![live, spare, work]
     }
 
+    /// T3-27's fixture: `alex@example.com` read 2m ago, `work` of Example Corp in use, and
+    /// `spare` with an old reading. The forecast picks 1.
+    fn three() -> Vec<AccountView> {
+        let one = account(1, "alex@example.com", read(120, 0.0, 30.0, false));
+        let mut work = account(2, "sam@corp.example", read(60, 53.0, 6.0, false));
+        work.row.alias = Some("work".into());
+        work.row.org_name = Some("Example Corp".into());
+        work.active = true;
+        let mut spare = account(3, "alex@personal.example", read(840, 0.0, 31.0, false));
+        spare.row.alias = Some("spare".into());
+        vec![one, work, spare]
+    }
+
     fn loaded(accounts: Vec<AccountView>) -> State {
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snapshot(accounts));
         state
+    }
+
+    /// `three()` in `theme`, the selection on row 2.
+    fn on_work(theme: Theme) -> State {
+        let mut state = loaded(three());
+        state.theme = theme;
+        update(&mut state, ch('j'), NOW_MS);
+        state
+    }
+
+    /// The display column `needle` starts at in `line`.
+    fn col(line: &str, needle: &str) -> usize {
+        let at = line
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} in {line:?}"));
+        width_of(&line[..at])
+    }
+
+    /// Display columns `from..to` of `line`.
+    fn columns(line: &str, from: usize, to: usize) -> String {
+        let mut at = 0;
+        let mut out = String::new();
+        for c in line.chars() {
+            let w = width_of(c.encode_utf8(&mut [0; 4]));
+            if at >= from && at + w <= to {
+                out.push(c);
+            }
+            at += w;
+        }
+        out
+    }
+
+    /// The body's first row on a `w`×`h` terminal.
+    fn body_y(state: &State, w: u16, h: u16) -> u16 {
+        crate::view::areas(state, Rect::new(0, 0, w, h)).body.y
+    }
+
+    /// The columns of row `y` whose cell draws a glyph in bold.
+    fn bold_cells(buf: &ratatui::buffer::Buffer, y: u16) -> Vec<u16> {
+        (0..buf.area.width)
+            .filter(|x| {
+                let cell = &buf[(*x, y)];
+                cell.symbol() != " " && cell.modifier.contains(Modifier::BOLD)
+            })
+            .collect()
+    }
+
+    /// The text of a line `Table` draws.
+    fn text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
     #[test]
@@ -875,11 +684,14 @@ mod tests {
     fn a_readings_age_advances_with_the_clock_between_reads() {
         let state = loaded(three());
         let at = |seconds: i64| draw_at(&state, 120, 24, NOW_MS + seconds * 1000);
+        // UPDATED, right-aligned under its head.
         let row_age = |lines: &[String]| {
+            let head = lines.iter().find(|l| l.contains("UPDATED"))?;
+            let from = col(head, "UPDATED");
             let row = lines
                 .iter()
-                .find(|l| l.contains("michael@example.com") && l.contains('%'));
-            row.map(|l| l.split_whitespace().last().unwrap().to_owned())
+                .find(|l| l.contains("alex@example.com") && l.contains('%'));
+            row.map(|l| columns(l, from, from + 7).trim().to_owned())
         };
         let detail = |lines: &[String]| {
             let line = lines.iter().find(|l| l.contains("fetched "));
@@ -902,36 +714,377 @@ mod tests {
     }
 
     #[test]
-    fn the_table_says_what_list_says_at_80_columns() {
-        let body = body_of(&loaded(three()), 80, 24, NOW_MS);
+    fn the_table_at_120_columns_has_14_cell_gauges_and_a_status_column() {
         assert_eq!(
-            &body[0..4],
-            [
-                "    #  ACCOUNT              5H           7D                   SPEND  AGE",
-                "▌*  1  michael@example.com    9%  2h40m   77%  3d09h  ▲ fast  —      2m",
-                "    2  spare@example.com     31%  2h40m   12%  3d09h          —      14m",
-                "    3  work (w@corp.com)    needs a new login",
-            ]
+            snapshot(three()).providers[0].forecast,
+            tagteam_engine::switch::BestForecast::Pick { order: vec![1] }
+        );
+        for theme in TIERS {
+            let state = on_work(theme);
+            let body = body_of(&state, 120, 40, NOW_MS);
+            let head = &body[0];
+            for (name, at) in [
+                ("ACCOUNT", 8),
+                ("5H", 39),
+                ("7D", 62),
+                ("UPDATED", 86),
+                ("STATUS", 95),
+            ] {
+                assert_eq!(col(head, name), at, "{theme:?} {name}: {head}");
+            }
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let y = body_y(&state, 120, 40);
+            let heads: String = roles(&buf, theme, y)
+                .chars()
+                .filter(|c| *c != ' ')
+                .collect();
+            let muted = canon(theme, "m").repeat(heads.chars().count());
+            assert_eq!(heads, muted, "{theme:?}: the heads are muted");
+            if theme.colourless() {
+                continue;
+            }
+            assert_eq!(
+                body[2],
+                format!(
+                    "▌   2 ● work   sam@corp.example{}━━━━━━━───────  53%{}╸─────────────   6%{}1m  in use",
+                    " ".repeat(8),
+                    " ".repeat(4),
+                    " ".repeat(10)
+                ),
+                "{theme:?}"
+            );
+            assert!(body[1].ends_with("2m  best"), "{theme:?}: {}", body[1]);
+            assert!(
+                body[3].ends_with("14m  ! old reading"),
+                "{theme:?}: {}",
+                body[3]
+            );
+            // The old reading's age and its phrase are in warn.
+            let row = roles(&buf, theme, y + 3);
+            let warn = canon(theme, "w");
+            for x in col(&body[3], "14m")..width_of(&body[3]) {
+                let letter = row.chars().nth(x).unwrap();
+                assert!(
+                    letter == ' ' || warn.starts_with(letter),
+                    "{theme:?} {x}: {row}"
+                );
+            }
+            // T3-15: Example Corp does not fit beside every name, so no org shows.
+            assert!(
+                body[0..4].iter().all(|l| !l.contains("Example Corp")),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_table_at_80_columns_has_9_cell_gauges_and_a_status_glyph() {
+        let state = on_work(Theme::new(true));
+        let body = body_of(&state, 80, 24, NOW_MS);
+        // The name column is cut to 23.
+        assert_eq!(col(&body[0], "5H"), 8 + 23 + 3, "{}", body[0]);
+        assert!(!body[0].contains("STATUS"), "{}", body[0]);
+        assert_eq!(
+            body[3],
+            format!(
+                "    3   spare  alex@personal.e…   {}   0%{}━━╸──────  31%{}14m !",
+                "─".repeat(9),
+                " ".repeat(4),
+                " ".repeat(9)
+            )
+        );
+        assert!(body[1].contains("━━╸──────  30%"), "{}", body[1]);
+        assert!(body[1].ends_with("  2m"), "{}", body[1]);
+        assert!(body[2].ends_with("  1m"), "{}", body[2]);
+        assert!(body[0..4].iter().all(|l| width_of(l) <= 80), "{body:?}");
+    }
+
+    #[test]
+    fn status_is_the_first_phrase_that_applies_with_a_quarantined_account_in_use() {
+        // §16: the STATUS order, with a quarantined account in use.
+        let quarantined = |position: u32, email: &str| {
+            let mut v = account(
+                position,
+                email,
+                unread(UsageStatus::ReloginRequired, None, None),
+            );
+            v.row.quarantine_reason = Some("invalid_grant".into());
+            v
+        };
+        let mut in_use = quarantined(1, "alex@example.com");
+        in_use.active = true;
+        let mut off_quarantined = quarantined(2, "sam@corp.example");
+        off_quarantined.row.disabled = true;
+        let mut off = account(3, "alex@personal.example", read(60, 9.0, 12.0, false));
+        off.row.disabled = true;
+        for theme in TIERS {
+            let mut state = loaded(vec![in_use.clone(), off_quarantined.clone(), off.clone()]);
+            state.theme = theme;
+            let body = body_of(&state, 120, 40, NOW_MS);
+            assert!(body[1].ends_with("  ✕ new login"), "{}", body[1]);
+            assert_eq!(columns(&body[1], 6, 7), "●", "{}", body[1]);
+            assert!(body[2].ends_with("  ✕ new login"), "{}", body[2]);
+            assert!(body[3].ends_with("  ○ disabled"), "{}", body[3]);
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let y = body_y(&state, 120, 40) + 1;
+            let row = roles(&buf, theme, y);
+            let at = col(&body[1], "✕ new login");
+            let crit = canon(theme, "c").chars().next().unwrap();
+            assert_eq!(row.chars().nth(at), Some(crit), "{theme:?}: {row}");
+            assert_eq!(
+                row.chars().nth(6),
+                canon(theme, "a").chars().next(),
+                "{theme:?}: {row}"
+            );
+        }
+        // Each problem comes before disabled, this session, in use and best.
+        let problems = [
+            (
+                unread(UsageStatus::ReloginRequired, None, None),
+                Some(("✕ new login", Role::Crit)),
+            ),
+            (
+                unread(UsageStatus::TokenExpired, None, None),
+                Some(("✕ expired", Role::Crit)),
+            ),
+            (
+                unread(UsageStatus::NoCredentials, None, None),
+                Some(("✕ no login", Role::Crit)),
+            ),
+            (
+                unread(UsageStatus::Unavailable, Some("http-429"), None),
+                Some(("! rate-limited", Role::Warn)),
+            ),
+            (
+                unread(UsageStatus::KeychainUnavailable, None, None),
+                Some(("! keychain", Role::Warn)),
+            ),
+            (
+                unread(UsageStatus::Unavailable, Some("over-budget"), None),
+                Some(("! budget", Role::Warn)),
+            ),
+            (
+                unread(UsageStatus::ForeignCredential, None, None),
+                Some(("! retrying", Role::Warn)),
+            ),
+            (
+                unread(UsageStatus::Unavailable, Some("refresh-failed"), None),
+                Some(("! retrying", Role::Warn)),
+            ),
+            (
+                read(840, 9.0, 12.0, false),
+                Some(("! old reading", Role::Warn)),
+            ),
+            // Not checked yet has no phrase of its own: the window columns say it.
+            (unread(UsageStatus::Unavailable, None, None), None),
+        ];
+        let kinds: Vec<_> = problems
+            .iter()
+            .map(|(usage, _)| {
+                tagteam_engine::words::problem(&account(1, "a1@x.co", usage.clone())).unwrap()
+            })
+            .collect();
+        assert_eq!(kinds, tagteam_engine::words::Problem::ALL);
+        for (usage, want) in problems {
+            let mut v = account(1, "a1@x.co", usage);
+            v.active = true;
+            v.row.disabled = true;
+            let got = status::phrase(&v, true, true);
+            let want = want.map_or(("○ disabled".to_owned(), Role::Muted), |(p, r)| {
+                (p.to_owned(), r)
+            });
+            assert_eq!(got, Some(want.clone()));
+            let glyph = want.0.split(' ').next().unwrap().to_owned();
+            assert_eq!(
+                status::glyph(&v, true, true).map(|(g, r)| (g.to_owned(), r)),
+                Some((glyph, want.1))
+            );
+        }
+        let mut v = account(1, "a1@x.co", read(60, 9.0, 12.0, false));
+        v.active = true;
+        v.row.disabled = true;
+        let order = [
+            ("○ disabled", Role::Muted, Some("○")),
+            ("▶ this session", Role::Muted, None),
+            ("in use", Role::Accent, None),
+            ("best", Role::Text, None),
+        ];
+        for (i, (phrase, role, glyph)) in order.into_iter().enumerate() {
+            v.row.disabled = i < 1;
+            let this = i < 2;
+            v.active = i < 3;
+            assert_eq!(
+                status::phrase(&v, this, true),
+                Some((phrase.to_owned(), role)),
+                "{i}"
+            );
+            assert_eq!(
+                status::glyph(&v, this, true),
+                glyph.map(|g| (g, role)),
+                "{i}"
+            );
+        }
+        assert_eq!(status::phrase(&v, false, false), None);
+        let mut key = account(1, "a1@x.co", unread(UsageStatus::ApiKey, None, None));
+        key.kind = API_KEY;
+        assert_eq!(
+            status::phrase(&key, false, false),
+            Some(("api key".to_owned(), Role::Muted))
+        );
+        assert_eq!(status::glyph(&key, false, false), None);
+    }
+
+    #[test]
+    fn a_token_from_a_newer_build_reads_as_retrying() {
+        // Review Focus 1: a failure kind this build cannot name still says its token.
+        let v = account(
+            1,
+            "alex@example.com",
+            unread(
+                UsageStatus::Unavailable,
+                Some("a-token-from-a-newer-build"),
+                None,
+            ),
+        );
+        for theme in TIERS {
+            let mut state = loaded(vec![v.clone()]);
+            state.theme = theme;
+            let body = body_of(&state, 120, 40, NOW_MS);
+            assert_eq!(
+                body[1],
+                format!(
+                    "▌   1   alex@example.com   ! usage check failed (a-token-from-a-newer-build)   {:>7}  ! retrying",
+                    "—"
+                ),
+                "{theme:?}"
+            );
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let row = roles(&buf, theme, body_y(&state, 120, 40) + 1);
+            let warn = canon(theme, "w").chars().next();
+            for x in [27, col(&body[1], "! retrying")] {
+                assert_eq!(row.chars().nth(x), warn, "{theme:?} {x}: {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_without_a_reading_says_its_status_across_the_windows() {
+        let mut key = account(
+            3,
+            "alex@personal.example",
+            unread(UsageStatus::ApiKey, None, None),
+        );
+        key.kind = API_KEY;
+        let accounts = vec![
+            account(1, "alex@example.com", read(60, 9.0, 12.0, false)),
+            account(
+                2,
+                "sam@corp.example",
+                unread(UsageStatus::ReloginRequired, None, None),
+            ),
+            key,
+            account(
+                4,
+                "a4@x.co",
+                unread(UsageStatus::KeychainUnavailable, None, Some(120)),
+            ),
+            account(5, "a5@x.co", unread(UsageStatus::Unavailable, None, None)),
+        ];
+        let said = [
+            ("✕ needs a new login", "c"),
+            ("api key · has no usage limits to show", "m"),
+            ("! can't read the Keychain · retry in 2m", "w"),
+            ("not checked yet", "m"),
+        ];
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            for w in [80u16, 120] {
+                let body = body_of(&state, w, 40, NOW_MS);
+                let head = &body[0];
+                let from = col(head, "5H");
+                let to = col(head, "UPDATED") - 3;
+                assert_eq!(to - from, if w == 80 { 34 } else { 44 }, "{head}");
+                let updated = col(head, "UPDATED");
+                let buf = draw_buffer(&state, w, 40, NOW_MS);
+                let y = body_y(&state, w, 40);
+                for (i, (words, role)) in said.iter().enumerate() {
+                    let row = &body[i + 2];
+                    assert_eq!(
+                        columns(row, from, to).trim_end(),
+                        fit(words, to - from),
+                        "{w}: {row}"
+                    );
+                    let roles = roles(&buf, theme, y + 2 + i as u16);
+                    assert_eq!(
+                        roles.chars().nth(from),
+                        canon(theme, role).chars().next(),
+                        "{theme:?} {w}: {row}"
+                    );
+                    assert_eq!(columns(row, updated, updated + 7), "      —", "{row}");
+                    assert_eq!(
+                        roles.chars().nth(updated + 6),
+                        canon(theme, "f").chars().next(),
+                        "{theme:?} {w}: {row}"
+                    );
+                }
+            }
+        }
+        // At 80 columns the longer two are cut.
+        let body = body_of(&loaded(accounts), 80, 24, NOW_MS);
+        assert!(
+            body[3].contains("api key · has no usage limits to …"),
+            "{}",
+            body[3]
+        );
+        assert!(
+            body[4].contains("! can't read the Keychain · retry…"),
+            "{}",
+            body[4]
         );
     }
 
     #[test]
-    fn a_wider_terminal_adds_a_gauge_per_window() {
-        let body = body_of(&loaded(three()), 120, 40, NOW_MS);
-        assert_eq!(
-            &body[0..4],
-            [
-                "    #  ACCOUNT              5H                  7D                          SPEND  AGE",
-                "▌*  1  michael@example.com  █░░░░░   9%  2h40m  █████░  77%  3d09h  ▲ fast  —      2m",
-                "    2  spare@example.com    ██░░░░  31%  2h40m  █░░░░░  12%  3d09h          —      14m",
-                "    3  work (w@corp.com)    needs a new login",
-            ]
-        );
+    fn the_marker_column_shows_in_use_in_a_session_and_disabled() {
+        let mut session = account(1, "alex@example.com", read(60, 9.0, 12.0, false));
+        session.in_session = true;
+        let mut in_use = account(2, "sam@corp.example", read(60, 53.0, 6.0, false));
+        in_use.active = true;
+        let mut off = account(3, "alex@personal.example", read(60, 9.0, 12.0, false));
+        off.row.disabled = true;
+        let plain = account(4, "a4@x.co", read(60, 9.0, 12.0, false));
+        let mut snap = snapshot(vec![session, in_use, off, plain]);
+        // A run shell: its own account is the one in the session.
+        snap.this = Some(id(1));
+        for theme in TIERS {
+            let mut state = fresh(Screen::Accounts);
+            state.theme = theme;
+            state.accounts.apply(snap.clone());
+            let body = body_of(&state, 120, 40, NOW_MS);
+            let marks: Vec<String> = body[1..5].iter().map(|l| columns(l, 6, 7)).collect();
+            assert_eq!(marks, ["▶", "●", "○", " "], "{body:?}");
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let y = body_y(&state, 120, 40);
+            let at = |row: u16| roles(&buf, theme, y + row).chars().nth(6);
+            assert_eq!(at(1), canon(theme, "a").chars().next(), "{theme:?}");
+            assert_eq!(at(2), canon(theme, "a").chars().next(), "{theme:?}");
+            assert_eq!(at(3), canon(theme, "m").chars().next(), "{theme:?}");
+            assert!(body[1].ends_with("  ▶ this session"), "{}", body[1]);
+            let row = roles(&buf, theme, y + 1);
+            let phrase = col(&body[1], "▶ this session");
+            assert_eq!(
+                row.chars().nth(phrase),
+                canon(theme, "m").chars().next(),
+                "{theme:?}: {row}"
+            );
+            assert!(body[2].ends_with("  in use"), "{}", body[2]);
+            assert!(body[3].ends_with("  ○ disabled"), "{}", body[3]);
+        }
     }
 
     #[test]
     fn the_detail_pane_shows_the_selected_account() {
-        let mut accounts = three();
+        let mut accounts = detail_three();
         accounts[0].usage.windows.as_mut().unwrap()[1].1 = Pace {
             expected_pct: Some(62.0),
             ahead: Some(true),
@@ -956,7 +1109,7 @@ mod tests {
 
     #[test]
     fn a_row_without_a_reading_says_why_in_the_detail_pane() {
-        let mut state = loaded(three());
+        let mut state = loaded(detail_three());
         update(&mut state, key(KeyCode::End), NOW_MS);
         let body = body_of(&state, 80, 24, NOW_MS);
         let top = body.len() - 7;
@@ -973,7 +1126,7 @@ mod tests {
     #[test]
     fn the_detail_pane_counts_down_to_the_next_poll_while_it_is_ahead() {
         // Spec §5.2: `fetched 2m ago · next poll in 1m · login expires in 6d`.
-        let mut accounts = three();
+        let mut accounts = detail_three();
         accounts[0].usage.next_poll_at = Some(NOW_S + 60);
         accounts[0].row.login_expires_at = Some((NOW_S + 6 * 86_400) * 1000);
         let state = loaded(accounts);
@@ -1476,139 +1629,297 @@ mod tests {
     }
 
     #[test]
-    fn the_active_marker_session_column_and_this_follow_list() {
-        let mut accounts = three();
-        accounts[1].in_session = true;
-        let mut snap = snapshot(accounts);
-        snap.this = Some(id(2));
-        let mut state = fresh(Screen::Accounts);
-        state.accounts.apply(snap);
-        let body = body_of(&state, 80, 24, NOW_MS);
-        assert_eq!(
-            &body[0..3],
-            [
-                "    #    ACCOUNT              5H           7D                   SPEND  AGE",
-                "▌*  1    michael@example.com    9%  2h40m   77%  3d09h  ▲ fast  —      2m",
-                "    2 ▶  spare@example.com     31%  2h40m   12%  3d09h          —      14m  this",
-            ]
-        );
-    }
-
-    #[test]
-    fn percentages_and_gauges_take_their_severity_colour_or_bold_without() {
-        let hot = account(1, "a@x.co", read(60, 95.0, 77.0, false));
-        for color in [true, false] {
-            let mut state = loaded(vec![hot.clone()]);
-            state.theme = Theme::new(color);
+    fn percentages_and_fills_take_their_severity_role_in_every_tier() {
+        let accounts = vec![
+            account(1, "alex@example.com", read(60, 53.0, 75.0, true)),
+            account(2, "sam@corp.example", read(60, 95.0, 0.0, false)),
+        ];
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            let body = body_of(&state, 120, 40, NOW_MS);
+            let five = col(&body[0], "5H");
+            let seven = col(&body[0], "7D");
             let buf = draw_buffer(&state, 120, 40, NOW_MS);
-            let (x, y) = locate(&buf, "95%").unwrap();
-            let (gx, gy) = locate(&buf, "██████").unwrap();
-            let (wx, wy) = locate(&buf, "77%").unwrap();
-            if color {
-                assert_eq!(buf[(x, y)].fg, Color::Red);
-                assert_eq!(buf[(gx, gy)].fg, Color::Red);
-                assert_eq!(buf[(wx, wy)].fg, Color::Yellow);
-            } else {
-                for (x, y) in [(x, y), (gx, gy), (wx, wy)] {
-                    assert_eq!(buf[(x, y)].fg, Color::Reset);
-                    assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
-                }
-                // §4.1: crit is underlined as well, so it reads apart from warn without colour.
-                for (x, y) in [(x, y), (gx, gy)] {
-                    assert!(buf[(x, y)].modifier.contains(Modifier::UNDERLINED));
-                }
-                assert!(!buf[(wx, wy)].modifier.contains(Modifier::UNDERLINED));
-            }
+            let y = body_y(&state, 120, 40);
+            let cell = |row: u16, from: usize| -> String {
+                roles(&buf, theme, y + row)
+                    .chars()
+                    .skip(from)
+                    .take(21)
+                    .collect()
+            };
+            // 53%: an accent fill on a faint track, the percentage in text.
+            assert_eq!(
+                cell(1, five),
+                canon(theme, "aaaaaaafffffff  ttt  "),
+                "{theme:?}"
+            );
+            // 75% ahead of pace: a warn fill and a warn percentage, then a warn `▲`.
+            assert_eq!(
+                cell(1, seven),
+                canon(theme, "wwwwwwwwwwwfff  www w"),
+                "{theme:?}"
+            );
+            assert!(body[1][..].contains("75% ▲"), "{}", body[1]);
+            // 95%: crit, fill and percentage.
+            assert_eq!(
+                cell(2, five),
+                canon(theme, "cccccccccccccf  ccc  "),
+                "{theme:?}"
+            );
+            // 0%: the track alone.
+            assert_eq!(
+                cell(2, seven),
+                canon(theme, "ffffffffffffff   tt  "),
+                "{theme:?}"
+            );
         }
     }
 
     #[test]
     fn the_selected_row_has_the_bar_and_a_bold_name_and_no_reverse_video() {
         for theme in TIERS {
-            let mut state = loaded(three());
-            state.theme = theme;
+            let state = on_work(theme);
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
-            // The body's first row is the column heads, its second the selected account.
-            let y = crate::view::areas(&state, buf.area).body.y + 1;
+            // The body's first row is the column heads; the selection is on the third.
+            let y = body_y(&state, 80, 24) + 2;
             assert!(
                 roles(&buf, theme, y).starts_with(&canon(theme, "a")),
                 "{theme:?}"
             );
             assert_eq!(buf[(0, y)].symbol(), "▌", "{theme:?}");
-            assert_eq!(buf[(0, y + 1)].symbol(), " ", "{theme:?}");
-            let (x, ny) = locate(&buf, "michael@example.com").unwrap();
-            assert_eq!(ny, y);
-            let (ox, oy) = locate(&buf, "spare@example.com").unwrap();
-            for i in 0..19 {
-                assert!(
-                    buf[(x + i, y)].modifier.contains(Modifier::BOLD),
-                    "{theme:?}"
-                );
+            for other in [y - 1, y + 1] {
+                assert_eq!(buf[(0, other)].symbol(), " ", "{theme:?}");
             }
+            let rows = text_of(&buf);
+            assert_eq!(columns(&rows[usize::from(y)], 8, 12), "work");
+            for x in 8..12 {
+                assert!(buf[(x, y)].modifier.contains(Modifier::BOLD), "{theme:?}");
+            }
+            assert_eq!(
+                columns(&rows[usize::from(y - 1)], 8, 24),
+                "alex@example.com"
+            );
             assert!(
-                !buf[(ox, oy)].modifier.contains(Modifier::BOLD),
+                !buf[(8, y - 1)].modifier.contains(Modifier::BOLD),
                 "{theme:?}"
             );
+            let tint = theme.sel_bg().bg.unwrap_or(Color::Reset);
             for x in 0..80 {
-                for row in [y, y + 1] {
+                for row in [y - 1, y, y + 1] {
                     assert!(
                         !buf[(x, row)].modifier.contains(Modifier::REVERSED),
                         "{theme:?} {x},{row}"
                     );
                 }
-                let tint = theme.sel_bg().bg.unwrap_or(Color::Reset);
                 assert_eq!(buf[(x, y)].bg, tint, "{theme:?} {x}");
-                assert_eq!(buf[(x, y + 1)].bg, Color::Reset, "{theme:?} {x}");
+                for row in [y - 1, y + 1] {
+                    assert_eq!(buf[(x, row)].bg, Color::Reset, "{theme:?} {x}");
+                }
             }
         }
     }
 
     #[test]
-    fn a_selected_active_row_bolds_its_name_alone_and_draws_the_marker_in_accent() {
+    fn only_the_selected_row_s_name_is_bold() {
+        // T3-16: in tiers 1 and 2 the selected row's name is its one bold, and the account in
+        // use has `●`, not bold.
+        for theme in &TIERS[1..] {
+            let theme = *theme;
+            let mut state = on_work(theme);
+            let y = body_y(&state, 120, 40);
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            assert_eq!(
+                bold_cells(&buf, y + 2),
+                (8..12).collect::<Vec<_>>(),
+                "{theme:?}"
+            );
+            for row in [y, y + 1, y + 3] {
+                assert_eq!(bold_cells(&buf, row), Vec::<u16>::new(), "{theme:?} {row}");
+            }
+            // Without an alias the email is the name.
+            update(&mut state, ch('k'), NOW_MS);
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            assert_eq!(
+                bold_cells(&buf, y + 1),
+                (8..24).collect::<Vec<_>>(),
+                "{theme:?}"
+            );
+            assert_eq!(
+                bold_cells(&buf, y + 2),
+                Vec::<u16>::new(),
+                "{theme:?}: the row in use"
+            );
+        }
+        // Tier 0 draws accent, warn and crit bold (§4.1): the selected row in use bolds `▌`,
+        // `●` and its name, and past them only what its roles draw bold, its fills and its
+        // `in use`.
+        let theme = TIERS[0];
+        let state = on_work(theme);
+        let y = body_y(&state, 120, 40) + 2;
+        let buf = draw_buffer(&state, 120, 40, NOW_MS);
+        let bold = bold_cells(&buf, y);
+        let (identity, rest): (Vec<u16>, Vec<u16>) = bold.into_iter().partition(|x| *x < 39);
+        assert_eq!(identity, [0, 6, 8, 9, 10, 11]);
+        let mut roles_bold: Vec<u16> = (39..46).collect();
+        roles_bold.push(62);
+        roles_bold.extend([95, 96, 98, 99, 100]);
+        assert_eq!(rest, roles_bold);
+    }
+
+    #[test]
+    fn a_disabled_row_is_dim_even_when_selected() {
+        let mut accounts = three();
+        accounts[0].row.disabled = true;
         for theme in TIERS {
-            let mut state = loaded(three());
+            let mut state = loaded(accounts.clone());
             state.theme = theme;
-            let buf = draw_buffer(&state, 80, 24, NOW_MS);
-            let y = crate::view::areas(&state, buf.area).body.y + 1;
-            assert_eq!(buf[(1, y)].symbol(), "*", "{theme:?}");
-            let accent = theme.role(Role::Accent);
-            assert_eq!(
-                buf[(1, y)].fg,
-                accent.fg.unwrap_or(Color::Reset),
-                "{theme:?}"
-            );
-            let (name, _) = locate(&buf, "michael@example.com").unwrap();
-            // Without colour, accent is bold, so the marker is the one other bold cell there.
-            let marker_bold = theme == TIERS[0];
-            assert_eq!(
-                buf[(1, y)].modifier.contains(Modifier::BOLD),
-                marker_bold,
-                "{theme:?}"
-            );
-            // Past the marker, the name's cells are the one bold run on the row. Without colour a
-            // warn percentage is bold as well, so the row is read up to the window columns.
-            let end = if theme == TIERS[0] { 30 } else { 80 };
-            let runs: Vec<u16> = (2..end)
-                .filter(|x| buf[(*x, y)].modifier.contains(Modifier::BOLD))
-                .collect();
-            assert_eq!(runs.first(), Some(&name), "{theme:?} {runs:?}");
-            assert!(
-                runs.windows(2).all(|p| p[1] == p[0] + 1),
-                "{theme:?} {runs:?}"
-            );
+            let y = body_y(&state, 120, 40) + 1;
+            update(&mut state, ch('j'), NOW_MS);
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let drawn = width_of(&text_of(&buf)[usize::from(y)]) as u16;
+            assert!(drawn > 60, "{drawn}");
+            for x in 0..drawn {
+                assert!(
+                    buf[(x, y)].modifier.contains(Modifier::DIM),
+                    "{theme:?} {x}"
+                );
+            }
+            update(&mut state, ch('k'), NOW_MS);
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            assert_eq!(buf[(0, y)].symbol(), "▌");
+            let tint = theme.sel_bg().bg.unwrap_or(Color::Reset);
+            for x in 0..120 {
+                let cell = &buf[(x, y)];
+                assert!(cell.modifier.contains(Modifier::DIM), "{theme:?} {x}");
+                assert_eq!(cell.bg, tint, "{theme:?} {x}");
+            }
         }
     }
 
-    /// Review Focus 2: names wider than their column are cut by display width, never by bytes,
-    /// and the table never overflows or panics at 80 columns.
+    #[test]
+    fn from_160_columns_scoped_windows_and_spend_get_columns() {
+        let mut usage = read(60, 9.0, 12.0, false);
+        let windows = usage.windows.as_mut().unwrap();
+        windows.push((
+            window(
+                "scoped:fable",
+                "Fable",
+                WindowKind::Scoped,
+                40.0,
+                Some(291_630),
+            ),
+            Pace::default(),
+        ));
+        let mut spend = window("spend", "spend", WindowKind::Spend, 0.0, Some(1_209_630));
+        spend.detail = Some(r#"{"used": 0, "limit": 20, "currency": "EUR"}"#.parse().unwrap());
+        windows.push((spend, Pace::default()));
+        let mut state = loaded(vec![
+            account(1, "alex@example.com", usage),
+            account(2, "sam@corp.example", read(60, 9.0, 12.0, false)),
+        ]);
+        state.theme = Theme::new(true);
+        let wide = body_of(&state, 160, 40, NOW_MS);
+        let head = &wide[0];
+        let (fable, spend) = (col(head, "FABLE"), col(head, "SPEND"));
+        assert!(col(head, "7D") < fable && fable < spend, "{head}");
+        assert!(spend < col(head, "UPDATED"), "{head}");
+        assert_eq!(columns(&wide[1], fable, fable + 6), " 40%  ", "{}", wide[1]);
+        assert_eq!(
+            columns(&wide[1], spend, spend + 9),
+            "€0 of €20",
+            "{}",
+            wide[1]
+        );
+        // A row without them has `—` in their place.
+        assert_eq!(columns(&wide[2], fable, fable + 4), "   —", "{}", wide[2]);
+        assert_eq!(columns(&wide[2], spend, spend + 1), "—", "{}", wide[2]);
+        assert!(wide.iter().all(|l| width_of(l) <= 160));
+        let narrow = body_of(&state, 120, 40, NOW_MS);
+        assert!(
+            !narrow[0].contains("FABLE") && !narrow[0].contains("SPEND"),
+            "{}",
+            narrow[0]
+        );
+        assert!(!narrow[1].contains("€0 of €20"), "{}", narrow[1]);
+    }
+
+    #[test]
+    fn a_narrow_table_shrinks_the_name_then_the_gauges() {
+        // T3-15's order, below the TUI's 80 columns.
+        let accounts = three();
+        let snap = snapshot(accounts.clone());
+        let forecast = &snap.providers[0].forecast;
+        let theme = Theme::new(true);
+        let draw = |width: usize| {
+            let table = Table::new(&accounts, forecast, None, width, NOW_S, NOW_S);
+            let head = text(&table.header(theme));
+            let rows: Vec<String> = accounts
+                .iter()
+                .map(|v| text(&table.row(v, NOW_S, theme)))
+                .collect();
+            for row in &rows {
+                assert!(width_of(row) <= width, "{width}: {row}");
+                assert!(row.contains('%'), "{width}: {row}");
+            }
+            (head, rows)
+        };
+        // At 72: the name down to 16, then the 7D gauge to 6; 5H keeps its 9.
+        let (head, rows) = draw(72);
+        assert_eq!(
+            [col(&head, "5H"), col(&head, "7D"), col(&head, "UPDATED")],
+            [27, 27 + 16 + 2, 45 + 13 + 3],
+            "{head}"
+        );
+        assert_eq!(
+            rows[0],
+            format!(
+                "    1   alex@example.com   {}   0%    ━╸────  30%{}2m",
+                "─".repeat(9),
+                " ".repeat(10)
+            )
+        );
+        assert!(
+            rows[2].starts_with("    3   spare  alex@per…   "),
+            "{}",
+            rows[2]
+        );
+        assert!(rows[2].ends_with("14m !"), "{}", rows[2]);
+        // At 60: the 5H gauge to 6 as well, and 7D to its percentage alone.
+        let (head, rows) = draw(60);
+        assert_eq!(
+            [col(&head, "5H"), col(&head, "7D"), col(&head, "UPDATED")],
+            [27, 27 + 13 + 2, 42 + 6 + 3],
+            "{head}"
+        );
+        assert_eq!(
+            rows[0],
+            format!(
+                "    1   alex@example.com   {}   0%     30%{}2m",
+                "─".repeat(6),
+                " ".repeat(10)
+            )
+        );
+        assert_eq!(
+            rows[2],
+            format!(
+                "    3   spare  alex@per…   {}   0%     31%{}14m !",
+                "─".repeat(6),
+                " ".repeat(9)
+            )
+        );
+    }
+
+    /// Review Focus 3: names wider than their column are cut by display width, never by bytes,
+    /// and the table never overflows or panics.
     #[test]
     fn wide_names_are_cut_by_display_width_and_never_overflow() {
-        let long = "a".repeat(52) + "@example.com";
-        let mut cjk = account(2, "山田太郎@x.co", read(60, 9.0, 12.0, false));
-        cjk.row.alias = Some("山田さんの仕事用アカウント😀😀😀😀".into());
+        let mut long = account(1, "alex@example.com", read(60, 9.0, 12.0, false));
+        long.row.alias = Some("a".repeat(200));
         let accounts = vec![
-            account(1, &long, read(60, 9.0, 12.0, false)),
-            cjk,
+            long,
+            account(2, "例のアカウント@example.com", read(840, 9.0, 12.0, false)),
             account(
                 3,
                 "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀@x.co",
@@ -1616,24 +1927,29 @@ mod tests {
             ),
         ];
         for w in [80, 100, 120] {
-            let buf = draw_buffer(&loaded(accounts.clone()), w, 24, NOW_MS);
-            let lines = text_of(&buf);
+            let state = loaded(accounts.clone());
+            let lines = draw(&state, w, 24);
             for line in &lines {
                 assert!(width_of(line) <= usize::from(w), "{w}: {line}");
             }
-            // Every row's window columns still line up with the header's.
-            let body = body_of(&loaded(accounts.clone()), w, 24, NOW_MS);
-            let col = body[0].find("5H").unwrap();
-            let head = width_of(&body[0][..col]);
-            for row in &body[1..4] {
-                let pct = row.find("9%").unwrap();
-                assert_eq!(width_of(&row[..pct]), head + 2, "{w}: {row}");
+            // Every row's UPDATED still sits under its head.
+            let body = body_of(&state, w, 24, NOW_MS);
+            let updated = col(&body[0], "UPDATED");
+            for (row, age) in body[1..4].iter().zip(["1m", "14m", "1m"]) {
+                assert_eq!(
+                    columns(row, updated, updated + 7).trim_start(),
+                    age,
+                    "{w}: {row}"
+                );
             }
+            // The old reading's mark shows.
+            let mark = if w < 100 { " !" } else { "  ! old reading" };
+            assert!(body[2].ends_with(mark), "{w}: {}", body[2]);
         }
         let narrow = body_of(&loaded(accounts), 80, 24, NOW_MS);
         assert!(narrow[1].contains("aaaa…"), "{}", narrow[1]);
         assert!(
-            narrow[2].starts_with("    2  山田さんの仕"),
+            narrow[2].starts_with("    2   例のアカウント@"),
             "{}",
             narrow[2]
         );
@@ -1906,7 +2222,7 @@ mod tests {
     }
 
     #[test]
-    fn several_providers_are_grouped_under_their_names() {
+    fn several_providers_are_grouped_under_their_display_names() {
         let mut other = account(1, "o@x.co", read(60, 50.0, 60.0, false));
         other.row.provider = ProviderId::new("fake-agent");
         other.row.id = AccountId::from_string("other-1");
@@ -1929,15 +2245,30 @@ mod tests {
             models: vec![],
             live: LiveLogin::None,
         });
+        for theme in TIERS {
+            let mut state = fresh(Screen::Accounts);
+            state.theme = theme;
+            state.accounts.apply(snap.clone());
+            let body = body_of(&state, 80, 24, NOW_MS);
+            assert_eq!(body[0], " Claude Code");
+            assert!(body[1].starts_with("    #   ACCOUNT"), "{}", body[1]);
+            assert!(body[2].contains("a1@x.co"));
+            assert_eq!(body[3], " FakeAgent");
+            assert!(body[4].starts_with("    #   ACCOUNT"));
+            assert!(body[5].contains("o@x.co"));
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            let y = body_y(&state, 80, 24);
+            for row in [y, y + 3] {
+                let letters: String = roles(&buf, theme, row)
+                    .chars()
+                    .filter(|c| *c != ' ')
+                    .collect();
+                let muted = canon(theme, "m").repeat(letters.chars().count());
+                assert_eq!(letters, muted, "{theme:?} {row}");
+            }
+        }
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snap);
-        let body = body_of(&state, 80, 24, NOW_MS);
-        assert_eq!(body[0], " claude-code");
-        assert!(body[1].starts_with("    #  ACCOUNT"), "{}", body[1]);
-        assert!(body[2].contains("a1@x.co"));
-        assert_eq!(body[3], " fake-agent");
-        assert!(body[4].starts_with("    #  ACCOUNT"));
-        assert!(body[5].contains("o@x.co"));
         update(&mut state, ch('j'), NOW_MS);
         assert_eq!(
             state.accounts.selected().unwrap().provider,
@@ -1996,7 +2327,7 @@ mod tests {
             ]
         );
         let body = body_of(&state, 80, 24, NOW_MS);
-        assert!(body[0].starts_with("    #  ACCOUNT"), "{}", body[0]);
+        assert!(body[0].starts_with("    #   ACCOUNT"), "{}", body[0]);
     }
 
     /// FakeAgent's view holding `accounts`, its live login `live`.
@@ -2084,15 +2415,20 @@ mod tests {
         key.kind = API_KEY;
         let mut off = account(2, "b@x.co", read(60, 9.0, 12.0, false));
         off.row.disabled = true;
-        let body = body_of(&loaded(vec![key, off]), 80, 24, NOW_MS);
-        assert!(body[1].ends_with("api key"), "{}", body[1]);
-        assert!(body[2].ends_with("disabled"), "{}", body[2]);
+        let state = loaded(vec![key, off]);
+        let wide = body_of(&state, 120, 40, NOW_MS);
+        assert!(wide[1].ends_with("  api key"), "{}", wide[1]);
+        assert!(wide[2].ends_with("  ○ disabled"), "{}", wide[2]);
+        // At 80 columns only the disabled glyph follows UPDATED.
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert!(body[1].ends_with("  —"), "{}", body[1]);
+        assert!(body[2].ends_with("1m ○"), "{}", body[2]);
     }
 
     #[test]
     fn the_detail_pane_announces_no_poll_the_status_rules_out() {
         // A quarantined account keeps its stored plan, but no poll comes (core §8.3).
-        let mut accounts = three();
+        let mut accounts = detail_three();
         accounts[2].usage.next_poll_at = Some(NOW_S + 180);
         let mut state = loaded(accounts);
         update(&mut state, key(KeyCode::End), NOW_MS);
@@ -2141,34 +2477,51 @@ mod tests {
 
     #[test]
     fn columns_give_way_to_the_notes_at_80_columns() {
+        // Below 160 columns the scoped and spend columns give way; the status keeps its glyph.
         let lines = draw(&loaded(crowded("http-429")), 80, 24);
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
         let body = body_of(&loaded(crowded("http-429")), 80, 24, NOW_MS);
         let head = &body[0];
         assert!(head.contains("5H") && head.contains("7D"), "{head}");
-        assert!(head.ends_with("AGE"), "{head}");
-        assert!(!head.contains("SONNET"), "{head}");
-        assert!(body[2].ends_with("disabled"), "{}", body[2]);
-        assert!(body[3].ends_with("rate-limited (retry 15m)"), "{}", body[3]);
-        // At 120 columns every column and every note fit.
-        let wide = body_of(&loaded(crowded("http-429")), 120, 40, NOW_MS);
+        assert!(head.ends_with("UPDATED"), "{head}");
+        assert!(
+            !head.contains("SONNET") && !head.contains("SPEND"),
+            "{head}"
+        );
+        assert!(body[2].ends_with("2m ○"), "{}", body[2]);
+        assert!(body[3].ends_with("2m !"), "{}", body[3]);
+        // At 160 columns every column and every phrase fit.
+        let lines = draw(&loaded(crowded("http-429")), 160, 40);
+        assert!(lines.iter().all(|l| width_of(l) <= 160), "{lines:?}");
+        let wide = body_of(&loaded(crowded("http-429")), 160, 40, NOW_MS);
         assert!(wide[0].contains("CLAUDE SONNET 4.5"), "{}", wide[0]);
         assert!(
-            wide[0].contains("SPEND") && wide[0].ends_with("AGE"),
+            wide[0].contains("SPEND") && wide[0].ends_with("STATUS"),
             "{}",
             wide[0]
         );
-        assert!(wide[2].ends_with("disabled"), "{}", wide[2]);
-        assert!(wide[3].ends_with("rate-limited (retry 15m)"), "{}", wide[3]);
+        assert!(wide[2].ends_with("  ○ disabled"), "{}", wide[2]);
+        assert!(wide[3].ends_with("  ! rate-limited"), "{}", wide[3]);
     }
 
     #[test]
     fn a_note_too_long_for_its_room_ends_in_an_ellipsis() {
+        // A row without a reading says its status across the window columns, cut to them.
         let long = "x".repeat(70);
-        let lines = draw(&loaded(crowded(&long)), 80, 24);
+        let mut accounts = crowded(&long);
+        accounts[2].usage.windows = None;
+        let lines = draw(&loaded(accounts.clone()), 80, 24);
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
-        let body = body_of(&loaded(crowded(&long)), 80, 24, NOW_MS);
-        assert!(body[3].ends_with('…'), "{}", body[3]);
-        assert!(body[3].contains("usage check failed (xxx"), "{}", body[3]);
+        let body = body_of(&loaded(accounts), 80, 24, NOW_MS);
+        let from = col(&body[0], "5H");
+        let to = col(&body[0], "UPDATED") - 3;
+        let group = columns(&body[3], from, to);
+        assert!(group.ends_with('…'), "{}", body[3]);
+        assert!(
+            group.starts_with("! usage check failed (xxx"),
+            "{}",
+            body[3]
+        );
+        assert!(body[3].ends_with("      — !"), "{}", body[3]);
     }
 }

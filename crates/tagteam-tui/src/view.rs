@@ -377,12 +377,14 @@ pub(crate) fn keep_visible(
     offset.min(lines.saturating_sub(rows))
 }
 
-/// `row` over `width` columns on `sel-bg` (tier 2 only; elsewhere it is padded and unstyled).
-pub(crate) fn tint(row: Line<'static>, width: usize, theme: Theme) -> Line<'static> {
+/// `row` over `width` columns on `sel-bg` (tier 2 only; elsewhere it is padded), keeping the
+/// row's own style under it: a disabled row stays DIM.
+pub(crate) fn tint(mut row: Line<'static>, width: usize, theme: Theme) -> Line<'static> {
     let used: usize = row.spans.iter().map(|s| width_of(&s.content)).sum();
-    let mut spans = row.spans;
-    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-    Line::from(spans).style(theme.sel_bg())
+    row.spans
+        .push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    row.style = row.style.patch(theme.sel_bg());
+    row
 }
 
 /// The selected row (spec §4.3): `▌` in accent over column 0, which `row`'s first span gives up
@@ -479,6 +481,38 @@ mod tests {
         assert_eq!(tint(light), Some(Color::Rgb(0xe8, 0xed, 0xf2)));
         assert_eq!(tint(Theme::new(true)), None);
         assert_eq!(tint(Theme::new(false)), None);
+    }
+
+    #[test]
+    fn select_keeps_the_row_s_own_style() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::style::{Color, Modifier};
+        use ratatui::widgets::Widget;
+
+        let width = 30;
+        for theme in TIERS {
+            let row = Line::from(vec![
+                Span::raw(" "),
+                Span::raw("1 "),
+                Span::raw("alex@example.com"),
+                Span::styled(" 95%", theme.role(Role::Crit)),
+            ])
+            .style(theme.dim());
+            let mut buf = Buffer::empty(Rect::new(0, 0, width as u16, 1));
+            Paragraph::new(select(row, Some(2), width, theme)).render(buf.area, &mut buf);
+            for x in 0..width as u16 {
+                let cell = &buf[(x, 0)];
+                assert!(cell.modifier.contains(Modifier::DIM), "{theme:?} {x}");
+                assert_eq!(
+                    cell.bg,
+                    theme.sel_bg().bg.unwrap_or(Color::Reset),
+                    "{theme:?} {x}"
+                );
+            }
+            assert!(buf[(3, 0)].modifier.contains(Modifier::BOLD), "{theme:?}");
+            assert_eq!(text_of(&buf)[0], "▌1 alex@example.com 95%", "{theme:?}");
+        }
     }
 
     #[test]
