@@ -633,6 +633,27 @@ fn a_truncated_answer_whose_end_comes_late_holds_the_keys_until_it_ends() {
 }
 
 #[test]
+fn a_typed_ahead_esc_does_not_unhold_a_truncated_answer() {
+    let home = Home::new();
+    one_response(&home);
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    tui.type_keys(b"\x1b\x1b]11;rgb:2b3b/");
+    tui.wait_for(Duration::from_secs(2), "the banner", held);
+    thread::sleep(Duration::from_millis(1_500));
+    tui.type_keys(b"3");
+    thread::sleep(SETTLE);
+    assert!(held(&tui.screen()), "the keys are still held");
+    tui.type_keys(b"2b3b/2b3b\x1b\\");
+    tui.wait_for(Duration::from_secs(2), "the banner gone", |s| !held(s));
+    tui.type_keys(b"2");
+    tui.wait_for(Duration::from_secs(2), "Tokens", tokens);
+    assert_eq!(tui.first_shown(history), None, "the `3` was read");
+    assert_eq!(live_email(home.root()), "b@x.co");
+    quit(tui);
+}
+
+#[test]
 fn a_typed_backslash_does_not_end_a_held_answer() {
     let home = Home::new();
     one_response(&home);
