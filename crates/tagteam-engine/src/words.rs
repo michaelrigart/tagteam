@@ -410,7 +410,7 @@ pub fn no_switch(reason: NoSwitchReason, facts: &NoSwitchFacts<'_>) -> String {
     let display = facts.display_name;
     match reason {
         NoSwitchReason::BelowThreshold => match facts.used_pct {
-            Some(u) => format!("no switch needed ({u:.0}%, switches at {t})"),
+            Some(u) => format!("no switch needed ({}%, switches at {t})", u.round() as i64),
             None => format!("no switch needed (switches at {t})"),
         },
         NoSwitchReason::Cooldown if facts.detail.is_empty() => {
@@ -1227,6 +1227,18 @@ mod tests {
         assert_eq!(
             no_switch(NoSwitchReason::ActiveUsageUnknown, &bare),
             "can't read the account in use"
+        );
+    }
+
+    #[test]
+    fn the_used_percentage_rounds_a_tie_up_as_list_does() {
+        let tie = NoSwitchFacts {
+            used_pct: Some(76.5),
+            ..facts("")
+        };
+        assert_eq!(
+            no_switch(NoSwitchReason::BelowThreshold, &tie),
+            "no switch needed (77%, switches at 90%)"
         );
     }
 
