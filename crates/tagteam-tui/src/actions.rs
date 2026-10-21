@@ -3,6 +3,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 use tagteam_engine::switch::UsageStrategy;
+use tagteam_engine::views::AccountView;
 use tagteam_engine::words;
 
 use crate::daemon;
@@ -10,38 +11,38 @@ use crate::host::{Action, ActionOutcome};
 use crate::msg::{Answer, AnswerTo, Cmd, Prompt, PromptKind};
 use crate::overlay::{ConfirmThen, Overlay, TextThen};
 use crate::screens;
-use crate::state::{Screen, State};
+use crate::source::CollectSummary;
+use crate::state::{Screen, State, ToastKind};
 
-/// `P` without a daemon to pause (spec §7.4).
-pub const NO_DAEMON_RUNNING: &str = "no daemon running";
+/// `P` without a daemon to pause (spec §10, T2-16).
+pub const NO_DAEMON_RUNNING: &str = "no daemon runs · tagteam daemon install starts one";
 
 /// Starts `action`: on the actions lane, or suspended when it needs the terminal (spec §7.3).
-/// While another runs it shows `busy: <action>` and drops it (spec §7.2).
+/// While another runs it says `still <label> · wait for it to finish` and drops it (redesign
+/// §9.4).
 pub(crate) fn start(state: &mut State, action: Action, now_ms: i64) -> Vec<Cmd> {
-    if let Some(running) = &state.running {
-        let text = format!("busy: {}", running.name());
-        state.toast(text, now_ms);
+    if busy(state, now_ms) {
         return vec![];
     }
     state.running = Some(action.clone());
     state.dirty = true;
     if action.needs_terminal() {
+        state.on_terminal = true;
         vec![Cmd::Suspend(action)]
     } else {
         vec![Cmd::Act(action)]
     }
 }
 
-/// `busy: <action>` when one runs; the action keys that open a dialog check it first.
+/// `still <label> · wait for it to finish` when an action runs; the action keys that open a
+/// dialog check it first.
 fn busy(state: &mut State, now_ms: i64) -> bool {
-    match &state.running {
-        Some(running) => {
-            let text = format!("busy: {}", running.name());
-            state.toast(text, now_ms);
-            true
-        }
-        None => false,
-    }
+    let Some(running) = &state.running else {
+        return false;
+    };
+    let text = format!("still {} · wait for it to finish", state.label_of(running));
+    state.toast(ToastKind::Info, text, now_ms);
+    true
 }
 
 /// The provider `A` adds to: `--provider`'s, else the default, which the accounts view lists
@@ -100,25 +101,72 @@ fn refresh(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     let shown = state.accounts.shown_ids();
     if !shown.is_empty() {
         cmds.push(state.collect_due(shown));
+        state.checking = Some(state.gens.collect);
     }
     cmds
 }
 
+/// The accounts the last accounts view lists.
+fn views(state: &State) -> impl Iterator<Item = &AccountView> {
+    state
+        .accounts
+        .snapshot()
+        .into_iter()
+        .flat_map(|s| s.providers.iter().flat_map(|p| p.accounts.iter()))
+}
+
+/// `r`'s toast once its collection is over and the accounts are read (T2-9, redesign §9.7), in
+/// this order: accounts rate-limited, the first warning, accounts updated, else that nothing
+/// was due.
+pub(crate) fn say_checked(state: &mut State, summary: &CollectSummary, now_ms: i64) {
+    let now_s = now_ms.div_euclid(1000);
+    let in_span = |at: i64| words::duration(at - now_s);
+    let (kind, text) = if !summary.rate_limited.is_empty() {
+        let retry = views(state)
+            .filter(|v| summary.rate_limited.contains(&v.row.id))
+            .filter_map(|v| v.usage.retry_at)
+            .min();
+        let mut text = format!(
+            "{} rate-limited",
+            words::plural(summary.rate_limited.len() as u64, "account")
+        );
+        if let Some(at) = retry {
+            text.push_str(&format!(" · retry in {}", in_span(at)));
+        }
+        (ToastKind::Warn, text)
+    } else if let Some(first) = summary.warnings.first() {
+        (ToastKind::Warn, format!("warning: {first}"))
+    } else if summary.updated > 0 {
+        let accounts = words::plural(summary.updated as u64, "account");
+        (ToastKind::Done, format!("updated {accounts}"))
+    } else {
+        let next = views(state).filter_map(|v| v.usage.next_poll_at).min();
+        let text = match next {
+            Some(at) => format!("already current · next update in {}", in_span(at)),
+            None => "already current".to_owned(),
+        };
+        (ToastKind::Info, text)
+    };
+    state.toast(kind, text, now_ms);
+}
+
 /// `P` (spec §7.4): pause the daemon's auto-switching for the provider the header follows, or
 /// resume it, as its last `status` says it is. A confirm dialog asks first, default no. Without a
-/// daemon (timer mode) it says so and changes nothing, and so for a provider the daemon runs no
-/// job for: the TUI changes no setting whose effect it cannot show.
+/// daemon (timer mode) it says how to start one and changes nothing, and so for a provider the
+/// daemon runs no job for: the TUI changes no setting whose effect it cannot show (T2-16).
 fn pause(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     if busy(state, now_ms) {
         return vec![];
     }
     if !state.daemon.live() {
-        state.toast(NO_DAEMON_RUNNING, now_ms);
+        state.toast(ToastKind::Info, NO_DAEMON_RUNNING, now_ms);
         return vec![];
     }
     let provider = daemon::focus(state);
     let Some(job) = state.daemon.job(&provider) else {
-        state.toast(format!("the daemon runs no job for {provider}"), now_ms);
+        let display = state.names_of(&provider).display_name;
+        let text = format!("the daemon runs no job for {display}");
+        state.toast(ToastKind::Info, text, now_ms);
         return vec![];
     };
     let (verb, on) = if job.autoswitch {
@@ -221,14 +269,23 @@ fn declined(to: AnswerTo, kind: &PromptKind) -> Cmd {
     Cmd::Answer { to, answer }
 }
 
-/// An action's outcome (spec §7.2): a command that needs the terminal is run again suspended
-/// (§7.3); a suspended action's outcome, whose output went to the terminal, shows nothing (R12);
-/// doctor's report opens its panel; one plain line is a toast; warnings, several lines or a
-/// failure open the result panel. Every view is re-read after every outcome (§7.3 step 4).
+/// An action's outcome (redesign §9.3, §9.6): a command that needs the terminal is run again
+/// suspended (§7.3); then, in this order:
+/// 1. a suspended action's return, worded by its exit code alone;
+/// 2. doctor's report, in its panel whatever the exit code;
+/// 3. `P`'s pause or resume with no stderr, in the provider's name;
+/// 4. nothing printed, a `Done` or `Failed` toast from the exit code;
+/// 5. exit 0 with no stderr, a `Done` toast of the output's lines joined by a space, when it
+///    fits the toast's three rows, else the result panel;
+/// 6. exit 0 with stderr, a `Warn` toast of one line, else the panel;
+/// 7. a non-zero exit, a `Failed` toast of one line, else the panel.
+///
+/// Every view is re-read after every outcome (§7.3 step 4).
 pub fn on_done(state: &mut State, action: Action, outcome: ActionOutcome, now_ms: i64) -> Vec<Cmd> {
     let (exit, out, err) = match outcome {
         ActionOutcome::NeedsTerminal if state.quitting.is_none() => {
             state.running = Some(action.clone());
+            state.on_terminal = true;
             return vec![Cmd::Suspend(action)];
         }
         ActionOutcome::NeedsTerminal => {
@@ -237,6 +294,7 @@ pub fn on_done(state: &mut State, action: Action, outcome: ActionOutcome, now_ms
         }
         ActionOutcome::Done { exit, out, err } => (exit, out, err),
     };
+    let on_terminal = std::mem::take(&mut state.on_terminal);
     state.running = None;
     state.dirty = true;
     if state.quitting.is_some() {
@@ -247,33 +305,94 @@ pub fn on_done(state: &mut State, action: Action, outcome: ActionOutcome, now_ms
     if matches!(action, Action::Autoswitch { .. }) {
         daemon::recheck(state, now_ms);
     }
+    announce(state, &action, (exit, &out, &err), on_terminal, now_ms);
+    state.reload_views(now_ms)
+}
+
+/// What an outcome shows (`on_done`'s list). `output` is the exit code, stdout and stderr.
+fn announce(
+    state: &mut State,
+    action: &Action,
+    output: (i32, &str, &str),
+    on_terminal: bool,
+    now_ms: i64,
+) {
+    let (exit, out, err) = output;
+    let name = action.name();
+    if on_terminal {
+        // R12: the output went to the terminal; there is nothing to show but how it ended.
+        let (kind, text) = match action {
+            Action::Run(account) => (
+                ToastKind::Info,
+                format!("session on {} ended", state.short_name(account)),
+            ),
+            _ if exit == 0 => (ToastKind::Done, format!("{name} finished")),
+            _ => (
+                ToastKind::Failed,
+                format!("{name} failed · its output is above in your terminal's scrollback"),
+            ),
+        };
+        state.toast(kind, text, now_ms);
+        return;
+    }
     let text = [out.trim_end(), err.trim_end()]
         .into_iter()
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
+    let quiet = err.trim().is_empty();
     match action {
-        // R12: a suspended action's output went to the terminal; there is nothing to show.
-        _ if text.is_empty() => {}
         Action::Doctor { online, .. } => {
             state.overlay = Some(Overlay::Doctor {
                 text,
                 scroll: 0,
-                online,
+                online: *online,
             });
+            return;
         }
-        _ if exit == 0 && err.trim().is_empty() && text.lines().count() == 1 => {
-            state.toast(text, now_ms);
+        Action::Autoswitch { provider, on } if exit == 0 && quiet => {
+            let display = state.names_of(provider).display_name;
+            let text = if *on {
+                "Auto resumed.".to_owned()
+            } else {
+                format!("Auto paused for {display}. P resumes.")
+            };
+            state.toast(ToastKind::Done, text, now_ms);
+            return;
         }
-        _ => {
-            state.overlay = Some(Overlay::Result {
-                title: action.name().to_owned(),
-                text,
-                scroll: 0,
-            });
-        }
+        _ => {}
     }
-    state.reload_views(now_ms)
+    if text.is_empty() {
+        let (kind, text) = if exit == 0 {
+            (ToastKind::Done, format!("{name} finished"))
+        } else {
+            (ToastKind::Failed, format!("{name} failed (exit {exit})"))
+        };
+        state.toast(kind, text, now_ms);
+        return;
+    }
+    let (kind, words) = match (exit == 0, quiet) {
+        (true, true) => {
+            let lines: Vec<&str> = out
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            (ToastKind::Done, lines.join(" "))
+        }
+        (true, false) => (ToastKind::Warn, text.clone()),
+        (false, _) => (ToastKind::Failed, text.clone()),
+    };
+    let one_line = kind == ToastKind::Done || text.lines().count() == 1;
+    if one_line && crate::chrome::toast_fits(state, kind, &words) {
+        state.toast(kind, words, now_ms);
+    } else {
+        state.overlay = Some(Overlay::Result {
+            title: name.to_owned(),
+            text,
+            scroll: 0,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -281,8 +400,11 @@ mod tests {
     use crossterm::event::KeyCode;
 
     use super::*;
+    use tagteam_engine::views::UsageStatus;
+
     use crate::host::AccountRef;
     use crate::msg::Msg;
+    use crate::source::CollectSummary;
     use crate::testutil::*;
     use crate::update::update;
 
@@ -369,7 +491,15 @@ mod tests {
         for c in ['s', 'b', 'x', 'a', 'm', 'A', 'D', 'R', 'r'] {
             let cmds = update(&mut state, ch(c), NOW_MS);
             assert!(cmds.is_empty(), "{c}: {cmds:?}");
-            assert_eq!(state.toast.as_ref().unwrap().text, "busy: switch", "{c}");
+            let toast = state.toast.as_ref().unwrap();
+            assert_eq!(
+                (toast.kind, toast.text.as_str()),
+                (
+                    ToastKind::Info,
+                    "still switching to 1 a1 · wait for it to finish"
+                ),
+                "{c}"
+            );
             assert!(state.overlay.is_none(), "{c}");
         }
         assert_eq!(state.running, Some(Action::Switch(sel(1))));
@@ -708,31 +838,37 @@ mod tests {
             matches!(cmds.as_slice(), [Cmd::LoadAccounts { .. }]),
             "{cmds:?}"
         );
-        assert_eq!(state.toast.as_ref().unwrap().text, "Enabled 1 a1@x.co.");
+        let toast = state.toast.as_ref().unwrap();
+        assert_eq!(
+            (toast.kind, toast.text.as_str()),
+            (ToastKind::Done, "Enabled 1 a1@x.co.")
+        );
         assert!(state.running.is_none() && state.overlay.is_none());
-        assert_eq!(draw(&state, 80, 24)[23], "Enabled 1 a1@x.co.");
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            footer_row("✓ Enabled 1 a1@x.co.", 80)
+        );
     }
 
     #[test]
     fn warnings_several_lines_or_a_failure_open_the_result_panel() {
+        let words = "word ".repeat(20).trim_end().to_owned();
+        let two_long = format!("{words}\n{words}\n");
         for (exit, out, err, want) in [
-            (
-                0,
-                "Switched to b@x.co (position 2).\nRestart Claude Code to apply.\n",
-                "",
-                "Switched to b@x.co (position 2).\nRestart Claude Code to apply.",
-            ),
+            // Two lines that do not fit a toast's three rows.
+            (0, two_long.as_str(), "", format!("{words}\n{words}")),
             (
                 0,
                 "Switched.\n",
                 "warning: usage was not collected\n",
-                "Switched.\nwarning: usage was not collected",
+                "Switched.\nwarning: usage was not collected".to_owned(),
             ),
             (
                 1,
                 "",
-                "tagteam: the selected account changed; nothing was done\n",
-                "tagteam: the selected account changed; nothing was done",
+                "tagteam: the selected account changed; nothing was done\nrun list and try again\n",
+                "tagteam: the selected account changed; nothing was done\nrun list and try again"
+                    .to_owned(),
             ),
         ] {
             let mut state = loaded(1);
@@ -747,8 +883,10 @@ mod tests {
             let Some(Overlay::Result { title, text, .. }) = &state.overlay else {
                 panic!("{exit} {out:?} {err:?}: {:?}", state.overlay);
             };
-            assert_eq!((title.as_str(), text.as_str()), ("switch", want));
+            assert_eq!((title.as_str(), text.as_str()), ("switch", want.as_str()));
+            assert!(state.toast.is_none(), "{exit} {out:?} {err:?}");
         }
+        // One line is a toast: here a failure.
         let mut state = loaded(1);
         on_done(
             &mut state,
@@ -757,6 +895,27 @@ mod tests {
                 1,
                 "",
                 "tagteam: the selected account changed; nothing was done\n",
+            ),
+            NOW_MS,
+        );
+        let toast = state.toast.as_ref().unwrap();
+        assert_eq!(
+            (toast.kind, toast.text.as_str()),
+            (
+                ToastKind::Failed,
+                "tagteam: the selected account changed; nothing was done"
+            )
+        );
+        assert!(state.overlay.is_none());
+        // A panel shows the CLI's words and closes on Esc.
+        let mut state = loaded(1);
+        on_done(
+            &mut state,
+            Action::Switch(sel(1)),
+            done(
+                1,
+                "",
+                "tagteam: the selected account changed; nothing was done\nrun list and try again\n",
             ),
             NOW_MS,
         );
@@ -771,26 +930,350 @@ mod tests {
         assert!(state.overlay.is_none());
     }
 
-    /// R12: a suspended action's output went to the terminal, so its outcome arrives empty and
-    /// shows nothing, whatever its exit; every view is read again (spec §7.3 step 4).
+    /// What an outcome left on screen.
+    #[derive(Debug, PartialEq)]
+    enum Shown {
+        Toast(ToastKind, String),
+        Panel(String, String),
+        Nothing,
+    }
+
+    /// `action`'s outcome arriving at a state with one account read, taken on the terminal or
+    /// not.
+    fn outcome_of(
+        action: Action,
+        on_terminal: bool,
+        exit: i32,
+        out: &str,
+        err: &str,
+    ) -> (State, Shown) {
+        let mut state = loaded(1);
+        state.running = Some(action.clone());
+        state.on_terminal = on_terminal;
+        on_done(&mut state, action, done(exit, out, err), NOW_MS);
+        assert!(state.running.is_none() && !state.on_terminal);
+        let shown = match (&state.toast, &state.overlay) {
+            (Some(t), None) => Shown::Toast(t.kind, t.text.clone()),
+            (None, Some(Overlay::Result { title, text, .. })) => {
+                Shown::Panel(title.clone(), text.clone())
+            }
+            (None, Some(Overlay::Doctor { text, .. })) => {
+                Shown::Panel("doctor".to_owned(), text.clone())
+            }
+            (None, None) => Shown::Nothing,
+            (toast, overlay) => panic!("{:?} {overlay:?}", toast.as_ref().map(|t| &t.text)),
+        };
+        (state, shown)
+    }
+
     #[test]
-    fn a_suspended_actions_outcome_shows_nothing_and_rereads_every_view() {
-        for exit in [0, 1, 130] {
-            let mut state = loaded(1);
-            state.history.select(id(1));
-            state.screen = Screen::History;
-            state.running = Some(Action::Run(sel(1)));
-            let cmds = on_done(&mut state, Action::Run(sel(1)), done(exit, "", ""), NOW_MS);
+    fn the_outcome_table_in_its_order() {
+        use ToastKind::{Done, Failed, Info, Warn};
+        let toast = |kind, text: &str| Shown::Toast(kind, text.to_owned());
+        let panel = |title: &str, text: &str| Shown::Panel(title.to_owned(), text.to_owned());
+        let switch = || Action::Switch(sel(1));
+        let doctor = || Action::Doctor {
+            provider: None,
+            online: false,
+        };
+        let auto = |on| Action::Autoswitch { provider: cc(), on };
+        let set = "Set provider.claude-code.daemon.autoswitch = false in ~/.config/tagteam/config.toml.\n";
+        let scrollback = "switch failed · its output is above in your terminal's scrollback";
+        let cases = [
+            // 2. A suspended action is worded by its exit code alone, whatever it printed.
+            (
+                "run",
+                Action::Run(sel(1)),
+                true,
+                0,
+                "",
+                "",
+                toast(Info, "session on 1 a1 ended"),
+            ),
+            (
+                "run, killed",
+                Action::Run(sel(1)),
+                true,
+                130,
+                "",
+                "",
+                toast(Info, "session on 1 a1 ended"),
+            ),
+            (
+                "hand-over ok",
+                switch(),
+                true,
+                0,
+                "",
+                "",
+                toast(Done, "switch finished"),
+            ),
+            (
+                "hand-over failed",
+                switch(),
+                true,
+                1,
+                "",
+                "",
+                toast(Failed, scrollback),
+            ),
+            (
+                "hand-over, output",
+                switch(),
+                true,
+                0,
+                "Enabled.\n",
+                "",
+                toast(Done, "switch finished"),
+            ),
+            // 3. Doctor's panel, whatever the exit code, even with no text.
+            (
+                "doctor",
+                doctor(),
+                false,
+                0,
+                "claude-code\n  ok\n",
+                "",
+                panel("doctor", "claude-code\n  ok"),
+            ),
+            (
+                "doctor, failed",
+                doctor(),
+                false,
+                1,
+                "",
+                "",
+                panel("doctor", ""),
+            ),
+            // 4. Auto's pause and resume, in the provider's name.
+            (
+                "pause",
+                auto(false),
+                false,
+                0,
+                set,
+                "",
+                toast(Done, "Auto paused for Claude Code. P resumes."),
+            ),
+            (
+                "resume",
+                auto(true),
+                false,
+                0,
+                set,
+                "",
+                toast(Done, "Auto resumed."),
+            ),
+            // With stderr it falls through to 7: a warning is never hidden.
+            (
+                "pause, warning",
+                auto(false),
+                false,
+                0,
+                "",
+                "warning: unknown key\n",
+                toast(Warn, "warning: unknown key"),
+            ),
+            (
+                "pause, failed",
+                auto(false),
+                false,
+                1,
+                "",
+                "tagteam: no config\n",
+                toast(Failed, "tagteam: no config"),
+            ),
+            // 5. Nothing printed.
+            (
+                "quiet",
+                switch(),
+                false,
+                0,
+                "",
+                "",
+                toast(Done, "switch finished"),
+            ),
+            (
+                "quiet, failed",
+                switch(),
+                false,
+                1,
+                "",
+                "",
+                toast(Failed, "switch failed (exit 1)"),
+            ),
+            // 6. Exit 0 with no stderr: the lines joined by a space.
+            (
+                "one line",
+                switch(),
+                false,
+                0,
+                "Enabled 1 a1@x.co.\n",
+                "",
+                toast(Done, "Enabled 1 a1@x.co."),
+            ),
+            (
+                "two lines",
+                switch(),
+                false,
+                0,
+                "Switched to b@x.co (position 2).\nRestart Claude Code to apply.\n",
+                "",
+                toast(
+                    Done,
+                    "Switched to b@x.co (position 2). Restart Claude Code to apply.",
+                ),
+            ),
+            // 7. Exit 0 with stderr: a Warn when it is one line.
+            (
+                "warning",
+                switch(),
+                false,
+                0,
+                "",
+                "warning: usage was not collected\n",
+                toast(Warn, "warning: usage was not collected"),
+            ),
+            (
+                "output and warning",
+                switch(),
+                false,
+                0,
+                "Switched.\n",
+                "warning: usage was not collected\n",
+                panel("switch", "Switched.\nwarning: usage was not collected"),
+            ),
+            // 8. A non-zero exit: a Failed when it is one line.
+            (
+                "failure",
+                switch(),
+                false,
+                2,
+                "",
+                "tagteam: no such account\n",
+                toast(Failed, "tagteam: no such account"),
+            ),
+            (
+                "failure, two lines",
+                switch(),
+                false,
+                2,
+                "",
+                "tagteam: no such account\ntry list\n",
+                panel("switch", "tagteam: no such account\ntry list"),
+            ),
+            (
+                "failure with output",
+                switch(),
+                false,
+                1,
+                "Switched.\n",
+                "tagteam: x\n",
+                panel("switch", "Switched.\ntagteam: x"),
+            ),
+        ];
+        for (case, action, on_terminal, exit, out, err, want) in cases {
+            let (_, shown) = outcome_of(action, on_terminal, exit, out, err);
+            assert_eq!(shown, want, "{case}");
+        }
+        // 1. NeedsTerminal asks to run again suspended, and marks the outcome to come.
+        let mut state = loaded(1);
+        let cmds = on_done(&mut state, switch(), ActionOutcome::NeedsTerminal, NOW_MS);
+        assert_eq!(cmds, [Cmd::Suspend(switch())]);
+        assert!(state.on_terminal && state.toast.is_none() && state.overlay.is_none());
+    }
+
+    #[test]
+    fn a_done_outcome_too_long_for_three_rows_opens_the_panel() {
+        let words = |n: usize| "word ".repeat(n).trim_end().to_owned();
+        // 300 characters on one line take five rows at 80 columns.
+        let long = words(60);
+        let (state, shown) = outcome_of(Action::Switch(sel(1)), false, 0, &format!("{long}\n"), "");
+        assert_eq!(shown, Shown::Panel("switch".to_owned(), long));
+        assert!(state.toast.is_none());
+        // 120 characters take two, with the pinned two on the last.
+        let fits = words(24);
+        let (state, shown) = outcome_of(Action::Switch(sel(1)), false, 0, &format!("{fits}\n"), "");
+        assert_eq!(shown, Shown::Toast(ToastKind::Done, fits.clone()));
+        let lines = draw(&state, 80, 24);
+        assert!(lines[22].starts_with("✓ word word"), "{lines:?}");
+        assert!(!lines[22].contains("q quit"), "{lines:?}");
+        assert!(lines[23].ends_with("? keys  q quit"), "{lines:?}");
+        let second = lines[23].trim_end_matches("? keys  q quit").trim_end();
+        assert_eq!(format!("{} {second}", lines[22]), format!("✓ {fits}"));
+        assert_eq!(
+            state.toast.as_ref().unwrap().until_ms,
+            NOW_MS + 8_000,
+            "a toast that wraps lasts 8 s"
+        );
+    }
+
+    /// R12: a suspended action's output went to the terminal, so its outcome arrives empty and
+    /// is worded by its exit code alone; every view is read again (spec §7.3 step 4).
+    #[test]
+    fn a_suspended_action_s_outcome_toasts_from_its_exit_code() {
+        let toast = |state: &State| {
+            let t = state.toast.as_ref().unwrap();
+            (t.kind, t.text.clone())
+        };
+        let reread = |cmds: &[Cmd], what: &str| {
             assert!(
                 matches!(
-                    cmds.as_slice(),
+                    cmds,
                     [Cmd::LoadAccounts { .. }, Cmd::LoadHistory { account, .. }]
                         if *account == id(1)
                 ),
-                "{exit}: {cmds:?}"
+                "{what}: {cmds:?}"
             );
-            assert!(state.toast.is_none() && state.overlay.is_none(), "{exit}");
-            assert!(state.running.is_none(), "{exit}");
+        };
+        for exit in [0, 1, 130] {
+            let mut state = loaded(1);
+            state.history.select(id(1));
+            let started = update(&mut state, ch('R'), NOW_MS);
+            state.screen = Screen::History;
+            assert_eq!(started, [Cmd::Suspend(Action::Run(sel(1)))]);
+            assert!(state.on_terminal);
+            let cmds = on_done(&mut state, Action::Run(sel(1)), done(exit, "", ""), NOW_MS);
+            reread(&cmds, "run");
+            assert_eq!(
+                toast(&state),
+                (ToastKind::Info, "session on 1 a1 ended".to_owned()),
+                "{exit}"
+            );
+            assert!(state.overlay.is_none() && state.running.is_none(), "{exit}");
+            assert!(!state.on_terminal, "{exit}");
+        }
+        // A hand-over for another action: `s` finds the keychain locked and asks for the
+        // terminal, then runs again suspended.
+        for (exit, want) in [
+            (0, (ToastKind::Done, "switch finished".to_owned())),
+            (
+                1,
+                (
+                    ToastKind::Failed,
+                    "switch failed · its output is above in your terminal's scrollback".to_owned(),
+                ),
+            ),
+        ] {
+            let mut state = loaded(1);
+            state.history.select(id(1));
+            update(&mut state, ch('s'), NOW_MS);
+            state.screen = Screen::History;
+            on_done(
+                &mut state,
+                Action::Switch(sel(1)),
+                ActionOutcome::NeedsTerminal,
+                NOW_MS,
+            );
+            let cmds = on_done(
+                &mut state,
+                Action::Switch(sel(1)),
+                done(exit, "", ""),
+                NOW_MS,
+            );
+            reread(&cmds, "switch");
+            assert_eq!(toast(&state), want, "{exit}");
+            assert!(state.running.is_none() && !state.on_terminal, "{exit}");
         }
     }
 
@@ -1030,7 +1513,12 @@ mod tests {
     #[test]
     fn an_indent_wider_than_a_third_of_a_panel_is_capped() {
         let mut state = loaded(1);
-        let line = format!("{}{}", " ".repeat(60), "word ".repeat(20).trim_end());
+        // A first line keeps the failure from being one line, which a toast would show.
+        let line = format!(
+            "tagteam: it failed\n{}{}",
+            " ".repeat(60),
+            "word ".repeat(20).trim_end()
+        );
         on_done(
             &mut state,
             Action::Switch(sel(1)),
@@ -1038,7 +1526,7 @@ mod tests {
             NOW_MS,
         );
         let drawn = draw(&state, 80, 24);
-        let rows: Vec<String> = drawn[2..5]
+        let rows: Vec<String> = drawn[3..6]
             .iter()
             .map(|l| {
                 l.chars()
@@ -1249,6 +1737,179 @@ mod tests {
                 }
             ]
         );
+        assert_eq!(state.checking, Some(1), "the collection a person asked for");
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            footer_row("⠋ checking usage…", 80),
+            "the spinner says so until it is over"
+        );
+    }
+
+    /// The accounts read `r` asks for, with `edit` applied to the accounts it holds.
+    fn read_back(state: &mut State, n: u32, edit: impl Fn(&mut Vec<AccountView>)) {
+        let mut accounts = many(n);
+        edit(&mut accounts);
+        let r#gen = state.gens.accounts;
+        let msg = Msg::Accounts {
+            r#gen,
+            result: Ok(snapshot(accounts)),
+        };
+        update(state, msg, NOW_MS);
+    }
+
+    fn collected(r#gen: u64, summary: CollectSummary) -> Msg {
+        Msg::Collected {
+            r#gen,
+            result: Ok(summary),
+        }
+    }
+
+    fn summary(fetched: usize, updated: usize) -> CollectSummary {
+        CollectSummary {
+            fetched,
+            warnings: vec![],
+            updated,
+            rate_limited: vec![],
+        }
+    }
+
+    #[test]
+    fn r_says_what_it_did() {
+        // T2-9, redesign §9.7: rate-limited, then warnings, then updated, then already current.
+        let said = |state: &State| {
+            state
+                .toast
+                .as_ref()
+                .map(|t| (t.kind, t.text.clone()))
+                .unwrap()
+        };
+        let pressed = |n: u32, edit: &dyn Fn(&mut Vec<AccountView>)| {
+            let mut accounts = many(n);
+            edit(&mut accounts);
+            let mut state = fresh(Screen::Accounts);
+            state.accounts.apply(snapshot(accounts));
+            update(&mut state, ch('r'), NOW_MS);
+            state
+        };
+        let limited = |retry_in: Vec<i64>| {
+            move |a: &mut Vec<AccountView>| {
+                for (i, v) in a.iter_mut().enumerate() {
+                    if let Some(s) = retry_in.get(i) {
+                        v.usage = unread(UsageStatus::Unavailable, Some("http-429"), Some(*s));
+                    }
+                }
+            }
+        };
+
+        // Rate-limited: the soonest retry of those accounts, from the accounts read after it.
+        let mut state = pressed(3, &|_| {});
+        update(
+            &mut state,
+            collected(
+                1,
+                CollectSummary {
+                    rate_limited: vec![id(1), id(2)],
+                    ..summary(2, 0)
+                },
+            ),
+            NOW_MS,
+        );
+        assert!(state.checking.is_none() && state.toast.is_none(), "not yet");
+        assert!(
+            !draw(&state, 80, 24)[23].contains("checking usage"),
+            "the spinner is over"
+        );
+        read_back(&mut state, 3, limited(vec![600, 240]));
+        assert_eq!(
+            said(&state),
+            (
+                ToastKind::Warn,
+                "2 accounts rate-limited · retry in 4m".to_owned()
+            )
+        );
+        assert!(state.checked.is_none(), "said once");
+        let mut state = pressed(1, &|_| {});
+        update(
+            &mut state,
+            collected(
+                1,
+                CollectSummary {
+                    rate_limited: vec![id(1)],
+                    ..summary(1, 0)
+                },
+            ),
+            NOW_MS,
+        );
+        read_back(&mut state, 1, limited(vec![240]));
+        assert_eq!(
+            said(&state),
+            (
+                ToastKind::Warn,
+                "1 account rate-limited · retry in 4m".to_owned()
+            )
+        );
+
+        // Warnings come next, at once when nothing was fetched.
+        let mut state = pressed(1, &|_| {});
+        let warned = CollectSummary {
+            warnings: vec!["usage for a1@x.co (position 1) was not collected: x".into()],
+            ..summary(0, 0)
+        };
+        update(&mut state, collected(1, warned), NOW_MS);
+        assert_eq!(
+            said(&state),
+            (
+                ToastKind::Warn,
+                "warning: usage for a1@x.co (position 1) was not collected: x".to_owned()
+            )
+        );
+
+        // Updated accounts: said once the accounts are read back.
+        let mut state = pressed(2, &|_| {});
+        let cmds = update(&mut state, collected(1, summary(2, 2)), NOW_MS);
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::LoadAccounts { .. }]),
+            "{cmds:?}"
+        );
+        assert!(state.toast.is_none());
+        read_back(&mut state, 2, |_| {});
+        assert_eq!(
+            said(&state),
+            (ToastKind::Done, "updated 2 accounts".to_owned())
+        );
+        let mut state = pressed(2, &|_| {});
+        update(&mut state, collected(1, summary(1, 1)), NOW_MS);
+        read_back(&mut state, 2, |_| {});
+        assert_eq!(
+            said(&state),
+            (ToastKind::Done, "updated 1 account".to_owned())
+        );
+
+        // Already current: at once, with the soonest next poll of the accounts shown.
+        let next = |polls: Vec<i64>| {
+            move |a: &mut Vec<AccountView>| {
+                for (v, at) in a.iter_mut().zip(&polls) {
+                    v.usage.next_poll_at = Some(NOW_S + at);
+                }
+            }
+        };
+        let mut state = pressed(2, &next(vec![300, 60]));
+        let cmds = update(&mut state, collected(1, summary(0, 0)), NOW_MS);
+        assert!(cmds.is_empty(), "nothing was fetched: {cmds:?}");
+        assert_eq!(
+            said(&state),
+            (
+                ToastKind::Info,
+                "already current · next update in 1m".to_owned()
+            )
+        );
+        let mut state = pressed(2, &|_| {});
+        update(&mut state, collected(1, summary(0, 0)), NOW_MS);
+        assert_eq!(
+            said(&state),
+            (ToastKind::Info, "already current".to_owned())
+        );
+        assert!(state.checking.is_none());
     }
 
     /// Claude Code's job in `mode`, with `autoswitch`.
@@ -1301,7 +1962,11 @@ mod tests {
             [Cmd::Act(pause.clone())]
         );
         assert_eq!(state.running, Some(pause));
-        assert_eq!(draw(&state, 80, 24)[23], "⠋ config…");
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            footer_row("⠋ pausing auto…", 80),
+            "the spinner says what runs"
+        );
     }
 
     #[test]
@@ -1321,11 +1986,21 @@ mod tests {
 
     #[test]
     fn p_without_a_daemon_says_so_and_changes_nothing() {
-        // Spec §7.4: in timer mode `P` shows `no daemon running`, also while the first
-        // `status` is still to come; and so for a provider the daemon runs no job for.
+        // Spec §7.4, T2-16: in timer mode `P` says how to start a daemon, also while the first
+        // `status` is still to come; and so for a provider the daemon runs no job for, which it
+        // names as the person knows it.
+        let said = |state: &State| {
+            let toast = state.toast.as_ref().unwrap();
+            (toast.kind, toast.text.clone())
+        };
+        let no_daemon = (
+            ToastKind::Info,
+            "no daemon runs · tagteam daemon install starts one".to_owned(),
+        );
         let mut state = loaded(1);
         assert!(update(&mut state, ch('P'), NOW_MS).is_empty());
-        assert_eq!(state.toast.as_ref().unwrap().text, NO_DAEMON_RUNNING);
+        assert_eq!(said(&state), no_daemon);
+        assert_eq!(NO_DAEMON_RUNNING, no_daemon.1);
         assert!(state.overlay.is_none());
         update(
             &mut state,
@@ -1333,14 +2008,17 @@ mod tests {
             NOW_MS,
         );
         update(&mut state, ch('P'), NOW_MS);
-        assert_eq!(state.toast.as_ref().unwrap().text, NO_DAEMON_RUNNING);
+        assert_eq!(said(&state), no_daemon);
         let mut state = loaded(1);
         let other = daemon_status(vec![daemon_job("fake-agent", "auto", true)], vec![]);
         go_live(&mut state, other);
         assert!(update(&mut state, ch('P'), NOW_MS).is_empty());
         assert_eq!(
-            state.toast.as_ref().unwrap().text,
-            "the daemon runs no job for claude-code"
+            said(&state),
+            (
+                ToastKind::Info,
+                "the daemon runs no job for Claude Code".to_owned()
+            )
         );
         assert!(state.overlay.is_none());
     }
@@ -1387,12 +2065,83 @@ mod tests {
     }
 
     #[test]
+    fn p_toasts_the_pause_in_the_provider_s_name() {
+        // Redesign §9.4: `Auto paused for <display name>. P resumes.`, never the provider's ID
+        // nor `config set`'s line, which names a file path.
+        let fake = tagteam_core::ProviderId::new("fake-agent");
+        let outcome = |display: &'static str, on: bool, focus_second: bool| {
+            let mut third = account(3, "c@x.co", read(60, 10.0, 20.0, false));
+            third.row.provider = fake.clone();
+            let mut snap = snapshot(many(1));
+            snap.providers
+                .push(tagteam_engine::views::ProviderAccounts {
+                    provider: fake.clone(),
+                    active_position: None,
+                    accounts: vec![third],
+                    threshold: 90.0,
+                    strategy: tagteam_core::autoswitch::Strategy::Best,
+                    names: tagteam_engine::views::ProviderNames {
+                        display_name: display,
+                        launch_command: "fakeagent",
+                    },
+                });
+            let mut state = fresh(Screen::Accounts);
+            state.accounts.apply(snap);
+            let status = daemon_status(
+                vec![
+                    daemon_job("claude-code", "auto", !on),
+                    daemon_job("fake-agent", "auto", !on),
+                ],
+                vec![],
+            );
+            go_live(&mut state, status);
+            if focus_second {
+                update(&mut state, ch('j'), NOW_MS);
+            }
+            update(&mut state, ch('P'), NOW_MS);
+            let cmds = update(&mut state, ch('y'), NOW_MS);
+            let [Cmd::Act(action)] = cmds.as_slice() else {
+                panic!("{cmds:?}");
+            };
+            let provider = if focus_second { fake.clone() } else { cc() };
+            assert_eq!(*action, Action::Autoswitch { provider, on });
+            let set = format!(
+                "Set provider.x.daemon.autoswitch = {on} in ~/.config/tagteam/config.toml.\n"
+            );
+            on_done(&mut state, action.clone(), done(0, &set, ""), NOW_MS);
+            let toast = state.toast.as_ref().unwrap();
+            (toast.kind, toast.text.clone())
+        };
+        assert_eq!(
+            outcome("FakeAgent", false, false),
+            (
+                ToastKind::Done,
+                "Auto paused for Claude Code. P resumes.".into()
+            )
+        );
+        assert_eq!(
+            outcome("FakeAgent", false, true),
+            (
+                ToastKind::Done,
+                "Auto paused for FakeAgent. P resumes.".into()
+            )
+        );
+        assert_eq!(
+            outcome("FakeAgent", true, true),
+            (ToastKind::Done, "Auto resumed.".into())
+        );
+    }
+
+    #[test]
     fn p_while_an_action_runs_is_busy() {
         let mut state = loaded(2);
         go_live(&mut state, job_in("auto", true));
         update(&mut state, ch('s'), NOW_MS);
         assert!(update(&mut state, ch('P'), NOW_MS).is_empty());
-        assert_eq!(state.toast.as_ref().unwrap().text, "busy: switch");
+        assert_eq!(
+            state.toast.as_ref().unwrap().text,
+            "still switching to 1 a1 · wait for it to finish"
+        );
         assert!(state.overlay.is_none());
     }
 
@@ -1422,7 +2171,12 @@ mod tests {
             matches!(cmds.as_slice(), [Cmd::LoadAccounts { .. }]),
             "{cmds:?}"
         );
-        assert_eq!(state.toast.as_ref().unwrap().text, set.trim_end());
+        let toast = state.toast.as_ref().unwrap();
+        assert_eq!(
+            (toast.kind, toast.text.as_str()),
+            (ToastKind::Done, "Auto paused for Claude Code. P resumes."),
+            "in the provider's name, in place of the file path the CLI prints"
+        );
         let fetch = |cmds: Vec<Cmd>| cmds.contains(&Cmd::FetchStatus { link });
         assert!(!fetch(update(&mut state, Msg::Tick, NOW_MS + 2_499)));
         assert!(fetch(update(&mut state, Msg::Tick, NOW_MS + 2_500)));

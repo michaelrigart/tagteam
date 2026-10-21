@@ -17,6 +17,8 @@ pub(crate) enum Role {
     Accent,
     Warn,
     Crit,
+    /// `✓` only: toasts, the doctor's report and "works again".
+    Ok,
 }
 
 /// Whether the terminal's background is dark or light (spec §4.2).
@@ -60,7 +62,7 @@ impl Theme {
     pub(crate) fn role(self, role: Role) -> Style {
         match self.tier {
             Tier::NoColor => match role {
-                Role::Text => Style::new(),
+                Role::Text | Role::Ok => Style::new(),
                 Role::Muted | Role::Faint => Style::new().add_modifier(Modifier::DIM),
                 Role::Accent | Role::Warn => Style::new().add_modifier(Modifier::BOLD),
                 Role::Crit => Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
@@ -72,6 +74,7 @@ impl Theme {
                 Role::Accent => Style::new().fg(Color::Cyan),
                 Role::Warn => Style::new().fg(Color::Yellow),
                 Role::Crit => Style::new().fg(Color::Red),
+                Role::Ok => Style::new().fg(Color::Green),
             },
             Tier::True(background) => {
                 let (dark, light) = match role {
@@ -81,6 +84,7 @@ impl Theme {
                     Role::Accent => ((0x56, 0xb6, 0xc2), (0x0a, 0x7d, 0x8c)),
                     Role::Warn => ((0xe5, 0xc0, 0x7b), (0x9a, 0x67, 0x00)),
                     Role::Crit => ((0xf0, 0x71, 0x78), (0xcf, 0x22, 0x2e)),
+                    Role::Ok => ((0x98, 0xc3, 0x79), (0x1a, 0x7f, 0x37)),
                 };
                 let (r, g, b) = match background {
                     Background::Dark => dark,
@@ -194,6 +198,15 @@ mod tests {
                     fg(Color::Red),
                     rgb(0xf0, 0x71, 0x78),
                     rgb(0xcf, 0x22, 0x2e),
+                ],
+            ),
+            (
+                Role::Ok,
+                [
+                    none,
+                    fg(Color::Green),
+                    rgb(0x98, 0xc3, 0x79),
+                    rgb(0x1a, 0x7f, 0x37),
                 ],
             ),
         ];

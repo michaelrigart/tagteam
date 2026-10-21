@@ -181,8 +181,8 @@ impl Home {
         assert!(store.record_usage(&r, &[window], at_s, &plan, 180).unwrap());
     }
 
-    /// A usable stored credential for `id`, and one usage reply queued for it.
-    fn fetchable(&self, id: &AccountId) {
+    /// A usable stored credential for `id`.
+    fn credential(&self, id: &AccountId) {
         let credential = json!({"claudeAiOauth": {
             "accessToken": format!("at-{id}"),
             "refreshToken": format!("rt-{id}"),
@@ -193,6 +193,11 @@ impl Home {
         }});
         self.kc
             .put(SERVICE, id.as_str(), credential.to_string().as_bytes());
+    }
+
+    /// A usable stored credential for `id`, and one usage reply queued for it.
+    fn fetchable(&self, id: &AccountId) {
+        self.credential(id);
         let recorded: Value = serde_json::from_str(include_str!(
             "../../tagteam-cc/tests/fixtures/endpoints/usage-200.json"
         ))
@@ -203,6 +208,14 @@ impl Home {
             200,
             recorded["body"].clone(),
         );
+    }
+
+    /// A usable stored credential for `id`, and the usage endpoint's refusal queued for it.
+    fn rate_limited(&self, id: &AccountId) {
+        self.credential(id);
+        let body = json!({"error": {"type": "rate_limit_error"}});
+        self.http
+            .push_json(Method::Get, &Endpoints::production().usage, 429, body);
     }
 }
 
@@ -393,12 +406,31 @@ fn collect_due_counts_the_readings_and_failures_it_recorded() {
         .unwrap();
     // `read` recorded a reading, `missing` a `vault-absent` failure; `fresh` was not due.
     assert_eq!(summary.fetched, 2, "{summary:?}");
+    assert_eq!(summary.updated, 1, "only `read` recorded a reading");
+    assert!(summary.rate_limited.is_empty(), "{summary:?}");
     let snap = source.accounts(None).unwrap();
     let a = &snap.providers[0].accounts[0];
     assert_eq!(a.usage.fetched_at, Some(NOW_S));
     // Nothing is due a moment later: a reading is fresh, a failure backs off.
     let again = source.collect_due(&[read, missing, fresh]).unwrap();
     assert_eq!(again.fetched, 0);
+}
+
+#[test]
+fn collect_due_lists_the_accounts_the_endpoint_rate_limited() {
+    let home = Home::new();
+    let fresh = home.add(CLAUDE_CODE, 1, "a@x.co");
+    let limited = home.add(CLAUDE_CODE, 2, "b@x.co");
+    home.reading(&fresh, 10, 5.0);
+    home.rate_limited(&limited);
+    let summary = home
+        .source()
+        .collect_due(&[fresh.clone(), limited.clone()])
+        .unwrap();
+    // `fresh` was not due; the refusal is recorded, so it counts as fetched, but not as updated.
+    assert_eq!(summary.fetched, 1, "{summary:?}");
+    assert_eq!(summary.updated, 0, "{summary:?}");
+    assert_eq!(summary.rate_limited, [limited], "{summary:?}");
 }
 
 fn fake() -> ProviderId {

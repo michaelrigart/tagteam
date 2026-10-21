@@ -3,19 +3,24 @@
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::views::{ProviderAccounts, ProviderNames};
 
+use crate::autoline;
+use crate::chrome;
 use crate::daemon::DaemonState;
-use crate::host::Action;
+use crate::host::{AccountRef, Action};
 use crate::msg::Cmd;
 use crate::overlay::Overlay;
 use crate::screens::accounts::AccountsState;
 use crate::screens::history::HistoryState;
 use crate::screens::tokens::TokensState;
+use crate::source::CollectSummary;
 use crate::theme::Theme;
 
 /// Timer mode re-reads and collects this often (spec §6.2).
 pub const REFRESH_MS: i64 = 30_000;
-/// A toast replaces the footer this long (spec §5.1).
+/// A `Done` or `Info` toast replaces the footer this long (redesign §5.5).
 pub const TOAST_MS: i64 = 5_000;
+/// A `Warn` or `Failed` toast, and a `Done` one that wraps, last this long (redesign §5.5).
+pub const TOAST_LONG_MS: i64 = 8_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -75,6 +80,14 @@ pub struct State {
     pub(crate) started_ms: i64,
     /// The default provider's names (§12.2), for a provider the accounts view does not list.
     pub(crate) fallback_names: ProviderNames,
+    /// The collect generation a person's `r` asked for, while it runs (spec §9.7): the spinner
+    /// says `checking usage` meanwhile.
+    pub(crate) checking: Option<u64>,
+    /// What that collection did, until the accounts read after it, which the `r` toast needs.
+    pub(crate) checked: Option<CollectSummary>,
+    /// The action running now was handed the terminal: its outcome is worded by the exit code
+    /// alone (T2-19).
+    pub(crate) on_terminal: bool,
 }
 
 /// A banner's words, and what raised them: a success of that same kind clears it, and a refusal
@@ -96,7 +109,17 @@ pub(crate) enum BannerKind {
     Refusal,
 }
 
+/// What a toast reports (redesign §5.5): its mark, its role and how long it lasts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    Done,
+    Info,
+    Warn,
+    Failed,
+}
+
 pub struct Toast {
+    pub kind: ToastKind,
     pub text: String,
     pub until_ms: i64,
 }
@@ -147,6 +170,9 @@ impl State {
             shown_s: now_ms.div_euclid(1000),
             started_ms: now_ms,
             fallback_names: names,
+            checking: None,
+            checked: None,
+            on_terminal: false,
         }
     }
 
@@ -249,13 +275,54 @@ impl State {
         self.banner.as_ref().map(|b| b.text.as_str())
     }
 
-    /// Shows `text` in place of the footer for `TOAST_MS`.
-    pub(crate) fn toast(&mut self, text: impl Into<String>, now_ms: i64) {
+    /// Shows `text` in place of the footer's left side: `Done` for 5 s (8 s when it takes more
+    /// than one row at `self.size`'s width, as the footer lays it out), `Info` for 5 s, `Warn`
+    /// and `Failed` for 8 s (redesign §5.5).
+    pub(crate) fn toast(&mut self, kind: ToastKind, text: impl Into<String>, now_ms: i64) {
+        let text = text.into();
+        let long = match kind {
+            ToastKind::Done => {
+                chrome::toast_rows(self, kind, &text, self.size.0)
+                    .rows
+                    .len()
+                    > 1
+            }
+            ToastKind::Info => false,
+            ToastKind::Warn | ToastKind::Failed => true,
+        };
+        let lasts = if long { TOAST_LONG_MS } else { TOAST_MS };
         self.toast = Some(Toast {
-            text: text.into(),
-            until_ms: now_ms + TOAST_MS,
+            kind,
+            text,
+            until_ms: now_ms + lasts,
         });
         self.dirty = true;
+    }
+
+    /// `account` as the person knows it: `words::short_name` from the last accounts view, else
+    /// its position alone.
+    pub(crate) fn short_name(&self, account: &AccountRef) -> String {
+        autoline::named(self.view_of(&account.provider), account.position)
+    }
+
+    /// The words the spinner and the busy toast give `action` (redesign §9.4), without the `…`.
+    pub(crate) fn label_of(&self, action: &Action) -> String {
+        let provider = match action {
+            Action::Switch(a)
+            | Action::Enable(a)
+            | Action::Disable(a)
+            | Action::ClearAlias(a)
+            | Action::Remove(a)
+            | Action::Run(a)
+            | Action::SetAlias { account: a, .. }
+            | Action::Move { account: a, .. } => Some(&a.provider),
+            Action::SwitchBy { provider, .. }
+            | Action::AddLive { provider }
+            | Action::Autoswitch { provider, .. } => Some(provider),
+            Action::Doctor { provider, .. } => provider.as_ref(),
+        };
+        let names = provider.map_or(self.fallback_names, |p| self.names_of(p));
+        action.label(&|a| self.short_name(a), names.display_name)
     }
 }
 
@@ -282,5 +349,33 @@ mod tests {
         state.quitting = Some(0);
         state.clear_banner(BannerKind::Accounts);
         assert_eq!(state.banner_text(), Some("locked"));
+    }
+
+    #[test]
+    fn each_toast_kind_lasts_as_long_as_it_says() {
+        // Redesign §5.5: Done 5 s, and 8 s when it wraps; Info 5 s; Warn and Failed 8 s.
+        let short = "Switched";
+        let wraps = "word ".repeat(20);
+        let lasts = |kind: ToastKind, text: &str| {
+            let mut state = testutil::fresh(Screen::Accounts);
+            assert_eq!(state.size, (80, 24));
+            state.dirty = false;
+            state.toast(kind, text, 1_000);
+            assert!(state.dirty);
+            let toast = state.toast.unwrap();
+            assert_eq!((toast.kind, toast.text.as_str()), (kind, text));
+            toast.until_ms - 1_000
+        };
+        assert_eq!(lasts(ToastKind::Done, short), TOAST_MS);
+        assert_eq!(lasts(ToastKind::Done, &wraps), TOAST_LONG_MS);
+        assert_eq!(lasts(ToastKind::Info, short), TOAST_MS);
+        assert_eq!(
+            lasts(ToastKind::Info, &wraps),
+            TOAST_MS,
+            "Info never takes longer"
+        );
+        assert_eq!(lasts(ToastKind::Warn, short), TOAST_LONG_MS);
+        assert_eq!(lasts(ToastKind::Failed, short), TOAST_LONG_MS);
+        assert_eq!((TOAST_MS, TOAST_LONG_MS), (5_000, 8_000));
     }
 }

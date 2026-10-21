@@ -20,8 +20,7 @@ const TWO_COLUMNS: u16 = 100;
 /// The columns between the two.
 const COLUMN_GAP: usize = 3;
 
-/// §4.4's marks, each with the role it is drawn in and its words (T2-25). `✓` is `Ok` in
-/// §4.1; there is no such role yet, so it takes `Text` until Task 10 adds it. Every glyph is one
+/// §4.4's marks, each with the role it is drawn in and its words (T2-25). Every glyph is one
 /// column wide.
 pub(crate) const MARKS: &[(&str, Role, &str)] = &[
     ("●", Role::Accent, "in use"),
@@ -30,7 +29,7 @@ pub(crate) const MARKS: &[(&str, Role, &str)] = &[
     ("▲", Role::Warn, "faster than an even pace"),
     ("✕", Role::Crit, "needs you"),
     ("!", Role::Warn, "tagteam retries"),
-    ("✓", Role::Text, "done"),
+    ("✓", Role::Ok, "done"),
     ("≥", Role::Text, "at least"),
     ("~", Role::Text, "estimated"),
     ("›", Role::Muted, "breadcrumb"),

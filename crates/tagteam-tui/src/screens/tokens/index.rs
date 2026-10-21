@@ -11,7 +11,7 @@ use super::requery;
 use crate::daemon::{self, words};
 use crate::msg::Cmd;
 use crate::source::SourceError;
-use crate::state::{Screen, State};
+use crate::state::{Screen, State, ToastKind};
 
 /// Spec §6.4: in timer mode the index is refreshed this often while Tokens is open, counted
 /// from the last refresh's return...
@@ -128,7 +128,7 @@ pub(crate) fn first_refresh(state: &mut State) -> Vec<Cmd> {
 /// `r` on Tokens (spec §7.1): a refresh at once, on the index lane, so no action holds it up.
 pub(crate) fn refresh_now(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     if state.tokens.watch.refreshing.is_some() {
-        state.toast(ALREADY, now_ms);
+        state.toast(ToastKind::Info, ALREADY, now_ms);
         return vec![];
     }
     refresh(state)

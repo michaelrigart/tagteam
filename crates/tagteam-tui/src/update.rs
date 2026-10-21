@@ -8,7 +8,7 @@ use crate::daemon;
 use crate::msg::{Cmd, Msg};
 use crate::overlay::{self, Overlay};
 use crate::screens;
-use crate::state::{BannerKind, REFRESH_MS, Screen, State};
+use crate::state::{BannerKind, REFRESH_MS, Screen, State, ToastKind};
 
 pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
     match msg {
@@ -34,6 +34,10 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                 Ok(snapshot) => {
                     state.accounts.apply(snapshot);
                     state.clear_banner(BannerKind::Accounts);
+                    // The read after `r`'s collection: the toast needs what it shows.
+                    if let Some(summary) = state.checked.take() {
+                        actions::say_checked(state, &summary, now_ms);
+                    }
                     if state.quitting.is_some() {
                         return vec![];
                     }
@@ -43,6 +47,9 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                 }
                 Err(e) => {
                     state.raise_banner(BannerKind::Accounts, e.message);
+                    if let Some(summary) = state.checked.take() {
+                        actions::say_checked(state, &summary, now_ms);
+                    }
                     vec![]
                 }
             }
@@ -63,16 +70,30 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
         }
         Msg::Collected { r#gen, result } => {
             // A collection slower than the timer is overtaken by the next. What it recorded is
-            // in the store all the same, so it is read back; its banner and toast are dropped.
+            // in the store all the same, so it is read back; its banner and toast are dropped,
+            // unless a person's `r` asked for it: that one is answered whatever came since.
+            let asked = state.checking == Some(r#gen);
+            if asked {
+                state.checking = None;
+                state.dirty = true;
+            }
             let stale = r#gen != state.gens.collect;
             match result {
                 Ok(summary) => {
                     if !stale {
                         state.dirty = true;
                         state.clear_banner(BannerKind::Collect);
-                        if let Some(first) = summary.warnings.first() {
-                            state.toast(format!("warning: {first}"), now_ms);
+                    }
+                    if asked && state.quitting.is_none() {
+                        // Spec §9.7: said at once when nothing was fetched, else once the
+                        // accounts read back show what it did.
+                        if summary.fetched == 0 {
+                            actions::say_checked(state, &summary, now_ms);
+                        } else {
+                            state.checked = Some(summary.clone());
                         }
+                    } else if !stale && let Some(first) = summary.warnings.first() {
+                        state.toast(ToastKind::Warn, format!("warning: {first}"), now_ms);
                     }
                     if summary.fetched == 0 || state.quitting.is_some() {
                         return vec![];
@@ -140,6 +161,7 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
             state.raise_banner(BannerKind::Refusal, words);
             if action.is_some() {
                 state.running = None;
+                state.on_terminal = false;
             }
             state.dirty = true;
             vec![]
@@ -260,9 +282,11 @@ fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
         state.toast = None;
         state.dirty = true;
     }
-    // Countdowns change at most once a second; the spinner turns while anything runs.
+    // Countdowns change at most once a second; the spinner turns while anything runs or `r`
+    // checks usage.
     let now_s = now_ms.div_euclid(1000);
-    if now_s != state.shown_s || state.running.is_some() || state.quitting.is_some() {
+    let spinning = state.running.is_some() || state.checking.is_some();
+    if now_s != state.shown_s || spinning || state.quitting.is_some() {
         state.shown_s = now_s;
         state.dirty = true;
     }
@@ -526,6 +550,8 @@ mod tests {
             result: Ok(CollectSummary {
                 fetched: 0,
                 warnings: vec!["usage for a@x.co (position 1) was not collected: x".into()],
+                updated: 0,
+                rate_limited: vec![],
             }),
         };
         assert!(update(&mut state, stale, NOW_MS).is_empty());
@@ -549,7 +575,12 @@ mod tests {
             state.collect_due(vec![id(1)]);
             let stale = |fetched, warnings: Vec<String>| Msg::Collected {
                 r#gen,
-                result: Ok(CollectSummary { fetched, warnings }),
+                result: Ok(CollectSummary {
+                    fetched,
+                    warnings,
+                    updated: 0,
+                    rate_limited: vec![],
+                }),
             };
             assert!(update(&mut state, stale(0, vec![]), NOW_MS).is_empty());
             let cmds = update(
@@ -648,6 +679,8 @@ mod tests {
             result: Ok(CollectSummary {
                 fetched,
                 warnings: vec![],
+                updated: 0,
+                rate_limited: vec![],
             }),
         };
         assert!(update(&mut state, collected(0), NOW_MS).is_empty());
@@ -712,13 +745,27 @@ mod tests {
                 result: Ok(CollectSummary {
                     fetched: 0,
                     warnings: vec!["usage for a@x.co (position 1) was not collected: x".into()],
+                    updated: 0,
+                    rate_limited: vec![],
                 }),
             },
             NOW_MS,
         );
+        let toast = state.toast.as_ref().unwrap();
         assert_eq!(
-            state.toast.as_ref().unwrap().text,
-            "warning: usage for a@x.co (position 1) was not collected: x"
+            (toast.kind, toast.text.as_str()),
+            (
+                ToastKind::Warn,
+                "warning: usage for a@x.co (position 1) was not collected: x"
+            ),
+            "a collection the timer asked for keeps today's words, as a warning"
+        );
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            footer_row(
+                "! warning: usage for a@x.co (position 1) was not collected: x",
+                80
+            )
         );
     }
 
@@ -872,6 +919,8 @@ mod tests {
                 result: Ok(CollectSummary {
                     fetched: 0,
                     warnings: vec![],
+                    updated: 0,
+                    rate_limited: vec![],
                 }),
             },
             NOW_MS,
@@ -893,6 +942,8 @@ mod tests {
             result: Ok(CollectSummary {
                 fetched: 1,
                 warnings: vec![],
+                updated: 0,
+                rate_limited: vec![],
             }),
         };
         assert!(update(&mut state, fetched, NOW_MS).is_empty());

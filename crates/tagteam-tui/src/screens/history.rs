@@ -719,7 +719,11 @@ mod tests {
             BannerKind::Refusal,
             ["the store could not be read"; 12].join("; "),
         );
-        state.toast(["Switched to a@x.co (position 1)"; 8].join(" "), NOW_MS);
+        state.toast(
+            crate::state::ToastKind::Info,
+            ["Switched to a@x.co (position 1)"; 8].join(" "),
+            NOW_MS,
+        );
         let right: Vec<String> = body_of(&state, 80, 24, NOW_MS)[0..16]
             .iter()
             .map(|l| right_of(l).unwrap_or("").trim_end().to_owned())

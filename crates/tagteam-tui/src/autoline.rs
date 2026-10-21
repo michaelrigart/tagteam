@@ -117,7 +117,7 @@ fn switched(view: Option<&ProviderAccounts>, s: &StatusSwitch) -> String {
 }
 
 /// The account at `position` by `words::short_name`, else the position alone.
-fn named(view: Option<&ProviderAccounts>, position: u32) -> String {
+pub(crate) fn named(view: Option<&ProviderAccounts>, position: u32) -> String {
     view.and_then(|v| v.accounts.iter().find(|a| a.row.position == position))
         .map_or_else(
             || position.to_string(),

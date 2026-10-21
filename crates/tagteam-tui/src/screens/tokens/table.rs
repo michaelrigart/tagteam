@@ -2319,7 +2319,7 @@ mod tests {
         }
         let words = "the store could not be opened because another tagteam holds its lock";
         state.raise_banner(BannerKind::Refusal, [words; 3].join("; "));
-        state.toast([words; 3].join("; "), NOW_MS);
+        state.toast(crate::state::ToastKind::Info, [words; 3].join("; "), NOW_MS);
         let notes = [
             "No price for claude-test-1, claude-test-2, claude-test-3, claude-test-4, claude-test-5, claude-test-6, claude-test-7, claude-test-8, claude-test-9, claude-test-10, claude-test-11, claude-test-12: counted without cost (≥ marks a partial cost).",
             "Output is a lower bound for 1 subagent response.",
@@ -2456,7 +2456,7 @@ mod tests {
         }
         let words = "the store could not be opened because another tagteam holds its lock";
         state.raise_banner(BannerKind::Refusal, [words; 3].join("; "));
-        state.toast([words; 3].join("; "), NOW_MS);
+        state.toast(crate::state::ToastKind::Info, [words; 3].join("; "), NOW_MS);
         let lines = draw(&state, 80, 24);
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
         assert_eq!(
@@ -2524,7 +2524,7 @@ mod tests {
         update(&mut state, Msg::Live(crate::live::Live::Event(ev)), NOW_MS);
         let words = "the store could not be opened because another tagteam holds its lock";
         state.raise_banner(BannerKind::Refusal, [words; 3].join("; "));
-        state.toast([words; 3].join("; "), NOW_MS);
+        state.toast(crate::state::ToastKind::Info, [words; 3].join("; "), NOW_MS);
         let lines = draw(&state, 80, 24);
         assert_eq!(lines.len(), 24, "{lines:?}");
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");

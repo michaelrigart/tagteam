@@ -45,7 +45,7 @@ pub(crate) fn areas(state: &State, area: Rect) -> Areas {
     let chrome = header + auto + rule;
     let spare = height.saturating_sub(chrome + 2);
     let banner = rows(chrome::banner_rows(state, area.width).len()).min(spare);
-    let footer = toast_rows(state, usize::from(area.width)).map_or(1, |t| rows(t.len()));
+    let footer = chrome::toast_height(state, area.width).map_or(1, rows);
     let footer = footer
         .min(spare - banner + 1)
         .min(height.saturating_sub(chrome));
@@ -179,16 +179,6 @@ pub(crate) fn wrap_rows(text: &str, width: usize, max: usize) -> Vec<String> {
     rows
 }
 
-/// The toast's rows, when the footer shows it: not once the shutdown has begun.
-fn toast_rows(state: &State, width: usize) -> Option<Vec<String>> {
-    let toast = state.toast.as_ref().filter(|_| state.quitting.is_none())?;
-    let mut rows = wrap_rows(&toast.text, width, WRAP_ROWS);
-    if rows.is_empty() {
-        rows.push(String::new());
-    }
-    Some(rows)
-}
-
 pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -222,9 +212,8 @@ pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
     overlay::render(state, frame);
 }
 
-/// The footer: `finishing <action>…` once the shutdown has begun, else the toast (on as many
-/// rows as it needs, `WRAP_ROWS` at most), else the running action's spinner, else the screen's
-/// keys and the pinned two (spec §5.1, §5.5, §10.2 step 4).
+/// The footer: `finishing <action>…` once the shutdown has begun, else `chrome::footer`'s toast,
+/// spinner or keys (spec §5.1, §5.5, §10.2 step 4).
 fn footer(state: &State, width: u16, now_ms: i64) -> Vec<Line<'static>> {
     if state.quitting.is_some() {
         let text = match &state.running {
@@ -233,17 +222,8 @@ fn footer(state: &State, width: u16, now_ms: i64) -> Vec<Line<'static>> {
         };
         return vec![Line::from(Span::styled(text, state.theme.strong()))];
     }
-    if let Some(rows) = toast_rows(state, usize::from(width)) {
-        return rows
-            .into_iter()
-            .map(|row| Line::from(Span::styled(row, state.theme.strong())))
-            .collect();
-    }
-    if let Some(action) = &state.running {
-        let frame = SPINNER[(now_ms.div_euclid(250)).rem_euclid(10) as usize];
-        return vec![Line::from(format!("{frame} {}…", action.name()))];
-    }
-    vec![chrome::footer(state, width)]
+    let frame = SPINNER[(now_ms.div_euclid(250)).rem_euclid(10) as usize];
+    chrome::footer(state, width, frame)
 }
 
 /// The columns `s` takes on a terminal: a CJK character or an emoji takes two.
@@ -402,7 +382,7 @@ mod tests {
     use crate::host::Action;
     use crate::msg::{Answer, AnswerTo, Cmd, Msg};
     use crate::overlay::{ConfirmThen, Overlay};
-    use crate::state::BannerKind;
+    use crate::state::{BannerKind, ToastKind};
     use crate::testutil::*;
     use crate::theme::Role;
     use crate::update::update;
@@ -501,7 +481,7 @@ mod tests {
     #[test]
     fn below_80_by_24_only_the_notice_is_drawn() {
         let mut state = fresh(Screen::Accounts);
-        state.toast("a toast", NOW_MS);
+        state.toast(ToastKind::Info, "a toast", NOW_MS);
         for (w, h) in [(79, 24), (80, 23), (20, 5)] {
             let lines = draw(&state, w, h);
             let cut: String = TOO_SMALL.chars().take(usize::from(w)).collect();
@@ -517,27 +497,56 @@ mod tests {
     fn the_footer_gives_way_to_a_toast_a_spinner_and_finishing() {
         let mut state = fresh(Screen::Accounts);
         state.running = Some(Action::AddLive { provider: cc() });
-        assert_eq!(draw(&state, 80, 24)[23], "⠋ add…");
+        let adding = |frame| format!("{frame} adding Claude Code's login…");
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            footer_row(&adding("⠋"), 80),
+            "the spinner, with the pinned two on its right"
+        );
         let later = draw_at(&state, 80, 24, NOW_MS + 250);
-        assert_eq!(later[23], "⠙ add…");
-        state.toast("busy: add", NOW_MS);
-        assert_eq!(draw(&state, 80, 24)[23], "busy: add");
+        assert_eq!(later[23], footer_row(&adding("⠙"), 80));
+        let busy = "still adding Claude Code's login · wait for it to finish";
+        state.toast(ToastKind::Info, busy, NOW_MS);
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            busy,
+            "a spinner this long leaves the toast too little room beside it, so the toast takes \
+             the row"
+        );
+        state.running = Some(Action::Doctor {
+            provider: None,
+            online: false,
+        });
+        state.toast(ToastKind::Info, "busy", NOW_MS);
+        let right = "⠋ running doctor…  ? keys  q quit";
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            format!("busy{}{right}", " ".repeat(80 - 1 - 4 - width_of(right))),
+            "the spinner sits right of the toast, before the pinned two"
+        );
         state.quitting = Some(0);
-        assert_eq!(draw(&state, 80, 24)[23], "finishing add…");
+        assert_eq!(draw(&state, 80, 24)[23], "finishing doctor…");
         state.running = None;
         assert_eq!(draw(&state, 80, 24)[23], "finishing…");
     }
 
     #[test]
-    fn a_toast_lasts_five_seconds() {
-        let mut state = fresh(Screen::Accounts);
-        state.toast("Switched", NOW_MS);
-        update(&mut state, Msg::Tick, NOW_MS + 4_999);
-        assert!(state.toast.is_some());
-        state.dirty = false;
-        update(&mut state, Msg::Tick, NOW_MS + 5_000);
-        assert!(state.toast.is_none());
-        assert!(state.dirty);
+    fn a_toast_lasts_as_long_as_its_kind_says() {
+        for (kind, lasts) in [
+            (ToastKind::Done, 5_000),
+            (ToastKind::Info, 5_000),
+            (ToastKind::Warn, 8_000),
+            (ToastKind::Failed, 8_000),
+        ] {
+            let mut state = fresh(Screen::Accounts);
+            state.toast(kind, "Switched", NOW_MS);
+            update(&mut state, Msg::Tick, NOW_MS + lasts - 1);
+            assert!(state.toast.is_some(), "{kind:?}");
+            state.dirty = false;
+            update(&mut state, Msg::Tick, NOW_MS + lasts);
+            assert!(state.toast.is_none(), "{kind:?}");
+            assert!(state.dirty, "{kind:?}");
+        }
     }
 
     #[test]
@@ -564,14 +573,18 @@ mod tests {
     fn a_long_toast_wraps_upwards_from_the_footer() {
         let mut state = fresh(Screen::Accounts);
         let text = "Alias of 2 averyveryverylongname.with.a.long.tail@example.com set to the-most-descriptive-alias-anyone-could-want.";
-        state.toast(text, NOW_MS);
+        state.toast(ToastKind::Info, text, NOW_MS);
         let lines = draw(&state, 80, 24);
+        // It wraps in the room the pinned two leave: 80 less `? keys  q quit`, the column they
+        // keep from the edge and two columns between.
         assert_eq!(
-            lines[22..],
-            [
-                "Alias of 2 averyveryverylongname.with.a.long.tail@example.com set to",
-                "the-most-descriptive-alias-anyone-could-want.",
-            ]
+            lines[22],
+            "Alias of 2 averyveryverylongname.with.a.long.tail@example.com"
+        );
+        assert_eq!(
+            lines[23],
+            footer_row("set to the-most-descriptive-alias-anyone-could-want.", 80),
+            "the pinned two sit on the last row"
         );
         assert_eq!(
             areas(&state, Rect::new(0, 0, 80, 24)).body,
@@ -691,10 +704,14 @@ mod tests {
     #[test]
     fn an_empty_toast_still_takes_the_footer_s_one_row() {
         let mut state = fresh(Screen::Accounts);
-        state.toast("", NOW_MS);
+        state.toast(ToastKind::Info, "", NOW_MS);
         let a = areas(&state, Rect::new(0, 0, 80, 24));
         assert_eq!(a.footer.height, 1);
         assert_eq!(a.body.height, 24 - 2 - 1);
-        assert_eq!(draw(&state, 80, 24)[23].trim_end(), "");
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            footer_row("", 80),
+            "nothing on the left, the pinned two on the right"
+        );
     }
 }
