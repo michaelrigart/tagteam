@@ -108,13 +108,13 @@ pub(crate) fn sparkline(
     cells: usize,
     theme: Theme,
 ) -> Span<'static> {
-    let span = i128::from((to_s - from_s).max(1));
+    let span = (i128::from(to_s) - i128::from(from_s)).max(1);
     let mut peaks: Vec<Option<f64>> = vec![None; cells];
     for s in samples {
         if s.fetched_at < from_s || s.fetched_at >= to_s {
             continue;
         }
-        let i = (i128::from(s.fetched_at - from_s) * cells as i128 / span) as usize;
+        let i = ((i128::from(s.fetched_at) - i128::from(from_s)) * cells as i128 / span) as usize;
         if let Some(slot) = peaks.get_mut(i) {
             *slot = Some(slot.map_or(s.pct, |p| p.max(s.pct)));
         }
@@ -205,6 +205,11 @@ mod tests {
             let (text, letters) = drawn(line_gauge(6.0, Some(10.0), 14, theme), theme);
             assert_eq!(text, format!("╸┼{}", track.repeat(12)), "{theme:?}");
             assert_eq!(letters, canon(theme, "amffffffffffff"), "{theme:?}");
+
+            // On the half cell the mark takes its place.
+            let (text, letters) = drawn(line_gauge(54.0, Some(50.0), 9, theme), theme);
+            assert_eq!(text, format!("━━━━┼{}", track.repeat(4)), "{theme:?}");
+            assert_eq!(letters, canon(theme, "aaaamffff"), "{theme:?}");
         }
     }
 
@@ -250,6 +255,7 @@ mod tests {
         };
         let samples = [at(10, 0.0), at(110, 50.0), at(120, 100.0), at(390, 20.0)];
         let outside = [at(-1, 90.0), at(400, 90.0)];
+        let peak_first = [at(110, 100.0), at(120, 50.0)];
         for theme in TIERS {
             let (text, letters) = drawn(vec![sparkline(&samples, 0, 400, 4, theme)], theme);
             assert_eq!(text, "▁█ ▂", "{theme:?}");
@@ -261,6 +267,49 @@ mod tests {
 
             let (text, _) = drawn(vec![sparkline(&[], 0, 400, 4, theme)], theme);
             assert_eq!(text, "    ", "{theme:?}");
+
+            let (text, _) = drawn(vec![sparkline(&peak_first, 0, 400, 4, theme)], theme);
+            assert_eq!(text, " █  ", "{theme:?}");
+        }
+    }
+
+    #[test]
+    fn the_gauges_draw_edge_inputs_exactly_their_cells_wide() {
+        let samples = [Sample {
+            fetched_at: 10,
+            pct: 60.0,
+            resets_at: None,
+        }];
+        for theme in TIERS {
+            let track = if theme.colourless() { "·" } else { "─" };
+            let line =
+                |pct, expected, cells| drawn(line_gauge(pct, expected, cells, theme), theme).0;
+            let lead = |pct, expected, cells| drawn(lead_bar(pct, expected, cells, theme), theme).0;
+            let spark = |from_s, to_s, cells| {
+                drawn(vec![sparkline(&samples, from_s, to_s, cells, theme)], theme).0
+            };
+            let cases = [
+                (line(54.0, Some(50.0), 0), "", 0),
+                (lead(54.0, Some(50.0), 0), "", 0),
+                (spark(0, 400, 0), "", 0),
+                (line(54.0, Some(50.0), 1), "┼", 1),
+                (lead(54.0, Some(50.0), 1), "│", 1),
+                (spark(0, 400, 1), "▅", 1),
+                (line(-20.0, None, 9), "─────────", 9),
+                (lead(-20.0, None, 9), "▁▁▁▁▁▁▁▁▁", 9),
+                (line(54.0, Some(150.0), 9), "━━━━╸───┼", 9),
+                (lead(54.0, Some(150.0), 9), "▆▆▆▆▆▁▁▁│", 9),
+                (line(54.0, Some(-10.0), 9), "┿━━━╸────", 9),
+                (lead(54.0, Some(-10.0), 9), "│▆▆▆▆▁▁▁▁", 9),
+                (line(54.0, Some(f64::NAN), 9), "━━━━╸────", 9),
+                (lead(54.0, Some(f64::NAN), 9), "▆▆▆▆▆▁▁▁▁", 9),
+                (spark(400, 400, 4), "    ", 4),
+                (spark(400, 0, 4), "    ", 4),
+            ];
+            for (n, (text, want, cells)) in cases.into_iter().enumerate() {
+                assert_eq!(text, want.replace('─', track), "case {n} in {theme:?}");
+                assert_eq!(text.chars().count(), cells, "case {n} in {theme:?}");
+            }
         }
     }
 }
