@@ -765,6 +765,7 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            shown_warnings: Arc::from(Vec::<String>::new()),
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = run(
@@ -889,6 +890,7 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            shown_warnings: Arc::from(Vec::<String>::new()),
         };
         let (built, provider) = engine(ctx, None);
         assert_eq!(provider.as_str(), CLAUDE_CODE);
@@ -923,6 +925,7 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            shown_warnings: Arc::from(Vec::<String>::new()),
         }
     }
 

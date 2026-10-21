@@ -59,6 +59,9 @@ pub struct Context {
     /// process's own.
     pub no_color_env: bool,
     pub force_color_env: bool,
+    /// The settings warnings the host has already shown, which a command leaves out of its
+    /// own (redesign §13): the TUI's, printed at start-up. The binary's own context holds none.
+    pub shown_warnings: Arc<[String]>,
 }
 
 #[derive(Default)]
@@ -120,6 +123,7 @@ impl Context {
             stdout_terminal: std::io::stdout().is_terminal(),
             no_color_env: env_flag(NO_COLOR),
             force_color_env: env_flag(FORCE_COLOR),
+            shown_warnings: Arc::from(Vec::<String>::new()),
         };
         // The variables this build's providers asked for, captured here at the process
         // boundary and never in `run`, so a hand-built `Context` carries exactly the
@@ -709,6 +713,7 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            shown_warnings: Arc::from(Vec::<String>::new()),
         };
         let registered: Vec<ProviderId> =
             build_registry(&ctx).all().iter().map(|p| p.id()).collect();
@@ -735,6 +740,7 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            shown_warnings: Arc::from(Vec::<String>::new()),
         };
         assert_eq!(
             home_vars(&build_registry(&ctx)),
@@ -760,6 +766,7 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            shown_warnings: Arc::from(Vec::<String>::new()),
         };
         assert_eq!(
             session_vars(&build_registry(&ctx)),
@@ -790,6 +797,7 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            shown_warnings: Arc::from(Vec::<String>::new()),
         };
         let names = scrubbed_vars(&build_registry(&ctx));
         for name in [

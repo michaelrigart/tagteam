@@ -175,6 +175,7 @@ impl Home {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            shown_warnings: Arc::from(Vec::<String>::new()),
         }
     }
 
@@ -208,11 +209,17 @@ impl Home {
     /// The host the TUI would get for this home, and its shutdown token. Nothing here spawns
     /// `Run`, so `exe` names nothing.
     fn host(&self) -> (CliHost, Cancel) {
+        self.host_shown(Vec::new())
+    }
+
+    /// `host`, for a TUI that printed `shown` at start-up (`tui_cmd`).
+    fn host_shown(&self, shown: Vec<String>) -> (CliHost, Cancel) {
         let shutdown = Cancel::new();
         let host = CliHost::new(
             &self.context(),
             shutdown.clone(),
             PathBuf::from("/nonexistent/tagteam"),
+            shown,
         );
         (host, shutdown)
     }
@@ -270,7 +277,9 @@ fn the_settings_warnings_the_tui_printed_are_not_repeated_in_an_action_s_output(
         err.starts_with("warning: ") && err.lines().count() == 1,
         "{err}"
     );
-    let (host, _) = home.host();
+    // `tui_cmd` passes the host what it printed.
+    let printed = err.trim_end().strip_prefix("warning: ").unwrap().to_owned();
+    let (host, _) = home.host_shown(vec![printed]);
     let outcome = host.act(&Action::Switch(home.at(1)), &mut Dialogs::none());
     assert_eq!(
         done(outcome),
@@ -304,7 +313,8 @@ fn a_settings_warning_that_appears_after_start_up_is_shown_by_the_action() {
 
 #[test]
 fn the_start_up_warnings_the_tui_names_are_the_ones_left_out() {
-    // A start-up for another provider than the default read warnings `new` cannot know.
+    // The host reads no settings of its own: it leaves out what `tui_cmd` says it printed, and
+    // nothing else.
     let home = Home::with_two();
     let dir = home.env.config_dir();
     fs::create_dir_all(&dir).unwrap();
@@ -315,12 +325,16 @@ fn the_start_up_warnings_the_tui_names_are_the_ones_left_out() {
         .strip_prefix("warning: ")
         .unwrap()
         .to_owned();
-    let (host, _) = home.host();
-    let host = host.with_startup_warnings(vec![text, "another".into()]);
+    let exe = PathBuf::from("/nonexistent/tagteam");
+    let host = CliHost::new(
+        &home.context(),
+        Cancel::new(),
+        exe.clone(),
+        vec![text, "another".into()],
+    );
     let outcome = host.act(&Action::Switch(home.at(1)), &mut Dialogs::none());
     assert_eq!(done(outcome).2, "");
-    let (host, _) = home.host();
-    let host = host.with_startup_warnings(vec![]);
+    let host = CliHost::new(&home.context(), Cancel::new(), exe, vec![]);
     let outcome = host.act(&Action::Switch(home.at(2)), &mut Dialogs::none());
     assert!(done(outcome).2.starts_with("warning: "));
 }
@@ -477,7 +491,12 @@ fn remove_refuses_to_delete_what_the_live_login_lives_in() {
     let (_profile, spelling) = cc_profile(home.root(), a.id.as_str());
     let mut ctx = home.context();
     tagteam_cc::env::set_securestorage_dir(&mut ctx.env, Some(spelling.into()));
-    let host = CliHost::new(&ctx, Cancel::new(), PathBuf::from("/nonexistent/tagteam"));
+    let host = CliHost::new(
+        &ctx,
+        Cancel::new(),
+        PathBuf::from("/nonexistent/tagteam"),
+        Vec::new(),
+    );
     assert_eq!(
         done(host.act(&Action::Remove(a.clone()), &mut Dialogs::none())),
         (
@@ -715,7 +734,7 @@ fn run_starts_tagteam_run_on_the_account_and_a_sigterm_is_forwarded_and_kept() {
     let home = Home::with_two();
     let (exe, out) = stub_run(home.root());
     let signal = home.env.cancel.clone();
-    let host = CliHost::new(&home.context(), Cancel::new(), exe);
+    let host = CliHost::new(&home.context(), Cancel::new(), exe, Vec::new());
     let a = home.at(1);
     let sender = signal_once_ready(&out, &signal, &[libc::SIGTERM]);
     let (code, _, _) = done(host.act_foreground(&Action::Run(a.clone())));
@@ -744,7 +763,7 @@ fn a_sigint_during_the_session_is_the_session_s_and_a_sighup_is_forwarded() {
     let home = Home::with_two();
     let (exe, out) = stub_run(home.root());
     let signal = home.env.cancel.clone();
-    let host = CliHost::new(&home.context(), Cancel::new(), exe);
+    let host = CliHost::new(&home.context(), Cancel::new(), exe, Vec::new());
     let sender = signal_once_ready(&out, &signal, &[libc::SIGINT, libc::SIGHUP]);
     let (code, _, _) = done(host.act_foreground(&Action::Run(home.at(1))));
     sender.join().unwrap();
@@ -758,7 +777,7 @@ fn a_signal_recorded_before_the_hand_over_runs_nothing_and_never_waits() {
     let home = Home::with_two();
     let (exe, out) = stub_run(home.root());
     let signal = home.env.cancel.clone();
-    let host = CliHost::new(&home.context(), Cancel::new(), exe);
+    let host = CliHost::new(&home.context(), Cancel::new(), exe, Vec::new());
     for n in [libc::SIGTERM, libc::SIGINT] {
         signal.request(n);
         assert_eq!(
@@ -775,7 +794,7 @@ fn run_never_runs_inside_the_tui() {
     // In-process, `run` would exec the agent in the TUI's place: it is always suspended.
     let home = Home::with_two();
     let (exe, out) = stub_run(home.root());
-    let host = CliHost::new(&home.context(), Cancel::new(), exe);
+    let host = CliHost::new(&home.context(), Cancel::new(), exe, Vec::new());
     let mut dialogs = Dialogs::none();
     assert!(matches!(
         host.act(&Action::Run(home.at(1)), &mut dialogs),

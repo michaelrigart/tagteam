@@ -20,6 +20,11 @@ pub trait Prompter {
     fn reaches_terminal(&self) -> bool {
         self.interactive()
     }
+    /// Appendix A.3: whether to unlock the login keychain now. `confirm` of
+    /// `app::UNLOCK_QUESTION`, default yes, unless the prompter hands the terminal over instead.
+    fn confirm_unlock(&mut self) -> bool {
+        self.confirm(crate::app::UNLOCK_QUESTION, true)
+    }
 }
 
 /// The controlling terminal's generic name: the last resort when neither stdin nor stderr names
@@ -540,6 +545,43 @@ mod tests {
         assert_eq!(broken, None);
         assert!(!confirmed(broken, true));
         assert!(!confirmed(answer_of(Ok(LineRead::Interrupted)), true));
+    }
+
+    /// A prompter that records each confirm's question and default, and answers `answer`.
+    struct Recording {
+        answer: bool,
+        asked: Vec<(String, bool)>,
+    }
+
+    impl Prompter for Recording {
+        fn interactive(&self) -> bool {
+            true
+        }
+        fn confirm(&mut self, question: &str, default_yes: bool) -> bool {
+            self.asked.push((question.to_owned(), default_yes));
+            self.answer
+        }
+        fn choose(&mut self, question: &str, _options: &[String]) -> Option<usize> {
+            panic!("unexpected choice: {question}")
+        }
+        fn secret(&mut self, question: &str) -> Option<String> {
+            panic!("unexpected secret: {question}")
+        }
+    }
+
+    #[test]
+    fn the_unlock_prompt_is_a_confirm_of_its_question_by_default() {
+        for answer in [true, false] {
+            let mut prompter = Recording {
+                answer,
+                asked: Vec::new(),
+            };
+            assert_eq!(prompter.confirm_unlock(), answer);
+            assert_eq!(
+                prompter.asked,
+                [(crate::app::UNLOCK_QUESTION.to_owned(), true)]
+            );
+        }
     }
 
     #[test]

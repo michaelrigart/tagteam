@@ -172,6 +172,7 @@ impl H {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            shown_warnings: Arc::from(Vec::<String>::new()),
         };
         adjust(&mut ctx);
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -1069,6 +1070,30 @@ fn settings_warnings_go_to_stderr_and_never_fail_the_command() {
         assert_eq!((code, err.as_str()), (0, expected.as_str()), "{text:?}");
         serde_json::from_str::<Value>(&out).expect("stdout stays one JSON object");
     }
+}
+
+#[test]
+fn a_warning_the_host_showed_is_left_out_and_a_new_one_is_printed() {
+    // Redesign §13, T3-25: a host that already showed a settings warning names it in
+    // `Context.shown_warnings`; the command prints only the others, each once.
+    let h = H::new();
+    let dir = h.env.config_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        "[autoswitch]\nthreshold = 5\n\n[ui]\ncolor = \"purple\"\n",
+    )
+    .unwrap();
+    let (_, warnings) = Settings::load(&h.env, &ProviderId::new(CLAUDE_CODE));
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    let shown: Arc<[String]> = Arc::from(vec![warnings[0].clone()]);
+    let (code, _, err) = h.run_in(&["list"], &mut Scripted::none(), |ctx| {
+        ctx.shown_warnings = shown;
+    });
+    assert_eq!(
+        (code, err.as_str()),
+        (0, format!("warning: {}\n", warnings[1]).as_str())
+    );
 }
 
 #[test]

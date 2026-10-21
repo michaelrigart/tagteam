@@ -114,8 +114,7 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
             return app::EXIT_ERROR;
         }
     };
-    let host =
-        Arc::new(CliHost::new(&ctx, shutdown.clone(), exe).with_startup_warnings(warnings.clone()));
+    let host = Arc::new(CliHost::new(&ctx, shutdown.clone(), exe, warnings.clone()));
     let screen = screen_for(cli);
     let opts = TuiOptions {
         screen,
