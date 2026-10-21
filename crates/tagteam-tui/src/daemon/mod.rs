@@ -8,10 +8,9 @@ pub mod words;
 
 use std::collections::BTreeMap;
 
-use serde_json::Value;
 use tagteam_core::autoswitch::NoSwitchReason;
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_daemon::protocol::{Event, Status, StatusProvider};
+use tagteam_daemon::protocol::{Event, PollPayload, Status, StatusProvider};
 use tagteam_daemon::tokens::TOKEN_INDEX;
 
 use crate::live::{Live, StatusError};
@@ -36,14 +35,6 @@ pub const SETTLE_MS: i64 = 2_000;
 /// Spec §7.4: `status` is fetched again this long after `P`'s setting was written. The daemon
 /// applies a setting within about a second (D4.2).
 pub const RECHECK_MS: i64 = 2_000;
-
-/// §8: the auto kinds that say an account's reading or state changed.
-const VIEW_KINDS: [&str; 4] = [
-    "poll",
-    "switch",
-    "account-quarantined",
-    "account-unquarantined",
-];
 
 /// The daemon's latest decision for a provider on this link (spec §5.3's rank 2).
 #[derive(Debug, Clone)]
@@ -107,7 +98,7 @@ pub struct DaemonState {
     noted: BTreeMap<String, Noted>,
     /// Each provider's last `poll` on this link, whose usage a `no-switch` of the same tick
     /// reads. A link can miss events before it, so a new one starts with none (C-R21).
-    polls: BTreeMap<String, Value>,
+    polls: BTreeMap<String, PollPayload>,
     /// A live link was lost in this session, and none has answered since (T2-10): the first
     /// `status` after it says the daemon is back.
     lost: bool,
@@ -288,8 +279,8 @@ fn on_event(state: &mut State, event: Event, now_ms: i64) -> Vec<Cmd> {
     }
     note(state, &event, now_ms);
     match event {
-        Event::Auto { kind, .. } => {
-            let views = VIEW_KINDS.contains(&kind.as_str());
+        Event::Auto { .. } => {
+            let views = event.changes_an_account();
             reread(state, now_ms, views, true);
         }
         Event::Usage { .. } => reread(state, now_ms, true, true),
@@ -302,8 +293,10 @@ fn on_event(state: &mut State, event: Event, now_ms: i64) -> Vec<Cmd> {
             state.daemon.stopping = Some((reason, now_ms + STOPPING_MS));
             state.dirty = true;
         }
-        Event::TokenIndex { provider, raw } => {
-            return screens::tokens::index::on_token_index(state, &provider, &raw, now_ms);
+        Event::TokenIndex { ref provider, .. } => {
+            if let Some(index) = event.token_index() {
+                return screens::tokens::index::on_token_index(state, provider, &index, now_ms);
+            }
         }
         Event::Unknown { .. } => {}
     }
@@ -314,67 +307,60 @@ fn on_event(state: &mut State, event: Event, now_ms: i64) -> Vec<Cmd> {
 /// at its `ts`, or now when it has none. A `poll` is kept for the `no-switch` of its tick, and an
 /// `all-exhausted` gives the `no-switch all-exhausted` before it its earliest reset.
 fn note(state: &mut State, event: &Event, now_ms: i64) {
-    let Event::Auto {
-        kind,
-        provider,
-        raw,
-    } = event
-    else {
+    let Event::Auto { provider, .. } = event else {
         return;
     };
     let d = &mut state.daemon;
-    let text = |field: &str| raw[field].as_str().unwrap_or_default().to_owned();
-    let what = match kind.as_str() {
-        "poll" => {
-            d.polls.insert(provider.clone(), raw.clone());
+    if let Some(poll) = event.poll() {
+        d.polls.insert(provider.clone(), poll);
+        return;
+    }
+    if let Some(exhausted) = event.all_exhausted() {
+        if let Some(Noted {
+            what:
+                NotedWhat::NoSwitch {
+                    reason: NoSwitchReason::AllExhausted,
+                    frees_at_ms,
+                    ..
+                },
+            ..
+        }) = d.noted.get_mut(provider)
+        {
+            *frees_at_ms = exhausted
+                .earliest_reset_at
+                .as_deref()
+                .and_then(words::iso_ms);
+            state.dirty = true;
+        }
+        return;
+    }
+    let what = if let Some(no_switch) = event.no_switch() {
+        let Some(reason) = no_switch.reason.known() else {
             return;
+        };
+        NotedWhat::NoSwitch {
+            reason,
+            detail: no_switch.detail,
+            used_pct: d.polls.get(provider).and_then(used_pct),
+            frees_at_ms: None,
         }
-        "no-switch" => {
-            let Some(reason) = raw["reason"].as_str().and_then(no_switch_reason) else {
-                return;
-            };
-            NotedWhat::NoSwitch {
-                reason,
-                detail: text("detail"),
-                used_pct: d.polls.get(provider).and_then(used_pct),
-                frees_at_ms: None,
-            }
-        }
-        "all-exhausted" => {
-            if let Some(Noted {
-                what:
-                    NotedWhat::NoSwitch {
-                        reason: NoSwitchReason::AllExhausted,
-                        frees_at_ms,
-                        ..
-                    },
-                ..
-            }) = d.noted.get_mut(provider)
-            {
-                *frees_at_ms = raw["earliestResetAt"].as_str().and_then(words::iso_ms);
-                state.dirty = true;
-            }
-            return;
-        }
-        "error" => NotedWhat::Error(text("message")),
-        "config-warning" => NotedWhat::Warning(text("message")),
-        _ => return,
+    } else if let Some(message) = event.error() {
+        NotedWhat::Error(message)
+    } else if let Some(message) = event.config_warning() {
+        NotedWhat::Warning(message)
+    } else {
+        return;
     };
-    let at_ms = raw["ts"].as_str().and_then(words::iso_ms).unwrap_or(now_ms);
+    let at_ms = event.at().and_then(words::iso_ms).unwrap_or(now_ms);
     d.noted.insert(provider.clone(), Noted { at_ms, what });
     state.dirty = true;
 }
 
-/// The reason a `no-switch` spells `code` (T2-27); none for one this TUI does not know.
-pub(crate) fn no_switch_reason(code: &str) -> Option<NoSwitchReason> {
-    NoSwitchReason::ALL.into_iter().find(|r| r.as_str() == code)
-}
-
-/// The usage of the account in use at `poll`: 100 less its `headroomPct`.
-fn used_pct(poll: &Value) -> Option<f64> {
-    let active = poll["active"]["number"].as_u64()?;
-    let headroom = poll["headroomPct"][active.to_string()].as_f64()?;
-    Some(100.0 - headroom)
+/// The usage of the account in use at `poll`: its binding window's (T3-29). None when the poll
+/// names no window near the account's own usage.
+fn used_pct(poll: &PollPayload) -> Option<f64> {
+    let active = poll.active.as_ref()?.number;
+    poll.binding(active).map(|b| b.used_pct as f64)
 }
 
 /// What an event asks for is read `REREAD_MS` from the first event that asks, once for every
@@ -436,7 +422,7 @@ pub(crate) fn keeps_index(state: &State) -> bool {
     let Some(job) = state.daemon.job(provider) else {
         return false;
     };
-    if job.mode == "waiting" && job.waiting_for.as_deref() == Some("schema") {
+    if job.waits_for_upgrade() {
         return false;
     }
     status.jobs.iter().any(|job| {
@@ -520,11 +506,7 @@ pub(crate) fn collected_elsewhere(state: &State, provider: &ProviderId) -> bool 
     state
         .daemon
         .job(provider)
-        .is_some_and(|job| match job.mode.as_str() {
-            "auto" | "collect" => true,
-            "waiting" => job.waiting_for.as_deref() == Some("engine-lock"),
-            _ => false,
-        })
+        .is_some_and(StatusProvider::collects_for_itself)
 }
 
 /// The accounts the timer offers the collector (spec §6.2, §6.3): those shown whose provider
@@ -546,6 +528,7 @@ mod tests {
 
     use serde_json::json;
     use tagteam_daemon::client::ClientError;
+    use tagteam_daemon::protocol::Wire;
     use tagteam_engine::views::ProviderAccounts;
 
     use super::*;
@@ -577,7 +560,7 @@ mod tests {
     fn mode(mode: &str) -> Event {
         Event::Mode {
             provider: "claude-code".into(),
-            mode: mode.into(),
+            mode: Wire::from_wire(mode),
             waiting_for: None,
             holder_pid: None,
             backoff: None,
@@ -807,6 +790,42 @@ mod tests {
     }
 
     #[test]
+    fn a_poll_without_a_binding_window_leaves_the_sentence_without_its_percentage() {
+        // T3-29: the no-switch sentence's usage is the binding window's, from the parser.
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(many(3)));
+        go_live(&mut state, auto_on());
+        let auto_with = |kind: &str, fields: serde_json::Value| {
+            let mut raw = json!({"schemaVersion": 1, "event": kind, "ts": "2026-09-21T14:13:20Z"});
+            for (k, v) in fields.as_object().unwrap() {
+                raw[k] = v.clone();
+            }
+            event(Event::Auto {
+                kind: kind.into(),
+                provider: "claude-code".into(),
+                raw,
+            })
+        };
+        let below = || auto_with("no-switch", json!({"reason": "below-threshold"}));
+        let poll = json!({"active": {"number": 1}, "headroomPct": {"1": 23.0}});
+        update(&mut state, auto_with("poll", poll), NOW_MS);
+        update(&mut state, below(), NOW_MS);
+        assert_eq!(
+            draw(&state, 80, 24)[1],
+            "   14:13  no switch needed (switches at 90%)"
+        );
+        let poll = json!({"active": {"number": 1}, "headroomPct": {"1": 23.0},
+            "windowsPct": {"1": {"5h": 40.0, "7d": 77.0}}});
+        update(&mut state, auto_with("poll", poll), NOW_MS);
+        update(&mut state, below(), NOW_MS);
+        assert_eq!(
+            draw(&state, 80, 24)[1],
+            "   14:13  no switch needed (77%, switches at 90%)",
+            "the binding window's usage"
+        );
+    }
+
+    #[test]
     fn a_mode_event_fetches_the_status_and_its_fields_are_not_applied() {
         // Spec §8: `status` is the authority; an event is a reason to fetch it.
         let mut state = showing(Screen::Accounts, 1);
@@ -894,7 +913,7 @@ mod tests {
             let mut jobs = vec![daemon_job("claude-code", "auto", true)];
             if let Some((mode, waiting_for)) = fake_job {
                 let mut job = daemon_job("fake-agent", mode, false);
-                job.waiting_for = waiting_for.map(str::to_owned);
+                job.waiting_for = waiting_for.map(Wire::from_wire);
                 jobs.push(job);
             }
             go_live(&mut state, daemon_status(jobs, vec![]));

@@ -3,8 +3,8 @@
 //! again. A daemon that keeps the index current (live mode) takes the timer's place, and its
 //! `token-index` events say when the index changed.
 
-use serde_json::Value;
 use tagteam_core::AccountId;
+use tagteam_daemon::protocol::TokenIndexPayload;
 use tagteam_engine::tokens::{IndexProgress, IndexState, PeriodKey, RefreshOutcome, TokenReport};
 
 use super::requery;
@@ -286,14 +286,14 @@ pub(crate) fn on_link_down(state: &mut State) {
 pub(crate) fn on_token_index(
     state: &mut State,
     provider: &str,
-    raw: &Value,
+    index: &TokenIndexPayload,
     now_ms: i64,
 ) -> Vec<Cmd> {
     let ours = provider == state.tokens.provider().as_str();
     if !ours || state.screen != Screen::Tokens || state.quitting.is_some() {
         return vec![];
     }
-    let Some(changed_ms) = raw["changedAt"].as_str().and_then(words::iso_ms) else {
+    let Some(changed_ms) = index.changed_at.as_deref().and_then(words::iso_ms) else {
         return vec![];
     };
     let shown = state.tokens.report().and_then(|r| r.index.changed_at_ms);
@@ -407,7 +407,7 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
 mod tests {
     use ratatui::style::{Color, Modifier};
     use serde_json::json;
-    use tagteam_daemon::protocol::{Event, Status, StatusJob};
+    use tagteam_daemon::protocol::{Event, Status, StatusJob, Wire};
     use tagteam_engine::tokens::{ActiveBlock, IndexReport, TokenPeriod, TokenRow};
 
     use super::*;
@@ -1471,7 +1471,7 @@ mod tests {
             last_error: None,
         };
         let mut waiting = daemon_job("claude-code", "waiting", true);
-        waiting.waiting_for = Some("schema".into());
+        waiting.waiting_for = Some(Wire::from_wire("schema"));
         let mut state = live_on_tokens(daemon_status(vec![waiting], vec![job]));
         assert!(refreshes(&tick(&mut state, NOW_MS + 60_000)));
     }

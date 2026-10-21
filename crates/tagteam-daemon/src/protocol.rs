@@ -263,6 +263,14 @@ impl<T: Spelled> Wire<T> {
     }
 }
 
+/// A spelling read from a string, kept as it came when this client does not know it (D5.6).
+impl<'de, T: Spelled> serde::Deserialize<'de> for Wire<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(Wire::from_wire(&s))
+    }
+}
+
 /// D5.2: the longest line either side sends, its newline left out.
 pub const MAX_LINE: usize = 64 * 1024;
 /// D5.3: the longest string `id` a request may carry, in bytes. A reply echoes the id, so this
@@ -522,10 +530,10 @@ pub struct StatusNotifications {
 pub struct StatusProvider {
     pub provider: String,
     /// D4.3's mode: `auto`, `collect`, `waiting` or `idle`.
-    pub mode: String,
+    pub mode: Wire<Mode>,
     pub autoswitch: bool,
     /// `engine-lock` or `schema`.
-    pub waiting_for: Option<String>,
+    pub waiting_for: Option<Wire<WaitingFor>>,
     pub holder_pid: Option<u32>,
     pub backoff: Option<StatusBackoff>,
     pub last_tick_at: Option<String>,
@@ -535,31 +543,23 @@ pub struct StatusProvider {
 }
 
 impl StatusProvider {
-    /// The mode as a typed value, or its spelling when this client does not know it.
-    pub fn mode(&self) -> Wire<Mode> {
-        Wire::from_wire(&self.mode)
-    }
-
-    pub fn waiting_for(&self) -> Option<Wire<WaitingFor>> {
-        self.waiting_for.as_deref().map(Wire::from_wire)
-    }
-
     /// The daemon job collects usage for this provider itself: `auto`, `collect`, or `waiting`
     /// for `engine-lock`. False for anything else, an unknown value included.
     pub fn collects_for_itself(&self) -> bool {
-        match self.mode().known() {
+        match self.mode.known() {
             Some(Mode::Auto | Mode::Collect) => true,
-            Some(Mode::Waiting) => {
-                self.waiting_for().and_then(|w| w.known()) == Some(WaitingFor::EngineLock)
-            }
+            Some(Mode::Waiting) => self.waits_for() == Some(WaitingFor::EngineLock),
             Some(Mode::Idle) | None => false,
         }
     }
 
     /// The job waits for a newer binary (`waiting` for `schema`). False for anything else.
     pub fn waits_for_upgrade(&self) -> bool {
-        self.mode().known() == Some(Mode::Waiting)
-            && self.waiting_for().and_then(|w| w.known()) == Some(WaitingFor::Schema)
+        self.mode.known() == Some(Mode::Waiting) && self.waits_for() == Some(WaitingFor::Schema)
+    }
+
+    fn waits_for(&self) -> Option<WaitingFor> {
+        self.waiting_for.as_ref().and_then(Wire::known)
     }
 }
 
@@ -575,15 +575,9 @@ pub struct StatusBackoff {
 #[serde(rename_all = "camelCase")]
 pub struct StatusOutcome {
     /// `switch`, `no-switch`, `collect` or `error`.
-    pub kind: String,
+    pub kind: Wire<OutcomeKind>,
     pub reason: Option<String>,
     pub at: String,
-}
-
-impl StatusOutcome {
-    pub fn kind(&self) -> Wire<OutcomeKind> {
-        Wire::from_wire(&self.kind)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -623,8 +617,8 @@ pub enum Event {
     Changed,
     Mode {
         provider: String,
-        mode: String,
-        waiting_for: Option<String>,
+        mode: Wire<Mode>,
+        waiting_for: Option<Wire<WaitingFor>>,
         holder_pid: Option<u32>,
         backoff: Option<StatusBackoff>,
     },
@@ -640,7 +634,7 @@ impl Event {
     /// `Some` only for `Event::Mode`.
     pub fn mode(&self) -> Option<Wire<Mode>> {
         match self {
-            Event::Mode { mode, .. } => Some(Wire::from_wire(mode)),
+            Event::Mode { mode, .. } => Some(mode.clone()),
             _ => None,
         }
     }
@@ -648,7 +642,7 @@ impl Event {
     /// `Some` only for an `Event::Mode` that names what it waits for.
     pub fn waiting_for(&self) -> Option<Wire<WaitingFor>> {
         match self {
-            Event::Mode { waiting_for, .. } => waiting_for.as_deref().map(Wire::from_wire),
+            Event::Mode { waiting_for, .. } => waiting_for.clone(),
             _ => None,
         }
     }
@@ -666,6 +660,50 @@ impl Event {
     /// `Some` only for an `Event::Auto` of kind `no-switch`.
     pub fn no_switch(&self) -> Option<NoSwitchPayload> {
         self.auto_raw("no-switch").and_then(parse_no_switch)
+    }
+
+    /// `poll`, `switch`, `account-quarantined` or `account-unquarantined`: an account's
+    /// reading or state changed (D5.5).
+    pub fn changes_an_account(&self) -> bool {
+        matches!(self, Event::Auto { kind, .. } if ACCOUNT_KINDS.contains(&kind.as_str()))
+    }
+
+    /// `Some` only for an `Event::Auto` of kind `all-exhausted`; a missing or null
+    /// `earliestResetAt` is `None`.
+    pub fn all_exhausted(&self) -> Option<AllExhaustedPayload> {
+        let raw = self.auto_raw("all-exhausted")?;
+        Some(AllExhaustedPayload {
+            earliest_reset_at: optional_text(raw, "earliestResetAt"),
+        })
+    }
+
+    /// An `error`'s `message`; a missing one reads as empty.
+    pub fn error(&self) -> Option<String> {
+        self.auto_raw("error").map(|raw| text(raw, "message"))
+    }
+
+    /// A `config-warning`'s `message`; a missing one reads as empty.
+    pub fn config_warning(&self) -> Option<String> {
+        self.auto_raw("config-warning")
+            .map(|raw| text(raw, "message"))
+    }
+
+    /// An auto event's envelope `ts`.
+    pub fn at(&self) -> Option<&str> {
+        match self {
+            Event::Auto { raw, .. } => raw.get("ts")?.as_str(),
+            _ => None,
+        }
+    }
+
+    /// `Some` only for `Event::TokenIndex`; a null or absent `changedAt` is `None`.
+    pub fn token_index(&self) -> Option<TokenIndexPayload> {
+        match self {
+            Event::TokenIndex { raw, .. } => Some(TokenIndexPayload {
+                changed_at: optional_text(raw, "changedAt"),
+            }),
+            _ => None,
+        }
     }
 
     fn auto_raw(&self, want: &str) -> Option<&Value> {
@@ -741,6 +779,28 @@ pub struct SwitchPayload {
 pub struct NoSwitchPayload {
     pub reason: Wire<NoSwitchReason>,
     pub detail: String,
+}
+
+/// An `all-exhausted` event's fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllExhaustedPayload {
+    pub earliest_reset_at: Option<String>,
+}
+
+/// The `token-index` fields the TUI reads (token report §12): when the index last changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenIndexPayload {
+    pub changed_at: Option<String>,
+}
+
+/// `raw`'s string `key`, empty when it holds none.
+fn text(raw: &Value, key: &str) -> String {
+    optional_text(raw, key).unwrap_or_default()
+}
+
+/// `raw`'s string `key`; `None` when it is absent, null or not a string.
+fn optional_text(raw: &Value, key: &str) -> Option<String> {
+    raw.get(key)?.as_str().map(str::to_owned)
 }
 
 /// A `poll` object's fields. `None` only for a value that is not an object.
@@ -828,6 +888,14 @@ const AUTO_EVENT_KINDS: [&str; 9] = [
     "config-warning",
 ];
 
+/// The auto kinds that say an account's reading or state changed (D5.5).
+const ACCOUNT_KINDS: [&str; 4] = [
+    "poll",
+    "switch",
+    "account-quarantined",
+    "account-unquarantined",
+];
+
 /// D5.7: a line's event, typed. `None` for anything that is not an object with a string
 /// `event`; a reply is one such thing.
 pub fn parse_event(v: &Value) -> Option<Event> {
@@ -857,8 +925,10 @@ fn typed_event(kind: &str, o: &Map<String, Value>, raw: &Value) -> Option<Event>
         "changed" => Event::Changed,
         "mode" => Event::Mode {
             provider: provider()?,
-            mode: o.get("mode")?.as_str()?.to_owned(),
-            waiting_for: nullable_str(o.get("waitingFor"))?,
+            mode: Wire::from_wire(o.get("mode")?.as_str()?),
+            waiting_for: nullable_str(o.get("waitingFor"))?
+                .as_deref()
+                .map(Wire::from_wire),
             holder_pid: nullable_u32(o.get("holderPid"))?,
             backoff: match o.get("backoff") {
                 None | Some(Value::Null) => None,
@@ -1260,6 +1330,96 @@ mod tests {
             }
         }
         assert_eq!(seen, [true; 3]);
+    }
+
+    #[test]
+    fn the_kinds_the_tui_reads_parse_from_event_json_s_own_output() {
+        let mut seen = [false; 3];
+        for (event, _) in auto_lines() {
+            let raw = event_json(&event, T0);
+            let typed = parse_event(&raw).unwrap();
+            assert_eq!(typed.at(), Some("2026-09-21T14:13:20Z"), "{raw}");
+            let changes = matches!(
+                event,
+                AutoEvent::Poll { .. }
+                    | AutoEvent::Switch { .. }
+                    | AutoEvent::AccountQuarantined { .. }
+                    | AutoEvent::AccountUnquarantined { .. }
+            );
+            assert_eq!(typed.changes_an_account(), changes, "{raw}");
+            let (mut exhausted, mut error, mut warning) = (None, None, None);
+            match &event {
+                AutoEvent::AllExhausted {
+                    earliest_reset_at, ..
+                } => {
+                    seen[0] = true;
+                    exhausted = Some(AllExhaustedPayload {
+                        earliest_reset_at: earliest_reset_at.map(format_iso8601),
+                    });
+                }
+                AutoEvent::Error { message, .. } => {
+                    seen[1] = true;
+                    error = Some(message.clone());
+                }
+                AutoEvent::ConfigWarning { message, .. } => {
+                    seen[2] = true;
+                    warning = Some(message.clone());
+                }
+                _ => {}
+            }
+            assert_eq!(typed.all_exhausted(), exhausted, "{raw}");
+            assert_eq!(typed.error(), error, "{raw}");
+            assert_eq!(typed.config_warning(), warning, "{raw}");
+            assert_eq!(typed.token_index(), None, "{raw}");
+        }
+        assert_eq!(seen, [true; 3]);
+
+        // A kind's object without its field reads as empty or none, never as `Unknown`.
+        let bare = |kind: &str| parse_event(&json!({"event": kind, "provider": "p"})).unwrap();
+        assert_eq!(
+            bare("all-exhausted").all_exhausted(),
+            Some(AllExhaustedPayload {
+                earliest_reset_at: None
+            })
+        );
+        assert_eq!(bare("error").error(), Some(String::new()));
+        assert_eq!(bare("config-warning").config_warning(), Some(String::new()));
+        assert_eq!(bare("error").at(), None, "no ts");
+        assert!(bare("poll").changes_an_account());
+        assert!(!bare("sleep").changes_an_account());
+
+        // `token-index`'s `changedAt`, as the hub writes it; null or absent is none.
+        let index = |changed_at_ms| {
+            let state = IndexState {
+                changed_at_ms,
+                ..IndexState::default()
+            };
+            let v = daemon_event_json(
+                &DaemonEvent::TokenIndex {
+                    provider: cc(),
+                    state,
+                },
+                T0,
+            );
+            parse_event(&v).unwrap()
+        };
+        let changed = index(Some((T0 - 60) * 1000));
+        assert_eq!(
+            changed.token_index(),
+            Some(TokenIndexPayload {
+                changed_at: Some("2026-09-21T14:12:20Z".into())
+            })
+        );
+        assert_eq!(changed.at(), None, "not an auto kind");
+        assert!(!changed.changes_an_account());
+        let never = TokenIndexPayload { changed_at: None };
+        assert_eq!(index(None).token_index(), Some(never.clone()));
+        let keyless = json!({"event": "token-index", "provider": "p"});
+        assert_eq!(parse_event(&keyless).unwrap().token_index(), Some(never));
+        assert_eq!(Event::Changed.token_index(), None);
+        assert_eq!(Event::Changed.all_exhausted(), None);
+        assert_eq!(Event::Changed.error(), None);
+        assert_eq!(Event::Changed.config_warning(), None);
     }
 
     #[test]
@@ -1907,7 +2067,7 @@ mod socket_protocol_tests {
             status.providers[0],
             StatusProvider {
                 provider: "claude-code".into(),
-                mode: "auto".into(),
+                mode: Wire::from_wire("auto"),
                 autoswitch: true,
                 waiting_for: None,
                 holder_pid: None,
@@ -1915,7 +2075,7 @@ mod socket_protocol_tests {
                 last_tick_at: Some(iso(T + 60)),
                 next_tick_at: Some(iso(T + 360)),
                 last_outcome: Some(StatusOutcome {
-                    kind: "no-switch".into(),
+                    kind: Wire::from_wire("no-switch"),
                     reason: Some("below-threshold".into()),
                     at: iso(T + 60),
                 }),
@@ -1935,12 +2095,15 @@ mod socket_protocol_tests {
             })
         );
         assert_eq!(
-            status.providers[2].waiting_for.as_deref(),
+            status.providers[2].waiting_for.as_ref().map(Wire::as_str),
             Some("engine-lock")
         );
         assert_eq!(status.providers[2].holder_pid, Some(5151));
-        assert_eq!(status.providers[3].waiting_for.as_deref(), Some("schema"));
-        assert_eq!(status.providers[4].mode, "idle");
+        assert_eq!(
+            status.providers[3].waiting_for.as_ref().map(Wire::as_str),
+            Some("schema")
+        );
+        assert_eq!(status.providers[4].mode.as_str(), "idle");
         assert_eq!(
             status.jobs[1],
             StatusJob {
@@ -1956,6 +2119,52 @@ mod socket_protocol_tests {
         later["daemon"]["uptime"] = json!(5);
         later["providers"][0]["queue"] = json!([]);
         assert_eq!(serde_json::from_value::<Status>(later).unwrap(), status);
+    }
+
+    #[test]
+    fn a_status_reads_its_typed_fields_as_the_daemon_wrote_them() {
+        let v = status_json(&snapshot(), Path::new(HOME));
+        let status: Status = serde_json::from_value(v.clone()).unwrap();
+        let auto = &status.providers[0];
+        assert_eq!(auto.mode, Wire::Known(Mode::Auto));
+        assert_eq!(auto.waiting_for, None);
+        assert_eq!(
+            auto.last_outcome.as_ref().map(|o| &o.kind),
+            Some(&Wire::Known(OutcomeKind::NoSwitch))
+        );
+        let waiting = &status.providers[2];
+        assert_eq!(waiting.mode, Wire::Known(Mode::Waiting));
+        assert_eq!(
+            waiting.waiting_for,
+            Some(Wire::Known(WaitingFor::EngineLock))
+        );
+        assert_eq!(
+            status.providers[3].waiting_for,
+            Some(Wire::Known(WaitingFor::Schema))
+        );
+        assert_eq!(
+            status.providers[4].last_outcome.as_ref().map(|o| &o.kind),
+            Some(&Wire::Known(OutcomeKind::Error))
+        );
+        // D5.6: a spelling a later daemon writes is kept as it came.
+        let mut later = v;
+        later["providers"][2]["mode"] = json!("paused");
+        later["providers"][2]["waitingFor"] = json!("later");
+        later["providers"][4]["lastOutcome"]["kind"] = json!("rested");
+        let later: Status = serde_json::from_value(later).unwrap();
+        let paused = &later.providers[2];
+        assert_eq!(paused.mode, Wire::Other("paused".into()));
+        assert_eq!(paused.mode.as_str(), "paused");
+        assert_eq!(paused.waiting_for, Some(Wire::Other("later".into())));
+        assert!(!paused.collects_for_itself());
+        assert!(!paused.waits_for_upgrade());
+        assert_eq!(
+            later.providers[4].last_outcome.as_ref().map(|o| &o.kind),
+            Some(&Wire::Other("rested".into()))
+        );
+        let mut not_a_string = status_json(&snapshot(), Path::new(HOME));
+        not_a_string["providers"][0]["mode"] = json!(7);
+        assert!(serde_json::from_value::<Status>(not_a_string).is_err());
     }
 
     #[test]
@@ -1999,8 +2208,8 @@ mod socket_protocol_tests {
                 },
                 Event::Mode {
                     provider: "claude-code".into(),
-                    mode: "waiting".into(),
-                    waiting_for: Some("engine-lock".into()),
+                    mode: Wire::from_wire("waiting"),
+                    waiting_for: Some(Wire::from_wire("engine-lock")),
                     holder_pid: Some(4242),
                     backoff: None,
                 },
@@ -2015,7 +2224,7 @@ mod socket_protocol_tests {
                 },
                 Event::Mode {
                     provider: "claude-code".into(),
-                    mode: "collect".into(),
+                    mode: Wire::from_wire("collect"),
                     waiting_for: None,
                     holder_pid: None,
                     backoff: Some(StatusBackoff {
@@ -2117,7 +2326,7 @@ mod socket_protocol_tests {
             parse_event(&bare),
             Some(Event::Mode {
                 provider: "p".into(),
-                mode: "auto".into(),
+                mode: Wire::from_wire("auto"),
                 waiting_for: None,
                 holder_pid: None,
                 backoff: None,
@@ -2148,9 +2357,9 @@ mod socket_protocol_tests {
     fn status_provider(mode: &str, waiting_for: Option<&str>) -> StatusProvider {
         StatusProvider {
             provider: "claude-code".into(),
-            mode: mode.into(),
+            mode: Wire::from_wire(mode),
             autoswitch: true,
-            waiting_for: waiting_for.map(str::to_owned),
+            waiting_for: waiting_for.map(Wire::from_wire),
             holder_pid: None,
             backoff: None,
             last_tick_at: None,
@@ -2222,28 +2431,28 @@ mod socket_protocol_tests {
     #[test]
     fn the_typed_accessors_read_the_strings_a_daemon_wrote() {
         let p = status_provider("waiting", Some("engine-lock"));
-        assert_eq!(p.mode(), Wire::Known(Mode::Waiting));
-        assert_eq!(p.waiting_for(), Some(Wire::Known(WaitingFor::EngineLock)));
+        assert_eq!(p.mode, Wire::Known(Mode::Waiting));
+        assert_eq!(p.waiting_for, Some(Wire::Known(WaitingFor::EngineLock)));
         let p = status_provider("paused", Some("later"));
-        assert_eq!(p.mode(), Wire::Other("paused".into()));
-        assert_eq!(p.waiting_for(), Some(Wire::Other("later".into())));
-        assert_eq!(status_provider("auto", None).waiting_for(), None);
+        assert_eq!(p.mode, Wire::Other("paused".into()));
+        assert_eq!(p.waiting_for, Some(Wire::Other("later".into())));
+        assert_eq!(status_provider("auto", None).waiting_for, None);
 
         let outcome = |kind: &str| StatusOutcome {
-            kind: kind.into(),
+            kind: Wire::from_wire(kind),
             reason: None,
             at: iso(T),
         };
         assert_eq!(
-            outcome("no-switch").kind(),
+            outcome("no-switch").kind,
             Wire::Known(OutcomeKind::NoSwitch)
         );
-        assert_eq!(outcome("rested").kind(), Wire::Other("rested".into()));
+        assert_eq!(outcome("rested").kind, Wire::Other("rested".into()));
 
         let mode_event = |mode: &str, waiting_for: Option<&str>| Event::Mode {
             provider: "claude-code".into(),
-            mode: mode.into(),
-            waiting_for: waiting_for.map(str::to_owned),
+            mode: Wire::from_wire(mode),
+            waiting_for: waiting_for.map(Wire::from_wire),
             holder_pid: None,
             backoff: None,
         };

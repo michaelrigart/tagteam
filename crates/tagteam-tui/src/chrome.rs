@@ -384,7 +384,7 @@ mod tests {
     use ratatui::style::{Color, Modifier};
     use tagteam_core::ProviderId;
     use tagteam_core::autoswitch::AutoStrategy;
-    use tagteam_daemon::protocol::{Event, Status, StatusBackoff, StatusSwitch};
+    use tagteam_daemon::protocol::{Event, Status, StatusBackoff, StatusSwitch, Wire};
 
     use super::*;
     use crate::host::{AccountRef, Action};
@@ -455,7 +455,7 @@ mod tests {
 
     fn job(mode: &str, waiting_for: Option<&str>, pid: Option<u32>) -> Status {
         let mut job = daemon_job("claude-code", mode, true);
-        job.waiting_for = waiting_for.map(str::to_owned);
+        job.waiting_for = waiting_for.map(Wire::from_wire);
         job.holder_pid = pid;
         daemon_status(vec![job], vec![])
     }
@@ -676,7 +676,7 @@ mod tests {
         );
         let mode = Event::Mode {
             provider: "claude-code".into(),
-            mode: "idle".into(),
+            mode: Wire::from_wire("idle"),
             waiting_for: None,
             holder_pid: None,
             backoff: None,
@@ -724,7 +724,7 @@ mod tests {
             });
         state.accounts.apply(snap);
         let mut waiting = daemon_job("fake-agent", "waiting", true);
-        waiting.waiting_for = Some("engine-lock".into());
+        waiting.waiting_for = Some(Wire::from_wire("engine-lock"));
         waiting.holder_pid = Some(77);
         let status = daemon_status(
             vec![daemon_job("claude-code", "auto", true), waiting],
@@ -799,7 +799,7 @@ mod tests {
             ),
         ] {
             let mut job = daemon_job("claude-code", mode, autoswitch);
-            job.waiting_for = (mode == "waiting").then(|| "engine-lock".to_owned());
+            job.waiting_for = (mode == "waiting").then(|| Wire::from_wire("engine-lock"));
             job.holder_pid = pid;
             job.backoff = Some(StatusBackoff {
                 reason: "keychain".into(),
