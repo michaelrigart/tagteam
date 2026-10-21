@@ -1777,11 +1777,11 @@ mod tests {
             card_at(&state, 120, 40, NOW_MS + 60_000).1[0],
             "    1 alex@example.com    not in use · updated 3m ago · next update in <1m · login valid 5 more days"
         );
-        // At 80 columns the name gives way first, then the facts' end.
+        // At 80 columns the name keeps its 16 columns, and the facts give way from their end.
         let title = card_rows(&state, 80, 24).1[0].clone();
         assert_eq!(
             title,
-            "    1 …    not in use · updated 2m ago · next update in 1m · login valid 6 more…"
+            "    1 alex@example.com    not in use · updated 2m ago · next update in 1m · log…"
         );
     }
 
@@ -3343,7 +3343,8 @@ mod tests {
         for theme in TIERS {
             let mut state = loaded(accounts.clone());
             state.theme = theme;
-            let (y, lead) = lead_rows(&state, 120, 40);
+            // 160 columns hold the name, the org, the facts and the pick whole.
+            let (y, lead) = lead_rows(&state, 160, 40);
             let facts = "    in use · login valid 6 more days · log in again before then";
             assert!(lead[0].contains(facts), "{}", lead[0]);
             assert!(
@@ -3351,7 +3352,7 @@ mod tests {
                 "{}",
                 lead[0]
             );
-            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let buf = draw_buffer(&state, 160, 40, NOW_MS);
             for (needle, role) in [
                 ("in use", 'm'),
                 ("login valid 6 more days", 'w'),
@@ -3360,6 +3361,31 @@ mod tests {
                 let (got, want) = role_of(&buf, theme, y, needle, role);
                 assert_eq!(got, want, "{theme:?} {needle}");
             }
+        }
+        // At 120 the name keeps its 16 columns and the facts give way from their end.
+        let lead = lead_rows(&loaded(accounts.clone()), 120, 40).1;
+        assert!(
+            lead[0].starts_with(
+                "  ● 2 work  sam@corp.…    in use · login valid 6 more days · log in again bef…   best now"
+            ),
+            "{}",
+            lead[0]
+        );
+        // Once passed: `login expired` in warn, and nothing to do before then.
+        accounts[1].row.login_expires_at = Some((NOW_S - HOUR) * 1000);
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            let (y, lead) = lead_rows(&state, 120, 40);
+            assert!(
+                lead[0].contains("    in use · login expired   "),
+                "{}",
+                lead[0]
+            );
+            assert!(!lead[0].contains("log in again"), "{}", lead[0]);
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let (got, want) = role_of(&buf, theme, y, "login expired", 'w');
+            assert_eq!(got, want, "{theme:?}");
         }
         accounts[1].row.login_expires_at = Some((NOW_S + 27 * 86_400) * 1000);
         let state = loaded(accounts);
@@ -3821,5 +3847,262 @@ mod tests {
                 assert_eq!(letters, canon(theme, "ff"), "{theme:?} {w}");
             }
         }
+    }
+
+    #[test]
+    fn a_title_keeps_its_name_readable_before_its_facts() {
+        // A name keeps min(its width, 16) columns on both cards' titles; the facts give way
+        // from their end first.
+        let titles = |email: &str| {
+            let mut in_use = account(1, email, read(60, 53.0, 6.0, false));
+            in_use.active = true;
+            in_use.usage.next_poll_at = Some(NOW_S + 120);
+            in_use.row.login_expires_at = Some((NOW_S + 6 * 86_400) * 1000);
+            let other = account(2, "sam@corp.example", read(60, 0.0, 10.0, false));
+            let state = loaded(vec![in_use, other]);
+            assert_eq!(state.accounts.selected().unwrap().position, 1);
+            let lead = lead_rows(&state, 80, 24).1[0].clone();
+            let card = card_rows(&state, 80, 24).1[0].clone();
+            for title in [&lead, &card] {
+                assert_eq!(width_of(title), 80, "{title}");
+                assert!(title.contains("    in use · "), "{title}");
+            }
+            assert!(lead.ends_with("   b switch"), "{lead}");
+            (lead, card)
+        };
+        let (lead, card) = titles("alex@example.com");
+        assert!(
+            lead.starts_with("  ● 1 alex@example.com    in use"),
+            "{lead}"
+        );
+        assert!(
+            card.starts_with("    1 alex@example.com    in use"),
+            "{card}"
+        );
+        assert!(card.ends_with('…'), "the facts give way: {card}");
+        let (lead, card) = titles("alex@personal.example");
+        assert!(
+            lead.starts_with("  ● 1 alex@personal.e…    in use"),
+            "{lead}"
+        );
+        assert!(
+            card.starts_with("    1 alex@personal.e…    in use"),
+            "{card}"
+        );
+        assert_eq!(width_of("alex@personal.e…"), 16);
+    }
+
+    #[test]
+    fn a_lead_bar_s_percentage_is_bold_from_70_percent() {
+        // T3-18: the lead card's percentage is bold from 70 %, in its severity.
+        let mut accounts = three();
+        let windows = accounts[1].usage.windows.as_mut().unwrap();
+        windows[0].0.pct = 75.0;
+        windows[1].0.pct = 69.0;
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            let (y, lead) = lead_rows(&state, 120, 40);
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let bold = |row: u16, needle: &str| {
+                let at = col(&lead[usize::from(row)], needle) as u16;
+                (at..at + needle.len() as u16)
+                    .all(|x| buf[(x, y + row)].modifier.contains(Modifier::BOLD))
+            };
+            assert!(bold(1, "75%"), "{theme:?}");
+            let (got, want) = role_of(&buf, theme, y + 1, "75%", 'w');
+            assert_eq!(got, want, "{theme:?}");
+            assert!(!bold(2, "69%"), "{theme:?}");
+            let (got, want) = role_of(&buf, theme, y + 2, "69%", 't');
+            assert_eq!(got, want, "{theme:?}");
+        }
+    }
+
+    #[test]
+    fn only_long_and_scoped_lead_bars_have_a_pace_mark() {
+        // C-8: a short window and a spend have no pace mark, whatever their expected share.
+        let mut accounts = three();
+        let windows = accounts[1].usage.windows.as_mut().unwrap();
+        for (w, p) in windows.iter_mut() {
+            w.pct = 40.0;
+            p.expected_pct = Some(50.0);
+        }
+        let pace = Pace {
+            expected_pct: Some(50.0),
+            ..Pace::default()
+        };
+        windows.push((
+            window(
+                "scoped:fable",
+                "Fable",
+                WindowKind::Scoped,
+                40.0,
+                Some(291_630),
+            ),
+            pace,
+        ));
+        let mut spend = window("spend", "spend", WindowKind::Spend, 40.0, Some(1_209_630));
+        spend.detail = Some(r#"{"used": 20, "limit": 50, "currency": "EUR"}"#.parse().unwrap());
+        windows.push((spend, pace));
+        let lead = lead_rows(&loaded(accounts), 120, 40).1;
+        // The label column is 5 wide: the bars are columns 11 to 63; the mark is cell 26.
+        let bar = |row: &str| columns(row, 11, 63);
+        let marked = format!("{}│{}", "▆".repeat(21) + &"▁".repeat(5), "▁".repeat(25));
+        assert_eq!(
+            bar(&lead[1]),
+            "▆".repeat(21) + &"▁".repeat(31),
+            "5h: {lead:?}"
+        );
+        assert_eq!(bar(&lead[2]), marked, "7d: {lead:?}");
+        assert_eq!(bar(&lead[3]), marked, "Fable: {lead:?}");
+        assert_eq!(
+            bar(&lead[4]),
+            "▆".repeat(21) + &"▁".repeat(31),
+            "spend: {lead:?}"
+        );
+    }
+
+    #[test]
+    fn ahead_of_pace_a_lead_bar_shows_its_mark_in_warn() {
+        let mut accounts = three();
+        accounts[1].usage.windows.as_mut().unwrap()[1].1.ahead = Some(true);
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            let (y, lead) = lead_rows(&state, 120, 40);
+            assert!(lead[1].ends_with("   53%  resets in 2h40m"), "{lead:?}");
+            assert!(lead[2].ends_with("    6% ▲  resets in 3d09h"), "{lead:?}");
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let (got, want) = role_of(&buf, theme, y + 2, "▲", 'w');
+            assert_eq!(got, want, "{theme:?}");
+        }
+    }
+
+    #[test]
+    fn a_lead_bar_s_projection_is_its_text_from_120_columns_and_its_clause_at_80() {
+        let mut accounts = three();
+        let windows = accounts[1].usage.windows.as_mut().unwrap();
+        windows[0].1 = Pace {
+            rate_per_hour: Some(15.7),
+            will_last_to_reset: Some(true),
+            ..Pace::default()
+        };
+        windows[1].1 = Pace {
+            rate_per_hour: Some(1.2),
+            method: Some(tagteam_core::ProjectionMethod::Regression),
+            exhaustion_at: Some(NOW_S + 187_200),
+            will_last_to_reset: Some(false),
+            ..Pace::default()
+        };
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            for (w, h, lasts, fills) in [
+                (
+                    120,
+                    40,
+                    "resets in 2h40m · +15.7%/h · lasts until it resets",
+                    "resets in 3d09h · +1.2%/h · full in 2d04h",
+                ),
+                (
+                    80,
+                    24,
+                    "resets in 2h40m · lasts",
+                    "resets in 3d09h · full in 2d04h",
+                ),
+            ] {
+                let (y, lead) = lead_rows(&state, w, h);
+                assert!(lead[1].ends_with(lasts), "{w}: {lead:?}");
+                assert!(lead[2].ends_with(fills), "{w}: {lead:?}");
+                let buf = draw_buffer(&state, w, h, NOW_MS);
+                let lasting = lasts.split(" · ").skip(1).collect::<Vec<_>>().join(" · ");
+                let (got, want) = role_of(&buf, theme, y + 1, &lasting, 't');
+                assert_eq!(got, want, "{theme:?} {w}");
+                let filling = fills.split(" · ").skip(1).collect::<Vec<_>>().join(" · ");
+                let (got, want) = role_of(&buf, theme, y + 2, &filling, 'w');
+                assert_eq!(got, want, "{theme:?} {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_best_pick_is_dropped_when_it_would_leave_the_title_under_16_columns() {
+        // T3-19: the pick is never cut. Its 83 columns and a 3-column gap leave the title's left
+        // part 16 columns at 102, and 15 at 101.
+        let mut accounts = three();
+        accounts[0].row.alias = Some("p".repeat(60));
+        let state = loaded(accounts);
+        let pick = format!("best now  1 {}   b switch", "p".repeat(60));
+        assert_eq!(width_of(&pick), 83);
+        for w in [102u16, 160] {
+            let title = lead_rows(&state, w, 40).1[0].clone();
+            assert!(title.ends_with(&pick), "{w}: {title}");
+            assert_eq!(width_of(&title), usize::from(w), "{title}");
+        }
+        for w in [80u16, 101] {
+            let title = lead_rows(&state, w, 40).1[0].clone();
+            assert!(!title.contains("best now"), "{w}: {title}");
+            assert!(
+                title.starts_with("  ● 2 work  sam@corp.example"),
+                "{w}: {title}"
+            );
+            assert!(title.ends_with("    in use"), "{w}: {title}");
+        }
+    }
+
+    #[test]
+    fn the_lead_card_s_label_column_is_a_quarter_of_its_width_at_most() {
+        let mut accounts = three();
+        let long = "x".repeat(100);
+        accounts[1].usage.windows.as_mut().unwrap().push((
+            window(
+                "scoped:long",
+                &long,
+                WindowKind::Scoped,
+                40.0,
+                Some(291_630),
+            ),
+            Pace::default(),
+        ));
+        let lead = lead_rows(&loaded(accounts), 120, 40).1;
+        assert_eq!(lead.len(), 4, "{lead:?}");
+        assert!(
+            lead[1].starts_with(&format!("    {:<30}  ▆", "5h")),
+            "{lead:?}"
+        );
+        assert!(
+            lead[3].starts_with(&format!("    {}  ▆", fit(&long, 30))),
+            "{lead:?}"
+        );
+        assert!(lead.iter().all(|l| width_of(l) <= 120), "{lead:?}");
+    }
+
+    #[test]
+    fn a_second_provider_s_lead_card_shows_its_own_account_in_use_and_pick() {
+        use tagteam_engine::switch::BestForecast;
+        let mut snap = snapshot(three());
+        let mut fake = fake_agent(
+            vec![fake_account(1, "a1@x.co"), fake_account(2, "a2@x.co")],
+            LiveLogin::Managed { position: 2 },
+        );
+        fake.accounts[1].active = true;
+        fake.forecast = BestForecast::Pick { order: vec![1] };
+        snap.providers.push(fake);
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snap);
+        let title = lead_rows(&state, 120, 40).1[0].clone();
+        assert!(title.starts_with("  ● 2 work"), "{title}");
+        assert!(
+            title.ends_with("best now  1 alex@example.com   b switch"),
+            "{title}"
+        );
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        let lead = lead_rows(&state, 120, 40).1;
+        assert!(lead[0].starts_with("  ● 2 a2@x.co    in use"), "{lead:?}");
+        assert!(
+            lead[0].ends_with("best now  1 a1@x.co   b switch"),
+            "{lead:?}"
+        );
+        assert!(lead[1].starts_with("    5h    ▆"), "{lead:?}");
     }
 }

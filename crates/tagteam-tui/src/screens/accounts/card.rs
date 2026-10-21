@@ -1,9 +1,11 @@
 //! The selected account's card (redesign §6.4, T3-20, T3-22): its title and facts, a row per
 //! window with a sparkline from the card's history read, its problem and remedy, and its keys.
-//! The lead card (§6.2) reuses its problem rows and `lead_keys`.
+//! The lead card (§6.2) reuses its problem rows, `lead_keys`, its title's parts and its label
+//! column.
 
 use ratatui::text::{Line, Span};
 use tagteam_core::{Pace, Sample, Window, WindowKind};
+use tagteam_engine::store::AccountRow;
 use tagteam_engine::views::{AccountView, HistoryWindow, UsageStatus};
 use tagteam_engine::words;
 
@@ -41,6 +43,9 @@ const FACT_SEP: &str = " · ";
 const PROBLEM_ROWS: usize = 2;
 /// The label column's least width; it takes a quarter of the card's at most (T3-20).
 const LABEL_LEAST: usize = 4;
+/// A title's name keeps this many columns, or its whole width when narrower, before its facts
+/// are cut: T3-15's least for the table's name.
+const NAME_LEAST: usize = 16;
 
 /// An account's windows, as its reading lists them; none without a reading.
 fn windows_of(v: &AccountView) -> &[(Window, Pace)] {
@@ -211,11 +216,19 @@ pub(crate) fn problem_rows(
     rows
 }
 
-/// The title (T3-20): `    {pos} {name}[ · {org}]    {facts}`, the name cut before the facts.
+/// The title (T3-20): `    {pos} {name}[ · {org}]    {facts}`, laid out by `title_spans`.
 fn title(state: &State, v: &AccountView, width: u16, now_ms: i64) -> Line<'static> {
     let theme = state.theme;
+    let head = vec![Span::raw(format!("{INDENT}{} ", v.row.position))];
+    let name = name_spans(&v.row, width, theme);
+    let facts = fact_spans(facts_of(state, v, now_ms), theme);
+    Line::from(title_spans(head, name, facts, usize::from(width)))
+}
+
+/// A card's name (§6.2, §6.4): the alias bold, two spaces and the email muted, or the email
+/// bold; the org muted from 120 columns.
+pub(super) fn name_spans(row: &AccountRow, width: u16, theme: Theme) -> Vec<Span<'static>> {
     let muted = theme.role(Role::Muted);
-    let row = &v.row;
     let email = words::email(row);
     let mut name = match &row.alias {
         Some(alias) => vec![
@@ -228,23 +241,63 @@ fn title(state: &State, v: &AccountView, width: u16, now_ms: i64) -> Line<'stati
     if let Some(org) = row.org_name.as_deref().filter(|_| width >= WIDE_FROM) {
         name.push(Span::styled(format!("{FACT_SEP}{org}"), muted));
     }
-    let mut facts: Vec<Span<'static>> = Vec::new();
-    for (i, (text, role)) in facts_of(state, v, now_ms).into_iter().enumerate() {
+    name
+}
+
+/// A card's facts, each in its role, joined by a muted ` · `.
+pub(super) fn fact_spans(facts: Vec<(String, Role)>, theme: Theme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, (text, role)) in facts.into_iter().enumerate() {
         if i > 0 {
-            facts.push(Span::styled(FACT_SEP, muted));
+            spans.push(Span::styled(FACT_SEP, theme.role(Role::Muted)));
         }
-        facts.push(Span::styled(text, theme.role(role)));
+        spans.push(Span::styled(text, theme.role(role)));
     }
-    let head = format!("{INDENT}{} ", row.position);
-    let facts_w: usize = facts.iter().map(|s| width_of(&s.content)).sum();
-    let room = usize::from(width)
-        .saturating_sub(width_of(&head) + TITLE_GAP.len() + facts_w)
-        .max(1);
-    let mut spans = vec![Span::raw(head)];
-    spans.extend(fit_spans(name, room));
-    spans.push(Span::raw(TITLE_GAP));
-    spans.extend(facts);
-    Line::from(fit_spans(spans, usize::from(width)))
+    spans
+}
+
+/// `{head}{name}    {facts}` in `room` columns. The name gives way first, down to
+/// `NAME_LEAST` columns (its whole width when narrower); then the facts are cut, from their
+/// end. Only when no room is left for them do they go, and the name below its floor.
+pub(super) fn title_spans(
+    head: Vec<Span<'static>>,
+    name: Vec<Span<'static>>,
+    facts: Vec<Span<'static>>,
+    room: usize,
+) -> Vec<Span<'static>> {
+    let width = |spans: &[Span<'static>]| spans.iter().map(|s| width_of(&s.content)).sum::<usize>();
+    let (head_w, name_w, facts_w) = (width(&head), width(&name), width(&facts));
+    let floor = name_w.min(NAME_LEAST);
+    let after_head = room.saturating_sub(head_w);
+    let name_room = after_head.saturating_sub(TITLE_GAP.len() + facts_w);
+    let mut spans = head;
+    if name_room >= floor {
+        spans.extend(fit_spans(name, name_room));
+        spans.push(Span::raw(TITLE_GAP));
+        spans.extend(facts);
+    } else {
+        let facts_room = after_head.saturating_sub(floor + TITLE_GAP.len());
+        if facts_room > 0 && !facts.is_empty() {
+            spans.extend(fit_spans(name, floor));
+            spans.push(Span::raw(TITLE_GAP));
+            spans.extend(fit_spans(facts, facts_room));
+        } else {
+            spans.extend(fit_spans(name, after_head));
+        }
+    }
+    fit_spans(spans, room)
+}
+
+/// A window rows' label column (T3-19, T3-20): the widest label, at least `LABEL_LEAST`, and a
+/// quarter of `width` at most, where a longer one is cut.
+pub(super) fn label_width<'a>(windows: impl IntoIterator<Item = &'a Window>, width: u16) -> usize {
+    windows
+        .into_iter()
+        .map(|w| width_of(&w.label))
+        .max()
+        .unwrap_or(0)
+        .max(LABEL_LEAST)
+        .min(usize::from(width) / 4)
 }
 
 /// The title's facts and their roles (T3-20): muted, the reading's age warn when it is old.
@@ -292,13 +345,7 @@ fn window_rows(
     now_ms: i64,
 ) -> Vec<Line<'static>> {
     let windows = windows_of(v);
-    let label_w = windows
-        .iter()
-        .map(|(w, _)| width_of(&w.label))
-        .max()
-        .unwrap_or(0)
-        .max(LABEL_LEAST)
-        .min(usize::from(width) / 4);
+    let label_w = label_width(windows.iter().map(|(w, _)| w), width);
     let card = state
         .accounts
         .card
@@ -485,5 +532,39 @@ mod tests {
         // One row left, or none: the window T3-22 reserves, and no hint.
         assert_eq!(shown(4, 3, 24), (1, false));
         assert_eq!(shown(2, 3, 24), (1, false));
+    }
+
+    #[test]
+    fn a_title_s_name_keeps_its_floor_until_its_facts_are_gone() {
+        let text = |spans: Vec<Span<'static>>| -> String {
+            spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let title = |room: usize| {
+            text(title_spans(
+                vec![Span::raw("    1 ")],
+                vec![Span::raw("alex@personal.example")],
+                vec![Span::raw("not in use")],
+                room,
+            ))
+        };
+        // Room for all: whole.
+        assert_eq!(title(41), "    1 alex@personal.example    not in use");
+        // Less: the name gives way down to 16 columns.
+        assert_eq!(title(38), "    1 alex@personal.exa…    not in use");
+        assert_eq!(title(36), "    1 alex@personal.e…    not in use");
+        // Then the facts, from their end.
+        assert_eq!(title(30), "    1 alex@personal.e…    not…");
+        assert_eq!(title(27), "    1 alex@personal.e…    …");
+        // Only with no room left for the facts does the name go below its floor.
+        assert_eq!(title(26), "    1 alex@personal.examp…");
+        assert_eq!(title(20), "    1 alex@personal…");
+        // A name narrower than 16 columns keeps its whole width.
+        let short = text(title_spans(
+            vec![Span::raw("    1 ")],
+            vec![Span::raw("a1@x.co")],
+            vec![Span::raw("not in use · updated 2m ago")],
+            30,
+        ));
+        assert_eq!(short, "    1 a1@x.co    not in use ·…");
     }
 }
