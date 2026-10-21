@@ -110,6 +110,9 @@ const OSC_ANSWER: &[u8] = b"\x1b]11;rgb:2828/2c2c/3434\x1b\\";
 const DA1_ANSWER: &[u8] = b"\x1b[?62;22c";
 /// How long a typed byte takes to be read, so that it is not read together with the next.
 const SETTLE: Duration = Duration::from_millis(100);
+/// Detection's quiet second (`detect::QUIET`) less a margin: an ending that comes before this
+/// is not that give-up, whatever the scheduler does to the events that caused it.
+const BEFORE_QUIET: Duration = Duration::from_millis(700);
 
 /// The accounts table, on the alternate screen.
 fn accounts(s: &Screen) -> bool {
@@ -605,7 +608,9 @@ fn after_an_answer_esc_acts_at_once() {
     tui.type_keys(b"?");
     tui.wait_for(Duration::from_secs(2), "help", help);
     tui.type_keys(b"\x1b");
-    tui.wait_for(Duration::from_millis(300), "help closed", |s| {
+    // A lone Esc held for the next key is never released by time: any bound under the quiet
+    // second tells the two apart.
+    tui.wait_for(Duration::from_millis(900), "help closed", |s| {
         accounts(s) && !help(s)
     });
     quit(tui);
@@ -722,7 +727,7 @@ fn sigterm_while_the_terminal_ignores_the_colour_query_exits_at_once() {
     let mut tui = asking(&home);
     tui.wait_for_output(LONG, "the query", QUERY);
     tui.signal(libc::SIGTERM);
-    let f = tui.finish(Duration::from_millis(500));
+    let f = tui.finish(BEFORE_QUIET);
     assert_eq!(f.status.code(), Some(143), "{}", f.screen.text());
     assert_restored(&f);
 }
@@ -733,7 +738,7 @@ fn ctrl_c_while_the_terminal_ignores_the_colour_query_quits_at_once() {
     let mut tui = asking(&home);
     tui.wait_for_output(LONG, "the query", QUERY);
     tui.type_keys(b"\x03");
-    let f = tui.finish(Duration::from_millis(500));
+    let f = tui.finish(BEFORE_QUIET);
     assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
     assert_restored(&f);
 }

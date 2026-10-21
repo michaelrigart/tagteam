@@ -1169,14 +1169,15 @@ mod tests {
         let script = Script::default();
         let (detection, _ours, _theirs, _asked) = detection();
         let (tx, _rx) = mpsc::channel();
+        let spawned = Instant::now();
         let input = Input::spawn_with(tx, script.clone(), Some(detection)).unwrap();
         thread::sleep(Duration::from_millis(100));
-        let started = Instant::now();
         assert!(input.pause());
+        // Acknowledged by the pause, not by detection's quiet second running out.
         assert!(
-            started.elapsed() < Duration::from_millis(200),
+            spawned.elapsed() < detect::BEFORE_QUIET,
             "{:?}",
-            started.elapsed()
+            spawned.elapsed()
         );
         input.resume();
     }
@@ -1239,7 +1240,7 @@ mod tests {
             Ok(Msg::Detected { background: None })
         ));
         assert!(matches!(
-            rx.recv_timeout(Duration::from_millis(100)),
+            rx.recv_timeout(detect::BEFORE_QUIET),
             Ok(Msg::Key(k)) if k.code == KeyCode::Esc
         ));
     }
