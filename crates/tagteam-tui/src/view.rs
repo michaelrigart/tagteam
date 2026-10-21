@@ -855,6 +855,12 @@ mod tests {
                 provider: fake,
                 active_position: None,
                 accounts: vec![third],
+                threshold: 90.0,
+                strategy: tagteam_core::autoswitch::Strategy::Best,
+                names: tagteam_engine::views::ProviderNames {
+                    display_name: "FakeAgent",
+                    launch_command: "fakeagent",
+                },
             });
         state.accounts.apply(snap);
         let mut waiting = daemon_job("fake-agent", "waiting", true);
@@ -1025,6 +1031,12 @@ mod tests {
                 provider: fake,
                 active_position: None,
                 accounts: vec![],
+                threshold: 90.0,
+                strategy: tagteam_core::autoswitch::Strategy::Best,
+                names: tagteam_engine::views::ProviderNames {
+                    display_name: "FakeAgent",
+                    launch_command: "fakeagent",
+                },
             });
         state.accounts.apply(snap);
         go_live(&mut state, one_job("auto", true));

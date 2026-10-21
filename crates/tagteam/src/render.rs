@@ -905,6 +905,12 @@ mod tests {
             provider: ProviderId::new(provider),
             active_position: active,
             accounts: vec![],
+            threshold: 90.0,
+            strategy: tagteam_core::autoswitch::Strategy::Best,
+            names: tagteam_engine::views::ProviderNames {
+                display_name: "Claude Code",
+                launch_command: "claude",
+            },
         }
     }
 
@@ -947,6 +953,12 @@ mod tests {
             provider: ProviderId::new(CLAUDE_CODE),
             active_position: None,
             accounts,
+            threshold: 90.0,
+            strategy: tagteam_core::autoswitch::Strategy::Best,
+            names: tagteam_engine::views::ProviderNames {
+                display_name: "Claude Code",
+                launch_command: "claude",
+            },
         }]
     }
 

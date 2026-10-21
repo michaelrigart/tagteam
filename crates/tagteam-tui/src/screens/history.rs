@@ -866,6 +866,12 @@ mod tests {
                 provider: tagteam_core::ProviderId::new("fake-agent"),
                 active_position: None,
                 accounts: vec![other],
+                threshold: 90.0,
+                strategy: tagteam_core::autoswitch::Strategy::Best,
+                names: tagteam_engine::views::ProviderNames {
+                    display_name: "FakeAgent",
+                    launch_command: "fakeagent",
+                },
             });
         let mut state = fresh(Screen::History);
         state.accounts.apply(snap);

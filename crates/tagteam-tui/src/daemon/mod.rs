@@ -750,6 +750,12 @@ mod tests {
             provider: fake,
             active_position: None,
             accounts: vec![third],
+            threshold: 90.0,
+            strategy: tagteam_core::autoswitch::Strategy::Best,
+            names: tagteam_engine::views::ProviderNames {
+                display_name: "FakeAgent",
+                launch_command: "fakeagent",
+            },
         });
         snap
     }

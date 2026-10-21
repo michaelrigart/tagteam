@@ -10,6 +10,7 @@ use tagteam_provider::{Identity, KindTraits, Provider, Read, RunShell};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::settings::Settings;
 use crate::store::{
     AccountRow, LiveIdentityCacheRow, Store, UsageStateRow, backoff_is_skewed, plan_is_skewed,
 };
@@ -121,11 +122,31 @@ const UNREGISTERED: KindTraits = KindTraits {
     display: None,
 };
 
+/// The provider's own words for the screens (ARCH-1): `Claude Code`, `claude`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderNames {
+    pub display_name: &'static str,
+    pub launch_command: &'static str,
+}
+
+impl ProviderNames {
+    pub fn of(p: &dyn Provider) -> ProviderNames {
+        ProviderNames {
+            display_name: p.display_name(),
+            launch_command: p.launch_command(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderAccounts {
     pub provider: ProviderId,
     pub active_position: Option<u32>,
     pub accounts: Vec<AccountView>,
+    /// The effective `autoswitch.threshold` and `autoswitch.strategy`, the provider's own table first.
+    pub threshold: f64,
+    pub strategy: tagteam_core::autoswitch::Strategy,
+    pub names: ProviderNames,
 }
 
 #[derive(Debug, Clone)]
@@ -488,11 +509,15 @@ impl Engine {
             .collect::<Result<Vec<_>, EngineError>>()?;
         let active_position = accounts.iter().find(|v| v.active).map(|v| v.row.position);
         let live_label = live.identity.map(|i| i.email.unwrap_or(i.label));
+        let (settings, _) = Settings::load(&self.env, provider);
         Ok((
             ProviderAccounts {
                 provider: provider.clone(),
                 active_position,
                 accounts,
+                threshold: settings.threshold,
+                strategy: settings.strategy,
+                names: ProviderNames::of(p.as_ref()),
             },
             live_label,
         ))
