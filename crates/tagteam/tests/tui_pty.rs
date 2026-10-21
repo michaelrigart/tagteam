@@ -104,9 +104,31 @@ impl Home {
     }
 }
 
+/// What the TUI writes to ask the terminal its background (OSC 11, then DA1), and the answers.
+const QUERY: &[u8] = b"\x1b]11;?\x1b\\\x1b[c";
+const OSC_ANSWER: &[u8] = b"\x1b]11;rgb:2828/2c2c/3434\x1b\\";
+const DA1_ANSWER: &[u8] = b"\x1b[?62;22c";
+/// How long a typed byte takes to be read, so that it is not read together with the next.
+const SETTLE: Duration = Duration::from_millis(100);
+
 /// The accounts table, on the alternate screen.
 fn accounts(s: &Screen) -> bool {
     s.on_alt() && s.contains("a@x.co") && s.contains("b@x.co")
+}
+
+/// `tagteam tui` on a terminal that says it draws 24-bit colour, so the TUI asks its background.
+fn asking(home: &Home) -> Pty {
+    let mut c = home.command(&["tui"]);
+    c.env("COLORTERM", "truecolor");
+    Pty::spawn(c, true)
+}
+
+fn asked(output: &[u8]) -> usize {
+    output.windows(QUERY.len()).filter(|w| *w == QUERY).count()
+}
+
+fn history(s: &Screen) -> bool {
+    s.on_alt() && s.contains("No usage history.")
 }
 
 /// The terminal handed back, and the wait for Enter on it (R5).
@@ -187,6 +209,8 @@ fn the_emulator_reads_back_text_moves_clears_and_the_alternate_screen() {
     assert!(!s.on_alt());
     assert_eq!(s.text(), "shell$\nback\n\n");
     assert_eq!(Screen::of("a界b".as_bytes(), 6, 1).text(), "a界b");
+    let queried = b"a\x1b]11;?\x1b\\b\x1b[c\x1b]0;title\x07c";
+    assert_eq!(Screen::of(queried, 6, 1).text(), "abc", "no query is text");
 }
 
 #[test]
@@ -317,6 +341,131 @@ fn tui_history_opens_on_history() {
     });
     tui.type_keys(b"q");
     assert_eq!(tui.finish(LONG).status.code(), Some(0));
+}
+
+#[test]
+fn the_colour_query_is_asked_once_and_an_answer_lets_the_keys_through() {
+    let home = Home::new();
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    tui.type_keys(&[OSC_ANSWER, DA1_ANSWER].concat());
+    tui.type_keys(b"3");
+    tui.wait_for(Duration::from_secs(2), "History", history);
+    tui.type_keys(b"q");
+    let f = tui.finish(LONG);
+    assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+    assert_eq!(asked(&f.output), 1, "asked once");
+    assert_restored(&f);
+}
+
+#[test]
+fn a_terminal_that_answers_only_da1_keeps_the_keys_working() {
+    let home = Home::new();
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    tui.type_keys(DA1_ANSWER);
+    tui.type_keys(b"3");
+    tui.wait_for(Duration::from_secs(2), "History", history);
+    tui.type_keys(b"q");
+    assert_eq!(tui.finish(LONG).status.code(), Some(0));
+}
+
+#[test]
+fn a_silent_terminal_is_given_up_after_a_second() {
+    let home = Home::new();
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    thread::sleep(Duration::from_millis(1_200));
+    tui.type_keys(b"3");
+    tui.wait_for(Duration::from_secs(2), "History", history);
+    tui.type_keys(b"q");
+    assert_eq!(tui.finish(LONG).status.code(), Some(0));
+}
+
+#[test]
+fn without_colorterm_or_with_no_color_nothing_is_asked() {
+    let home = Home::new();
+    let mut plain = home.command(&["tui"]);
+    plain.env_remove("COLORTERM");
+    let mut no_colour = home.command(&["tui"]);
+    no_colour.env("COLORTERM", "truecolor").env("NO_COLOR", "1");
+    for cmd in [plain, no_colour] {
+        let mut tui = Pty::spawn(cmd, true);
+        tui.wait_for(LONG, "the accounts table", accounts);
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(asked(&tui.output()), 0, "nothing was asked");
+        tui.type_keys(b"q");
+        assert_eq!(tui.finish(LONG).status.code(), Some(0));
+    }
+}
+
+/// Types `before`, `key` and `after`, each in a read of its own, at a TUI that has asked its
+/// background, then `2`. Tokens shows and History, which `3` would have opened, never did: the
+/// key was dropped by detection, not read.
+fn drops_the_key_in(before: &[u8], key: &[u8], after: &[u8]) {
+    let home = Home::new();
+    one_response(&home);
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    for bytes in [before, key, after] {
+        if !bytes.is_empty() {
+            tui.type_keys(bytes);
+            thread::sleep(SETTLE);
+        }
+    }
+    tui.type_keys(b"2");
+    tui.wait_for(Duration::from_secs(2), "the token report", token_report);
+    assert_eq!(tui.first_shown(history), None, "the key reached the keys");
+    tui.type_keys(b"q");
+    assert_eq!(tui.finish(LONG).status.code(), Some(0));
+}
+
+#[test]
+fn a_key_before_the_colour_answer_is_dropped() {
+    drops_the_key_in(b"", b"3", &[OSC_ANSWER, DA1_ANSWER].concat());
+}
+
+#[test]
+fn a_key_between_the_two_answers_is_dropped() {
+    drops_the_key_in(OSC_ANSWER, b"3", DA1_ANSWER);
+}
+
+#[test]
+fn an_answer_split_across_reads_is_read_whole() {
+    let home = Home::new();
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    let (first, rest) = OSC_ANSWER.split_at(12);
+    tui.type_keys(first);
+    thread::sleep(Duration::from_millis(100));
+    tui.type_keys(rest);
+    tui.type_keys(DA1_ANSWER);
+    tui.type_keys(b"3");
+    tui.wait_for(Duration::from_secs(2), "History", history);
+    tui.type_keys(b"q");
+    assert_eq!(tui.finish(LONG).status.code(), Some(0));
+}
+
+#[test]
+fn sigterm_while_the_terminal_ignores_the_colour_query_exits_at_once() {
+    let home = Home::new();
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    tui.signal(libc::SIGTERM);
+    let f = tui.finish(Duration::from_millis(500));
+    assert_eq!(f.status.code(), Some(143), "{}", f.screen.text());
+    assert_restored(&f);
+}
+
+#[test]
+fn ctrl_c_while_the_terminal_ignores_the_colour_query_quits_at_once() {
+    let home = Home::new();
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    tui.type_keys(b"\x03");
+    let f = tui.finish(Duration::from_millis(500));
+    assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+    assert_restored(&f);
 }
 
 #[test]

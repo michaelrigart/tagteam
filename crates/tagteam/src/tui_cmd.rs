@@ -104,6 +104,10 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
     let opts = TuiOptions {
         screen,
         color,
+        truecolor: matches!(
+            std::env::var("COLORTERM").as_deref(),
+            Ok("truecolor" | "24bit")
+        ),
         provider: provider.clone(),
         tokens_provider,
         tz,

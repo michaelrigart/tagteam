@@ -10,6 +10,7 @@ use crate::host::{Action, ActionOutcome};
 use crate::lanes::Coalesce;
 use crate::live::{Live, StatusError};
 use crate::source::{AccountsSnapshot, CollectSummary, SourceError};
+use crate::theme::Background;
 
 /// The views lane's requests: store-served reads, no network (spec §4.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +186,10 @@ pub enum Msg {
     SuspendRefused {
         action: Option<Action>,
         why: &'static str,
+    },
+    /// What the terminal said its background is (spec §4.2); `None` when it said nothing.
+    Detected {
+        background: Option<Background>,
     },
 }
 
