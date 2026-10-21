@@ -163,6 +163,8 @@ pub fn banner(state: &State) -> Option<String> {
 /// T3-21: the card's read once it is due, while Accounts shows; it waits for Accounts
 /// otherwise.
 pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
+    // Whatever changed the selection, its card is read; a no-op when nothing did.
+    state.accounts.schedule_card(now_ms);
     let due = state.accounts.card_due_ms.is_some_and(|at| at <= now_ms);
     if !due || state.screen != Screen::Accounts || state.quitting.is_some() {
         return vec![];
@@ -1553,6 +1555,15 @@ mod tests {
         state.raise_banner(BannerKind::Refusal, banner.clone());
         let seven = card_windows(&state, 80, 24);
         assert_eq!(seven.len(), 7, "{seven:?}");
+        // With nothing hidden there is nothing to hint at.
+        let hint = |state: &State, h: u16| {
+            let (y, card) = card_rows(state, 80, h);
+            let at = card
+                .iter()
+                .position(|l| l.trim_start().starts_with("J K:"))?;
+            Some((y + at as u16, card[at].clone()))
+        };
+        assert_eq!(hint(&state, 24), None);
         update(&mut state, ch('J'), NOW_MS);
         assert_eq!(card_windows(&state, 80, 24), seven);
         // Twenty-four do not: `J` until nothing moves shows the last.
@@ -1561,6 +1572,15 @@ mod tests {
         let first = card_windows(&state, 80, 24);
         assert_eq!(first[0], "5h");
         assert!(first.len() < 24, "{first:?}");
+        // The last window row says which show, muted, in the other screens' words.
+        let (y, said) = hint(&state, 24).unwrap();
+        assert_eq!(said, format!("    J K: windows 1–{} of 24", first.len()));
+        let buf = draw_buffer(&state, 80, 24, NOW_MS);
+        let (got, want) = role_of(&buf, Theme::new(false), y, &said[4..], 'm');
+        assert_eq!(got, want);
+        update(&mut state, ch('J'), NOW_MS);
+        let moved = format!("    J K: windows 2–{} of 24", first.len() + 1);
+        assert_eq!(hint(&state, 24).map(|h| h.1), Some(moved));
         loop {
             let before = card_windows(&state, 80, 24);
             update(&mut state, ch('J'), NOW_MS);
@@ -1571,6 +1591,8 @@ mod tests {
         let last = card_windows(&state, 80, 24);
         assert_eq!(last.last().map(String::as_str), Some("M22"), "{last:?}");
         assert_eq!(last.len(), first.len(), "whole rows, the same count");
+        let end = format!("    J K: windows {}–24 of 24", 25 - last.len());
+        assert_eq!(hint(&state, 24).map(|h| h.1), Some(end));
         assert!(draw(&state, 80, 24).iter().all(|l| width_of(l) <= 80));
         // Taller: the scroll is clamped, so the last window shows from further up, and `K`
         // moves at once.
@@ -1585,9 +1607,14 @@ mod tests {
         let taller = card_windows(&state, 80, 30);
         assert_eq!(taller.last().map(String::as_str), Some("M22"), "{taller:?}");
         assert!(taller.len() > last.len(), "{taller:?}");
+        let from = 25 - taller.len();
+        let clamped = format!("    J K: windows {from}–24 of 24");
+        assert_eq!(hint(&state, 30).map(|h| h.1), Some(clamped));
         update(&mut state, ch('K'), NOW_MS);
         let up = card_windows(&state, 80, 30);
         assert_eq!(up[1..], taller[..taller.len() - 1], "{up:?}");
+        let back = format!("    J K: windows {}–23 of 24", from - 1);
+        assert_eq!(hint(&state, 30).map(|h| h.1), Some(back));
     }
 
     #[test]

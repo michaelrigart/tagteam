@@ -14,7 +14,7 @@ use crate::chrome::fit_spans;
 use crate::gauge::sparkline;
 use crate::state::State;
 use crate::theme::{Role, Theme};
-use crate::view::{pad, width_of, wrap_rows};
+use crate::view::{fit, pad, width_of, wrap_rows};
 
 /// The card's history read waits this long after the selection, or its reading, changes
 /// (T3-21).
@@ -48,8 +48,12 @@ fn windows_of(v: &AccountView) -> &[(Window, Pace)] {
 }
 
 /// The card's lines at `width`, its windows from `from` on, in at most `rows` (T3-20, T3-22).
-/// `on_lead` names the windows the lead card shows for the account in use (T3-32): those
-/// rows leave out their reset and projection. It is empty for any other account.
+/// When `rows` is less than `min_height`, it returns `min_height` lines all the same: the
+/// title, one window, the problem rows and the keys row are never dropped. When not every
+/// window fits and two rows or more are left for them, the last of those says which show and
+/// how to scroll (`J K: windows 3–9 of 24`, muted). `on_lead` names the windows the lead card
+/// shows for the account in use (T3-32): those rows leave out their reset and projection. It
+/// is empty for any other account.
 pub(crate) fn lines(
     state: &State,
     v: &AccountView,
@@ -61,11 +65,31 @@ pub(crate) fn lines(
 ) -> Vec<Line<'static>> {
     let problems = problem_rows(state, v, width, now_ms);
     let keys = keys_row(v, width, state.theme);
-    let room = room(rows, 1 + problems.len() + keys.len(), windows_of(v).len());
-    let from = from.min(windows_of(v).len().saturating_sub(room));
+    let n = windows_of(v).len();
+    let shown = Shown::of(rows, 1 + problems.len() + keys.len(), n);
+    let from = from.min(n - shown.windows);
     let mut lines = vec![title(state, v, width, now_ms)];
-    let windows = window_rows(state, v, width, on_lead, now_ms);
-    lines.extend(windows.into_iter().skip(from).take(room));
+    lines.extend(window_rows(
+        state,
+        v,
+        width,
+        from..from + shown.windows,
+        on_lead,
+        now_ms,
+    ));
+    if shown.hint {
+        let (a, b) = (from + 1, from + shown.windows);
+        lines.push(Line::from(vec![
+            Span::raw(INDENT),
+            Span::styled(
+                fit(
+                    &format!("J K: windows {a}–{b} of {n}"),
+                    usize::from(width).saturating_sub(INDENT.len()),
+                ),
+                state.theme.role(Role::Muted),
+            ),
+        ]));
+    }
     lines.extend(problems);
     lines.extend(keys);
     lines
@@ -82,13 +106,27 @@ pub(super) fn furthest(
 ) -> usize {
     let n = windows_of(v).len();
     let fixed = min_height(state, v, width, now_ms) - usize::from(n > 0);
-    n.saturating_sub(room(rows, fixed, n))
+    n.saturating_sub(Shown::of(rows, fixed, n).windows)
 }
 
-/// The window rows `rows` lines hold beside the card's `fixed` others: one at least when it
-/// has any of its `windows`, as T3-22 reserves.
-fn room(rows: usize, fixed: usize, windows: usize) -> usize {
-    rows.saturating_sub(fixed).max(usize::from(windows > 0))
+/// What the card's window rows show in `rows` lines beside its `fixed` others.
+struct Shown {
+    /// How many windows: one at least when it has any, as T3-22 reserves.
+    windows: usize,
+    /// Whether the last window row says which windows show instead (`J K: windows a–b of n`):
+    /// when not every window fits and two rows or more are left for them.
+    hint: bool,
+}
+
+impl Shown {
+    fn of(rows: usize, fixed: usize, windows: usize) -> Shown {
+        let room = rows.saturating_sub(fixed).max(usize::from(windows > 0));
+        let hint = windows > room && room >= 2;
+        Shown {
+            windows: (room - usize::from(hint)).min(windows),
+            hint,
+        }
+    }
 }
 
 /// §6.2's windows for the lead card at `width`, before any fold, by key: the first short and
@@ -163,7 +201,7 @@ pub(crate) fn problem_rows(
     let now_s = now_ms.div_euclid(1000);
     if let Some(remedy) = words::remedy(problem, v, &names, now_s) {
         let under = format!("{INDENT}{GAP}");
-        let room = width.saturating_sub(under.len());
+        let room = width.saturating_sub(width_of(&under));
         rows.extend(
             wrap_rows(&remedy, room, PROBLEM_ROWS)
                 .into_iter()
@@ -244,11 +282,12 @@ fn facts_of(state: &State, v: &AccountView, now_ms: i64) -> Vec<(String, Role)> 
     facts
 }
 
-/// Each of `v`'s windows as one row (T3-20).
+/// `v`'s windows in `shown` as a row each (T3-20); the label column fits every window's.
 fn window_rows(
     state: &State,
     v: &AccountView,
     width: u16,
+    shown: std::ops::Range<usize>,
     on_lead: &[String],
     now_ms: i64,
 ) -> Vec<Line<'static>> {
@@ -265,7 +304,7 @@ fn window_rows(
         .card
         .as_ref()
         .filter(|c| c.account.row.id == v.row.id);
-    windows
+    windows[shown.start.min(windows.len())..shown.end.min(windows.len())]
         .iter()
         .map(|(w, p)| {
             let samples = card
@@ -300,16 +339,20 @@ impl Row<'_> {
     /// the width. From 120 columns `▲` takes its words when the row still fits.
     fn line(&self, now_s: i64, theme: Theme) -> Line<'static> {
         let width = usize::from(self.width);
-        if self.width >= WIDE_FROM && self.pace.ahead == Some(true) {
-            let long = self.spans(now_s, true, theme);
-            if long.iter().map(|s| width_of(&s.content)).sum::<usize>() <= width {
-                return Line::from(long);
+        let (mut spans, mark) = self.spans(now_s, theme);
+        if let Some(at) = mark.filter(|_| self.width >= WIDE_FROM) {
+            let words = words::ahead_words(self.pace.expected_pct);
+            let drawn: usize = spans.iter().map(|s| width_of(&s.content)).sum();
+            if drawn - width_of(AHEAD) + width_of(&words) <= width {
+                spans[at].content = words.into();
+                return Line::from(spans);
             }
         }
-        Line::from(fit_spans(self.spans(now_s, false, theme), width))
+        Line::from(fit_spans(spans, width))
     }
 
-    fn spans(&self, now_s: i64, ahead_words: bool, theme: Theme) -> Vec<Span<'static>> {
+    /// The row's spans with `▲` alone, and which span `▲` is when the window is ahead.
+    fn spans(&self, now_s: i64, theme: Theme) -> (Vec<Span<'static>>, Option<usize>) {
         let (w, p) = (self.window, self.pace);
         let wide = self.width >= WIDE_FROM;
         let (since, tag) = match w.kind {
@@ -327,17 +370,14 @@ impl Row<'_> {
             Span::raw(GAP),
             Span::styled(value, theme.severity(words::severity(pct))),
         ];
+        let mut mark = None;
         if p.ahead == Some(true) {
-            let mark = if ahead_words {
-                words::ahead_words(p.expected_pct)
-            } else {
-                AHEAD.to_owned()
-            };
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(mark, theme.role(Role::Warn)));
+            mark = Some(spans.len());
+            spans.push(Span::styled(AHEAD, theme.role(Role::Warn)));
         }
         if self.on_lead {
-            return spans;
+            return (spans, mark);
         }
         let reset = match (w.resets_at, w.kind) {
             (Some(at), _) if at > now_s => {
@@ -373,7 +413,7 @@ impl Row<'_> {
             spans.push(Span::raw(if reset.is_some() { FACT_SEP } else { GAP }));
             spans.push(projection);
         }
-        spans
+        (spans, mark)
     }
 }
 
@@ -411,4 +451,26 @@ fn keys_row(v: &AccountView, width: u16, theme: Theme) -> Vec<Line<'static>> {
         spans.push(Span::styled(label, theme.role(Role::Muted)));
     }
     vec![Line::from(fit_spans(spans, usize::from(width)))]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_windows_give_their_last_row_to_the_hint_when_two_rows_are_left() {
+        let shown = |rows, fixed, n| {
+            let s = Shown::of(rows, fixed, n);
+            (s.windows, s.hint)
+        };
+        // Everything fits: every window, no hint.
+        assert_eq!(shown(10, 3, 7), (7, false));
+        assert_eq!(shown(10, 3, 0), (0, false));
+        // Two rows or more left and windows hidden: one fewer window, and the hint.
+        assert_eq!(shown(10, 3, 24), (6, true));
+        assert_eq!(shown(5, 3, 24), (1, true));
+        // One row left, or none: the window T3-22 reserves, and no hint.
+        assert_eq!(shown(4, 3, 24), (1, false));
+        assert_eq!(shown(2, 3, 24), (1, false));
+    }
 }
