@@ -30,7 +30,7 @@ use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::http::Method;
 use tagteam_provider::keychain::Keychain;
-use tagteam_provider::liveness::{FakeProcess, FakeProcessProbe, parse_lstart};
+use tagteam_provider::liveness::{FakeProcess, FakeProcessProbe, ProcessProbe, parse_lstart};
 use tagteam_provider::process::{Captured, ProcessSpawner, ScriptedSpawner};
 use tagteam_provider::profile::{
     LAUNCH_DIR, ProfileMarker, RunShell, Seed, canonical_profile_path, profile_path,
@@ -838,6 +838,25 @@ impl Fx {
     /// An engine over the same Keychain, oracle and clock, but a different Env.
     pub fn engine_with_env(&self, env: Env) -> Engine {
         self.engine_over(env, self.keychain_vault(), self.oracle.clone())
+    }
+
+    /// An engine over the same Env, Keychain, oracle and clock whose session records are judged
+    /// by `process` rather than the fixture's probe: for a probe that does something while it
+    /// answers.
+    pub fn engine_with_process(&self, process: Arc<dyn ProcessProbe>) -> Engine {
+        Engine::new(EngineConfig {
+            env: self.env.clone(),
+            registry: ProviderRegistry::new().with(self.cc.clone()),
+            vault: self.keychain_vault(),
+            oracle: self.oracle.clone(),
+            clock: self.clock.clone(),
+            http: self.http.clone(),
+            default_provider: ProviderId::new(CLAUDE_CODE),
+            settings: Settings::default(),
+            process,
+            spawner: self.spawner.clone(),
+            run_shell: RunShell::Outside,
+        })
     }
 
     /// An engine over the same Keychain, clock and Env, but a caller-supplied oracle — for

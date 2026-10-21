@@ -6,6 +6,7 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,8 +27,10 @@ use tagteam_engine::collect::{CollectMode, CollectReport, Collected};
 use tagteam_engine::store::{Ineligible, UsageStateRow};
 use tagteam_engine::vault::SERVICE;
 use tagteam_engine::{Engine, EngineError};
+use tagteam_provider::liveness::{FakeProcessProbe, ProcessProbe};
 use tagteam_provider::{
-    Cancel, Http, HttpError, HttpRequest, HttpResponse, Keychain, Method, Provider, ScriptedHttp,
+    Cancel, FakeClock, Http, HttpError, HttpRequest, HttpResponse, Keychain, Method, Provider,
+    ScriptedHttp,
 };
 
 /// The fixture clock's start, in the seconds the usage tables hold (Decision 1).
@@ -80,6 +83,36 @@ fn spend_budget(fx: &Fx, id: &AccountId, n: usize, ago: i64) {
             rusqlite::params![fx.provider().as_str(), key, NOW_S - ago],
         )
         .unwrap();
+    }
+}
+
+/// A probe that answers as the fixture's does, after letting the clock run `ms` the first time
+/// it is asked.
+struct SlowProbe {
+    inner: Arc<FakeProcessProbe>,
+    clock: Arc<FakeClock>,
+    ms: i64,
+    asked: AtomicBool,
+}
+
+impl ProcessProbe for SlowProbe {
+    fn exists(&self, pid: u32) -> Option<bool> {
+        if !self.asked.swap(true, Ordering::SeqCst) {
+            self.clock.advance_ms(self.ms);
+        }
+        self.inner.exists(pid)
+    }
+
+    fn start_time_s(&self, pid: u32) -> Option<i64> {
+        self.inner.start_time_s(pid)
+    }
+
+    fn start_ticks(&self, pid: u32) -> Option<u64> {
+        self.inner.start_ticks(pid)
+    }
+
+    fn mentions(&self, pid: u32, needle: &str) -> Option<bool> {
+        self.inner.mentions(pid, needle)
     }
 }
 
@@ -953,6 +986,46 @@ fn a_scheduled_tick_reads_the_due_live_account_then_the_stalest_due_candidate() 
         report.outcomes,
         [(c, Collected::Recorded), (a, Collected::Recorded)]
     );
+}
+
+#[test]
+fn a_round_judges_its_candidates_due_at_the_time_it_started_not_after_their_session_reads() {
+    // §8.6: phase 2 reads the clock once, before it inspects the candidates' sessions. a's plan
+    // falls 1 s after phase 2 starts, and the clock passes it while a's session record is read;
+    // the round is judged at its start, so it leaves a alone.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    fx.script_usage(200, usage_fixture());
+    scheduled(&fx, 99.9);
+    fx.clock.advance_ms(100_000);
+    let started = NOW_S + 100;
+    plan_poll(&fx, &a, started + 1);
+    let profile = fx.make_profile(&a);
+    fx.dead_record(&profile, 4242);
+    let probe = Arc::new(SlowProbe {
+        inner: fx.process.clone(),
+        clock: fx.clock.clone(),
+        ms: 2_000,
+        asked: AtomicBool::new(false),
+    });
+    let slow = fx.engine_with_process(probe.clone());
+    fx.http.clear();
+    fx.script_usage(200, usage_fixture());
+    let requests = usage_requests(&fx);
+
+    let report = scheduled_on(&slow, 99.9, &[]);
+
+    assert!(
+        probe.asked.load(Ordering::SeqCst),
+        "the round read a's session record"
+    );
+    assert_eq!(
+        report.outcomes.iter().map(|(_, c)| c).collect::<Vec<_>>(),
+        [&Collected::Ineligible(Ineligible::NotDue)],
+        "only the live account was looked at, and it is not due"
+    );
+    assert_eq!(usage_requests(&fx), requests, "a was not read");
+    assert_eq!(state(&fx, &a).fetched_at, Some(NOW_S));
 }
 
 #[test]
