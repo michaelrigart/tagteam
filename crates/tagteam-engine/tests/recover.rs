@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use common::{
     API_KEY, Fx, STRAY_API_KEY, assert_journal_cleared, crash_row, crashed_switch, credential,
-    dead_holder, journal, prev_refresh_token, vault_fp, write_target_credential,
+    dead_holder, held_guard, journal, prev_refresh_token, vault_fp, write_target_credential,
 };
 use serde_json::Value;
 use tagteam_cc::ItemKind;
@@ -330,7 +330,11 @@ fn an_unreadable_identity_never_passes_for_an_absent_one() {
         from_identity: None,
         ..crash_row(&fx, &b, &a)
     };
-    fx.engine.store().unwrap().insert_journal(&row).unwrap();
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_journal(&held_guard(&fx.env), &row)
+        .unwrap();
     let config = fx.paths().global_config;
     // An unpaired surrogate: the file splices, but the value does not parse.
     let unreadable = common::CLAUDE_JSON.replacen(
@@ -594,11 +598,12 @@ fn a_row_that_appears_while_waiting_for_the_lock_is_recovered() {
     // The row is written by "another process" after this command's pre-lock scan found nothing.
     let store = fx.engine.store().unwrap();
     let (writer, pending) = (store.clone(), std::sync::Mutex::new(Some(row)));
+    let env = fx.env.clone();
     fx.engine.on_point(
         "before-mutation-lock",
         Box::new(move || {
             if let Some(row) = pending.lock().unwrap().take() {
-                writer.insert_journal(&row).unwrap();
+                writer.insert_journal(&held_guard(&env), &row).unwrap();
             }
         }),
     );
@@ -681,7 +686,7 @@ fn a_forced_switch_killed_before_landing_leaves_the_superseded_row() {
         started_at: 2,
         prior: Some(Box::new(unresolved.clone())),
     };
-    store.insert_journal(&forced).unwrap();
+    store.insert_journal(&held_guard(&fx.env), &forced).unwrap();
     any_mutation(&fx, &a);
     assert_eq!(journal(&fx), Some(unresolved));
 }
@@ -693,7 +698,11 @@ fn a_live_holder_is_left_alone() {
     let b = fx.add("b@x.co", "rt-b");
     let mut row = crash_row(&fx, &b, &a);
     row.holder = ProcessStamp::current().unwrap();
-    fx.engine.store().unwrap().insert_journal(&row).unwrap();
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_journal(&held_guard(&fx.env), &row)
+        .unwrap();
     write_target_credential(&fx, &a);
     any_mutation(&fx, &a);
     assert_eq!(
@@ -965,7 +974,11 @@ fn forward_recovery_records_the_row_s_epoch_so_a_later_replacement_stays_stale_m
             to_epoch,
             ..crash_row(&fx, &b, &a)
         };
-        fx.engine.store().unwrap().insert_journal(&row).unwrap();
+        fx.engine
+            .store()
+            .unwrap()
+            .insert_journal(&held_guard(&fx.env), &row)
+            .unwrap();
         write_target_credential(&fx, &a); // the switch landed a's credential, then died
         // Then a replacement of a's login wrote the vault and its replacer died; recovery's
         // own account lock finishes it before recovering the row.

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{Fx, crash_row, mutation_lock_free};
+use common::{Fx, crash_row, held_guard, mutation_lock_free};
 use serde_json::json;
 use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::ClaudeCode;
@@ -207,7 +207,11 @@ fn metadata_commands_recover_without_asking_the_oracle() {
     let a = fx.add("a@x.co", "rt-a");
     let b = fx.add("b@x.co", "rt-b");
     let row = crash_row(&fx, &a, &b);
-    fx.engine.store().unwrap().insert_journal(&row).unwrap();
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_journal(&held_guard(&fx.env), &row)
+        .unwrap();
     fx.rotate_live("rt-unknown"); // neither generation the row names: only the oracle could say
     let engine = http_engine(&fx);
     engine.set_alias(&a, Some("work")).unwrap();
@@ -250,7 +254,11 @@ fn a_signal_before_a_pre_lock_oracle_request_sends_none() {
     // A command that recovers an interrupted switch first asks the oracle about the live
     // credential the row does not name, before the mutation lock.
     let row = crash_row(&fx, &a, &b);
-    fx.engine.store().unwrap().insert_journal(&row).unwrap();
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_journal(&held_guard(&fx.env), &row)
+        .unwrap();
     fx.rotate_live("rt-unknown");
 
     let err = http_engine(&fx).remove(&a).unwrap_err();

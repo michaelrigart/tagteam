@@ -15,6 +15,7 @@ use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::shape::compose;
 use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Window, WindowKind};
+use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::auto::{AutoEvent, EventSink};
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
@@ -140,6 +141,23 @@ pub fn mutation_lock_free(env: &Env) -> bool {
     MutationGuard::acquire(&probe, Duration::ZERO).is_ok()
 }
 
+/// The mutation lock, taken directly under a token of its own, as `mutation_lock_free` takes it.
+/// A test that plants a journal row through `Store::insert_journal` needs the token, and
+/// `Engine::mutation_guard` would recover the row it plants (§9.1).
+pub fn held_guard(env: &Env) -> MutationGuard {
+    let mut env = env.clone();
+    env.cancel = Cancel::new();
+    MutationGuard::acquire(&env, MutationGuard::TIMEOUT).unwrap()
+}
+
+/// `id`'s account lock, taken directly under a token of its own. `Engine::lock_account` would
+/// reconcile the replacement a test plants through `Store::begin_replacement` (§12.5).
+pub fn held_lock(env: &Env, id: &AccountId) -> AccountLock {
+    let mut env = env.clone();
+    env.cancel = Cancel::new();
+    AccountLock::acquire(&env, id, AccountLock::WAIT).unwrap()
+}
+
 /// A process that is gone: its journal rows are recoverable (§12.6). Shared by `recover.rs`
 /// and `invariant.rs`, which both need to plant a crashed switch's journal row. The pid is one
 /// no process can hold (above any pid_max), so `is_live()` is false on macOS (ESRCH) and on
@@ -191,7 +209,11 @@ pub fn write_target_credential(fx: &Fx, to: &AccountId) {
 /// Leaves a journal row as a switch from `from` to `to` that died after step 6.
 pub fn crashed_switch(fx: &Fx, from: &AccountId, to: &AccountId) {
     let row = crash_row(fx, from, to);
-    fx.engine.store().unwrap().insert_journal(&row).unwrap();
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_journal(&held_guard(&fx.env), &row)
+        .unwrap();
 }
 
 /// The provider's current journal row, if any.
@@ -691,7 +713,7 @@ impl Fx {
             .store()
             .unwrap()
             .begin_replacement(
-                id,
+                &held_lock(&self.env, id),
                 self.cc.fingerprint(new_bytes).unwrap().as_str(),
                 &meta,
                 live_names_account,
@@ -735,12 +757,14 @@ impl Fx {
         };
         let fp = self.cc.fingerprint(new_bytes).unwrap();
         store
-            .begin_replacement(id, fp.as_str(), &meta, self.live_names(id))
+            .begin_replacement(&lock, fp.as_str(), &meta, self.live_names(id))
             .unwrap();
         self.fixture_vault()
             .store(&lock, new_bytes, self.cc.as_ref())
             .unwrap();
-        store.finish_replacement(id, self.clock.now_ms()).unwrap();
+        store
+            .finish_replacement(&lock, self.clock.now_ms())
+            .unwrap();
     }
 
     /// A vault over the fixture's own backend: the Keychain on macOS, files on Linux, as the

@@ -15,10 +15,11 @@ use crate::switch::{
     Axis, OracleHint, Settle, answer_for, refuse_unreadable, refuse_unsafe_live_reads,
 };
 
-/// What a recovery holds while it finishes one interrupted switch: the row, the account locks
-/// of both accounts it names, CC's live locks, the live read under them, and the pre-lock
-/// oracle hints.
+/// What a recovery holds while it finishes one interrupted switch: the mutation guard, the row,
+/// the account locks of both accounts it names, CC's live locks, the live read under them, and
+/// the pre-lock oracle hints.
 struct Recovery<'a, 'g> {
+    guard: &'a MutationGuard,
     row: &'a JournalRow,
     accounts: &'a [AccountLock],
     locks: &'a LiveLocks<'g>,
@@ -171,19 +172,18 @@ impl Engine {
             direction = direction.name(),
             "recovering an interrupted switch"
         );
+        let rec = Recovery {
+            guard,
+            row,
+            accounts: &accounts,
+            locks: &locks,
+            live: &live,
+            hints,
+        };
         let activated = match direction {
-            Direction::Forward(fp) => {
-                let rec = Recovery {
-                    row,
-                    accounts: &accounts,
-                    locks: &locks,
-                    live: &live,
-                    hints,
-                };
-                self.finish_forward(p, &store, &rec, &fp, source)?
-            }
+            Direction::Forward(fp) => self.finish_forward(p, &store, &rec, &fp, source)?,
             Direction::Backward(fp) => {
-                self.finish_backward(p, &store, row, &locks, &live, &fp)?;
+                self.finish_backward(p, &store, &rec, &fp)?;
                 None
             }
             Direction::Undecidable => None,
@@ -425,11 +425,16 @@ impl Engine {
         &self,
         p: &dyn Provider,
         store: &Store,
-        row: &JournalRow,
-        locks: &LiveLocks<'_>,
-        live: &LiveAuth,
+        rec: &Recovery<'_, '_>,
         established: &str,
     ) -> Result<(), EngineError> {
+        let Recovery {
+            guard,
+            row,
+            locks,
+            live,
+            ..
+        } = *rec;
         // An unmanaged outgoing login was journaled from the credential entry (§9.4 step 6).
         let from = match &row.from_id {
             Some(id) => store.account(id)?,
@@ -456,7 +461,7 @@ impl Engine {
             return Ok(());
         }
         match &row.prior {
-            Some(prior) => store.insert_journal(prior)?,
+            Some(prior) => store.insert_journal(guard, prior)?,
             None => store.delete_journal(&row.provider)?,
         }
         Ok(())

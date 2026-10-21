@@ -607,7 +607,7 @@ fn a_journal_row_naming_the_target_is_left_to_the_mutation_lock() {
         let holder = thread::spawn(move || {
             let guard = other.mutation_guard().unwrap();
             let store = other.store().unwrap();
-            store.insert_journal(&row).unwrap();
+            store.insert_journal(&guard, &row).unwrap();
             ready_tx.send(()).unwrap();
             thread::sleep(Duration::from_millis(300));
             store.delete_journal(&row.provider).unwrap();

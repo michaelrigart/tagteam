@@ -1,7 +1,7 @@
 use tagteam_core::{AccountId, OutgoingAction, OutgoingClass, OutgoingFacts, decide_outgoing};
 use tagteam_provider::{
-    BeforeFallback, DoomedEntry, Identity, LiveAuth, LiveChange, LiveLocks, ProcessStamp, Provider,
-    Read, ReadError, SecretStore, StoredLogin,
+    BeforeFallback, DoomedEntry, Identity, LiveAuth, LiveChange, LiveLocks, MutationGuard,
+    ProcessStamp, Provider, Read, ReadError, SecretStore, StoredLogin,
 };
 
 use crate::account_lock::AccountLock;
@@ -41,6 +41,7 @@ pub(super) struct Locked {
 
 /// What a switch holds while it runs under every lock.
 pub(super) struct LockedSwitch<'a, 'g> {
+    pub(super) guard: &'a MutationGuard,
     pub(super) store: &'a Store,
     pub(super) account_locks: &'a [AccountLock],
     pub(super) locks: &'a LiveLocks<'g>,
@@ -273,6 +274,7 @@ impl Engine {
         // Steps 7–10.
         let mut tx = Rollback {
             undos: Vec::new(),
+            guard: ls.guard,
             locks: ls.locks,
             store: ls.store,
             provider,
@@ -454,26 +456,29 @@ impl Engine {
         } else {
             None
         };
-        ls.store.insert_journal(&JournalRow {
-            provider: provider.clone(),
-            holder: ProcessStamp::current()?,
-            from_id: pf.outgoing.as_ref().map(|o| o.id.clone()),
-            to_id: pf.target.id.clone(),
-            from_fp: from_secret
-                .as_deref()
-                .and_then(|b| p.fingerprint(b))
-                .map(|f| f.as_str().to_owned()),
-            from_identity: pf.live_identity.as_ref().map(|i| i.raw.clone()),
-            to_fp: p
-                .fingerprint(target_secret)
-                .map(|f| f.as_str().to_owned())
-                .unwrap_or_default(),
-            // §9.4 step 6: read under the target's account lock, so it cannot move before
-            // the commit; a forward recovery records it (§9.6).
-            to_epoch: Some(pf.target.login_epoch),
-            started_at: self.now_ms(),
-            prior: prior.clone(),
-        })?;
+        ls.store.insert_journal(
+            ls.guard,
+            &JournalRow {
+                provider: provider.clone(),
+                holder: ProcessStamp::current()?,
+                from_id: pf.outgoing.as_ref().map(|o| o.id.clone()),
+                to_id: pf.target.id.clone(),
+                from_fp: from_secret
+                    .as_deref()
+                    .and_then(|b| p.fingerprint(b))
+                    .map(|f| f.as_str().to_owned()),
+                from_identity: pf.live_identity.as_ref().map(|i| i.raw.clone()),
+                to_fp: p
+                    .fingerprint(target_secret)
+                    .map(|f| f.as_str().to_owned())
+                    .unwrap_or_default(),
+                // §9.4 step 6: read under the target's account lock, so it cannot move before
+                // the commit; a forward recovery records it (§9.6).
+                to_epoch: Some(pf.target.login_epoch),
+                started_at: self.now_ms(),
+                prior: prior.clone(),
+            },
+        )?;
         Ok(prior)
     }
 

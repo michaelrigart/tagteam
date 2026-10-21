@@ -1074,7 +1074,11 @@ fn a_switch_under_way_is_information() {
     let b = fx.add("b@x.co", "rt-b");
     let mut row = crash_row(&fx, &a, &b);
     row.holder = ProcessStamp::current().unwrap();
-    fx.engine.store().unwrap().insert_journal(&row).unwrap();
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_journal(&held_guard(&fx.env), &row)
+        .unwrap();
     let c = one(&doctor(&fx), "switch.interrupted").clone();
     assert_eq!(c.status, CheckStatus::Info);
     assert!(c.message.contains("under way"), "{}", c.message);

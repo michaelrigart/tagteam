@@ -637,7 +637,7 @@ impl Engine {
         let provider = self.provider(&row.provider)?;
         match self.vault.read(lock.id()) {
             Read::Present(b) if provider.fingerprint(&b).is_some_and(|f| f.as_str() == fp) => {
-                match store.finish_replacement(lock.id(), self.now_ms()) {
+                match store.finish_replacement(lock, self.now_ms()) {
                     Ok(()) => {}
                     Err(StoreError::ReplacementUnreadable(_)) if mode == Reconcile::Removing => {}
                     Err(StoreError::ReplacementUnreadable(detail)) => {
@@ -869,11 +869,13 @@ mod tests {
 
         let to_id = AccountId::from_string("acc");
         seed_account(&engine, &provider, &to_id);
+        let guard = MutationGuard::acquire(engine.env(), MutationGuard::TIMEOUT).unwrap();
         engine
             .store()
             .unwrap()
-            .insert_journal(&unresolved_journal(&provider, &to_id))
+            .insert_journal(&guard, &unresolved_journal(&provider, &to_id))
             .unwrap();
+        drop(guard);
         assert!(matches!(
             engine.settle_or_refuse(&GuardRequest::refusing_one(&provider)),
             Err(EngineError::InterruptedSwitch(_))
@@ -887,11 +889,13 @@ mod tests {
         let provider = ProviderId::new("p");
         let to_id = AccountId::from_string("acc");
         seed_account(&engine, &provider, &to_id);
+        let guard = MutationGuard::acquire(engine.env(), MutationGuard::TIMEOUT).unwrap();
         engine
             .store()
             .unwrap()
-            .insert_journal(&unresolved_journal(&provider, &to_id))
+            .insert_journal(&guard, &unresolved_journal(&provider, &to_id))
             .unwrap();
+        drop(guard);
         rusqlite::Connection::open(engine.store_file())
             .unwrap()
             .execute("UPDATE switch_journal SET prior = 'not json'", [])

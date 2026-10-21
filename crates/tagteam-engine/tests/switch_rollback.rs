@@ -6,7 +6,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{Fx, mutation_lock_free};
+use common::{Fx, held_guard, mutation_lock_free};
 use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_service};
 use tagteam_core::AccountId;
@@ -73,7 +73,11 @@ fn undecidable_row(fx: &Fx, to: &AccountId) -> JournalRow {
         started_at: 1,
         prior: None,
     };
-    fx.engine.store().unwrap().insert_journal(&row).unwrap();
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_journal(&held_guard(&fx.env), &row)
+        .unwrap();
     row
 }
 

@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use common::{
     API_KEY, Fx, INERT_ITEM, cc_holds_storage_write_from, cc_marks_dead, cc_marks_dead_and_more,
-    cc_released, crashed_switch, dead_holder, journal, mutation_lock_free, write_target_credential,
-    writer_holds_storage_write_from,
+    cc_released, crashed_switch, dead_holder, held_guard, journal, mutation_lock_free,
+    write_target_credential, writer_holds_storage_write_from,
 };
 use serde_json::{Value, json};
 use tagteam_cc::{ItemKind, keychain_account};
@@ -28,7 +28,11 @@ use tagteam_provider::Keychain;
 fn the_command_exits(fx: &Fx) {
     let mut row = journal(fx).unwrap();
     row.holder = dead_holder();
-    fx.engine.store().unwrap().insert_journal(&row).unwrap();
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_journal(&held_guard(&fx.env), &row)
+        .unwrap();
     fx.engine.fail_at(None);
 }
 

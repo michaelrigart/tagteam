@@ -711,7 +711,12 @@ impl Engine {
                     from_live: source.from_live,
                 };
                 // §12.5 step 1, with the default home's evidence in the same transaction.
-                store.begin_replacement(&row.id, &new_fp, &meta, source.live_names_account)?;
+                store.begin_replacement(
+                    lock_for(&row.id),
+                    &new_fp,
+                    &meta,
+                    source.live_names_account,
+                )?;
                 if let Err(e) = self.vault.store(lock_for(&row.id), secret, p) {
                     // The write never landed: reconcile in process rather than leaving the
                     // marker dangling for the next lock holder to find.
@@ -729,7 +734,7 @@ impl Engine {
                     }
                     return Err(e.into());
                 }
-                store.finish_replacement(&row.id, self.now_ms())?;
+                store.finish_replacement(lock_for(&row.id), self.now_ms())?;
             }
             None => {
                 // At a free position first; it moves once any occupant is gone.

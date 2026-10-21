@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::atomic::ensure_private_dir;
-use tagteam_provider::{Clock, Identity, ProcessStamp, SystemClock};
+use tagteam_provider::{Clock, Identity, MutationGuard, ProcessStamp, SystemClock};
+
+use crate::account_lock::AccountLock;
 
 mod tokens;
 mod usage;
@@ -1088,9 +1090,11 @@ impl Store {
     /// had before the increment. The live store is then stale-marked whoever activated it and
     /// whatever the row held before; for a login taken from the live store, `finish_replacement`
     /// lifts the mark. A rollback restores that same epoch, so it needs no undo here.
+    ///
+    /// The account is `lock.id()`: holding its lock is the proof (§6.2, §9.1).
     pub fn begin_replacement(
         &self,
-        id: &AccountId,
+        lock: &AccountLock,
         fp: &str,
         meta: &LoginMeta<'_>,
         live_names_account: bool,
@@ -1107,6 +1111,7 @@ impl Store {
             "login_expires_at": meta.login_expires_at,
             "from_live": meta.from_live,
         });
+        let id = lock.id();
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let n = tx.execute(
@@ -1164,7 +1169,10 @@ impl Store {
     /// `begin_replacement` made it so, and a switch that committed another account after a
     /// replacer died is the newer record. Metadata without `from_live` is not from the live
     /// store.
-    pub fn finish_replacement(&self, id: &AccountId, at: i64) -> Result<(), StoreError> {
+    ///
+    /// The account is `lock.id()`: holding its lock is the proof (§6.2, §9.1).
+    pub fn finish_replacement(&self, lock: &AccountLock, at: i64) -> Result<(), StoreError> {
+        let id = lock.id();
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<Option<String>> = tx
@@ -1568,8 +1576,8 @@ impl Store {
 
     /// Writes the provider's journal row, atomically replacing any row already there: a
     /// forced switch settles an undecidable row this way without a gap in which neither
-    /// row exists (§9.6).
-    pub fn insert_journal(&self, j: &JournalRow) -> Result<(), StoreError> {
+    /// row exists (§9.6). Holding the `MutationGuard` is the proof (§9.1).
+    pub fn insert_journal(&self, _guard: &MutationGuard, j: &JournalRow) -> Result<(), StoreError> {
         self.lock().execute(
             "INSERT OR REPLACE INTO switch_journal \
              (provider, holder_pid, holder_start, from_id, to_id, from_fp, from_identity, to_fp, \

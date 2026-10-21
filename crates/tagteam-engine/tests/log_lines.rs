@@ -810,18 +810,21 @@ fn purge_logs_no_path_of_an_orphaned_profile_or_of_the_data_directory() {
     fx.engine
         .store()
         .unwrap()
-        .insert_journal(&tagteam_engine::store::JournalRow {
-            provider: alien.clone(),
-            holder: common::dead_holder(),
-            from_id: None,
-            to_id: ghost.clone(),
-            from_fp: None,
-            from_identity: None,
-            to_fp: "sha256:00".into(),
-            to_epoch: None,
-            started_at: 1,
-            prior: None,
-        })
+        .insert_journal(
+            &common::held_guard(&fx.env),
+            &tagteam_engine::store::JournalRow {
+                provider: alien.clone(),
+                holder: common::dead_holder(),
+                from_id: None,
+                to_id: ghost.clone(),
+                from_fp: None,
+                from_identity: None,
+                to_fp: "sha256:00".into(),
+                to_epoch: None,
+                started_at: 1,
+                prior: None,
+            },
+        )
         .unwrap();
     // A dangling entry: no marker, and no path to resolve.
     std::os::unix::fs::symlink(sessions.join("nowhere"), sessions.join("carol@example.com"))
