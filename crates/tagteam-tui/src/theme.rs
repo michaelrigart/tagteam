@@ -57,6 +57,11 @@ impl Theme {
         }
     }
 
+    /// Tier 0 (§4.2): parts that colour would tell apart draw another glyph.
+    pub(crate) fn colourless(self) -> bool {
+        self.tier == Tier::NoColor
+    }
+
     /// §4.1's style for `role` in this tier: tier 0 by modifiers alone, tier 1 by the terminal's
     /// own ANSI colours, tier 2 by the background's hues.
     pub(crate) fn role(self, role: Role) -> Style {

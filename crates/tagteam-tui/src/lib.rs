@@ -9,6 +9,7 @@ mod autoline;
 mod chrome;
 pub(crate) mod daemon;
 mod detect;
+mod gauge;
 pub mod host;
 mod input;
 mod keys;
