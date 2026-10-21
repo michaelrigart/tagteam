@@ -1,6 +1,6 @@
 # tagteam — review refactor: the provider boundary and clean code
 
-**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/22 (R1), https://github.com/michaelrigart/tagteam/pull/24 (R2), https://github.com/michaelrigart/tagteam/pull/25 (R3), https://github.com/michaelrigart/tagteam/pull/30 (R4a)
+**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/22 (R1), https://github.com/michaelrigart/tagteam/pull/24 (R2), https://github.com/michaelrigart/tagteam/pull/25 (R3), https://github.com/michaelrigart/tagteam/pull/30 (R4a), https://github.com/michaelrigart/tagteam/pull/31 (R4b)
 **Date:** 2026-10-19
 **Scope:** Fixes the architecture and clean-code findings of the 2026-10-19 codebase review, plus
 its PERF-R-1, on branch `review-refactor`. Every finding the review raised on that axis is
