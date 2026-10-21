@@ -10,7 +10,7 @@ use tagteam_provider::TransientKind;
 use crate::failure::FailureKind;
 use crate::store::AccountRow;
 use crate::tokens::TokenReport;
-use crate::views::{AccountView, HistoryWindow, NO_DATA, UsageStatus, UsageView};
+use crate::views::{AccountView, HistoryWindow, NO_DATA, ProviderNames, UsageStatus, UsageView};
 
 /// A window a reading does not have, or an age that is not known.
 pub const MISSING: &str = "—";
@@ -114,23 +114,33 @@ pub fn spend_text(w: &Window) -> Option<String> {
     ))
 }
 
+// The status heads a problem's sentence restates (§11.1, T3-12).
+const LOGIN_EXPIRED: &str = "login expired";
+const KEYCHAIN: &str = "can't read the Keychain";
+const NEEDS_LOGIN: &str = "needs a new login";
+const OTHER_ACCOUNT: &str = "logged in as another account";
+const NO_LOGIN: &str = "no stored login";
+const RATE_LIMITED: &str = "rate-limited";
+const BUDGET: &str = "paused to stay within the request budget";
+const CHECK_FAILED: &str = "usage check failed";
+
 /// A usage status's head and, for a failure said by its token, that token (T3-8).
 fn status_parts(u: &UsageView) -> (&'static str, Option<String>) {
     match u.status {
         UsageStatus::Ok => ("no usage reported", None),
-        UsageStatus::TokenExpired => ("login expired", None),
+        UsageStatus::TokenExpired => (LOGIN_EXPIRED, None),
         UsageStatus::ApiKey => ("api key", None),
-        UsageStatus::KeychainUnavailable => ("can't read the Keychain", None),
-        UsageStatus::ReloginRequired => ("needs a new login", None),
-        UsageStatus::ForeignCredential => ("logged in as another account", None),
-        UsageStatus::NoCredentials => ("no stored login", None),
+        UsageStatus::KeychainUnavailable => (KEYCHAIN, None),
+        UsageStatus::ReloginRequired => (NEEDS_LOGIN, None),
+        UsageStatus::ForeignCredential => (OTHER_ACCOUNT, None),
+        UsageStatus::NoCredentials => (NO_LOGIN, None),
         UsageStatus::Unsupported => ("usage unsupported", None),
         UsageStatus::Unavailable => match u.error.as_deref() {
             None | Some(NO_DATA) => (NOT_CHECKED, None),
             Some(e) => match FailureKind::parse(e) {
-                FailureKind::Provider(TransientKind::Http(429)) => ("rate-limited", None),
-                FailureKind::OverBudget => ("paused to stay within the request budget", None),
-                _ => ("usage check failed", Some(e.to_owned())),
+                FailureKind::Provider(TransientKind::Http(429)) => (RATE_LIMITED, None),
+                FailureKind::OverBudget => (BUDGET, None),
+                _ => (CHECK_FAILED, Some(e.to_owned())),
             },
         },
     }
@@ -510,6 +520,140 @@ pub fn trigger(trigger: Trigger) -> &'static str {
 pub fn short_name(position: u32, alias: Option<&str>, email_or_label: &str) -> String {
     let name = alias.unwrap_or_else(|| email_or_label.split('@').next().unwrap_or(email_or_label));
     format!("{position} {name}")
+}
+
+/// What needs attention on an account (redesign §6.3, §11.2, T3-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Problem {
+    NeedsLogin,
+    LoginExpired,
+    NoLogin,
+    RateLimited,
+    Keychain,
+    Budget,
+    OtherAccount,
+    Retrying,
+    OldReading,
+    NotChecked,
+}
+
+impl Problem {
+    /// Every problem once, in declaration order.
+    pub const ALL: [Problem; 10] = [
+        Problem::NeedsLogin,
+        Problem::LoginExpired,
+        Problem::NoLogin,
+        Problem::RateLimited,
+        Problem::Keychain,
+        Problem::Budget,
+        Problem::OtherAccount,
+        Problem::Retrying,
+        Problem::OldReading,
+        Problem::NotChecked,
+    ];
+}
+
+/// The account's one problem, from its usage: `None` for a healthy reading, an API key or an
+/// unsupported provider. Disabled is not a problem.
+pub fn problem(v: &AccountView) -> Option<Problem> {
+    let u = &v.usage;
+    match u.status {
+        UsageStatus::ReloginRequired => Some(Problem::NeedsLogin),
+        UsageStatus::TokenExpired => Some(Problem::LoginExpired),
+        UsageStatus::NoCredentials => Some(Problem::NoLogin),
+        UsageStatus::KeychainUnavailable => Some(Problem::Keychain),
+        UsageStatus::ForeignCredential => Some(Problem::OtherAccount),
+        UsageStatus::Unavailable => Some(match u.error.as_deref() {
+            None | Some(NO_DATA) => Problem::NotChecked,
+            Some(e) => match FailureKind::parse(e) {
+                FailureKind::Provider(TransientKind::Http(429)) => Problem::RateLimited,
+                FailureKind::OverBudget => Problem::Budget,
+                _ => Problem::Retrying,
+            },
+        }),
+        UsageStatus::Ok if u.windows.is_some() && !u.decision_grade => Some(Problem::OldReading),
+        UsageStatus::Ok | UsageStatus::ApiKey | UsageStatus::Unsupported => None,
+    }
+}
+
+/// `words` with its first letter in capitals, to open a sentence.
+fn capitalised(words: &str) -> String {
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// T3-12's sentence. `when` is the quarantine's time in the caller's form (`Sat 09:02`).
+pub fn problem_sentence(problem: Problem, v: &AccountView, when: Option<&str>) -> String {
+    let (head, cause) = match problem {
+        Problem::NeedsLogin => {
+            let reason = v
+                .row
+                .quarantine_reason
+                .as_deref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default();
+            let when = when.map(|w| format!(", {w}")).unwrap_or_default();
+            let cause = format!("its stored login was refused{reason}{when}");
+            return format!("{}: {cause}.", capitalised(NEEDS_LOGIN));
+        }
+        Problem::LoginExpired => (
+            LOGIN_EXPIRED,
+            "its stored login ran out and could not be renewed",
+        ),
+        Problem::NoLogin => (NO_LOGIN, "tagteam holds no login for this account"),
+        Problem::Keychain => (KEYCHAIN, "it is locked, or it refused tagteam"),
+        Problem::RateLimited => (RATE_LIMITED, "the usage check was turned away for now"),
+        Problem::OtherAccount => (
+            OTHER_ACCOUNT,
+            "the login tagteam read belongs to a different account",
+        ),
+        Problem::OldReading => ("old reading", "too old to pick the best account by"),
+        Problem::Budget => return format!("{}.", capitalised(BUDGET)),
+        Problem::Retrying => {
+            let token = v.usage.error.clone().into_iter().collect();
+            return format!("{}.", capitalised(&with_detail(CHECK_FAILED, token)));
+        }
+        Problem::NotChecked => return format!("{}.", capitalised(NOT_CHECKED)),
+    };
+    format!("{}: {cause}.", capitalised(head))
+}
+
+/// §11.2's remedy (T3-13): `Log in to <display name> as alex@example.com, then press A here.`
+pub fn remedy(
+    problem: Problem,
+    v: &AccountView,
+    names: &ProviderNames,
+    now_s: i64,
+) -> Option<String> {
+    let ahead = |at: Option<i64>| at.filter(|&at| at > now_s).map(|at| duration(at - now_s));
+    let u = &v.usage;
+    let display = names.display_name;
+    Some(match problem {
+        Problem::NeedsLogin | Problem::LoginExpired | Problem::NoLogin => format!(
+            "Log in to {display} as {}, then press A here.",
+            email(&v.row)
+        ),
+        Problem::Keychain => "Unlock it (security unlock-keychain), then press r.".into(),
+        Problem::RateLimited | Problem::Retrying => {
+            format!("tagteam tries again in {}.", ahead(u.retry_at)?)
+        }
+        Problem::Budget => match ahead(u.retry_at) {
+            Some(span) => format!("tagteam checks again in {span}, when the hourly budget allows."),
+            None => "tagteam checks again when the hourly budget allows.".into(),
+        },
+        Problem::OtherAccount => format!(
+            "{display} is logged in as a different account. Switch with s, or log in again."
+        ),
+        Problem::NotChecked | Problem::OldReading => {
+            match ahead(u.next_poll_at).or_else(|| ahead(u.retry_at)) {
+                Some(span) => format!("tagteam checks it within {span}."),
+                None => "Press r to check it now.".into(),
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1546,5 +1690,267 @@ mod tests {
         assert_eq!(short_name(2, Some("work"), "sam@corp.example"), "2 work");
         assert_eq!(short_name(1, None, "alex@example.com"), "1 alex");
         assert_eq!(short_name(3, None, "ci-label"), "3 ci-label");
+    }
+
+    const NAMES: ProviderNames = ProviderNames {
+        display_name: "Claude Code",
+        launch_command: "claude",
+    };
+
+    /// An account with `problem`: quarantined for `invalid_grant` when it needs a new login,
+    /// its retry 4m ahead (12m for the budget) and its next poll 12m ahead.
+    fn with_problem(problem: Problem) -> AccountView {
+        let failed = |error: &str, retry_in: i64| UsageView {
+            next_poll_at: Some(NOW + 720),
+            ..unread(UsageStatus::Unavailable, Some(error), Some(retry_in))
+        };
+        let usage = match problem {
+            Problem::NeedsLogin => unread(UsageStatus::ReloginRequired, None, None),
+            Problem::LoginExpired => unread(UsageStatus::TokenExpired, None, Some(240)),
+            Problem::NoLogin => unread(UsageStatus::NoCredentials, None, Some(240)),
+            Problem::RateLimited => failed("http-429", 240),
+            Problem::Keychain => unread(UsageStatus::KeychainUnavailable, None, Some(240)),
+            Problem::Budget => failed("over-budget", 720),
+            Problem::OtherAccount => unread(UsageStatus::ForeignCredential, None, Some(240)),
+            Problem::Retrying => failed("refresh-failed", 240),
+            Problem::OldReading => UsageView {
+                decision_grade: false,
+                next_poll_at: Some(NOW + 720),
+                ..read(vec![five_hour(), seven_day()])
+            },
+            Problem::NotChecked => failed(NO_DATA, 240),
+        };
+        let mut v = view(1, "alex@example.com", OAUTH, usage);
+        if problem == Problem::NeedsLogin {
+            v.row.quarantine_reason = Some("invalid_grant".into());
+            v.row.quarantine_at = Some(NOW - HOUR);
+        }
+        v
+    }
+
+    #[test]
+    fn every_problem_has_its_sentence_and_remedy() {
+        use Problem::*;
+        let login = "Log in to Claude Code as alex@example.com, then press A here.";
+        let expected = [
+            (
+                NeedsLogin,
+                "Needs a new login: its stored login was refused (invalid_grant), Sat 09:02.",
+                Some(login),
+            ),
+            (
+                LoginExpired,
+                "Login expired: its stored login ran out and could not be renewed.",
+                Some(login),
+            ),
+            (
+                NoLogin,
+                "No stored login: tagteam holds no login for this account.",
+                Some(login),
+            ),
+            (
+                RateLimited,
+                "Rate-limited: the usage check was turned away for now.",
+                Some("tagteam tries again in 4m."),
+            ),
+            (
+                Keychain,
+                "Can't read the Keychain: it is locked, or it refused tagteam.",
+                Some("Unlock it (security unlock-keychain), then press r."),
+            ),
+            (
+                Budget,
+                "Paused to stay within the request budget.",
+                Some("tagteam checks again in 12m, when the hourly budget allows."),
+            ),
+            (
+                OtherAccount,
+                "Logged in as another account: the login tagteam read belongs to a different account.",
+                Some(
+                    "Claude Code is logged in as a different account. Switch with s, or log in again.",
+                ),
+            ),
+            (
+                Retrying,
+                "Usage check failed (refresh-failed).",
+                Some("tagteam tries again in 4m."),
+            ),
+            (
+                OldReading,
+                "Old reading: too old to pick the best account by.",
+                Some("tagteam checks it within 12m."),
+            ),
+            (
+                NotChecked,
+                "Not checked yet.",
+                Some("tagteam checks it within 12m."),
+            ),
+        ];
+        assert_eq!(expected.len(), Problem::ALL.len());
+        for p in Problem::ALL {
+            let (_, sentence, fix) = expected.iter().find(|(q, ..)| *q == p).unwrap();
+            let v = with_problem(p);
+            assert_eq!(problem(&v), Some(p), "{p:?}");
+            assert_eq!(
+                problem_sentence(p, &v, Some("Sat 09:02")),
+                *sentence,
+                "{p:?}"
+            );
+            assert_eq!(remedy(p, &v, &NAMES, NOW).as_deref(), *fix, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn the_problem_list_is_every_problem_once() {
+        use Problem::*;
+        fn index(p: Problem) -> usize {
+            match p {
+                NeedsLogin => 0,
+                LoginExpired => 1,
+                NoLogin => 2,
+                RateLimited => 3,
+                Keychain => 4,
+                Budget => 5,
+                OtherAccount => 6,
+                Retrying => 7,
+                OldReading => 8,
+                NotChecked => 9,
+            }
+        }
+        assert_eq!(Problem::ALL.map(index), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn a_problem_follows_the_account_s_usage() {
+        let unavailable = |error: Option<&str>| unread(UsageStatus::Unavailable, error, None);
+        let old = UsageView {
+            decision_grade: false,
+            ..read(vec![five_hour()])
+        };
+        let rows = [
+            (
+                unread(UsageStatus::ReloginRequired, None, None),
+                Some(Problem::NeedsLogin),
+            ),
+            (
+                unread(UsageStatus::TokenExpired, None, None),
+                Some(Problem::LoginExpired),
+            ),
+            (
+                unread(UsageStatus::NoCredentials, None, None),
+                Some(Problem::NoLogin),
+            ),
+            (
+                unread(UsageStatus::KeychainUnavailable, None, None),
+                Some(Problem::Keychain),
+            ),
+            (
+                unread(UsageStatus::ForeignCredential, None, None),
+                Some(Problem::OtherAccount),
+            ),
+            (unavailable(Some("http-429")), Some(Problem::RateLimited)),
+            (unavailable(Some("over-budget")), Some(Problem::Budget)),
+            (unavailable(Some(NO_DATA)), Some(Problem::NotChecked)),
+            (unavailable(None), Some(Problem::NotChecked)),
+            (unavailable(Some("refresh-failed")), Some(Problem::Retrying)),
+            (unavailable(Some("http-503")), Some(Problem::Retrying)),
+            (old, Some(Problem::OldReading)),
+            (read(vec![five_hour(), seven_day()]), None),
+            (unread(UsageStatus::ApiKey, None, None), None),
+            (unread(UsageStatus::Unsupported, None, None), None),
+        ];
+        for (usage, want) in rows {
+            let v = view(1, "alex@example.com", OAUTH, usage);
+            assert_eq!(problem(&v), want, "{:?}", v.usage);
+        }
+        let mut disabled = view(1, "alex@example.com", OAUTH, read(vec![five_hour()]));
+        disabled.row.disabled = true;
+        assert_eq!(problem(&disabled), None, "disabled is not a problem");
+    }
+
+    #[test]
+    fn an_unknown_failure_token_is_a_failed_check_with_no_remedy_until_a_retry() {
+        let token = "a-token-from-a-newer-build";
+        let mut v = view(
+            1,
+            "alex@example.com",
+            OAUTH,
+            unread(UsageStatus::Unavailable, Some(token), None),
+        );
+        assert_eq!(problem(&v), Some(Problem::Retrying));
+        assert_eq!(
+            problem_sentence(Problem::Retrying, &v, None),
+            "Usage check failed (a-token-from-a-newer-build)."
+        );
+        assert_eq!(remedy(Problem::Retrying, &v, &NAMES, NOW), None);
+        v.usage.retry_at = Some(NOW + 240);
+        assert_eq!(
+            remedy(Problem::Retrying, &v, &NAMES, NOW).as_deref(),
+            Some("tagteam tries again in 4m.")
+        );
+    }
+
+    #[test]
+    fn a_problem_without_its_facts_still_reads() {
+        let mut v = with_problem(Problem::NeedsLogin);
+        assert_eq!(
+            problem_sentence(Problem::NeedsLogin, &v, None),
+            "Needs a new login: its stored login was refused (invalid_grant)."
+        );
+        v.row.quarantine_reason = None;
+        v.row.quarantine_at = None;
+        assert_eq!(
+            problem_sentence(Problem::NeedsLogin, &v, Some("Sat 09:02")),
+            "Needs a new login: its stored login was refused, Sat 09:02."
+        );
+        assert_eq!(
+            problem_sentence(Problem::NeedsLogin, &v, None),
+            "Needs a new login: its stored login was refused."
+        );
+
+        let unplanned = |p: Problem| {
+            let mut v = with_problem(p);
+            v.usage.retry_at = None;
+            v.usage.next_poll_at = None;
+            remedy(p, &v, &NAMES, NOW)
+        };
+        for p in [Problem::NotChecked, Problem::OldReading] {
+            assert_eq!(
+                unplanned(p).as_deref(),
+                Some("Press r to check it now."),
+                "{p:?}"
+            );
+        }
+        assert_eq!(
+            unplanned(Problem::Budget).as_deref(),
+            Some("tagteam checks again when the hourly budget allows.")
+        );
+        for p in [Problem::RateLimited, Problem::Retrying] {
+            assert_eq!(unplanned(p), None, "{p:?}");
+        }
+
+        // A time that has passed is no time ahead.
+        let mut passed = with_problem(Problem::NotChecked);
+        passed.usage.retry_at = Some(NOW - 5);
+        passed.usage.next_poll_at = Some(NOW);
+        assert_eq!(
+            remedy(Problem::NotChecked, &passed, &NAMES, NOW).as_deref(),
+            Some("Press r to check it now.")
+        );
+        // With no planned poll, a retry still ahead is the time named.
+        let mut retry_only = with_problem(Problem::NotChecked);
+        retry_only.usage.next_poll_at = None;
+        assert_eq!(
+            remedy(Problem::NotChecked, &retry_only, &NAMES, NOW).as_deref(),
+            Some("tagteam checks it within 4m.")
+        );
+        // A row without an email is named by its label.
+        let mut token = with_problem(Problem::NoLogin);
+        token.row.email = None;
+        token.row.label = "a1@x.co".into();
+        assert_eq!(
+            remedy(Problem::NoLogin, &token, &NAMES, NOW).as_deref(),
+            Some("Log in to Claude Code as a1@x.co, then press A here.")
+        );
     }
 }
