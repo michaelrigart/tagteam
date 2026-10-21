@@ -2685,10 +2685,26 @@ mod tests {
             .position(|l| l.starts_with(" SESSION"))
             .unwrap();
         assert_eq!(total - head - 1, 3, "the table keeps three rows: {lines:?}");
+        assert_eq!(lines[total + 1], format!(" {}", DETAIL[0]), "{lines:?}");
+        assert!(lines[20].starts_with(" J K: lines 1–"), "{lines:?}");
         let seen = scrolled_below(&mut state);
-        assert!(
-            reads(&seen, &format!("{long}, claude-sonnet-5-5")),
-            "{seen:?}"
+        for value in [
+            format!("{long}, claude-sonnet-5-5"),
+            format!("No price for {long}: counted without cost (≥ marks a partial cost)."),
+        ] {
+            assert!(reads(&seen, &value), "{seen:?}");
+        }
+        assert!(!seen.iter().any(|l| l.contains('…')), "{seen:?}");
+        let lines = draw(&state, 80, 24);
+        let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
+        let head = lines
+            .iter()
+            .position(|l| l.starts_with(" SESSION"))
+            .unwrap();
+        assert_eq!(
+            total - head - 1,
+            3,
+            "scrolled, the table keeps three rows: {lines:?}"
         );
     }
 

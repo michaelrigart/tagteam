@@ -649,15 +649,16 @@ mod tests {
                 .collect();
             let muted = canon(theme, "m").repeat(heads.chars().count());
             assert_eq!(heads, muted, "{theme:?}: the heads are muted");
-            if theme.colourless() {
-                continue;
-            }
+            // Tier 0 draws the tracks as `·` (§4.1).
+            let track = if theme.colourless() { "·" } else { "─" };
             assert_eq!(
                 body[2],
                 format!(
-                    "▌   2 ● work   sam@corp.example{}━━━━━━━───────  53%{}╸─────────────   6%{}1m  in use",
+                    "▌   2 ● work   sam@corp.example{}━━━━━━━{}  53%{}╸{}   6%{}1m  in use",
                     " ".repeat(8),
+                    track.repeat(7),
                     " ".repeat(4),
+                    track.repeat(13),
                     " ".repeat(10)
                 ),
                 "{theme:?}"
@@ -1571,6 +1572,11 @@ mod tests {
         let moved = draw(&state, 120, 40);
         update(&mut state, card(late, id(1), Ok(full)), NOW_MS);
         assert_eq!(draw(&state, 120, 40), moved);
+        // Back on the first account, its card is still the last read it took, not the late one.
+        update(&mut state, ch('k'), NOW_MS);
+        let back = card_rows(&state, 120, 40).1;
+        assert!(back[1].contains('▅'), "{back:?}");
+        assert!(!back[1].contains('█'), "{back:?}");
     }
 
     /// `read`'s 5h and 7d, then a scoped window for each of `models`, each of those ahead of
@@ -2134,6 +2140,7 @@ mod tests {
             assert_eq!(rows.len(), 1, "{width}: {card:?}");
             assert_eq!(width_of(rows[0]), usize::from(width), "{width}: {card:?}");
             assert!(rows[0].ends_with('…'), "{width}: {card:?}");
+            assert!(rows[0].contains('€'), "the spend shows: {width}: {card:?}");
         }
         // The card reaches it at 80×24 under a 3-row banner, a 3-row toast and a problem.
         state.raise_banner(
@@ -2953,6 +2960,25 @@ mod tests {
             state.accounts.selected().unwrap().provider,
             ProviderId::new("fake-agent")
         );
+    }
+
+    #[test]
+    fn a_provider_heading_wider_than_the_terminal_is_cut_to_it() {
+        const WIDE_NAME: &str =
+            "FakeAgent, a provider whose display name is far wider than any eighty-column terminal";
+        let mut snap = snapshot(many(1));
+        let mut fake = fake_agent(vec![fake_account(1, "a1@x.co")], LiveLogin::None);
+        fake.names.display_name = WIDE_NAME;
+        snap.providers.push(fake);
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snap);
+        let body = table_of(&state, 80, 24, NOW_MS);
+        assert_eq!(body[0], " Claude Code");
+        assert!(width_of(WIDE_NAME) > 80);
+        assert_eq!(body[3], format!(" {}", fit(WIDE_NAME, 79)), "{body:?}");
+        assert!(body[3].ends_with('…'), "{body:?}");
+        assert_eq!(width_of(&body[3]), 80, "{body:?}");
+        assert!(body[4].starts_with("    #   ACCOUNT"), "{body:?}");
     }
 
     #[test]
