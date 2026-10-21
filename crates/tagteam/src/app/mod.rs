@@ -21,8 +21,7 @@ mod early;
 mod failure;
 
 pub(crate) use context::{
-    ColorEnv, build_engine, build_registry, color_enabled, command_settings, engine_for,
-    fallback_provider, locate, locate_run_shell, registry,
+    ColorEnv, command_settings, engine_for, fallback_provider, locate_run_shell, registry,
 };
 pub use context::{Context, Io};
 pub use failure::KIND_STALE_SELECTION;
