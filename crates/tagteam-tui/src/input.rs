@@ -18,6 +18,7 @@ use signal_hook_mio::v1_0::Signals;
 
 use crate::detect::{self, Control as Typed};
 use crate::msg::Msg;
+use crate::replies::ReplyFilter;
 use crate::term;
 
 /// How long the thread rests after the terminal fails it, before it tries again.
@@ -352,22 +353,70 @@ impl Input {
 
 /// Asks the terminal its background, reads what it says before the first crossterm read, and
 /// sends it as `Detected` (§4.2). A Ctrl-C or Ctrl-Z that ended the reading is sent after it, as
-/// the key crossterm would have read. False once the UI thread is gone.
-fn ask_background(control: &Control, tx: &Sender<Msg>, detection: Detection) -> bool {
+/// the key crossterm would have read. The filter for the keys that follow is calm when no query
+/// was asked or its DA1 answer was read, and otherwise wary, from where the parser stood however
+/// the reading ended (a quiet second, the limit, a stop or pause, Ctrl-C or Ctrl-Z): detection is
+/// not started again. `None` once the UI thread is gone.
+fn ask_background(
+    control: &Control,
+    tx: &Sender<Msg>,
+    detection: Detection,
+) -> Option<ReplyFilter> {
     let Detection { ask, fd } = detection;
     let stop = || *control.lock() != Mode::Reading;
     let replies = ask().then(|| detect::read(fd, Instant::now(), &stop));
     let background = replies.as_ref().and_then(detect::Replies::background);
-    if tx.send(Msg::Detected { background }).is_err() {
-        return false;
-    }
+    tx.send(Msg::Detected { background }).ok()?;
+    let filter = match &replies {
+        Some(replies) if !replies.answered() => ReplyFilter::wary(replies.handoff()),
+        _ => ReplyFilter::calm(),
+    };
     let key = match replies.and_then(|replies| replies.control()) {
         Some(Typed::Interrupt) => 'c',
         Some(Typed::Suspend) => 'z',
-        None => return true,
+        None => return Some(filter),
     };
     let key = KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL);
-    tx.send(Msg::Key(key)).is_ok()
+    tx.send(Msg::Key(key)).ok()?;
+    Some(filter)
+}
+
+/// The keys' way to the UI thread: through the reply filter, which tells the UI thread once when
+/// it starts to drop every key and once when it stops (§4.2).
+struct Keys {
+    filter: ReplyFilter,
+    /// `KeysHeld { held: true }` was sent and `false` has not been.
+    told: bool,
+}
+
+impl Keys {
+    /// Sends what `event` is to the UI thread. False once it is gone.
+    fn send(&mut self, event: Event, tx: &Sender<Msg>) -> bool {
+        match message(event) {
+            Some(Msg::Key(key)) => {
+                let pass = self.filter.key(key);
+                if self.told && !self.filter.holding() {
+                    self.told = false;
+                    if tx.send(Msg::KeysHeld { held: false }).is_err() {
+                        return false;
+                    }
+                }
+                pass.into_iter().all(|key| tx.send(Msg::Key(key)).is_ok())
+            }
+            Some(msg) => tx.send(msg).is_ok(),
+            None => true,
+        }
+    }
+
+    /// A drain has ended: the keys the terminal holds are all handled. False once the UI thread
+    /// is gone.
+    fn drained(&mut self, tx: &Sender<Msg>) -> bool {
+        if self.filter.holding() && !self.told {
+            self.told = true;
+            return tx.send(Msg::KeysHeld { held: true }).is_ok();
+        }
+        true
+    }
 }
 
 /// The thread: reads while the mode is `Reading`, and between two calls into the terminal
@@ -378,12 +427,20 @@ fn read(
     tx: &Sender<Msg>,
     detection: Option<Detection>,
 ) {
-    if let Some(detection) = detection {
-        if !ask_background(control, tx, detection) {
-            control.set(&mut control.lock(), Mode::Stopped);
-            return;
-        }
-    }
+    let filter = match detection {
+        Some(detection) => match ask_background(control, tx, detection) {
+            Some(filter) => filter,
+            None => {
+                control.set(&mut control.lock(), Mode::Stopped);
+                return;
+            }
+        },
+        None => ReplyFilter::calm(),
+    };
+    let mut keys = Keys {
+        filter,
+        told: false,
+    };
     // crossterm may hold events from before.
     let mut more = true;
     loop {
@@ -409,7 +466,7 @@ fn read(
                 }
             }
         }
-        if !step(&mut events, tx, &mut more) {
+        if !step(&mut events, tx, &mut more, &mut keys) {
             control.set(&mut control.lock(), Mode::Stopped);
             return;
         }
@@ -419,13 +476,13 @@ fn read(
 /// One call into the terminal, so the mode is looked at between any two: the next event
 /// crossterm holds while there may be `more`, else a wait. False once the thread is to stop:
 /// the terminal has hung up, or the UI thread is gone and nothing reads these any more.
-fn step(events: &mut impl Events, tx: &Sender<Msg>, more: &mut bool) -> bool {
+fn step(events: &mut impl Events, tx: &Sender<Msg>, more: &mut bool, keys: &mut Keys) -> bool {
     if *more {
         return match events.next() {
-            Ok(Next::Event(event)) => message(event).is_none_or(|msg| tx.send(msg).is_ok()),
+            Ok(Next::Event(event)) => keys.send(event, tx),
             Ok(Next::Empty) => {
                 *more = false;
-                true
+                keys.drained(tx)
             }
             Ok(Next::Closed) => false,
             // A terminal that cannot be read now: a hang-up arrives as SIGHUP. No spinning.
@@ -1122,6 +1179,101 @@ mod tests {
             started.elapsed()
         );
         input.resume();
+    }
+
+    fn esc() -> KeyEvent {
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+    }
+
+    fn ctrl_g() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn a_held_reply_is_told_once_and_its_end_once() {
+        let script = Script::default();
+        let (detection, _ours, mut theirs, _asked) = detection();
+        // The terminal began its answer and said no more: detection hands off in an OSC.
+        theirs.write_all(b"\x1b]11;rgb:").unwrap();
+        script.queue([Next::Event(Event::Key(key('j'))), Next::Empty]);
+        let (tx, rx) = mpsc::channel();
+        let _input = Input::spawn_with(tx, script.clone(), Some(detection)).unwrap();
+        let within = Duration::from_secs(3);
+        assert!(matches!(
+            rx.recv_timeout(within),
+            Ok(Msg::Detected { background: None })
+        ));
+        assert!(matches!(
+            rx.recv_timeout(within),
+            Ok(Msg::KeysHeld { held: true })
+        ));
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "neither `j` nor a second telling"
+        );
+        script.queue([
+            Next::Event(Event::Key(ctrl_g())),
+            Next::Event(Event::Key(key('k'))),
+        ]);
+        assert!(matches!(
+            rx.recv_timeout(within),
+            Ok(Msg::KeysHeld { held: false })
+        ));
+        assert!(matches!(
+            rx.recv_timeout(within),
+            Ok(Msg::Key(k)) if k.code == KeyCode::Char('k')
+        ));
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    #[test]
+    fn after_an_answered_query_esc_is_sent_at_once() {
+        let script = Script::default();
+        let (detection, _ours, mut theirs, _asked) = detection();
+        theirs.write_all(b"\x1b[?62;22c").unwrap();
+        script.queue([Next::Event(Event::Key(esc())), Next::Empty]);
+        let (tx, rx) = mpsc::channel();
+        let _input = Input::spawn_with(tx, script.clone(), Some(detection)).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Msg::Detected { background: None })
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(100)),
+            Ok(Msg::Key(k)) if k.code == KeyCode::Esc
+        ));
+    }
+
+    #[test]
+    fn a_pause_that_ended_detection_leaves_the_filter_wary() {
+        // The query was asked and no DA1 answer was read: after the pause, detection does not
+        // start again, and a lone Esc waits for the next key.
+        let script = Script::default();
+        let (detection, _ours, _theirs, _asked) = detection();
+        let (tx, rx) = mpsc::channel();
+        let input = Input::spawn_with(tx, script.clone(), Some(detection)).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert!(input.pause());
+        script.queue([Next::Event(Event::Key(esc()))]);
+        input.resume();
+        let within = Duration::from_secs(2);
+        assert!(matches!(
+            rx.recv_timeout(within),
+            Ok(Msg::Detected { background: None })
+        ));
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the Esc is held"
+        );
+        script.push(Event::Key(key('j')));
+        assert!(matches!(
+            rx.recv_timeout(within),
+            Ok(Msg::Key(k)) if k.code == KeyCode::Esc
+        ));
+        assert!(matches!(
+            rx.recv_timeout(within),
+            Ok(Msg::Key(k)) if k.code == KeyCode::Char('j')
+        ));
     }
 
     /// Held by each test that makes a `Wait`. A SIGWINCH reaches every `Wait` in the process,

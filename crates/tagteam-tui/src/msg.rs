@@ -191,6 +191,10 @@ pub enum Msg {
     Detected {
         background: Option<Background>,
     },
+    /// The input thread drops every key until an unfinished colour reply ends (spec §4.2).
+    KeysHeld {
+        held: bool,
+    },
 }
 
 /// Which waiting CLI prompt an answer is for (spec §7.2): the runtime holds the prompt's sender

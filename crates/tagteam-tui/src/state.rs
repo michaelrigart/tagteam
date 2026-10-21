@@ -57,6 +57,8 @@ pub struct State {
     pub toast: Option<Toast>,
     /// A failed read's error, in the CLI's words (spec §10.4).
     pub(crate) banner: Option<Banner>,
+    /// The input thread is dropping every key until an unfinished colour reply ends (§4.2).
+    pub(crate) keys_held: bool,
     /// The action running now, in the TUI or suspended (spec §7.2).
     pub running: Option<Action>,
     pub gens: Gens,
@@ -130,6 +132,7 @@ impl State {
             overlay: None,
             toast: None,
             banner: None,
+            keys_held: false,
             running: None,
             gens: Gens::default(),
             refresh: Refresh {

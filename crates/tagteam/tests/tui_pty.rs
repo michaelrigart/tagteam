@@ -446,6 +446,204 @@ fn an_answer_split_across_reads_is_read_whole() {
     assert_eq!(tui.finish(LONG).status.code(), Some(0));
 }
 
+/// An answer whose digits would show Tokens or History, and whose `b` would switch, if any of it
+/// leaked. The DA1 answer that follows it is short.
+const ANSWER: &[u8] = b"\x1b]11;rgb:2b3b/2b3b/2b3b\x1b\\";
+const SHORT_DA1: &[u8] = b"\x1b[?62c";
+/// What the banner says while the keys are held.
+const HELD: &str = "the terminal sent an unfinished colour report";
+
+fn tokens(s: &Screen) -> bool {
+    s.on_alt() && s.contains("[Day]")
+}
+
+fn help(s: &Screen) -> bool {
+    s.on_alt() && (s.contains(" Help ") || s.contains("keys and marks"))
+}
+
+fn held(s: &Screen) -> bool {
+    s.on_alt() && s.contains(HELD)
+}
+
+fn removing(s: &Screen) -> bool {
+    s.on_alt() && s.contains("Remove ")
+}
+
+/// A TUI that asked its background, and heard nothing for over a second: detection has given up.
+fn given_up(home: &Home) -> Pty {
+    let mut tui = asking(home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    thread::sleep(Duration::from_millis(1_300));
+    tui
+}
+
+/// The accounts table is still what shows, as if nothing was typed, then `3`: History shows, and
+/// `unseen` never did before it. A burst of leaked keys can end on History before a frame draws,
+/// so the table is looked at before the `3`, as well as for the screens `unseen` names.
+fn then_history(tui: &mut Pty, unseen: &[&dyn Fn(&Screen) -> bool]) {
+    thread::sleep(SETTLE);
+    let screen = tui.screen();
+    assert!(
+        accounts(&screen) && !history(&screen),
+        "a key of the reply was read:\n{}",
+        screen.text()
+    );
+    tui.type_keys(b"3");
+    tui.wait_for(Duration::from_secs(2), "History", history);
+    for seen in unseen {
+        assert_eq!(tui.first_shown(seen), None, "a key of the reply was read");
+    }
+}
+
+fn quit(tui: Pty) {
+    tui.type_keys(b"q");
+    let f = tui.finish(LONG);
+    assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+    assert_restored(&f);
+}
+
+#[test]
+fn an_answer_after_the_give_up_never_reaches_the_keys() {
+    let home = Home::new();
+    one_response(&home);
+    let mut tui = given_up(&home);
+    tui.type_keys(&[ANSWER, SHORT_DA1].concat());
+    then_history(&mut tui, &[&tokens]);
+    assert_eq!(live_email(home.root()), "b@x.co");
+    quit(tui);
+}
+
+#[test]
+fn a_delayed_split_answer_never_reaches_the_keys() {
+    let home = Home::new();
+    one_response(&home);
+    let mut tui = given_up(&home);
+    tui.type_keys(b"\x1b");
+    thread::sleep(Duration::from_millis(500));
+    tui.type_keys(b"]11;rgb:2b3b/2b3b/2b3b\x07");
+    then_history(&mut tui, &[&tokens]);
+    assert_eq!(live_email(home.root()), "b@x.co");
+    quit(tui);
+}
+
+#[test]
+fn a_delayed_split_da1_answer_never_reaches_the_keys() {
+    let home = Home::new();
+    one_response(&home);
+    let mut tui = given_up(&home);
+    tui.type_keys(b"\x1b");
+    thread::sleep(Duration::from_millis(500));
+    tui.type_keys(b"[?62;22c");
+    then_history(&mut tui, &[&help, &tokens]);
+    quit(tui);
+}
+
+#[test]
+fn a_delayed_split_answer_leaves_an_open_dialog_open() {
+    let home = Home::new();
+    let mut tui = given_up(&home);
+    tui.type_keys(b"x");
+    tui.wait_for(Duration::from_secs(2), "the remove question", removing);
+    tui.type_keys(b"\x1b");
+    thread::sleep(Duration::from_millis(500));
+    tui.type_keys(b"]11;rgb:2b3b/2b3b/2b3b\x07");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        removing(&tui.screen()),
+        "the Esc did not close the question"
+    );
+    tui.type_keys(b"n");
+    tui.wait_for(Duration::from_secs(2), "the question closed", |s| {
+        accounts(s) && !removing(s)
+    });
+    quit(tui);
+}
+
+#[test]
+fn after_an_answer_esc_acts_at_once() {
+    let home = Home::new();
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    tui.type_keys(&[ANSWER, SHORT_DA1].concat());
+    tui.type_keys(b"?");
+    tui.wait_for(Duration::from_secs(2), "help", help);
+    tui.type_keys(b"\x1b");
+    tui.wait_for(Duration::from_millis(300), "help closed", |s| {
+        accounts(s) && !help(s)
+    });
+    quit(tui);
+}
+
+#[test]
+fn a_truncated_answer_whose_end_comes_late_holds_the_keys_until_it_ends() {
+    let home = Home::new();
+    one_response(&home);
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    tui.type_keys(b"\x1b]11;rgb:2b3b/");
+    tui.wait_for(Duration::from_secs(2), "the banner", held);
+    thread::sleep(Duration::from_millis(1_500));
+    tui.type_keys(b"3");
+    thread::sleep(SETTLE);
+    assert!(held(&tui.screen()), "the keys are still held");
+    tui.type_keys(b"2b3b/2b3b\x1b\\");
+    tui.wait_for(Duration::from_secs(2), "the banner gone", |s| !held(s));
+    tui.type_keys(b"2");
+    tui.wait_for(Duration::from_secs(2), "Tokens", tokens);
+    assert_eq!(tui.first_shown(history), None, "the `3` was read");
+    assert_eq!(live_email(home.root()), "b@x.co");
+    quit(tui);
+}
+
+#[test]
+fn a_typed_backslash_does_not_end_a_held_answer() {
+    let home = Home::new();
+    one_response(&home);
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    tui.type_keys(b"\x1b]11;rgb:2b3b/");
+    tui.wait_for(Duration::from_secs(2), "the banner", held);
+    tui.type_keys(b"\\");
+    thread::sleep(SETTLE);
+    tui.type_keys(b"3");
+    thread::sleep(SETTLE);
+    assert!(held(&tui.screen()), "a bare backslash is no terminator");
+    tui.type_keys(b"2b3b/2b3b\x1b\\");
+    tui.wait_for(Duration::from_secs(2), "the banner gone", |s| !held(s));
+    tui.type_keys(b"2");
+    tui.wait_for(Duration::from_secs(2), "Tokens", tokens);
+    assert_eq!(tui.first_shown(history), None, "the `3` was read");
+    quit(tui);
+}
+
+#[test]
+fn a_da1_answer_cut_before_its_c_holds_the_keys_until_the_c() {
+    let home = Home::new();
+    one_response(&home);
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    tui.type_keys(&[ANSWER, b"\x1b[?6"].concat());
+    tui.wait_for(Duration::from_secs(2), "the banner", held);
+    thread::sleep(Duration::from_millis(1_300));
+    tui.type_keys(b"2;22c");
+    tui.wait_for(Duration::from_secs(2), "the banner gone", |s| !held(s));
+    then_history(&mut tui, &[&tokens]);
+    quit(tui);
+}
+
+#[test]
+fn an_answer_that_never_ends_still_lets_ctrl_c_quit() {
+    let home = Home::new();
+    let mut tui = asking(&home);
+    tui.wait_for_output(LONG, "the query", QUERY);
+    tui.type_keys(b"\x1b]11;rgb:2b3b/");
+    tui.wait_for(Duration::from_secs(2), "the banner", held);
+    tui.type_keys(b"\x03");
+    let f = tui.finish(Duration::from_secs(2));
+    assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+    assert_restored(&f);
+}
+
 #[test]
 fn sigterm_while_the_terminal_ignores_the_colour_query_exits_at_once() {
     let home = Home::new();
