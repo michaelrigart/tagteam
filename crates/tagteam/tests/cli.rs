@@ -432,13 +432,13 @@ fn list_and_status_mark_quarantined_accounts() {
     quarantine(d.path(), &a);
     quarantine(d.path(), &b);
     offline(d.path()).arg("list").assert().success().stdout(
-        "    #  ACCOUNT\n    1  a@x.co   relogin required\n *  2  b@x.co   relogin required\n",
+        "    #  ACCOUNT\n    1  a@x.co   needs a new login\n *  2  b@x.co   needs a new login\n",
     );
     offline(d.path())
         .arg("status")
         .assert()
         .success()
-        .stdout("Live: b@x.co (position 2 of 2), relogin required\n");
+        .stdout("Live: b@x.co (position 2 of 2), needs a new login\n");
     let out = offline(d.path()).args(["list", "--json"]).output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["accounts"][0]["usageStatus"], "relogin_required");

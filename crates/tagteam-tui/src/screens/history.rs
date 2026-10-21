@@ -570,9 +570,9 @@ mod tests {
         );
         assert!(right[0].starts_with("5h  "), "{:?}", right[0]);
         assert!(right[0].ends_with("    9%"), "{:?}", right[0]);
-        assert_eq!(right[1], "    no rate yet");
+        assert_eq!(right[1], "    not enough data yet");
         assert!(right[2].ends_with("   95%"), "{:?}", right[2]);
-        assert_eq!(right[3], "    +5.0 pts/h · runs out in 12h00m (regression)");
+        assert_eq!(right[3], "    +5.0%/h · full in 12h00m");
         let last = lines.last().unwrap();
         assert_eq!(
             right_of(last).unwrap_or(""),
@@ -584,7 +584,8 @@ mod tests {
     #[test]
     fn a_projection_too_wide_for_the_panel_wraps_under_the_sparkline() {
         // Spec §5.1: 80×24 is enough; spec §5.4: each window's rate and projection. At 80
-        // columns the panel is 53 wide, and a long model label leaves 34 for the projection.
+        // columns the panel is 53 wide, and a long model label leaves 34 for the projection: a
+        // past-due one, 41 wide, does not fit them.
         let mut state = on_history(many(1));
         state.history.select(id(1));
         let sonnet = "Claude Sonnet 4.5";
@@ -598,7 +599,7 @@ mod tests {
         let pace = Pace {
             rate_per_hour: Some(5.0),
             method: Some(ProjectionMethod::Regression),
-            exhaustion_at: Some(NOW_S + 43_200),
+            exhaustion_at: Some(NOW_S - 3 * HOUR),
             will_last_to_reset: Some(false),
             ..Pace::default()
         };
@@ -619,8 +620,8 @@ mod tests {
         assert_eq!(
             narrow[1..],
             [
-                format!("{under}+5.0 pts/h"),
-                format!("{under}runs out in 12h00m (regression)"),
+                format!("{under}+5.0%/h"),
+                format!("{under}should have been full 3h00m ago"),
                 String::new(),
             ]
         );
@@ -628,7 +629,7 @@ mod tests {
         assert_eq!(
             wide[1..3],
             [
-                format!("{under}+5.0 pts/h · runs out in 12h00m (regression)"),
+                format!("{under}+5.0%/h · should have been full 3h00m ago"),
                 String::new(),
             ]
         );
@@ -664,7 +665,7 @@ mod tests {
                 history_window(wide, vec![sample(HOUR, 95.0)], pace),
             ],
         ));
-        let right: Vec<String> = body_of(&state, 80, 24, NOW_MS)[0..7]
+        let right: Vec<String> = body_of(&state, 80, 24, NOW_MS)[0..6]
             .iter()
             .map(|l| right_of(l).unwrap_or("").trim_end().to_owned())
             .collect();
@@ -673,17 +674,11 @@ mod tests {
             "{right:?}"
         );
         assert!(right[0].ends_with("    9%"), "{right:?}");
-        assert_eq!(right[1], format!("{:19}no rate yet", ""));
+        assert_eq!(right[1], format!("{:19}not enough data yet", ""));
         assert_eq!([right[2].as_str(), right[3].as_str()].join(" "), long);
         assert!(right[4].starts_with(&" ".repeat(19)), "{right:?}");
         assert!(right[4].ends_with("   95%"), "{right:?}");
-        assert_eq!(
-            right[5..7],
-            [
-                format!("{:19}+5.0 pts/h", ""),
-                format!("{:19}runs out in 12h00m (regression)", ""),
-            ]
-        );
+        assert_eq!(right[5], format!("{:19}+5.0%/h · full in 12h00m", ""));
     }
 
     #[test]
@@ -738,11 +733,8 @@ mod tests {
         );
         assert!(right[label + 2].ends_with("   95%"), "{right:?}");
         assert_eq!(
-            right[label + 3..label + 5],
-            [
-                format!("{:19}+5.0 pts/h", ""),
-                format!("{:19}runs out in 12h00m (regression)", ""),
-            ]
+            right[label + 3],
+            format!("{:19}+5.0%/h · full in 12h00m", "")
         );
     }
 

@@ -908,9 +908,9 @@ mod tests {
             &body[0..4],
             [
                 "    #  ACCOUNT              5H           7D                   SPEND  AGE",
-                "▌*  1  michael@example.com    9%  2h40m   77%  3d09h  ▲ pace  —      2m",
+                "▌*  1  michael@example.com    9%  2h40m   77%  3d09h  ▲ fast  —      2m",
                 "    2  spare@example.com     31%  2h40m   12%  3d09h          —      14m",
-                "    3  work (w@corp.com)    relogin required",
+                "    3  work (w@corp.com)    needs a new login",
             ]
         );
     }
@@ -922,9 +922,9 @@ mod tests {
             &body[0..4],
             [
                 "    #  ACCOUNT              5H                  7D                          SPEND  AGE",
-                "▌*  1  michael@example.com  █░░░░░   9%  2h40m  █████░  77%  3d09h  ▲ pace  —      2m",
+                "▌*  1  michael@example.com  █░░░░░   9%  2h40m  █████░  77%  3d09h  ▲ fast  —      2m",
                 "    2  spare@example.com    ██░░░░  31%  2h40m  █░░░░░  12%  3d09h          —      14m",
-                "    3  work (w@corp.com)    relogin required",
+                "    3  work (w@corp.com)    needs a new login",
             ]
         );
     }
@@ -948,7 +948,7 @@ mod tests {
             [
                 format!("─ 1 michael@example.com · active · oauth {}", "─".repeat(79)),
                 " 5h    9%  resets in 2h40m".to_owned(),
-                " 7d   77%  resets in 3d09h  ▲ ahead of pace (expected 62%)  +1.2 pts/h · runs out in 2d04h (regression)".to_owned(),
+                " 7d   77%  resets in 3d09h  ▲ ahead of pace (expected 62%)  +1.2%/h · full in 2d04h".to_owned(),
                 " fetched 2m ago · login expires in 6d03h".to_owned(),
             ]
         );
@@ -967,7 +967,7 @@ mod tests {
         );
         assert_eq!(width_of(&body[top]), 80);
         assert_eq!(body[top + 1], " never fetched");
-        assert_eq!(body[top + 2], " usage: relogin required");
+        assert_eq!(body[top + 2], " usage: needs a new login");
     }
 
     #[test]
@@ -1081,13 +1081,13 @@ mod tests {
                     " {:<17}  {:>4}  resets in 3d09h  ▲ ahead of pace (expected 62%)",
                     "7d", "77%"
                 ),
-                format!("{under}+1.2 pts/h · runs out in 2d04h (regression)"),
+                format!("{under}+1.2%/h · full in 2d04h"),
                 format!(" {:<17}  €123.45 of €200  resets in 14d00h", "spend"),
                 format!(
                     " {:<17}  {:>4}  resets in 3d09h  ▲ ahead of pace (expected 20%)",
                     "Claude Sonnet 4.5", "41%"
                 ),
-                format!("{under}+1.5 pts/h · runs out in 1d00h (average)"),
+                format!("{under}+1.5%/h · full in 1d00h"),
                 " fetched 2m ago".to_owned(),
             ]
         );
@@ -1098,7 +1098,7 @@ mod tests {
         assert_eq!(
             wide[rule + 2],
             format!(
-                " {:<17}  {:>4}  resets in 3d09h  ▲ ahead of pace (expected 62%)  +1.2 pts/h · runs out in 2d04h (regression)",
+                " {:<17}  {:>4}  resets in 3d09h  ▲ ahead of pace (expected 62%)  +1.2%/h · full in 2d04h",
                 "7d", "77%"
             )
         );
@@ -1151,10 +1151,7 @@ mod tests {
         );
         let rest = pane[label + 2..].join(" ");
         assert!(rest.contains("▲ ahead of pace (expected 20%)"), "{rest}");
-        assert!(
-            rest.contains("+1.5 pts/h · runs out in 1d00h (average)"),
-            "{rest}"
-        );
+        assert!(rest.contains("+1.5%/h · full in 1d00h"), "{rest}");
     }
 
     /// A 1,000-character model name, as the provider accepts any non-empty `display_name`.
@@ -1198,11 +1195,8 @@ mod tests {
         );
         let rest = lines[label + 2..].join(" ");
         assert!(rest.contains("▲ ahead of pace (expected 20%)"), "{lines:?}");
-        assert!(
-            rest.contains("+1.5 pts/h · runs out in 1d00h (average)"),
-            "{lines:?}"
-        );
-        assert!(rest.contains(" usage: unavailable (http-429)"), "{lines:?}");
+        assert!(rest.contains("+1.5%/h · full in 1d00h"), "{lines:?}");
+        assert!(rest.contains(" usage: rate-limited"), "{lines:?}");
     }
 
     #[test]
@@ -1273,11 +1267,8 @@ mod tests {
         assert!(lines[label + 2].contains("resets in 3d09h"), "{lines:?}");
         let rest = lines[label + 2..].join(" ");
         assert!(rest.contains("▲ ahead of pace (expected 20%)"), "{lines:?}");
-        assert!(
-            rest.contains("+1.5 pts/h · runs out in 1d00h (average)"),
-            "{lines:?}"
-        );
-        assert!(rest.contains(" usage: unavailable (http-429)"), "{lines:?}");
+        assert!(rest.contains("+1.5%/h · full in 1d00h"), "{lines:?}");
+        assert!(rest.contains(" usage: rate-limited"), "{lines:?}");
     }
 
     #[test]
@@ -1340,10 +1331,10 @@ mod tests {
         let block = lines[label..age].join("\n");
         assert!(block.contains("of €100…"), "{lines:?}");
         assert!(
-            block.contains("should have run out 400d00h ago (regression)"),
+            block.contains("should have been full 400d00h ago"),
             "{lines:?}"
         );
-        assert_eq!(lines[age + 1], " usage: unavailable (http-429)");
+        assert_eq!(lines[age + 1], " usage: rate-limited");
     }
 
     #[test]
@@ -1417,7 +1408,7 @@ mod tests {
         let haiku = lines.iter().find(|l| l.starts_with(" Haiku")).unwrap();
         assert_eq!(
             haiku.trim_end(),
-            " Haiku    42%  resets in 3d09h  ▲ ahead of pace (expected 20%)  +1.5 pts/h · runs out in 1d00h (average)"
+            " Haiku    42%  resets in 3d09h  ▲ ahead of pace (expected 20%)  +1.5%/h · full in 1d00h"
         );
         assert!(
             !lines.iter().any(|l| l.contains("J K")),
@@ -1445,7 +1436,7 @@ mod tests {
             .position(|l| l.starts_with(" fetched"))
             .unwrap();
         assert!(lines[age - 2].starts_with(" M3 "), "{lines:?}");
-        assert!(lines[age - 1].trim_start().starts_with("+1.5 pts/h"));
+        assert!(lines[age - 1].trim_start().starts_with("+1.5%/h"));
         let rule = |state: &State| {
             draw(state, 80, 24)
                 .into_iter()
@@ -1497,7 +1488,7 @@ mod tests {
             &body[0..3],
             [
                 "    #    ACCOUNT              5H           7D                   SPEND  AGE",
-                "▌*  1    michael@example.com    9%  2h40m   77%  3d09h  ▲ pace  —      2m",
+                "▌*  1    michael@example.com    9%  2h40m   77%  3d09h  ▲ fast  —      2m",
                 "    2 ▶  spare@example.com     31%  2h40m   12%  3d09h          —      14m  this",
             ]
         );
@@ -2120,7 +2111,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l == " usage: unavailable (http-429, retry 15m)"),
+                .any(|l| l == " usage: rate-limited (retry 15m)"),
             "{lines:?}"
         );
     }
@@ -2158,11 +2149,7 @@ mod tests {
         assert!(head.ends_with("AGE"), "{head}");
         assert!(!head.contains("SONNET"), "{head}");
         assert!(body[2].ends_with("disabled"), "{}", body[2]);
-        assert!(
-            body[3].ends_with("unavailable (http-429, retry 15m)"),
-            "{}",
-            body[3]
-        );
+        assert!(body[3].ends_with("rate-limited (retry 15m)"), "{}", body[3]);
         // At 120 columns every column and every note fit.
         let wide = body_of(&loaded(crowded("http-429")), 120, 40, NOW_MS);
         assert!(wide[0].contains("CLAUDE SONNET 4.5"), "{}", wide[0]);
@@ -2172,11 +2159,7 @@ mod tests {
             wide[0]
         );
         assert!(wide[2].ends_with("disabled"), "{}", wide[2]);
-        assert!(
-            wide[3].ends_with("unavailable (http-429, retry 15m)"),
-            "{}",
-            wide[3]
-        );
+        assert!(wide[3].ends_with("rate-limited (retry 15m)"), "{}", wide[3]);
     }
 
     #[test]
@@ -2186,6 +2169,6 @@ mod tests {
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
         let body = body_of(&loaded(crowded(&long)), 80, 24, NOW_MS);
         assert!(body[3].ends_with('…'), "{}", body[3]);
-        assert!(body[3].contains("unavailable (xxx"), "{}", body[3]);
+        assert!(body[3].contains("usage check failed (xxx"), "{}", body[3]);
     }
 }

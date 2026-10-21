@@ -990,8 +990,8 @@ fn run_on_an_account_moved_elsewhere_is_refused_and_launches_nothing() {
     let mut tui = home.tui(&["tui"]);
     tui.wait_for(LONG, "the accounts table", accounts);
     // The start-up collection fails offline, which counts as fetched, so the TUI re-reads once
-    // (§6.2): the rows go from "no data yet" to "unavailable (pre-send, ...)". Wait for that, so
-    // the `move` below is the only change after the TUI's last read.
+    // (§6.2): the rows go from "not checked yet" to "usage check failed (pre-send, ...)". Wait
+    // for that, so the `move` below is the only change after the TUI's last read.
     tui.wait_for(LONG, "the start-up re-read", |s| {
         s.on_alt() && s.contains("pre-send")
     });
