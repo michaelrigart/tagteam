@@ -71,6 +71,35 @@ pub(crate) enum AutoFreshened {
     Skip,
 }
 
+/// Which table reads the gate's outcome: the manual switch's (§7.2; `chosen`: a rotation's or
+/// a usage strategy's pick) or the automatic switch's (§11.2 step 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateMode {
+    Manual { chosen: bool },
+    Auto,
+}
+
+/// What a mode's table makes of one gate outcome. A mode never gets the verdicts of the
+/// other's table: the manual switch gets the first four, the automatic switch `Proceed` and
+/// the last three.
+#[derive(Debug)]
+pub(crate) enum GateVerdict {
+    /// Go ahead.
+    Proceed,
+    /// Go ahead, with this warning for the outcome.
+    ProceedWarn(String),
+    /// A chosen target turned out dead or session-owned: plan again (§9.3).
+    Replan,
+    /// Refuse with this error.
+    Refuse(EngineError),
+    /// Not a candidate after all (§12.5). Try the next target.
+    Skip,
+    /// The gate has quarantined it (§7.4). Try the next target.
+    Quarantined,
+    /// Transient or systemic, with what went wrong. Try the next target.
+    Failed(FreshenFailure),
+}
+
 impl Engine {
     /// §7.2: refreshes the plan's target through the gate when its access token is about to
     /// expire. This runs before the mutation lock is taken (§4.3). A rotation whose pick turns
@@ -160,28 +189,93 @@ impl Engine {
         if !due {
             return Ok(Freshened::Go(vec![]));
         }
-        let label = target.label.as_str();
-        let pending = |detail: String| EngineError::RescuePending {
-            position: target.position,
-            label: target.label.clone(),
-            detail,
-        };
         // §14.1: nothing is locked yet, so a signal that has landed stops the switch before it
         // spends the target's refresh token.
         self.check_cancel()?;
-        Ok(match self.refresh_stored(p, &target.id, &vault)? {
-            // Busy: another process is refreshing it now. The account lock this switch waits
-            // for, and the pending-rescue settle under it (§6.2), pick up that refresh.
+        let out = self.refresh_stored(p, &target.id, &vault)?;
+        match self.classify_gate(out, p, target, GateMode::Manual { chosen })? {
+            GateVerdict::Proceed => Ok(Freshened::Go(vec![])),
+            GateVerdict::ProceedWarn(warning) => Ok(Freshened::Go(vec![warning])),
+            GateVerdict::Replan => Ok(Freshened::Replan),
+            GateVerdict::Refuse(e) => Err(e),
+            GateVerdict::Skip | GateVerdict::Quarantined | GateVerdict::Failed(_) => {
+                unreachable!("classify_gate gives a manual switch no automatic verdict")
+            }
+        }
+    }
+
+    /// Reads the refresh gate's outcome (§7.3) for `row` by `mode`'s table: the manual switch's
+    /// (§7.2) or the automatic switch's (§11.2 step 10). It writes nothing and sends nothing.
+    pub(crate) fn classify_gate(
+        &self,
+        out: GateOutcome,
+        p: &dyn Provider,
+        row: &AccountRow,
+        mode: GateMode,
+    ) -> Result<GateVerdict, EngineError> {
+        let auto = mode == GateMode::Auto;
+        let chosen = mode == GateMode::Manual { chosen: true };
+        let warn =
+            |why: &str| GateVerdict::ProceedWarn(cannot_refresh(p.display_name(), &row.label, why));
+        let pending = |detail: String| {
+            GateVerdict::Refuse(EngineError::RescuePending {
+                position: row.position,
+                label: row.label.clone(),
+                detail,
+            })
+        };
+        Ok(match out {
+            // Busy: another process is refreshing it now. The account lock a switch waits for,
+            // and the pending-rescue settle under it (§6.2), pick up that refresh (§7.2).
             GateOutcome::Refreshed(_) | GateOutcome::AlreadyFresh(_) | GateOutcome::Busy => {
-                Freshened::Go(vec![])
+                GateVerdict::Proceed
             }
-            GateOutcome::Dead(_) if chosen => Freshened::Replan,
-            GateOutcome::Dead(_) => return Err(needs_relogin(p, target)),
-            GateOutcome::Transient { rescued: true, .. } => {
-                return Err(pending(
-                    "the refresh succeeded, but the vault could not be written; the new token is in rescue/".into(),
-                ));
+            // The gate found it live where planning did not (it became the live login, or the
+            // live identity could not be read): never refreshed here. A manual switch's
+            // `rederive` plans the self-switch again, and the warning is carried into its
+            // outcome. An automatic switch's own checks under its locks decide (§9.4 step 1).
+            GateOutcome::Owned(OwnedBy::Live) if auto => GateVerdict::Proceed,
+            GateOutcome::Owned(OwnedBy::Live) => warn("it may be the live login"),
+            // A journal row names it. The gate cannot tell a switch still in progress from an
+            // interrupted one, so a manual switch does not refuse: with `--force` it supersedes
+            // the row, and without it `guard` decides under the mutation lock (it waits for a
+            // live holder, and recovers or refuses a dead one with the right message). An
+            // automatic switch's checks under its locks decide too (§9.6).
+            GateOutcome::Owned(OwnedBy::Journal) if auto => GateVerdict::Proceed,
+            GateOutcome::Owned(OwnedBy::Journal) => warn("an unfinished switch names it"),
+            // §7.2's last row, §9.2's refusals. A session that started since planning owns the
+            // target: a rotation or a usage strategy plans again, and its walk now skips it
+            // (§9.3); a direct target is refused. A conflicting profile refuses either way
+            // (§12.5). An automatic switch passes both over.
+            GateOutcome::Owned(OwnedBy::Session) if auto => GateVerdict::Skip,
+            GateOutcome::Owned(OwnedBy::Session) if chosen => GateVerdict::Replan,
+            // The gate answers only "a session"; the state is read again to name a daemon.
+            GateOutcome::Owned(OwnedBy::Session) => GateVerdict::Refuse(session_owned(
+                p,
+                row,
+                &self.session_state(p, row)?,
+            )),
+            GateOutcome::Conflict if auto => GateVerdict::Skip,
+            GateOutcome::Conflict => GateVerdict::Refuse(profile_conflict(row)),
+            GateOutcome::Dead(_) if auto => GateVerdict::Quarantined,
+            GateOutcome::Dead(_) if chosen => GateVerdict::Replan,
+            GateOutcome::Dead(_) => GateVerdict::Refuse(needs_relogin(p, row)),
+            // The successor is lost and the vault's generation is spent (§7.3 step 6): no
+            // retry helps, and activating would hand CC a used refresh token.
+            GateOutcome::Unpersisted if auto => GateVerdict::Quarantined,
+            GateOutcome::Unpersisted => GateVerdict::Refuse(needs_relogin(p, row)),
+            // The vault's generation is spent and its successor waits in `rescue/`: activating
+            // it would hand the agent a used refresh token. A later tick adopts the rescue.
+            GateOutcome::Transient { rescued: true, .. } if auto => {
+                GateVerdict::Failed(FreshenFailure::Rescued)
             }
+            GateOutcome::Transient { rescued: true, .. } => pending(
+                "the refresh succeeded, but the vault could not be written; the new token is in rescue/".into(),
+            ),
+            GateOutcome::Transient {
+                kind: GateFailure::RescueUnreadable,
+                ..
+            } if auto => GateVerdict::Failed(FreshenFailure::Gate(GateFailure::RescueUnreadable)),
             GateOutcome::Transient {
                 kind: GateFailure::RescueUnreadable,
                 ..
@@ -190,62 +284,30 @@ impl Engine {
                 // readable one under this kind; only unreadable files can be named. The error's
                 // own text adds "retry once the vault can be written".
                 let damaged: Vec<String> = self
-                    .rescues_for(&target.id)
+                    .rescues_for(&row.id)
                     .into_iter()
                     .filter_map(|r| match r {
                         RescueFile::Unreadable { path, .. } => Some(path.display().to_string()),
                         RescueFile::Entry(_) => None,
                     })
                     .collect();
-                let detail = if damaged.is_empty() {
+                pending(if damaged.is_empty() {
                     "a pending rescue could not be adopted".to_owned()
                 } else {
                     format!("{} cannot be read", damaged.join(", "))
-                };
-                return Err(pending(detail));
+                })
             }
             // Nothing was spent, or what was spent is lost either way; once the account is
             // live, the gate leaves its refresh to CC (§7.3 step 2). A profile that cannot be
             // read (`profile-unreadable`) lands here too, and the transaction refuses it.
-            GateOutcome::Transient { kind, .. } => Freshened::Go(vec![cannot_refresh(
-                p.display_name(),
-                label,
-                &kind.as_str(),
-            )]),
-            GateOutcome::Systemic(detail) => {
-                Freshened::Go(vec![cannot_refresh(p.display_name(), label, &detail)])
+            GateOutcome::Transient { kind, .. } if auto => {
+                GateVerdict::Failed(FreshenFailure::Gate(kind))
             }
-            // The successor is lost and the vault's generation is spent (§7.3 step 6): no
-            // retry helps, and activating would hand CC a used refresh token.
-            GateOutcome::Unpersisted => return Err(needs_relogin(p, target)),
-            // A journal row names it. The gate cannot tell a switch still in progress from an
-            // interrupted one, so this does not refuse: with `--force` the switch supersedes
-            // the row, and without it `guard` decides under the mutation lock (it waits for a
-            // live holder, and recovers or refuses a dead one with the right message).
-            GateOutcome::Owned(OwnedBy::Journal) => Freshened::Go(vec![cannot_refresh(
-                p.display_name(),
-                label,
-                "an unfinished switch names it",
-            )]),
-            // The gate found it live where planning did not (it became the live login, or the
-            // live identity could not be read): never refreshed here. `rederive` plans the
-            // self-switch again, and the warning is carried into its outcome.
-            GateOutcome::Owned(OwnedBy::Live) => Freshened::Go(vec![cannot_refresh(
-                p.display_name(),
-                label,
-                "it may be the live login",
-            )]),
-            // §7.2's last row, §9.2's refusals. A session that started since planning owns the
-            // target: a rotation or a usage strategy plans again, and its walk now skips it
-            // (§9.3); a direct target is refused. A conflicting profile refuses either way
-            // (§12.5).
-            GateOutcome::Owned(OwnedBy::Session) if chosen => Freshened::Replan,
-            // The gate answers only "a session"; the state is read again to name a daemon.
-            GateOutcome::Owned(OwnedBy::Session) => {
-                let state = self.session_state(p, target)?;
-                return Err(session_owned(p, target, &state));
+            GateOutcome::Transient { kind, .. } => warn(&kind.as_str()),
+            GateOutcome::Systemic(detail) if auto => {
+                GateVerdict::Failed(FreshenFailure::Text(detail))
             }
-            GateOutcome::Conflict => return Err(profile_conflict(target)),
+            GateOutcome::Systemic(detail) => warn(&detail),
         })
     }
 
@@ -328,26 +390,15 @@ impl Engine {
         // §14.1: nothing is locked now, so a signal that has landed stops the tick before it
         // spends the target's refresh token.
         self.check_cancel()?;
-        Ok(match self.refresh_stored(p, &target.id, &vault)? {
-            // Busy: another process is refreshing it now; the switch's account lock and its
-            // pending-rescue settle pick that refresh up, as for a manual switch (§7.2).
-            GateOutcome::Refreshed(_) | GateOutcome::AlreadyFresh(_) | GateOutcome::Busy => {
-                AutoFreshened::Ready
+        let out = self.refresh_stored(p, &target.id, &vault)?;
+        Ok(match self.classify_gate(out, p, target, GateMode::Auto)? {
+            GateVerdict::Proceed => AutoFreshened::Ready,
+            GateVerdict::Skip => AutoFreshened::Skip,
+            GateVerdict::Quarantined => AutoFreshened::Quarantined,
+            GateVerdict::Failed(failure) => AutoFreshened::Failed(failure),
+            GateVerdict::ProceedWarn(_) | GateVerdict::Replan | GateVerdict::Refuse(_) => {
+                unreachable!("classify_gate gives an automatic switch no manual verdict")
             }
-            // It became the live login, or an unfinished switch names it: the switch's own
-            // checks under its locks decide (§9.4 step 1, §9.6).
-            GateOutcome::Owned(OwnedBy::Live | OwnedBy::Journal) => AutoFreshened::Ready,
-            GateOutcome::Dead(_) | GateOutcome::Unpersisted => AutoFreshened::Quarantined,
-            // The vault's generation is spent and its successor waits in `rescue/`: activating
-            // it would hand the agent a used refresh token. A later tick adopts the rescue.
-            GateOutcome::Transient { rescued: true, .. } => {
-                AutoFreshened::Failed(FreshenFailure::Rescued)
-            }
-            GateOutcome::Transient { kind, .. } => {
-                AutoFreshened::Failed(FreshenFailure::Gate(kind))
-            }
-            GateOutcome::Systemic(detail) => AutoFreshened::Failed(FreshenFailure::Text(detail)),
-            GateOutcome::Owned(OwnedBy::Session) | GateOutcome::Conflict => AutoFreshened::Skip,
         })
     }
 
