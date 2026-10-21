@@ -82,10 +82,38 @@ impl PartialEq<str> for FailureKind {
     }
 }
 
+/// Why the refresh gate (§7.3) or active-token refresh (§7.5) did nothing decisive (§8.6.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateFailure {
+    VaultAbsent,
+    NotRefreshable,
+    VaultUnreadable,
+    RescueUnreadable,
+    ProfileUnreadable,
+    RefreshFailed,
+    VaultWrite,
+    /// The token request itself failed, spelled by `TransientKind::token`.
+    Provider(TransientKind),
+}
+
+impl GateFailure {
+    /// The spelling the logs, the warnings and `AutoFreshened::Failed` carry.
+    pub fn as_str(&self) -> Cow<'static, str> {
+        Cow::Borrowed(match self {
+            GateFailure::VaultAbsent => "vault-absent",
+            GateFailure::NotRefreshable => "not-refreshable",
+            GateFailure::VaultUnreadable => "vault-unreadable",
+            GateFailure::RescueUnreadable => "rescue-unreadable",
+            GateFailure::ProfileUnreadable => "profile-unreadable",
+            GateFailure::RefreshFailed => "refresh-failed",
+            GateFailure::VaultWrite => "vault-write",
+            GateFailure::Provider(kind) => return Cow::Owned(kind.token()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use tagteam_provider::TransientKind;
-
     use super::*;
 
     #[test]
@@ -149,5 +177,23 @@ mod tests {
         assert!(kind == "http-429");
         assert!(kind != "http-401");
         assert!(&FailureKind::Other("x-new".into()) == "x-new");
+    }
+
+    #[test]
+    fn every_gate_failure_keeps_its_spelling() {
+        use GateFailure::*;
+        for (kind, s) in [
+            (VaultAbsent, "vault-absent"),
+            (NotRefreshable, "not-refreshable"),
+            (VaultUnreadable, "vault-unreadable"),
+            (RescueUnreadable, "rescue-unreadable"),
+            (ProfileUnreadable, "profile-unreadable"),
+            (RefreshFailed, "refresh-failed"),
+            (VaultWrite, "vault-write"),
+            (Provider(TransientKind::PreSend), "pre-send"),
+            (Provider(TransientKind::Http(503)), "http-503"),
+        ] {
+            assert_eq!(kind.as_str(), s);
+        }
     }
 }

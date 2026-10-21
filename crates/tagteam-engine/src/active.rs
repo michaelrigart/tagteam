@@ -12,6 +12,7 @@ use tagteam_provider::{
 use crate::account_lock::AccountLock;
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::failure::GateFailure;
 use crate::hooks;
 use crate::oracle::verdict;
 use crate::quarantine::QuarantineReason;
@@ -54,7 +55,7 @@ pub enum ActiveOutcome {
     Dead(QuarantineReason),
     Systemic(String),
     Transient {
-        kind: String,
+        kind: GateFailure,
     },
     /// The successor is held nowhere: logged at ERROR, and the account quarantined
     /// `successor_lost` (§7.5 step 5, §7.4).
@@ -146,7 +147,7 @@ fn log_active(
             provider = %provider,
             account,
             outcome = "transient",
-            kind = kind.as_str(),
+            kind = &*kind.as_str(),
             "{OUTCOME}"
         ),
         Ok(ActiveOutcome::Unpersisted) => {
@@ -406,7 +407,7 @@ impl Engine {
                     .map(|c| c.bytes().to_vec());
                 if !holds(live_now) && !holds(self.vault.read(&row.id).present()) {
                     return Ok(ActiveOutcome::Transient {
-                        kind: "refresh-failed".into(),
+                        kind: GateFailure::RefreshFailed,
                     });
                 }
                 let reason: QuarantineReason = reason.into();
@@ -414,7 +415,9 @@ impl Engine {
                 Ok(ActiveOutcome::Dead(reason))
             }
             RefreshResult::Systemic(detail) => Ok(ActiveOutcome::Systemic(detail)),
-            RefreshResult::Transient(kind) => Ok(ActiveOutcome::Transient { kind: kind.token() }),
+            RefreshResult::Transient(kind) => Ok(ActiveOutcome::Transient {
+                kind: GateFailure::Provider(kind),
+            }),
         }
     }
 

@@ -14,11 +14,12 @@ use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::active::{ActiveOutcome, ActiveTrigger};
 use tagteam_engine::export::ExportRequest;
+use tagteam_engine::failure::GateFailure;
 use tagteam_engine::transfer::ImportRecord;
 use tagteam_engine::vault::SERVICE;
 use tagteam_engine::views::StatuslineView;
-use tagteam_provider::Clock;
 use tagteam_provider::http::{HttpError, Method};
+use tagteam_provider::{Clock, TransientKind};
 
 /// One test at a time: each captures through a subscriber of its own, and `tracing` caches
 /// whether a call site is enabled across every subscriber alive in the process, so a test
@@ -376,6 +377,32 @@ fn an_active_token_refresh_logs_its_outcome_by_provider_and_account() {
     assert_eq!(field(line, "outcome"), Some("\"not-needed\""), "{line}");
     no_email(&logs);
     no_token(&logs);
+}
+
+#[test]
+fn an_active_token_refresh_that_fails_transiently_logs_its_kind_as_a_string() {
+    // §7.5, §8.6.2: `kind` is a quoted string like the gate's, never a `Debug` rendering.
+    let _serial = one_at_a_time();
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let mut live = fx.live_credential().unwrap();
+    live["claudeAiOauth"]["expiresAt"] = json!(fx.clock.now_ms());
+    fx.set_live_credential(live.to_string().as_bytes());
+
+    let (out, logs) = capture_logs(|| {
+        fx.engine
+            .refresh_active(&fx.provider(), ActiveTrigger::Expired)
+            .unwrap()
+    });
+    assert_eq!(
+        out,
+        ActiveOutcome::Transient {
+            kind: GateFailure::Provider(TransientKind::PreSend)
+        }
+    );
+    let line = one(&logs, "active-token refresh outcome");
+    assert_eq!(field(line, "outcome"), Some("\"transient\""), "{line}");
+    assert_eq!(field(line, "kind"), Some("\"pre-send\""), "{line}");
 }
 
 #[test]
@@ -979,7 +1006,7 @@ fn a_profile_whose_state_cannot_be_read_is_logged_by_a_fixed_phrase() {
             .unwrap()
     });
     assert!(
-        matches!(&gated, tagteam_engine::refresh::GateOutcome::Transient { kind, .. } if kind == "profile-unreadable"),
+        matches!(&gated, tagteam_engine::refresh::GateOutcome::Transient { kind, .. } if kind.as_str() == "profile-unreadable"),
         "{gated:?}"
     );
     assert_eq!(
