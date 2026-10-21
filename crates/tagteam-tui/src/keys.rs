@@ -13,7 +13,7 @@ use crate::view::width_of;
 pub(crate) struct KeyRow {
     /// `None`: every screen.
     pub(crate) screen: Option<Screen>,
-    /// As help shows them: `j k ↑ ↓ PgUp PgDn Home End`.
+    /// As help shows them: `j k ↑ ↓`.
     pub(crate) keys: &'static str,
     pub(crate) does: &'static str,
     pub(crate) footer: Footer,
@@ -135,7 +135,7 @@ pub(crate) const KEYS: &[KeyRow] = &[
     KeyRow {
         screen: None,
         keys: "Esc",
-        does: "close overlay; back; Accounts: clear warnings",
+        does: "close the overlay, go back, or clear warnings",
         footer: Footer::No,
         #[cfg(test)]
         probes: &[named(KeyCode::Esc)],

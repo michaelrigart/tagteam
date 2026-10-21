@@ -72,7 +72,8 @@ pub(crate) fn header(state: &State, width: u16) -> Line<'static> {
 }
 
 /// The auto line (§5.3): ` {mark} {when}  {text}`, with no `when` ` {mark} {text}`, then
-/// ` · next check HH:MM`; the mark in its role, the time and the suffix muted, cut to `width`.
+/// ` · next check HH:MM`; the mark in its role, the time, rank 3's `last switch … · ` and the
+/// suffix muted, cut to `width`.
 pub(crate) fn auto_line(state: &State, width: u16, now_ms: i64) -> Line<'static> {
     let theme = state.theme;
     let said = autoline::said(state, width, now_ms);
@@ -85,6 +86,9 @@ pub(crate) fn auto_line(state: &State, width: u16, now_ms: i64) -> Line<'static>
     if let Some(when) = said.when {
         spans.push(Span::styled(when, theme.role(Role::Muted)));
         spans.push(Span::raw("  "));
+    }
+    if let Some(lead) = said.lead {
+        spans.push(Span::styled(lead, theme.role(Role::Muted)));
     }
     let text = if said.muted { Role::Muted } else { Role::Text };
     spans.push(Span::styled(said.text, theme.role(text)));
@@ -280,10 +284,8 @@ pub(crate) fn footer(state: &State, width: u16, frame: &str) -> Vec<Line<'static
     if let Some(spinner) = spinner {
         let room = columns.saturating_sub(spans_width(&pinned) + keys::RIGHT_INSET + 2);
         let left = vec![spinner];
-        if spans_width(&left) > room {
-            return vec![Line::from(fit_spans(left, columns))];
-        }
-        return vec![beside(left, pinned)];
+        // A label too long for its room is cut, never the pinned two.
+        return vec![beside(fit_spans(left, room), pinned)];
     }
     let mut left = Vec::new();
     for (n, (key, label)) in keys::footer_items(state, width).into_iter().enumerate() {
@@ -1309,6 +1311,24 @@ mod tests {
             draw(&state, 80, 24)[23],
             footer_row("⠋ adding Claude Code's login…", 80)
         );
+    }
+
+    #[test]
+    fn a_long_spinner_label_is_cut_and_never_costs_the_pinned_keys() {
+        // §5.5, UX-4: the longest alias is 64 columns; at 80 the label gives way, not `? keys`.
+        let mut accounts = many(2);
+        accounts[0].row.alias = Some("x".repeat(64));
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(accounts));
+        state.running = Some(Action::Switch(AccountRef {
+            id: id(1),
+            provider: cc(),
+            position: 1,
+        }));
+        // 63 columns of label (the 80 less the pinned 14, its inset and a gap of 2), ending `…`.
+        let label = format!("⠋ switching to 1 {}…", "x".repeat(45));
+        assert_eq!(width_of(&label), 63);
+        assert_eq!(draw(&state, 80, 24)[23], format!("{label}  ? keys  q quit"));
     }
 
     #[test]

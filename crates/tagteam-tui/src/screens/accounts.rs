@@ -28,11 +28,11 @@ const LOADING: &str = "Loading accounts…";
 const NO_ACCOUNTS: &str = "No accounts yet";
 /// The banners the accounts view raises (spec §5.1).
 pub const RUN_SHELL: &str = "inside a `tagteam run` session: account changes are refused here";
-/// A gauge's width, in cells, and the narrowest the ACCOUNT column is cut to.
 /// The account cell's place among a row's spans (`Table::row`): the selection bolds it.
 const NAME_SPAN: usize = 3;
-
+/// A gauge's width, in cells.
 const GAUGE: usize = 6;
+/// The narrowest the ACCOUNT column is cut to.
 const ACCOUNT_MIN: usize = 12;
 /// The room the notes after a row's cells are given at least, when columns or the ACCOUNT
 /// column give way for them: the longest note, up to this many columns.
@@ -138,7 +138,7 @@ fn windows_of(v: &AccountView) -> &[(Window, Pace)] {
 }
 
 /// What the accounts view has to say above the body: a run shell (spec §3), else a live login
-/// tagteam does not manage (`status`'s own words).
+/// tagteam does not manage (redesign §5.6's sentence).
 pub fn banner(state: &State) -> Option<String> {
     let snap = state.accounts.snapshot.as_ref()?;
     if snap.in_run_shell {

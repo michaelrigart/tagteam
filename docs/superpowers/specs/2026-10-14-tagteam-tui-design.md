@@ -226,25 +226,26 @@ pub enum ActionOutcome {
 
 ```
  tagteam   1 Accounts   2 Tokens   3 History                    ● auto on · switches at 90%   ? keys
- ⇄ 11:28  auto switched 1 alex → 2 work · alex's 5h reached 93% · next check 14:16
+ ⇄ 11:28  auto switched 1 alex → 2 work (before it reached the limit) · next check 14:16
  ────────────────────────────────────────────────────────────────────────────────────────────
  (banner, 0–3 rows)
  (body)
  s switch  b best  n next  ⏎ history  P pause auto  r refresh                    ? keys  q quit
 ```
 
-- **The chrome rows** are the header, the auto line, the Now strip on Tokens and History, a faint
-  rule from 30 rows, the banner, the body and the footer. Which rows show does not change with the
-  daemon's mode. The header shows the tabs and auto's state with its threshold (§7.4), the auto
-  line shows auto's last action in plain words, the banner shows an unmanaged live login, a run
-  shell, the start-up warnings or an error (§10.4), and the footer shows the screen's keys with
-  `? keys` and `q quit` pinned. A toast replaces the footer's keys, and a running action shows a
-  spinner with its label. *(Amended by the TUI redesign spec §5.1–§5.6.)*
+- **The chrome rows** are the header, the auto line, a faint rule from 30 rows, the banner, the
+  body and the footer (the Now strip on Tokens and History comes with T3). Which rows show does
+  not change with the daemon's mode. The header shows the tabs and auto's state with its
+  threshold (§7.4), the auto line shows auto's last action in plain words, the banner shows an
+  unmanaged live login, a run shell, the start-up warnings or an error (§10.4), and the footer
+  shows the screen's keys with `? keys` and `q quit` pinned. A toast replaces the footer's keys,
+  and a running action shows a spinner with its label. *(Amended by the TUI redesign spec
+  §5.1–§5.6.)*
 - **Colour.**
   - Three tiers: tier 0 under `NO_COLOR`, `--no-color` or `ui.color = never`; tier 1 with the 16
-    named ANSI colours; tier 2 in truecolor when `COLORTERM` says so and the terminal reports its background. Each
-    colour is a role (`text`, `muted`, `faint`, `accent`, `warn`, `crit`, `ok`, `sel-bg`, `surface`), and the theme is
-    the only place that names one.
+    named ANSI colours; tier 2 in truecolor when `COLORTERM` says so and the terminal reports its
+    background. Each colour is a role (`text`, `muted`, `faint`, `accent`, `warn`, `crit`, `ok`,
+    `sel-bg`, `surface`), and the theme is the only place that names one.
   - Percentages and gauges take core §13.5's severities (≥ 70 % warning, ≥ 90 % critical).
   - The selection is `▌` in the first column with the name in bold. Without colour, emphasis is
     bold, underline or DIM.
@@ -518,10 +519,10 @@ runs (core §12.5):
 
 Pausing is the daemon's persistent setting `provider.<id>.daemon.autoswitch` (§8), so it
 survives a daemon restart.
-- **In live mode,** `P` asks `Pause auto for <display name>?` (or `Resume…`) *(Amended by the TUI redesign spec §9.4.)*, from the
-  effective `autoswitch` in the daemon's `status`. A yes runs
-  `config set provider.<id>.daemon.autoswitch false` (or `true`) through `Host`, exactly as the
-  CLI runs it. Two seconds later the TUI re-fetches `status`: the daemon applies a settings
+- **In live mode,** `P` asks `Pause auto for <display name>?` (or `Resume…`), from the
+  effective `autoswitch` in the daemon's `status`. *(Amended by the TUI redesign spec §9.4.)* A
+  yes runs `config set provider.<id>.daemon.autoswitch false` (or `true`) through `Host`,
+  exactly as the CLI runs it. Two seconds later the TUI re-fetches `status`: the daemon applies a settings
   change within about a second (D4.2), and a pause need not change the mode, so no event may
   follow (one switchable account is `collect` either way).
 - **The header** shows each provider's state from the latest `status` reply (D4.3, D5.4).

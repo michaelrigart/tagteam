@@ -42,6 +42,8 @@ with the one before, so any release may contain breaking changes. Each section s
   the keychain. It ignores action keys for 300 ms after a dialog closes.
 - `tagteam tui` shows the settings warnings in a banner, and keeps the last token report on screen
   when a new one cannot be read.
+- `tagteam tui`'s Accounts screen no longer binds `g` and `G`, and `q` closes an open overlay
+  before it quits.
 
 ### Security
 

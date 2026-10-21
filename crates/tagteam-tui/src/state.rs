@@ -320,9 +320,14 @@ impl State {
     }
 
     /// `account` as the person knows it: `words::short_name` from the last accounts view, else
-    /// its position alone.
+    /// its position alone. The account's ID finds it first, so a re-read that moved it (a move,
+    /// a remove, `R`) under a running action still names it; the position is the fallback.
     pub(crate) fn short_name(&self, account: &AccountRef) -> String {
-        autoline::named(self.view_of(&account.provider), account.position)
+        let view = self.view_of(&account.provider);
+        let position = view
+            .and_then(|v| v.accounts.iter().find(|a| a.row.id == account.id))
+            .map_or(account.position, |a| a.row.position);
+        autoline::named(view, position)
     }
 
     /// The words the spinner and the busy toast give `action` (redesign §9.4), without the `…`.
@@ -350,6 +355,36 @@ impl State {
 mod tests {
     use super::*;
     use crate::testutil;
+
+    #[test]
+    fn a_short_name_follows_the_account_when_a_re_read_moves_its_position() {
+        let mut state = testutil::fresh(Screen::Accounts);
+        state.accounts.apply(testutil::snapshot(testutil::many(2)));
+        let first = AccountRef {
+            id: testutil::id(1),
+            provider: testutil::cc(),
+            position: 1,
+        };
+        assert_eq!(state.short_name(&first), "1 a1");
+        // The re-read while an action runs: a1 is now second, and a2 is first.
+        let mut moved = testutil::many(2);
+        moved[0].row.position = 2;
+        moved[1].row.position = 1;
+        moved.reverse();
+        state.accounts.apply(testutil::snapshot(moved));
+        assert_eq!(state.short_name(&first), "2 a1");
+        // Gone from the view: the position it had is all there is to go on.
+        let mut removed = testutil::many(2);
+        removed.remove(0);
+        removed[0].row.position = 1;
+        state.accounts.apply(testutil::snapshot(removed));
+        let gone = AccountRef {
+            id: testutil::id(9),
+            provider: testutil::cc(),
+            position: 7,
+        };
+        assert_eq!(state.short_name(&gone), "7");
+    }
 
     #[test]
     fn a_banner_clears_for_its_own_kind_or_a_refusal_and_never_while_quitting() {

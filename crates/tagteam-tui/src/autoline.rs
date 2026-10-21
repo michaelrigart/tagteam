@@ -32,8 +32,10 @@ const SWITCH: (&str, Role) = ("⇄", Role::Accent);
 pub(crate) struct Said {
     /// The glyph, in its role (T2-13).
     pub(crate) mark: Option<(&'static str, Role)>,
-    /// When it happened (`when`), for ranks 1 and 2; rank 3 says it in `text`.
+    /// When it happened (`when`), for ranks 1 and 2.
     pub(crate) when: Option<String>,
+    /// Rank 3's `last switch {when} · `, muted and run straight into `text`.
+    pub(crate) lead: Option<String>,
     pub(crate) text: String,
     /// Rank 4's `text` is muted.
     pub(crate) muted: bool,
@@ -56,6 +58,7 @@ pub(crate) fn said(state: &State, width: u16, now_ms: i64) -> Said {
     let said = |mark, when, text| Said {
         mark,
         when,
+        lead: None,
         text,
         muted: false,
         next: next.clone(),
@@ -71,12 +74,10 @@ pub(crate) fn said(state: &State, width: u16, now_ms: i64) -> Said {
         return said(mark, Some(when(noted.at_ms, now_ms, tz)), text);
     }
     if let Some((at, s)) = switch.filter(|(at, _)| now_ms - at <= MONTH_MS) {
-        let text = format!(
-            "last switch {} · {}",
-            when(at, now_ms, tz),
-            switched(view, s)
-        );
-        return said(Some(SWITCH), None, text);
+        return Said {
+            lead: Some(format!("last switch {} · ", when(at, now_ms, tz))),
+            ..said(Some(SWITCH), None, switched(view, s))
+        };
     }
     Said {
         muted: true,
@@ -311,6 +312,26 @@ mod tests {
                 "{trigger}: an account the view does not list is its position"
             );
         }
+    }
+
+    #[test]
+    fn rank_3_mutes_the_last_switch_time_and_leaves_the_event_in_the_text_role() {
+        // §5.3: the time is muted; the event's words are text.
+        let mut job = auto_on();
+        job.last_switch = Some(switch("2026-09-19T15:38:00Z", 3, 1, "added-later"));
+        let mut state = live_with(job);
+        assert_eq!(
+            line(&state, 80),
+            " ⇄ last switch Sat 15:38 · auto switched 3 a3 → 1 a1"
+        );
+        assert_eq!(
+            letters(&mut state),
+            format!(
+                " a {}{}",
+                all("last switch Sat 15:38 · ", 'm'),
+                all("auto switched 3 a3 → 1 a1", 't')
+            )
+        );
     }
 
     #[test]
