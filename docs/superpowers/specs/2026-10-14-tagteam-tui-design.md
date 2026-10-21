@@ -522,9 +522,9 @@ survives a daemon restart.
 - **In live mode,** `P` asks `Pause auto for <display name>?` (or `Resume…`), from the
   effective `autoswitch` in the daemon's `status`. *(Amended by the TUI redesign spec §9.4.)* A
   yes runs `config set provider.<id>.daemon.autoswitch false` (or `true`) through `Host`,
-  exactly as the CLI runs it. Two seconds later the TUI re-fetches `status`: the daemon applies a settings
-  change within about a second (D4.2), and a pause need not change the mode, so no event may
-  follow (one switchable account is `collect` either way).
+  exactly as the CLI runs it. Two seconds later the TUI re-fetches `status`: the daemon applies
+  a settings change within about a second (D4.2), and a pause need not change the mode, so no
+  event may follow (one switchable account is `collect` either way).
 - **The header** shows each provider's state from the latest `status` reply (D4.3, D5.4).
   Events never set it directly (§8). Its words, glyphs and 80-column forms are the redesign spec's
   §5.2 table. *(Amended by the TUI redesign spec §5.2.)*
