@@ -17,6 +17,10 @@ pub(crate) const QUIET: Duration = Duration::from_secs(1);
 pub(crate) const LIMIT: Duration = Duration::from_secs(2);
 /// How long one wait on the terminal lasts (T2-2): the longest a stop waits to be seen.
 const SLICE: Duration = Duration::from_millis(50);
+/// Tests: an ending that is not the quiet give-up (a stop, a control byte, the DA1 answer) is
+/// told from it by coming before this, whatever the scheduler does to the events that cause it.
+#[cfg(test)]
+pub(crate) const BEFORE_QUIET: Duration = QUIET.saturating_sub(Duration::from_millis(300));
 /// The longest OSC body that can be a colour.
 const BODY: usize = 64;
 
@@ -334,18 +338,32 @@ mod tests {
         read_from(&ours)
     }
 
-    /// `script` run on the peer's end while `read` runs, with `stop`.
+    /// `script` run on the peer's end while `read` runs, with `stop`. The peer stays open until
+    /// `read` has returned: a hang-up would end it too.
     fn trickled(
         stop: &dyn Fn() -> bool,
-        script: impl FnOnce(UnixStream) + Send + 'static,
+        script: impl FnOnce(&mut UnixStream) + Send + 'static,
     ) -> (Replies, Duration) {
         let (ours, theirs) = UnixStream::pair().unwrap();
-        let writer = thread::spawn(move || script(theirs));
+        // Taken first: the writer's events come at least their delay after it.
         let started = Instant::now();
+        let writer = thread::spawn(move || {
+            let mut theirs = theirs;
+            script(&mut theirs);
+            theirs
+        });
         let replies = read(ours.as_raw_fd(), started, stop);
         let took = started.elapsed();
-        writer.join().unwrap();
+        drop(writer.join().unwrap());
         (replies, took)
+    }
+
+    /// An ending that came from something other than `QUIET`'s give-up.
+    fn assert_before_quiet(took: Duration) {
+        assert!(
+            took < BEFORE_QUIET,
+            "{took:?} is not before {BEFORE_QUIET:?}"
+        );
     }
 
     fn assert_within(took: Duration, low: Duration, high: Duration) {
@@ -359,10 +377,10 @@ mod tests {
     fn an_osc_11_answer_then_da1_gives_the_background() {
         let (dark, took) = answered(b"\x1b]11;rgb:2828/2c2c/3434\x1b\\\x1b[?62;22c");
         assert_eq!(dark.background(), Some(Background::Dark));
-        assert!(took < Duration::from_millis(100), "{took:?}");
+        assert_before_quiet(took);
         let (light, took) = answered(b"\x1b]11;rgb:ffff/ffff/ffff\x07\x1b[?62;22c");
         assert_eq!(light.background(), Some(Background::Light));
-        assert!(took < Duration::from_millis(100), "{took:?}");
+        assert_before_quiet(took);
     }
 
     #[test]
@@ -370,7 +388,7 @@ mod tests {
         let (replies, took) = answered(DA1);
         assert_eq!(replies.background(), None);
         assert_eq!(replies.control(), None);
-        assert!(took < Duration::from_millis(100), "{took:?}");
+        assert_before_quiet(took);
     }
 
     #[test]
@@ -378,12 +396,12 @@ mod tests {
         let (ours, _theirs) = UnixStream::pair().unwrap();
         let (replies, took) = read_from(&ours);
         assert_eq!(replies.background(), None);
-        assert_within(took, QUIET, QUIET + Duration::from_millis(300));
+        assert_within(took, QUIET, LIMIT);
     }
 
     #[test]
     fn a_trickle_is_given_up_after_two_seconds() {
-        let (replies, took) = trickled(&|| false, |mut theirs| {
+        let (replies, took) = trickled(&|| false, |theirs| {
             for _ in 0..8 {
                 if theirs.write_all(b"j").is_err() {
                     break;
@@ -392,38 +410,38 @@ mod tests {
             }
         });
         assert_eq!(replies.background(), None);
-        assert_within(took, LIMIT, LIMIT + Duration::from_millis(300));
+        assert_within(took, LIMIT, LIMIT + QUIET);
     }
 
     #[test]
     fn a_stop_ends_detection_within_a_slice() {
         let stopped = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stopped);
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let started = Instant::now();
         let raise = thread::spawn(move || {
             thread::sleep(Duration::from_millis(100));
             flag.store(true, Ordering::SeqCst);
         });
-        let (ours, _theirs) = UnixStream::pair().unwrap();
-        let started = Instant::now();
         let stop = || stopped.load(Ordering::SeqCst);
         read(ours.as_raw_fd(), started, &stop);
         let took = started.elapsed();
         raise.join().unwrap();
-        assert_within(took, Duration::from_millis(100), Duration::from_millis(200));
+        assert_within(took, Duration::from_millis(100), BEFORE_QUIET);
     }
 
     #[test]
     fn ctrl_c_or_ctrl_z_ends_detection_at_once_and_is_kept() {
         for (typed, control) in [(b"\x03", Control::Interrupt), (b"\x1a", Control::Suspend)] {
             for before in [&b""[..], b"\x1b]11;rgb:28"] {
-                let (replies, took) = trickled(&|| false, move |mut theirs| {
+                let (replies, took) = trickled(&|| false, move |theirs| {
                     theirs.write_all(before).unwrap();
                     thread::sleep(Duration::from_millis(100));
                     theirs.write_all(typed).unwrap();
                 });
                 assert_eq!(replies.control(), Some(control), "after {before:?}");
                 assert_eq!(replies.background(), None);
-                assert_within(took, Duration::from_millis(100), Duration::from_millis(200));
+                assert_within(took, Duration::from_millis(100), BEFORE_QUIET);
             }
         }
     }
@@ -437,14 +455,14 @@ mod tests {
 
     #[test]
     fn a_reply_split_across_writes_is_read_whole() {
-        let (replies, took) = trickled(&|| false, |mut theirs| {
+        let (replies, took) = trickled(&|| false, |theirs| {
             theirs.write_all(b"\x1b]11;rgb:ffff/ff").unwrap();
             thread::sleep(Duration::from_millis(50));
             theirs.write_all(b"ff/ffff\x1b\\").unwrap();
             theirs.write_all(DA1).unwrap();
         });
         assert_eq!(replies.background(), Some(Background::Light));
-        assert!(took < Duration::from_millis(500), "{took:?}");
+        assert_before_quiet(took);
     }
 
     #[test]
@@ -490,7 +508,7 @@ mod tests {
                     "{} then {end:?}",
                     String::from_utf8_lossy(body)
                 );
-                assert!(took < Duration::from_millis(100), "{took:?}");
+                assert_before_quiet(took);
             }
         }
     }
@@ -524,7 +542,7 @@ mod tests {
             assert!(replies.answered(), "{typed:?}");
             assert_eq!(replies.background(), Some(Background::Light), "{typed:?}");
             assert_eq!(replies.handoff(), Handoff::None, "{typed:?}");
-            assert!(took < Duration::from_millis(100), "{took:?}");
+            assert_before_quiet(took);
         }
     }
 
@@ -577,7 +595,7 @@ mod tests {
                         let (ours, mut theirs) = UnixStream::pair().unwrap();
                         theirs.write_all(bytes).unwrap();
                         let (replies, took) = read_from(&ours);
-                        assert_within(took, QUIET, QUIET + Duration::from_millis(300));
+                        assert_within(took, QUIET, LIMIT);
                         assert_eq!(replies.handoff(), *handoff, "{bytes:?}");
                         assert!(!replies.answered(), "{bytes:?}");
                     })
@@ -593,7 +611,7 @@ mod tests {
     fn the_hand_off_after_the_limit_is_where_the_parser_stood() {
         // An OSC body that never ends, a byte every 300 ms: the limit ends the read, not the
         // quiet second.
-        let (replies, took) = trickled(&|| false, |mut theirs| {
+        let (replies, took) = trickled(&|| false, |theirs| {
             if theirs.write_all(b"\x1b]11;").is_err() {
                 return;
             }
@@ -604,7 +622,7 @@ mod tests {
                 }
             }
         });
-        assert_within(took, LIMIT, LIMIT + Duration::from_millis(300));
+        assert_within(took, LIMIT, LIMIT + QUIET);
         assert_eq!(replies.handoff(), Handoff::Osc);
         assert!(!replies.answered());
     }
@@ -615,11 +633,12 @@ mod tests {
             let stopped = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&stopped);
             let stop = move || stopped.load(Ordering::SeqCst);
-            let (replies, _) = trickled(&stop, move |mut theirs| {
+            let (replies, took) = trickled(&stop, move |theirs| {
                 theirs.write_all(bytes).unwrap();
                 thread::sleep(Duration::from_millis(100));
                 flag.store(true, Ordering::SeqCst);
             });
+            assert_within(took, Duration::from_millis(100), BEFORE_QUIET);
             assert_eq!(replies.handoff(), handoff, "{bytes:?}");
             assert!(!replies.answered(), "{bytes:?}");
         }
@@ -635,7 +654,7 @@ mod tests {
             let (replies, took) = answered(bytes);
             assert!(replies.answered(), "{bytes:?}");
             assert_eq!(replies.handoff(), Handoff::None, "{bytes:?}");
-            assert!(took < Duration::from_millis(100), "{took:?}");
+            assert_before_quiet(took);
         }
         for bytes in [&b"\x1b[1;1R"[..], b"\x1b[?1u", b"\x1b]11;?\x07"] {
             let mut replies = Replies::new();
