@@ -642,11 +642,13 @@ impl Engine {
             .registry
             .get(&row.provider)
             .is_some_and(|p| self.in_session(p.as_ref(), &row));
-        self.account_view_with(row, active, true, in_session, false)
+        // Trust under the provider's settings as they are now, as the list row judges it.
+        let (settings, _) = Settings::load(&self.env, &row.provider);
+        self.account_view_with(row, active, true, in_session, false, &settings.models)
     }
 
-    /// `account_view`, with or without pace on its windows (see `usage_view`), and with
-    /// `in_session` as the caller knows it. It is never computed here: `statusline` passes
+    /// `account_view`, with or without pace on its windows (see `usage_view`), its trust judged
+    /// under `models`, and with `in_session` as the caller knows it. It is never computed here: `statusline` passes
     /// `false`, which keeps the status bar away from profile directories (§13.5, Decision 17).
     /// A usage read that fails is logged at WARN, or at DEBUG for the status bar
     /// (`status_bar`), where everything logs at DEBUG at most (§14.2).
@@ -657,26 +659,16 @@ impl Engine {
         with_pace: bool,
         in_session: bool,
         status_bar: bool,
+        models: &[String],
     ) -> AccountView {
         let provider = self.registry.get(&row.provider);
         let kind = provider
             .as_ref()
             .map_or(UNREGISTERED, |p| p.kind_traits(&row.kind));
         let supported = provider.is_some_and(|p| p.capabilities().usage);
-        // Trust under the provider's settings as they are now, as the list row judges it.
-        let (settings, _) = Settings::load(&self.env, &row.provider);
         let usage = self
             .existing_store()
-            .and_then(|s| {
-                self.usage_view(
-                    s.as_deref(),
-                    &row,
-                    &kind,
-                    supported,
-                    with_pace,
-                    &settings.models,
-                )
-            })
+            .and_then(|s| self.usage_view(s.as_deref(), &row, &kind, supported, with_pace, models))
             .unwrap_or_else(|e| {
                 if status_bar {
                     tracing::debug!(
@@ -902,7 +894,8 @@ impl Engine {
     }
 
     /// §13.5: the line's account and, when tagteam manages it, its usage. No network, no
-    /// Keychain, and the store is never created.
+    /// Keychain, and the store is never created. Its trust is judged under the engine's
+    /// settings, as the one-shot process read them: the line reads no `config.toml` again.
     /// - In a run shell for `provider` (§12.8), the account the marker names, by id
     ///   (`shell_account`): no `.claude.json` is parsed, the profile's or the default home's,
     ///   and one tagteam does not manage shows nothing.
@@ -921,7 +914,14 @@ impl Engine {
                     // account is in a session (Decision 17): the status bar stays away from
                     // profile directories. It logs at DEBUG at most (§14.2).
                     ShellAccount::Managed(row) => StatuslineView::Managed {
-                        account: self.account_view_with(row, false, false, false, true),
+                        account: self.account_view_with(
+                            row,
+                            false,
+                            false,
+                            false,
+                            true,
+                            &self.settings().models,
+                        ),
                     },
                     ShellAccount::Unmanaged | ShellAccount::NotInShell => StatuslineView::NoLogin,
                 });
@@ -940,7 +940,14 @@ impl Engine {
             // The line shows no pace, so none is computed, and no session state (Decision 17).
             // It logs at DEBUG at most (§14.2).
             Some(row) => StatuslineView::Managed {
-                account: self.account_view_with(row, true, false, false, true),
+                account: self.account_view_with(
+                    row,
+                    true,
+                    false,
+                    false,
+                    true,
+                    &self.settings().models,
+                ),
             },
             None => StatuslineView::Unmanaged { email: login.label },
         })

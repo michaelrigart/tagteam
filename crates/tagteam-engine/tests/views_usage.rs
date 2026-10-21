@@ -1209,3 +1209,34 @@ fn every_view_judges_trust_under_the_provider_s_settings_as_they_are_now() {
         "under the models as written"
     );
 }
+
+#[test]
+fn the_statusline_judges_trust_under_the_engine_s_settings() {
+    // §13.5: a one-shot process, whose start-up snapshot is as fresh as a load; the line reads
+    // no `config.toml` again. `account_view` reads the provider's settings as they are now. a
+    // was read 4000 s ago and refused since; its Fable window has reset already.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a"); // live
+    let windows = vec![
+        window("5h", "5h", WindowKind::Short, 10.0, T0 + 9_630),
+        window("7d", "7d", WindowKind::Long, 10.0, T0 + 291_630),
+        window("scoped:Fable", "Fable", WindowKind::Scoped, 10.0, T0 - 100),
+    ];
+    record(&fx, &a, &windows, T0 - 4_000, T0 - 3_500);
+    fail(&fx, &a, "http-429", T0 - 3_000, T0 + 600, Some(T0 + 600));
+    fs::create_dir_all(fx.env.config_dir()).unwrap();
+    fs::write(
+        fx.env.config_dir().join("config.toml"),
+        "[autoswitch]\nmodels = [\"Fable\"]\n",
+    )
+    .unwrap();
+    let StatuslineView::Managed { account } = fx.engine.statusline(&fx.provider()).unwrap() else {
+        panic!("the live account is managed");
+    };
+    assert!(
+        account.usage.decision_grade,
+        "under the start-up models, which do not name Fable"
+    );
+    let stored = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
+    assert!(!fx.engine.account_view(stored, true).usage.decision_grade);
+}
