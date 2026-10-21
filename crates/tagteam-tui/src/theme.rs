@@ -116,22 +116,60 @@ impl Theme {
         }
     }
 
+    /// §4.1's `surface`: a dialog's background in tier 2, nothing otherwise.
+    pub(crate) fn surface(self) -> Style {
+        match self.tier {
+            Tier::True(background) => Style::new().bg(surface_color(background)),
+            Tier::NoColor | Tier::Ansi => Style::new(),
+        }
+    }
+
+    /// DIM: the backdrop behind an overlay (§9.1), and later a disabled row or a stale report.
+    pub(crate) fn dim(self) -> Style {
+        Style::new().add_modifier(Modifier::DIM)
+    }
+
     /// A focused button or the text cursor (§4.3, §9.1): an accent fill in tiers 1 and 2 (the
     /// text in the tier's background: black in tier 1, `surface`'s hex in tier 2), REVERSED in
     /// tier 0.
     pub(crate) fn focus(self) -> Style {
+        self.fill(Role::Accent)
+    }
+
+    /// A focused destructive button (§9.1): `focus`, filled in crit. Tier 0 keeps crit's
+    /// modifiers under REVERSED.
+    pub(crate) fn focus_crit(self) -> Style {
+        self.fill(Role::Crit)
+    }
+
+    fn fill(self, role: Role) -> Style {
         match self.tier {
-            Tier::NoColor => Style::new().add_modifier(Modifier::REVERSED),
-            Tier::Ansi => Style::new().fg(Color::Black).bg(Color::Cyan),
+            Tier::NoColor => {
+                let reversed = Style::new().add_modifier(Modifier::REVERSED);
+                if role == Role::Crit {
+                    self.role(role).patch(reversed)
+                } else {
+                    reversed
+                }
+            }
+            Tier::Ansi => {
+                let fill = self.role(role).fg.unwrap_or(Color::Reset);
+                Style::new().fg(Color::Black).bg(fill)
+            }
             Tier::True(background) => {
-                let text = match background {
-                    Background::Dark => Color::Rgb(0x1f, 0x23, 0x29),
-                    Background::Light => Color::Rgb(0xf6, 0xf8, 0xfa),
-                };
-                let fill = self.role(Role::Accent).fg.unwrap_or(text);
+                let text = surface_color(background);
+                let fill = self.role(role).fg.unwrap_or(text);
                 Style::new().fg(text).bg(fill)
             }
         }
+    }
+}
+
+/// §4.1's `surface` hex: a dialog's background, and the text of a fill drawn on it.
+const fn surface_color(background: Background) -> Color {
+    match background {
+        Background::Dark => Color::Rgb(0x1f, 0x23, 0x29),
+        Background::Light => Color::Rgb(0xf6, 0xf8, 0xfa),
     }
 }
 
@@ -247,6 +285,39 @@ mod tests {
             assert_eq!(theme.sel_bg(), sel, "{theme:?}");
             assert_eq!(theme.focus(), focus, "{theme:?}");
         }
+    }
+
+    #[test]
+    fn surface_is_tier_2s_ground_dim_is_a_modifier_and_a_fill_draws_on_the_surface() {
+        let rgb = |r, g, b| Color::Rgb(r, g, b);
+        let surface = [
+            Style::new(),
+            Style::new(),
+            Style::new().bg(rgb(0x1f, 0x23, 0x29)),
+            Style::new().bg(rgb(0xf6, 0xf8, 0xfa)),
+        ];
+        for (theme, surface) in TIERS.into_iter().zip(surface) {
+            assert_eq!(theme.surface(), surface, "{theme:?}");
+            assert_eq!(theme.dim(), Style::new().add_modifier(Modifier::DIM));
+            // A fill's text is the surface's own colour in tier 2: one source for the hex.
+            if let Some(ground) = surface.bg {
+                assert_eq!(theme.focus().fg, Some(ground), "{theme:?}");
+                assert_eq!(theme.focus_crit().fg, Some(ground), "{theme:?}");
+                assert_eq!(
+                    theme.focus_crit().bg,
+                    theme.role(Role::Crit).fg,
+                    "{theme:?}"
+                );
+            }
+        }
+        assert_eq!(
+            TIERS[1].focus_crit(),
+            Style::new().fg(Color::Black).bg(Color::Red)
+        );
+        assert_eq!(
+            TIERS[0].focus_crit(),
+            TIERS[0].role(Role::Crit).add_modifier(Modifier::REVERSED)
+        );
     }
 
     #[test]

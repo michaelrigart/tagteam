@@ -14,7 +14,9 @@ use tagteam_engine::tokens::{
 use super::table::account_name;
 use super::{TokensState, load};
 use crate::msg::Cmd;
-use crate::overlay::{CHOICE_ROWS, GUTTER, KeyOutcome, Overlay, boxed, gutter_rows};
+use crate::overlay::{
+    BOX_COLS, BOX_ROWS, BoxSpec, CHOICE_ROWS, GUTTER, KeyOutcome, Overlay, boxed, gutter_rows,
+};
 use crate::source::SourceError;
 use crate::state::State;
 use crate::view::{scrolled_windows, wrap_rows};
@@ -275,7 +277,7 @@ pub(crate) fn handle_key(
 pub(crate) fn render(state: &State, dialog: &FilterDialog, frame: &mut Frame) {
     let area = frame.area();
     let w = 64u16.min(area.width.saturating_sub(4));
-    let inner = usize::from(w).saturating_sub(4).max(1);
+    let inner = usize::from(w).saturating_sub(BOX_COLS).max(1);
     let mut tail: Vec<Line<'static>> = Vec::new();
     if let Some(error) = &dialog.error {
         let style = state
@@ -297,15 +299,15 @@ pub(crate) fn render(state: &State, dialog: &FilterDialog, frame: &mut Frame) {
             );
         }
         lines.extend(tail);
-        lines.push(Line::from("Esc cancel"));
-        boxed(frame, area, " Filter ", lines, w);
+        let spec = BoxSpec {
+            title: "Filter".to_owned(),
+            keys: "Esc cancel",
+            destructive: false,
+            width: w,
+        };
+        boxed(frame, state.theme, spec, lines);
         return;
     };
-    tail.extend(
-        wrap_rows(KEYS, inner, CHOICE_ROWS)
-            .into_iter()
-            .map(Line::from),
-    );
     // Each choice's rows, after its kind's heading when it is the first of its kind.
     let mut blocks: Vec<Vec<Line<'static>>> = Vec::new();
     let mut at = 0;
@@ -335,9 +337,10 @@ pub(crate) fn render(state: &State, dialog: &FilterDialog, frame: &mut Frame) {
         }
         blocks.push(block);
     }
-    // The box: the list, the tail, the border, and a row's margin above and below.
+    // The box: the list, the tail, the border and padding, and a row's margin above and below.
+    // The keys are in the border.
     let room = usize::from(area.height)
-        .saturating_sub(tail.len() + 4)
+        .saturating_sub(tail.len() + BOX_ROWS + 2)
         .max(1);
     let heights: Vec<usize> = blocks.iter().map(Vec::len).collect();
     // From the first choice that keeps the cursor's whole choice in view.
@@ -355,7 +358,13 @@ pub(crate) fn render(state: &State, dialog: &FilterDialog, frame: &mut Frame) {
         .flat_map(|(_, block)| block)
         .collect();
     lines.extend(tail);
-    boxed(frame, area, " Filter ", lines, w);
+    let spec = BoxSpec {
+        title: "Filter".to_owned(),
+        keys: KEYS,
+        destructive: false,
+        width: w,
+    };
+    boxed(frame, state.theme, spec, lines);
 }
 
 #[cfg(test)]
@@ -368,6 +377,13 @@ mod tests {
     use crate::state::Screen;
     use crate::testutil::*;
     use crate::update::update;
+
+    /// The dialog's keys are in its bottom border, flush to the corner.
+    fn keys_in_border(lines: &[String]) -> bool {
+        lines
+            .iter()
+            .any(|l| l.contains(&format!("{KEYS} ─╯")) && l.contains('╰'))
+    }
 
     const OPUS: &str = "claude-opus-5-5";
     const SONNET: &str = "claude-sonnet-5-5";
@@ -498,7 +514,7 @@ mod tests {
         ] {
             assert!(lines.iter().any(|l| l.contains(text)), "{text}: {lines:?}");
         }
-        assert!(lines.iter().any(|l| l.contains(KEYS)));
+        assert!(keys_in_border(&lines), "{lines:?}");
     }
 
     #[test]
@@ -594,14 +610,21 @@ mod tests {
 
     #[test]
     fn the_dialog_takes_every_key_and_esc_leaves_the_filter_as_it_was() {
-        // R9: `q` and `1` are the dialog's while it is open.
+        // R9: `1` is the dialog's while it is open, and `q` closes it (as `Esc` does, UX-16)
+        // before it would quit.
         let mut state = dialog();
-        update(&mut state, ch('q'), NOW_MS);
         update(&mut state, ch('1'), NOW_MS);
         assert_eq!((state.quitting, state.screen), (None, Screen::Tokens));
+        assert!(state.overlay.is_some());
         update(&mut state, ch(' '), NOW_MS);
         assert!(update(&mut state, key(KeyCode::Esc), NOW_MS).is_empty());
         assert!(state.overlay.is_none());
+        assert_eq!(state.tokens.query(NOW_MS).accounts, None);
+        let mut state = dialog();
+        update(&mut state, ch(' '), NOW_MS);
+        assert!(update(&mut state, ch('q'), NOW_MS).is_empty());
+        assert!(state.overlay.is_none());
+        assert_eq!((state.quitting, state.screen), (None, Screen::Tokens));
         assert_eq!(state.tokens.query(NOW_MS).accounts, None);
     }
 
@@ -705,7 +728,7 @@ mod tests {
             lines.iter().any(|l| l.contains("[x] model-40")),
             "{lines:?}"
         );
-        assert!(lines.iter().any(|l| l.contains(KEYS)), "{lines:?}");
+        assert!(keys_in_border(&lines), "{lines:?}");
         update(&mut state, key(KeyCode::Home), NOW_MS);
         let lines = draw(&state, 80, 24);
         assert!(lines.iter().any(|l| l.contains("Accounts")), "{lines:?}");
@@ -774,21 +797,23 @@ mod tests {
                 .map(|l| l.split('│').nth(1).unwrap_or("").to_owned())
                 .collect()
         };
-        let lines = inside(&draw(&state, 80, 24));
+        let drawn = draw(&state, 80, 24);
+        let lines = inside(&drawn);
         let read = squash(&lines.concat());
         assert!(
             read.contains(&squash(&format!("[x] 2 {alias} ({label})"))),
             "{lines:?}"
         );
         assert!(!lines.iter().any(|l| l.contains('…')), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains(KEYS)), "{lines:?}");
+        assert!(keys_in_border(&drawn), "{drawn:?}");
         update(&mut state, key(KeyCode::End), NOW_MS);
-        let lines = inside(&draw(&state, 80, 24));
+        let drawn = draw(&state, 80, 24);
+        let lines = inside(&drawn);
         assert!(
             squash(&lines.concat()).contains(&squash(&format!("[x] {model}-12"))),
             "the last choice whole: {lines:?}"
         );
-        assert!(lines.iter().any(|l| l.contains(KEYS)), "{lines:?}");
+        assert!(keys_in_border(&drawn), "{drawn:?}");
         // A long failure wraps too.
         let mut state = fresh(Screen::Tokens);
         state.start();
@@ -858,22 +883,27 @@ mod tests {
                 .map(|l| l.split('│').nth(1).unwrap_or("").trim_end().to_owned())
                 .collect()
         };
-        let lines = inside(&draw(&state, 80, 24));
+        let drawn = draw(&state, 80, 24);
+        let lines = inside(&drawn);
         assert!(
             lines.iter().any(|l| l.contains("[x] 1 a1@x.co")),
             "{lines:?}"
         );
-        assert!(lines.iter().any(|l| l.contains(KEYS)), "{lines:?}");
+        assert!(keys_in_border(&drawn), "{drawn:?}");
         // The long model is the last; End puts the cursor on it.
         update(&mut state, key(KeyCode::End), NOW_MS);
-        let lines = inside(&draw(&state, 80, 24));
-        let at = lines
+        let drawn = draw(&state, 80, 24);
+        let at = drawn
             .iter()
-            .position(|l| l.starts_with(" ▌ [x] claude-xxx"))
-            .unwrap_or_else(|| panic!("{lines:?}"));
-        assert!(lines[at + 1].contains(&"x".repeat(40)), "{lines:?}");
-        assert!(lines[at + 2].ends_with('…'), "{lines:?}");
-        assert!(lines[at + 3].contains(KEYS), "{lines:?}");
+            .position(|l| l.contains("▌ [x] claude-xxx"))
+            .unwrap_or_else(|| panic!("{drawn:?}"));
+        assert!(drawn[at + 1].contains(&"x".repeat(40)), "{drawn:?}");
+        assert!(drawn[at + 2].ends_with("…  │"), "{drawn:?}");
+        assert!(
+            drawn[at + 4].contains(KEYS),
+            "after a padding row: {drawn:?}"
+        );
+        assert!(keys_in_border(&drawn), "{drawn:?}");
         // The gutter's `▌` is on the choice's first row only; its text is bold on all three.
         let buf = draw_buffer(&state, 80, 24, NOW_MS);
         let (x, y) = locate(&buf, "▌ [x] claude-xxx").unwrap();
@@ -898,12 +928,15 @@ mod tests {
             result: failed,
         };
         update(&mut state, msg, NOW_MS);
-        let lines = inside(&draw(&state, 80, 24));
-        let at = lines
+        let drawn = draw(&state, 80, 24);
+        let at = drawn
             .iter()
             .position(|l| l.contains("the choices could not be read"))
-            .unwrap_or_else(|| panic!("{lines:?}"));
-        assert!(lines[at + 2].ends_with('…'), "{lines:?}");
-        assert!(lines[at + 3].contains("Esc cancel"), "{lines:?}");
+            .unwrap_or_else(|| panic!("{drawn:?}"));
+        assert!(drawn[at + 2].contains('…'), "{drawn:?}");
+        assert!(
+            drawn[at + 4].contains("Esc cancel ─╯"),
+            "the keys in the border, after a padding row: {drawn:?}"
+        );
     }
 }

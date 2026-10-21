@@ -1337,15 +1337,15 @@ mod tests {
         for _ in 0..5 {
             update(&mut state, key(KeyCode::Down), NOW_MS);
         }
-        let drawn = draw(&state, 80, 24);
-        assert!(drawn.iter().any(|l| l.contains("check 6: ok")));
-        assert!(!drawn.iter().any(|l| l.contains("check 5: ok")));
+        let shown = panel_text(&state, 80, 24);
+        assert_eq!(shown[0], "check 6: ok");
+        assert!(!shown.iter().any(|l| l.contains("check 5: ok")));
         for _ in 0..100 {
             update(&mut state, key(KeyCode::Down), NOW_MS);
         }
         assert!(
-            matches!(state.overlay, Some(Overlay::Doctor { scroll: 20, .. })),
-            "40 rows in a 20-row panel: the last page, not the last row on top"
+            matches!(state.overlay, Some(Overlay::Doctor { scroll: 23, .. })),
+            "40 rows in a 17-row panel (the body's 21, less its frame): the last page, not the last row on top"
         );
         assert_eq!(
             update(&mut state, ch('o'), NOW_MS),
@@ -1360,7 +1360,7 @@ mod tests {
 
     #[test]
     fn a_long_output_line_wraps_in_its_panel_and_scrolls_to_its_end() {
-        // Spec §5.5: the panel shows the action's output; at 80 columns it is 72 wide.
+        // Spec §5.5: the panel shows the action's output; at 80 columns it is 74 wide.
         let mut state = loaded(1);
         let long = "  warning: usage for averyveryverylongname@example.com (position 2) was not collected: the endpoint answered http-429, retry in 5m";
         let text: String = (1..=30)
@@ -1377,40 +1377,31 @@ mod tests {
         let Some(Overlay::Result { scroll, .. }) = &state.overlay else {
             panic!("{:?}", state.overlay);
         };
-        assert_eq!(*scroll, 12, "32 rows, the last page of 20");
-        let drawn = draw(&state, 80, 24);
-        let inside = |l: &String| l.chars().skip(4).take(72).collect::<String>();
+        assert_eq!(*scroll, 15, "32 rows, the last page of 17");
+        let shown = panel_text(&state, 80, 24);
         assert_eq!(
-            inside(&drawn[21]).trim_end(),
+            shown.last().unwrap(),
             "  not collected: the endpoint answered http-429, retry in 5m",
-            "the last row, indented as its line is: {drawn:?}"
+            "the last row, indented as its line is: {shown:?}"
         );
-        assert_eq!(
-            drawn[2].chars().skip(4).take(7).collect::<String>(),
-            "line 13"
-        );
+        assert_eq!(shown[0], "line 16");
         update(&mut state, key(KeyCode::Up), NOW_MS);
-        let drawn = draw(&state, 80, 24);
+        let shown = panel_text(&state, 80, 24);
         assert_eq!(
-            inside(&drawn[21]).trim_end(),
+            shown.last().unwrap(),
             "  warning: usage for averyveryverylongname@example.com (position 2) was"
         );
     }
 
     #[test]
     fn a_resize_clamps_a_panels_scroll_and_the_next_key_moves_at_once() {
-        // Thirty 100-column lines: two rows each at 80 columns, one at 120.
-        let text: String = (1..=30)
+        // Twenty-nine 97-column lines, two rows each at 80 columns and one at 120, then a short
+        // one: the last page starts on a line's first row at both widths.
+        let text: String = (1..=29)
             .map(|i| format!("{i:02} {}\n", "word ".repeat(19).trim_end()))
+            .chain(["30 end\n".to_owned()])
             .collect();
-        let first_row = |state: &State, w: u16| -> String {
-            let drawn = draw(state, w, 24);
-            drawn[2]
-                .chars()
-                .skip(4)
-                .take(usize::from(w) - 8)
-                .collect::<String>()
-        };
+        let first_row = |state: &State, w: u16| -> String { panel_text(state, w, 24).remove(0) };
         for action in [
             Action::Switch(sel(1)),
             Action::Doctor {
@@ -1422,8 +1413,8 @@ mod tests {
             on_done(&mut state, action.clone(), done(1, &text, ""), NOW_MS);
             update(&mut state, key(KeyCode::End), NOW_MS);
             assert!(
-                first_row(&state, 80).starts_with("21 word"),
-                "{action:?}: the last page of 60 rows starts at row 40"
+                first_row(&state, 80).starts_with("22 word"),
+                "{action:?}: the last page of 59 rows starts at row 42"
             );
             update(
                 &mut state,
@@ -1434,12 +1425,12 @@ mod tests {
                 NOW_MS,
             );
             assert!(
-                first_row(&state, 120).starts_with("11 word"),
+                first_row(&state, 120).starts_with("14 word"),
                 "{action:?}: the last page of 30 rows, not a blank panel"
             );
             update(&mut state, key(KeyCode::Up), NOW_MS);
             assert!(
-                first_row(&state, 120).starts_with("10 word"),
+                first_row(&state, 120).starts_with("13 word"),
                 "{action:?}: Up moves from what shows"
             );
         }
@@ -1447,8 +1438,8 @@ mod tests {
 
     #[test]
     fn a_panel_scrolls_no_further_than_its_last_page() {
-        // A 24-row terminal: 20 rows of text between the panel's borders.
-        for (lines, furthest) in [(5, 0), (20, 0), (21, 1), (45, 25)] {
+        // A 24-row terminal: its body is 21 rows, so 17 rows of text between the panel's frame.
+        for (lines, furthest) in [(5, 0), (17, 0), (18, 1), (45, 28)] {
             for action in [
                 Action::Switch(sel(1)),
                 Action::Doctor {
@@ -1484,7 +1475,7 @@ mod tests {
                 assert!(
                     drawn
                         .iter()
-                        .any(|l| l.contains(&format!("line {}", lines - 19.min(lines - 1)))),
+                        .any(|l| l.contains(&format!("line {}", lines - 16.min(lines - 1)))),
                     "and a full page with it: {drawn:?}"
                 );
             }
@@ -1503,14 +1494,9 @@ mod tests {
         ] {
             let mut state = loaded(1);
             on_done(&mut state, action.clone(), done(1, text, ""), NOW_MS);
-            let drawn = draw(&state, 80, 24);
-            let inside = |l: &String| l.chars().skip(4).take(72).collect::<String>();
-            let rows: Vec<String> = drawn[2..9]
-                .iter()
-                .map(|l| inside(l).trim_end().to_owned())
-                .collect();
+            let rows = panel_text(&state, 80, 24);
             assert_eq!(
-                rows,
+                rows[..7],
                 [
                     "claude-code",
                     "  ok one",
@@ -1547,18 +1533,8 @@ mod tests {
             done(1, &line, ""),
             NOW_MS,
         );
-        let drawn = draw(&state, 80, 24);
-        let rows: Vec<String> = drawn[3..6]
-            .iter()
-            .map(|l| {
-                l.chars()
-                    .skip(4)
-                    .take(72)
-                    .collect::<String>()
-                    .trim_end()
-                    .to_owned()
-            })
-            .collect();
+        let shown = panel_text(&state, 80, 24);
+        let rows = &shown[1..3];
         let indent = " ".repeat(24);
         assert!(
             rows.iter().all(|r| r.starts_with(&indent) && r.len() > 24),
@@ -1598,7 +1574,7 @@ mod tests {
         let text = |y: usize| -> String {
             lines[y]
                 .chars()
-                .skip(10)
+                .skip(11)
                 .take(60)
                 .collect::<String>()
                 .trim_end()
@@ -1621,18 +1597,18 @@ mod tests {
         for y in at..at + 3 {
             let y = u16::try_from(y).unwrap();
             let bar = if y as usize == at { "▌" } else { " " };
-            assert_eq!(buf[(10, y)].symbol(), bar, "row {y}");
-            for x in 12..20 {
+            assert_eq!(buf[(11, y)].symbol(), bar, "row {y}");
+            for x in 13..21 {
                 assert!(buf[(x, y)].modifier.contains(bold), "{x},{y}");
             }
-            for x in 10..70 {
+            for x in 11..69 {
                 assert!(!buf[(x, y)].modifier.contains(reversed), "{x},{y}");
             }
         }
         // The first choice is not selected: no bar, no bold.
         let first = u16::try_from(at - 1).unwrap();
-        assert_eq!(buf[(10, first)].symbol(), " ");
-        assert!(!buf[(12, first)].modifier.contains(bold));
+        assert_eq!(buf[(11, first)].symbol(), " ");
+        assert!(!buf[(13, first)].modifier.contains(bold));
     }
 
     #[test]
@@ -1652,14 +1628,14 @@ mod tests {
             }),
             NOW_MS,
         );
-        // The box's content starts at column 10. A choice's two-column gutter (`▌ ` on the
+        // The box's content starts at column 11. A choice's two-column gutter (`▌ ` on the
         // selected one) comes first, so `choices` drops it to read the choices' own text.
         let text = |state: &State| -> Vec<String> {
             draw(state, 80, 24)
                 .iter()
                 .map(|l| {
                     l.chars()
-                        .skip(10)
+                        .skip(11)
                         .take(60)
                         .collect::<String>()
                         .trim_end()
@@ -1684,9 +1660,10 @@ mod tests {
             "{shown:?}"
         );
         assert!(
-            text(&state)
+            draw(&state, 80, 24)
                 .iter()
-                .any(|l| l == "↑ ↓ choose · Enter · Esc cancel")
+                .any(|l| l.ends_with("↑ ↓ choose · Enter · Esc cancel ─╯")),
+            "the keys stay in the border"
         );
         for _ in 0..19 {
             update(&mut state, key(KeyCode::Down), NOW_MS);
@@ -1697,9 +1674,10 @@ mod tests {
             "{shown:?}"
         );
         assert!(
-            text(&state)
+            draw(&state, 80, 24)
                 .iter()
-                .any(|l| l == "↑ ↓ choose · Enter · Esc cancel")
+                .any(|l| l.ends_with("↑ ↓ choose · Enter · Esc cancel ─╯")),
+            "the keys stay in the border"
         );
     }
 

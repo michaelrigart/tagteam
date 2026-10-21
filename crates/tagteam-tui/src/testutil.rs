@@ -251,6 +251,26 @@ pub(crate) fn body_of(state: &State, w: u16, h: u16, now_ms: i64) -> Vec<String>
     rows.split_off(usize::from(body.y))
 }
 
+/// What a panel shows of its text on a `w`×`h` terminal: the rows of the body between the
+/// panel's border and padding (four rows less than the body), each without the border and
+/// padding beside it, trailing spaces trimmed.
+pub(crate) fn panel_text(state: &State, w: u16, h: u16) -> Vec<String> {
+    let body = crate::view::areas(state, Rect::new(0, 0, w, h)).body;
+    let mut rows = draw(state, w, h);
+    rows.truncate(usize::from(body.y + body.height).saturating_sub(2));
+    rows.split_off(usize::from(body.y) + 2)
+        .iter()
+        .map(|l| {
+            l.chars()
+                .skip(3)
+                .take(usize::from(w) - 6)
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
+}
+
 /// Each row of `buf` as text, trailing spaces trimmed. A cell a wide character covers is
 /// skipped, as a terminal shows it.
 pub(crate) fn text_of(buf: &Buffer) -> Vec<String> {

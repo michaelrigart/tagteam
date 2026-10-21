@@ -8,12 +8,12 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::KeyOutcome;
 use super::panel::{panel, panel_width, scrolled};
+use super::{BoxSpec, KeyOutcome};
 use crate::keys::KEYS;
 use crate::state::{Screen, State};
 use crate::theme::Role;
-use crate::view::{pad, width_of, wrap};
+use crate::view::{body_at, pad, width_of, wrap};
 
 /// From this many columns wide the help runs in two columns (§9.2).
 const TWO_COLUMNS: u16 = 100;
@@ -44,8 +44,8 @@ pub(super) fn key(state: &State, scroll: &mut u16, key: KeyEvent) -> KeyOutcome 
     match key.code {
         KeyCode::Char('?' | 'q') | KeyCode::Esc | KeyCode::Enter => KeyOutcome::Close,
         code => {
-            let (width, height) = state.size;
-            *scroll = scrolled(*scroll, code, rows(state, width).len(), height);
+            let rows = rows(state, state.size.0).len();
+            *scroll = scrolled(*scroll, code, rows, body_at(state).height);
             KeyOutcome::Keep
         }
     }
@@ -53,14 +53,13 @@ pub(super) fn key(state: &State, scroll: &mut u16, key: KeyEvent) -> KeyOutcome 
 
 pub(super) fn render(state: &State, frame: &mut Frame, area: Rect, scroll: u16) {
     let lines = rows(state, area.width);
-    panel(
-        frame,
-        area,
-        " Help ",
-        lines,
-        scroll,
-        "Esc close · ↑ ↓ scroll",
-    );
+    let spec = BoxSpec {
+        title: "Help".to_owned(),
+        keys: "Esc close · ↑ ↓ scroll",
+        destructive: false,
+        width: area.width,
+    };
+    panel(state, frame, spec, lines, scroll);
 }
 
 fn screen_name(screen: Screen) -> &'static str {
@@ -315,16 +314,18 @@ mod tests {
         let at = end.iter().position(|l| l.contains(last.2)).unwrap();
         assert!(inner(&end[at]).starts_with(last.0), "{end:?}");
         assert!(
-            end[at + 1].trim_start().starts_with('└'),
-            "the last row ends the panel: {end:?}"
+            inner(&end[at + 1]).is_empty() && end[at + 2].trim_start().starts_with('╰'),
+            "the last row ends the panel, its padding row and border below: {end:?}"
         );
+        // The panel's text starts two rows (border, padding) under the body's top.
+        let first = |state: &State| panel_text(state, 80, 24).remove(0);
         update(&mut state, key(KeyCode::Home), NOW_MS);
-        assert!(inner(&draw(&state, 80, 24)[2]).starts_with("Accounts"));
+        assert!(first(&state).starts_with("Accounts"));
         update(&mut state, key(KeyCode::PageDown), NOW_MS);
-        let after = draw(&state, 80, 24);
-        assert!(!inner(&after[2]).starts_with("Accounts"), "{after:?}");
+        let after = panel_text(&state, 80, 24);
+        assert!(!after[0].starts_with("Accounts"), "{after:?}");
         update(&mut state, key(KeyCode::PageUp), NOW_MS);
-        assert!(inner(&draw(&state, 80, 24)[2]).starts_with("Accounts"));
+        assert!(first(&state).starts_with("Accounts"));
     }
 
     #[test]
