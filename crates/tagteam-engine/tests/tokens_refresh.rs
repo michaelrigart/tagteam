@@ -17,7 +17,7 @@ use tagteam_engine::settings::Settings;
 use tagteam_engine::store::{RefreshStats, TokenFileRow, UsageRow, usage_key};
 use tagteam_engine::tokens::{IndexProgress, IndexReport, RefreshOutcome, Wait, tokens_lock_path};
 use tagteam_engine::vault::{KeychainVault, Vault};
-use tagteam_engine::{Engine, EngineConfig};
+use tagteam_engine::{Engine, EngineConfig, EventSource};
 use tagteam_fake::{FakeAgent, FakeUsage, append_transcript, usage_line_json};
 use tagteam_provider::{Cancel, Clock, FlockGuard, RunShell};
 
@@ -109,6 +109,7 @@ fn fake_engine(ffx: &FakeFx, fake: FakeAgent, settings: Settings) -> Engine {
         process: ffx.fx.process.clone(),
         spawner: ffx.fx.spawner.clone(),
         run_shell: RunShell::Outside,
+        source: EventSource::Cli,
     })
 }
 

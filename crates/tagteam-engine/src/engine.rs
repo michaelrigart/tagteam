@@ -11,6 +11,7 @@ use tagteam_provider::{Cancel, Clock, Env, Http, MutationGuard, Provider, Provid
 
 use crate::account_lock::AccountLock;
 use crate::error::EngineError;
+use crate::event::EventSource;
 use crate::hooks;
 use crate::oracle::Oracle;
 use crate::registry::ProviderRegistry;
@@ -108,6 +109,9 @@ pub struct EngineConfig {
     pub spawner: Arc<dyn ProcessSpawner>,
     /// §12.8, from `detect_run_shell`; `env` is already the effective (outer) environment.
     pub run_shell: RunShell,
+    /// Who raised the events this engine records: the command that built it (review refactor
+    /// §8.7).
+    pub source: EventSource,
 }
 
 pub struct Engine {
@@ -126,6 +130,8 @@ pub struct Engine {
     pub(crate) spawner: Arc<dyn ProcessSpawner>,
     /// Where this process stands (§12.8).
     pub(crate) run_shell: RunShell,
+    /// The `source` this engine's events are recorded under.
+    source: EventSource,
     store: Mutex<Option<Arc<Store>>>,
     #[cfg(feature = "test-hooks")]
     pub(crate) fail_at: Mutex<Option<&'static str>>,
@@ -148,6 +154,7 @@ impl Engine {
             process: cfg.process,
             spawner: cfg.spawner,
             run_shell: cfg.run_shell,
+            source: cfg.source,
             store: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
             fail_at: Mutex::new(None),
@@ -158,6 +165,11 @@ impl Engine {
 
     pub fn env(&self) -> &Env {
         &self.env
+    }
+
+    /// Who raised the events this engine records (review refactor §8.7).
+    pub fn source(&self) -> EventSource {
+        self.source
     }
 
     /// The cancel token every cancellation point checks (§4.2, §14.1). It is the Env's, so
@@ -708,6 +720,7 @@ mod tests {
             process: Arc::new(tagteam_provider::liveness::FakeProcessProbe::new()),
             spawner: Arc::new(tagteam_provider::process::ScriptedSpawner::new()),
             run_shell: RunShell::Outside,
+            source: EventSource::Cli,
         }
     }
 
@@ -740,6 +753,18 @@ mod tests {
                 .provider_ids()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn the_engine_records_events_under_the_source_it_was_built_with() {
+        let d = tempfile::tempdir().unwrap();
+        for source in EventSource::ALL {
+            let engine = Engine::new(EngineConfig {
+                source,
+                ..test_config(Env::for_test(d.path()))
+            });
+            assert_eq!(engine.source(), source);
+        }
     }
 
     #[test]

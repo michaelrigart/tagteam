@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use clap::builder::{PossibleValue, StringValueParser, TypedValueParser};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use tagteam_engine::EventSource;
 use tagteam_engine::settings::KEYS;
 use tagteam_engine::tokens::TokenPeriod;
 use tagteam_provider::Platform;
@@ -492,6 +493,17 @@ pub enum ScreenArg {
 }
 
 impl Command {
+    /// Who the events the command's engine records are from (review refactor §8.7): `auto` and
+    /// the daemon's foreground run are their own sources, every other command, `daemon`'s
+    /// service actions included, is `cli`.
+    pub fn event_source(&self) -> EventSource {
+        match self {
+            Command::Auto { .. } => EventSource::Auto,
+            Command::Daemon { action: None } => EventSource::Daemon,
+            _ => EventSource::Cli,
+        }
+    }
+
     /// Whether the command reads or writes a Keychain item on macOS, and so runs the lock check
     /// first (Appendix A.3). `list` and `status` are not among them although they collect usage
     /// and may read Keychain items: they degrade to `keychain_unavailable` rows rather than run
@@ -908,5 +920,30 @@ mod tests {
                 action: Some(DaemonAction::Status)
             })
         ));
+    }
+
+    #[test]
+    fn each_command_records_its_events_under_its_own_source() {
+        use clap::Parser;
+        use tagteam_engine::EventSource;
+
+        for (args, source) in [
+            (&["tagteam", "auto"][..], EventSource::Auto),
+            (
+                &["tagteam", "auto", "--once", "--dry-run"],
+                EventSource::Auto,
+            ),
+            (&["tagteam", "daemon"], EventSource::Daemon),
+            (&["tagteam", "daemon", "status"], EventSource::Cli),
+            (&["tagteam", "daemon", "install"], EventSource::Cli),
+            (&["tagteam", "daemon", "uninstall"], EventSource::Cli),
+            (&["tagteam", "switch"], EventSource::Cli),
+            (&["tagteam", "tui"], EventSource::Cli),
+            (&["tagteam", "run"], EventSource::Cli),
+            (&["tagteam", "list"], EventSource::Cli),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.command.unwrap().event_source(), source, "{args:?}");
+        }
     }
 }

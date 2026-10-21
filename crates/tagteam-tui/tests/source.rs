@@ -22,7 +22,7 @@ use tagteam_engine::tokens::{
     PeriodKey, RefreshOutcome, RowAccount, TokenGrouping, TokenPeriod, TokenQuery, tokens_lock_path,
 };
 use tagteam_engine::vault::{KeychainVault, SERVICE, Vault};
-use tagteam_engine::{Engine, EngineConfig};
+use tagteam_engine::{Engine, EngineConfig, EventSource};
 use tagteam_fake::{FAKE_AGENT, FakeAgent, FakeUsage, append_transcript, usage_line_json};
 use tagteam_provider::http::Method;
 use tagteam_provider::liveness::FakeProcessProbe;
@@ -81,6 +81,7 @@ impl Home {
             process: Arc::new(FakeProcessProbe::new()),
             spawner: Arc::new(ScriptedSpawner::new()),
             run_shell,
+            source: EventSource::Cli,
         })
     }
 

@@ -379,7 +379,7 @@ mod tests {
     use tagteam_engine::settings::Settings;
     use tagteam_engine::store::{Eligibility, Reserve};
     use tagteam_engine::vault::{KeychainVault, SERVICE, Vault};
-    use tagteam_engine::{Engine, EngineConfig};
+    use tagteam_engine::{Engine, EngineConfig, EventSource};
     use tagteam_provider::liveness::SystemProcessProbe;
     use tagteam_provider::profile::RunShell;
     use tagteam_provider::{Clock, Env, FakeClock, FakeKeychain, ScriptedHttp};
@@ -427,6 +427,7 @@ mod tests {
                 // Nothing here validates, and a scripted spawner never starts a process (§15.1).
                 spawner: Arc::new(tagteam_provider::process::ScriptedSpawner::new()),
                 run_shell: RunShell::Outside,
+                source: EventSource::Auto,
             });
             Fx {
                 _dir: dir,

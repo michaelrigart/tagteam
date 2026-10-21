@@ -27,7 +27,7 @@ use tagteam_engine::store::{
 };
 use tagteam_engine::switch::{SwitchOutcome, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBackend, VaultError};
-use tagteam_engine::{Engine, EngineConfig, EngineError};
+use tagteam_engine::{Engine, EngineConfig, EngineError, EventSource};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::http::Method;
 use tagteam_provider::keychain::Keychain;
@@ -374,6 +374,7 @@ impl Fx {
             process: process.clone(),
             spawner: spawner.clone(),
             run_shell: RunShell::Outside,
+            source: EventSource::Cli,
         });
         Fx {
             dir,
@@ -840,6 +841,7 @@ impl Fx {
             process: self.process.clone(),
             spawner,
             run_shell,
+            source: EventSource::Cli,
         })
     }
 
@@ -880,6 +882,7 @@ impl Fx {
             process,
             spawner: self.spawner.clone(),
             run_shell: RunShell::Outside,
+            source: EventSource::Cli,
         })
     }
 
@@ -1298,6 +1301,7 @@ impl FakeFx {
             process: fx.process.clone(),
             spawner: fx.spawner.clone(),
             run_shell: RunShell::Outside,
+            source: EventSource::Cli,
         });
         FakeFx { fx, fake, engine }
     }
@@ -1327,6 +1331,7 @@ impl FakeFx {
             process: self.fx.process.clone(),
             spawner: self.fx.spawner.clone(),
             run_shell,
+            source: EventSource::Cli,
         })
     }
 
@@ -1501,6 +1506,7 @@ impl Fx {
             process: self.process.clone(),
             spawner: self.spawner.clone(),
             run_shell: RunShell::Outside,
+            source: EventSource::Cli,
         })
     }
 }

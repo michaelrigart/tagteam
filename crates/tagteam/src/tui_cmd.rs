@@ -6,6 +6,7 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 
 use tagteam_core::{AccountId, ProviderId};
+use tagteam_engine::EventSource;
 use tagteam_engine::daemon::daemon_socket_path;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::tokens::{IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport};
@@ -52,10 +53,11 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
     // `statusline`. It refuses an unknown `--provider`, prints the settings warnings once,
     // before the alternate screen hides them, and reads `ui.color`. It reads the settings file
     // and nothing else.
-    let (probe, warnings) = match app::engine_for(inside.clone(), provider.as_ref()) {
-        Ok(built) => built,
-        Err(e) => return app::fail_to(&mut out, &mut err, false, e.kind(), &e.to_string()),
-    };
+    let (probe, warnings) =
+        match app::engine_for(inside.clone(), provider.as_ref(), EventSource::Cli) {
+            Ok(built) => built,
+            Err(e) => return app::fail_to(&mut out, &mut err, false, e.kind(), &e.to_string()),
+        };
     for w in &warnings {
         let _ = writeln!(err, "warning: {w}");
     }
@@ -136,7 +138,7 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
 /// were printed once already. A lane whose engine cannot be built refuses every read with why.
 fn sources(ctx: Context, provider: Option<ProviderId>) -> SourceFactory {
     Arc::new(
-        move || match app::engine_for(ctx.clone(), provider.as_ref()) {
+        move || match app::engine_for(ctx.clone(), provider.as_ref(), EventSource::Cli) {
             Ok((engine, _warnings)) => Box::new(EngineSource::new(engine)) as Box<dyn Source>,
             Err(e) => Box::new(Refused(SourceError::from(e))),
         },

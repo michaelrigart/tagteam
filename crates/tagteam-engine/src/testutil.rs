@@ -15,6 +15,7 @@ use tagteam_provider::{Env, FakeClock, FakeKeychain, Identity, Provider};
 
 use crate::account_lock::AccountLock;
 use crate::engine::{Engine, EngineConfig};
+use crate::event::EventSource;
 use crate::oracle::NoOracle;
 use crate::registry::ProviderRegistry;
 use crate::settings::Settings;
@@ -59,6 +60,7 @@ impl T {
             process: Arc::new(tagteam_provider::liveness::FakeProcessProbe::new()),
             spawner: Arc::new(tagteam_provider::process::ScriptedSpawner::new()),
             run_shell: RunShell::Outside,
+            source: EventSource::Cli,
         });
         T {
             _dir: dir,

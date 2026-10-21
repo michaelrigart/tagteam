@@ -26,7 +26,7 @@ use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::vault::{KeychainVault, SERVICE, Vault};
-use tagteam_engine::{Engine, EngineConfig};
+use tagteam_engine::{Engine, EngineConfig, EventSource};
 use tagteam_provider::http::Method;
 use tagteam_provider::liveness::FakeProcessProbe;
 use tagteam_provider::process::{Captured, ScriptedSpawner};
@@ -137,6 +137,7 @@ impl Real {
             process: Arc::new(FakeProcessProbe::new()),
             run_shell: RunShell::Outside,
             spawner: spawner.clone(),
+            source: EventSource::Cli,
         });
         Real {
             env,

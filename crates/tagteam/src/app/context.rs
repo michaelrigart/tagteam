@@ -13,7 +13,7 @@ use tagteam_engine::service::recorded_vars;
 use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{self, ColorMode, Settings};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
-use tagteam_engine::{Engine, EngineConfig, EngineError};
+use tagteam_engine::{Engine, EngineConfig, EngineError, EventSource};
 use tagteam_provider::http::Http;
 use tagteam_provider::liveness::SystemProcessProbe;
 use tagteam_provider::process::SystemSpawner;
@@ -290,14 +290,16 @@ pub(crate) fn locate_run_shell(ctx: &Context) -> Result<Located, EngineError> {
 pub(crate) fn engine_for(
     ctx: Context,
     provider: Option<&ProviderId>,
+    source: EventSource,
 ) -> Result<(Engine, Vec<String>), EngineError> {
     let located = locate_run_shell(&ctx)?;
-    Ok(build_engine(
+    Ok(build_engine_as(
         ctx,
         located.registry,
         located.run_shell,
         located.env,
         provider,
+        source,
     ))
 }
 
@@ -356,13 +358,15 @@ pub(crate) fn command_settings(
 /// settings are those of the provider the command acts on (`flag`, else the default, as
 /// `command_settings` chooses it): its own tables come first. `env` is the effective
 /// environment `locate` returned with `run_shell`. The HTTP adapter is built on its first
-/// request, never before (§13.5), and the oracle sends through the same one.
-pub(crate) fn build_engine(
+/// request, never before (§13.5), and the oracle sends through the same one. The engine records
+/// its events under `source` (review refactor §8.7).
+pub(crate) fn build_engine_as(
     ctx: Context,
     registry: ProviderRegistry,
     run_shell: RunShell,
     env: Env,
     flag: Option<&ProviderId>,
+    source: EventSource,
 ) -> (Engine, Vec<String>) {
     let vault = match ctx.platform {
         Platform::MacOs => Vault::new(Box::new(KeychainVault::new(
@@ -401,6 +405,7 @@ pub(crate) fn build_engine(
         process: Arc::new(SystemProcessProbe),
         spawner: Arc::new(SystemSpawner),
         run_shell,
+        source,
     });
     (engine, chosen.warnings)
 }

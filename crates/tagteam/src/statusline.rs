@@ -16,7 +16,7 @@ use tagteam_engine::settings::{STATUSLINE_MODEL_PREFIX, is_statusline_placeholde
 use tagteam_engine::vault::{KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, StatuslineView};
 use tagteam_engine::words::{self, MISSING};
-use tagteam_engine::{Engine, EngineConfig};
+use tagteam_engine::{Engine, EngineConfig, EventSource};
 use tagteam_provider::liveness::SystemProcessProbe;
 use tagteam_provider::process::SystemSpawner;
 use tagteam_provider::{
@@ -291,6 +291,7 @@ fn assemble(
         // Nor does it launch or validate, so its spawner is never called either.
         spawner: Arc::new(SystemSpawner),
         run_shell,
+        source: EventSource::Cli,
     });
     (engine, chosen.provider)
 }
