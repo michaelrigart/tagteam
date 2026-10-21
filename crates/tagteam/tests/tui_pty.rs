@@ -1117,7 +1117,7 @@ fn p_pauses_the_daemon_s_auto_switch_and_resumes_it() {
     tui.wait_for(LONG, "live mode", live);
     tui.type_keys(b"P");
     tui.wait_for(LONG, "the question", |s| {
-        s.contains("Pause auto-switch for claude-code?")
+        s.contains("Pause auto for Claude Code?")
     });
     tui.type_keys(b"y");
     let confirmed = Instant::now();
@@ -1128,7 +1128,7 @@ fn p_pauses_the_daemon_s_auto_switch_and_resumes_it() {
     thread::sleep(Duration::from_millis(350).saturating_sub(confirmed.elapsed()));
     tui.type_keys(b"P");
     tui.wait_for(LONG, "the question", |s| {
-        s.contains("Resume auto-switch for claude-code?")
+        s.contains("Resume auto for Claude Code?")
     });
     tui.type_keys(b"y");
     tui.wait_for(LONG, "auto-switch again", live);

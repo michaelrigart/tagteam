@@ -12,12 +12,16 @@ use crate::screens;
 use crate::state::{Screen, State};
 use crate::theme::{Role, Theme};
 
-/// Below this the body is replaced by `TOO_SMALL` (spec §5.1).
+/// Below this the body is replaced by `too_small`'s notice (redesign §4.5).
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
-pub const TOO_SMALL: &str = "terminal too small (80×24 needed)";
 /// The spinner's frames, one per tick while an action runs.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// `Terminal 72×20 · tagteam needs 80×24` (§4.5, UX-16).
+pub(crate) fn too_small(width: u16, height: u16) -> String {
+    format!("Terminal {width}×{height} · tagteam needs {MIN_WIDTH}×{MIN_HEIGHT}")
+}
 
 /// Where each part of the screen goes (redesign §5.1).
 pub(crate) struct Areas {
@@ -182,7 +186,13 @@ pub(crate) fn wrap_rows(text: &str, width: usize, max: usize) -> Vec<String> {
 pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-        frame.render_widget(Paragraph::new(TOO_SMALL), area);
+        let notice = fit(&too_small(area.width, area.height), usize::from(area.width));
+        let at = centered(
+            area,
+            u16::try_from(width_of(&notice)).unwrap_or(u16::MAX),
+            1,
+        );
+        frame.render_widget(Paragraph::new(notice), at);
         return;
     }
     let areas = areas(state, area);
@@ -315,6 +325,38 @@ pub(crate) fn centered(area: Rect, w: u16, h: u16) -> Rect {
     )
 }
 
+/// A title (bold) and a sentence (muted) in the middle of `area` (redesign §5.7), each centred
+/// across it. The sentence wraps onto the rows the title leaves, `WRAP_ROWS` at most; with none
+/// to spare it is left out.
+pub(crate) fn centred_block(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    sentence: Option<&str>,
+    theme: Theme,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let width = usize::from(area.width);
+    let row = |text: String, style| {
+        let pad = " ".repeat(width.saturating_sub(width_of(&text)) / 2);
+        Line::from(vec![Span::raw(pad), Span::styled(text, style)])
+    };
+    let mut lines = vec![row(fit(title, width), theme.strong())];
+    let spare = usize::from(area.height).saturating_sub(1).min(WRAP_ROWS);
+    if let Some(sentence) = sentence.filter(|_| spare > 0) {
+        let muted = theme.role(Role::Muted);
+        lines.extend(
+            wrap_rows(sentence, width, spare)
+                .into_iter()
+                .map(|text| row(text, muted)),
+        );
+    }
+    let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    frame.render_widget(Paragraph::new(lines), centered(area, area.width, height));
+}
+
 /// The first line to show so that lines `first..=last` show, moving as little as it can, and
 /// never past the last full page (R22).
 pub(crate) fn keep_visible(
@@ -386,6 +428,7 @@ mod tests {
     use crate::testutil::*;
     use crate::theme::Role;
     use crate::update::update;
+    use tagteam_engine::views::ProviderNames;
 
     #[test]
     fn select_puts_the_bar_in_column_0_bolds_the_name_and_tints_only_in_tier_2() {
@@ -479,18 +522,133 @@ mod tests {
     }
 
     #[test]
-    fn below_80_by_24_only_the_notice_is_drawn() {
+    fn below_80_by_24_the_body_says_the_size_it_needs() {
         let mut state = fresh(Screen::Accounts);
         state.toast(ToastKind::Info, "a toast", NOW_MS);
-        for (w, h) in [(79, 24), (80, 23), (20, 5)] {
+        for (w, h) in [(72, 20), (79, 24), (80, 23)] {
+            let notice = format!("Terminal {w}×{h} · tagteam needs 80×24");
             let lines = draw(&state, w, h);
-            let cut: String = TOO_SMALL.chars().take(usize::from(w)).collect();
-            assert_eq!(lines[0], cut, "{w}x{h}");
-            assert!(
-                lines[1..].iter().all(String::is_empty),
-                "{w}x{h}: {lines:?}"
+            let middle = usize::from(h - 1) / 2;
+            let pad = " ".repeat((usize::from(w) - width_of(&notice)) / 2);
+            assert_eq!(lines[middle], format!("{pad}{notice}"), "{w}x{h}");
+            for (n, line) in lines.iter().enumerate().filter(|(n, _)| *n != middle) {
+                assert!(line.is_empty(), "{w}x{h} row {n}: {lines:?}");
+            }
+        }
+        let narrow = draw(&state, 20, 5);
+        assert_eq!(narrow[2], fit("Terminal 20×5 · tagteam needs 80×24", 20));
+        assert!(
+            narrow
+                .iter()
+                .enumerate()
+                .all(|(n, l)| n == 2 || l.is_empty())
+        );
+    }
+
+    /// The rows of `lines` from `title` down, at `width`, each with its column: the block's
+    /// title and then its sentence when there is one.
+    fn block_at(lines: &[String], title: &str) -> (usize, usize) {
+        let row = lines
+            .iter()
+            .position(|l| l.trim() == title)
+            .unwrap_or_else(|| panic!("no `{title}` in {lines:?}"));
+        (row, lines[row].len() - lines[row].trim_start().len())
+    }
+
+    /// `title` and `sentence` stand in the middle of the rows from `top` to the body's end, each
+    /// centred across `w` columns.
+    fn assert_centred(state: &State, (w, h): (u16, u16), top: u16, title: &str, sentence: &str) {
+        let body = areas(state, Rect::new(0, 0, w, h)).body;
+        let lines = draw(state, w, h);
+        let (row, col) = block_at(&lines, title);
+        let rows = body.height - top;
+        assert_eq!(
+            row,
+            usize::from(body.y + top + (rows - 2) / 2),
+            "{w}x{h} `{title}`: {lines:?}"
+        );
+        assert_eq!(
+            col,
+            (usize::from(w) - width_of(title)) / 2,
+            "{w}x{h} {title}"
+        );
+        let under = &lines[row + 1];
+        assert_eq!(under.trim(), sentence, "{w}x{h}");
+        let at = (usize::from(w) - width_of(sentence)) / 2;
+        assert_eq!(
+            under.len() - under.trim_start().len(),
+            at,
+            "{w}x{h} {sentence}"
+        );
+    }
+
+    #[test]
+    fn the_empty_states_say_what_to_do() {
+        for size in [(80, 24), (120, 40)] {
+            // Loading: a title alone.
+            let state = fresh(Screen::Accounts);
+            let body = areas(&state, Rect::new(0, 0, size.0, size.1)).body;
+            let lines = draw(&state, size.0, size.1);
+            let (row, col) = block_at(&lines, "Loading accounts…");
+            assert_eq!(row, usize::from(body.y + (body.height - 1) / 2), "{size:?}");
+            assert_eq!(col, (usize::from(size.0) - 17) / 2, "{size:?}");
+            assert!(!lines.iter().any(|l| l.contains("loading")), "{lines:?}");
+            // No accounts.
+            let mut state = fresh(Screen::Accounts);
+            state.accounts.apply(snapshot(vec![]));
+            assert_centred(
+                &state,
+                size,
+                0,
+                "No accounts yet",
+                "Log in with claude, then press A to add that login.",
+            );
+            // Tokens, nothing indexed: under the lines that say what is reported.
+            let mut state = fresh(Screen::Tokens);
+            let cmds = state.start();
+            let [_, Cmd::LoadReport { r#gen, query }] = cmds.as_slice() else {
+                panic!("{cmds:?}")
+            };
+            let mut report = token_report(query.clone(), vec![]);
+            report.index.refreshed_at_ms = None;
+            let msg = Msg::TokenReport {
+                r#gen: *r#gen,
+                result: Ok(report),
+            };
+            update(&mut state, msg, NOW_MS);
+            state.size = size;
+            let head = body_of(&state, size.0, size.1, NOW_MS)
+                .iter()
+                .position(|l| l == " UTC · catching up")
+                .expect("the header's last row");
+            assert_centred(
+                &state,
+                size,
+                u16::try_from(head + 1).unwrap(),
+                "No token usage yet",
+                "tagteam reads Claude Code's transcripts; they appear here as you use it.",
             );
         }
+    }
+
+    #[test]
+    fn the_empty_states_follow_the_provider_they_are_for() {
+        let fake = ProviderNames {
+            display_name: "FakeAgent",
+            launch_command: "fakeagent",
+        };
+        let mut state = fresh(Screen::Accounts);
+        state.fallback_names = fake;
+        let mut snap = snapshot(vec![]);
+        snap.providers.clear();
+        state.accounts.apply(snap);
+        let lines = draw(&state, 80, 24);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.trim() == "Log in with fakeagent, then press A to add that login."),
+            "{lines:?}"
+        );
     }
 
     #[test]

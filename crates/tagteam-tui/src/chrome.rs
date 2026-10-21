@@ -317,7 +317,7 @@ pub(crate) fn banner(state: &State) -> Option<(String, Role)> {
     if let Some(error) = tokens {
         return Some((error.to_owned(), Role::Warn));
     }
-    screens::accounts::banner(&state.accounts).map(|text| (text, Role::Warn))
+    screens::accounts::banner(state).map(|text| (text, Role::Warn))
 }
 
 /// The banner's rows at `width`, in its role: one column in, `✕` (crit) or `!` (warn), then its

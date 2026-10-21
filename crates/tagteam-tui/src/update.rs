@@ -974,7 +974,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(shown, format!("! usage was not collected: {message}"));
-        assert_eq!(body_of(&state, 80, 24, NOW_MS)[0], " loading…");
+        assert!(
+            draw(&state, 80, 24)
+                .iter()
+                .any(|l| l.trim() == "Loading accounts…")
+        );
     }
 
     #[test]

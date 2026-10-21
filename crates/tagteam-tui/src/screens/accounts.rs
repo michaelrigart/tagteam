@@ -8,7 +8,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind};
-use tagteam_engine::views::{AccountView, HistoryWindow, UsageStatus};
+use tagteam_engine::views::{AccountView, HistoryWindow, ProviderNames, UsageStatus};
 use tagteam_engine::words::{self, WindowColumn};
 
 use crate::host::AccountRef;
@@ -18,13 +18,14 @@ use crate::state::{Screen, State};
 use crate::theme::{Role, Theme};
 use crate::update;
 use crate::view::{
-    fit, flow, furthest_scroll, keep_visible, pad, scrolled_windows, select, width_of, wrap_rows,
+    centred_block, fit, flow, furthest_scroll, keep_visible, pad, scrolled_windows, select,
+    width_of, wrap_rows,
 };
 
-/// Spec §10.4's empty state: no store, or no accounts.
-pub const NO_ACCOUNTS: &str = "No accounts yet. Log in with claude, then press A to add the login.";
-/// Spec §6.1: drawn until the first `accounts` result arrives.
-pub const LOADING: &str = "loading…";
+/// Redesign §5.7: drawn until the first `accounts` result arrives.
+const LOADING: &str = "Loading accounts…";
+/// The title of the empty state: no store, or no accounts.
+const NO_ACCOUNTS: &str = "No accounts yet";
 /// The banners the accounts view raises (spec §5.1).
 pub const RUN_SHELL: &str = "inside a `tagteam run` session: account changes are refused here";
 /// A gauge's width, in cells, and the narrowest the ACCOUNT column is cut to.
@@ -138,14 +139,24 @@ fn windows_of(v: &AccountView) -> &[(Window, Pace)] {
 
 /// What the accounts view has to say above the body: a run shell (spec §3), else a live login
 /// tagteam does not manage (`status`'s own words).
-pub fn banner(state: &AccountsState) -> Option<String> {
-    let snap = state.snapshot.as_ref()?;
+pub fn banner(state: &State) -> Option<String> {
+    let snap = state.accounts.snapshot.as_ref()?;
     if snap.in_run_shell {
         return Some(RUN_SHELL.to_owned());
     }
-    snap.unmanaged_live
-        .as_ref()
-        .map(|email| format!("Live: {email} (not managed by tagteam); press A to add it"))
+    snap.unmanaged_live.as_ref().map(|email| {
+        let display = followed(state).display_name;
+        format!(
+            "{display} is logged in as {email}, which tagteam doesn't manage · press A to add it"
+        )
+    })
+}
+
+/// The names of the provider the accounts view follows: `--provider`'s, else the default, which
+/// Tokens reports on (the unmanaged login's, and the empty state's).
+fn followed(state: &State) -> ProviderNames {
+    let provider = state.provider.as_ref().unwrap_or(state.tokens.provider());
+    state.names_of(provider)
 }
 
 pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
@@ -542,11 +553,13 @@ fn gauge(pct: f64) -> String {
 pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     let st = &state.accounts;
     let Some(snap) = st.snapshot.as_ref() else {
-        frame.render_widget(Paragraph::new(format!(" {LOADING}")), area);
+        centred_block(frame, area, LOADING, None, state.theme);
         return;
     };
     if st.rows().is_empty() {
-        frame.render_widget(Paragraph::new(format!(" {NO_ACCOUNTS}")), area);
+        let launch = followed(state).launch_command;
+        let sentence = format!("Log in with {launch}, then press A to add that login.");
+        centred_block(frame, area, NO_ACCOUNTS, Some(&sentence), state.theme);
         return;
     }
     let now_s = now_ms.div_euclid(1000);
@@ -589,6 +602,20 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
                 }
             }
         });
+    }
+    if let [only] = st.rows().as_slice() {
+        let room = usize::from(table_area.height).saturating_sub(shown.len());
+        if room > 0 {
+            let display = state.names_of(&only.row.provider).display_name;
+            let hint = format!(
+                " Add a second account to switch: log in to {display} as it, then press A."
+            );
+            let hint = fit(&hint, width);
+            shown.push(Line::from(Span::styled(
+                hint,
+                state.theme.role(Role::Muted),
+            )));
+        }
     }
     frame.render_widget(Paragraph::new(shown), table_area);
     if let Some(v) = st.selected_view() {
@@ -1613,19 +1640,93 @@ mod tests {
         );
     }
 
-    /// Review Focus 3: with no store and no accounts, the empty state.
+    /// Review Focus 3: with no store and no accounts, the empty state (redesign §5.7).
     #[test]
     fn no_accounts_shows_the_empty_state() {
         let state = loaded(vec![]);
-        let body = body_of(&state, 80, 24, NOW_MS);
-        assert_eq!(
-            body[0],
-            " No accounts yet. Log in with claude, then press A to add the login."
-        );
+        let lines = draw(&state, 80, 24);
+        for text in [
+            "No accounts yet",
+            "Log in with claude, then press A to add that login.",
+        ] {
+            assert!(lines.iter().any(|l| l.trim() == text), "{text}: {lines:?}");
+        }
         assert_eq!(state.accounts.selected(), None);
         assert!(state.accounts.shown_ids().is_empty());
-        let unloaded = body_of(&fresh(Screen::Accounts), 80, 24, NOW_MS);
-        assert_eq!(unloaded[0], " loading…");
+        let unloaded = draw(&fresh(Screen::Accounts), 80, 24);
+        assert!(unloaded.iter().any(|l| l.trim() == "Loading accounts…"));
+    }
+
+    #[test]
+    fn with_one_account_the_table_says_how_to_add_a_second() {
+        let state = loaded(many(1));
+        let body = body_of(&state, 80, 24, NOW_MS);
+        let hint = " Add a second account to switch: log in to Claude Code as it, then press A.";
+        assert_eq!(body[2], hint, "{body:?}");
+        assert!(body[1].contains("a1@x.co"), "{body:?}");
+        let two = body_of(&loaded(many(2)), 80, 24, NOW_MS);
+        assert!(!two.iter().any(|l| l.contains("Add a second")), "{two:?}");
+    }
+
+    #[test]
+    fn the_words_name_each_provider_by_its_own_names() {
+        let mut other = account(1, "o@x.co", read(60, 50.0, 60.0, false));
+        other.row.provider = ProviderId::new("fake-agent");
+        other.row.id = AccountId::from_string("other-1");
+        let mut snap = snapshot(vec![]);
+        snap.providers.push(ProviderAccounts {
+            provider: ProviderId::new("fake-agent"),
+            active_position: None,
+            accounts: vec![other],
+            threshold: 90.0,
+            strategy: tagteam_core::autoswitch::Strategy::Best,
+            names: tagteam_engine::views::ProviderNames {
+                display_name: "FakeAgent",
+                launch_command: "fakeagent",
+            },
+        });
+        snap.unmanaged_live = Some("s@x.co".into());
+        let mut state = fresh(Screen::Accounts);
+        state.provider = Some(ProviderId::new("fake-agent"));
+        state.accounts.apply(snap);
+        // The one account, so the table asks for a second.
+        let lines = draw(&state, 120, 24);
+        assert!(
+            lines.iter().any(|l| l.trim_end()
+                == " Add a second account to switch: log in to FakeAgent as it, then press A."),
+            "{lines:?}"
+        );
+        // The unmanaged login is the one of the provider the TUI follows.
+        assert_eq!(
+            lines[2],
+            " ! FakeAgent is logged in as s@x.co, which tagteam doesn't manage · press A to add it"
+        );
+        // The remove question names it too.
+        update(&mut state, ch('x'), NOW_MS);
+        let Some(crate::overlay::Overlay::Confirm { question, .. }) = &state.overlay else {
+            panic!("{:?}", state.overlay);
+        };
+        assert_eq!(
+            question,
+            "Remove 1 o@x.co? Its stored login is deleted; FakeAgent is not changed."
+        );
+        // No accounts for it: the launch command.
+        let mut empty = snapshot(vec![]);
+        empty.providers[0].provider = ProviderId::new("fake-agent");
+        empty.providers[0].names = tagteam_engine::views::ProviderNames {
+            display_name: "FakeAgent",
+            launch_command: "fakeagent",
+        };
+        let mut state = fresh(Screen::Accounts);
+        state.provider = Some(ProviderId::new("fake-agent"));
+        state.accounts.apply(empty);
+        let lines = draw(&state, 80, 24);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.trim() == "Log in with fakeagent, then press A to add that login."),
+            "{lines:?}"
+        );
     }
 
     /// Review Focus 4: the table scrolls so the selected row is always visible, and `j`/`k`
@@ -1833,8 +1934,11 @@ mod tests {
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snap.clone());
         assert_eq!(
-            draw(&state, 80, 24)[2],
-            " ! Live: s@x.co (not managed by tagteam); press A to add it"
+            draw(&state, 80, 24)[2..4],
+            [
+                " ! Claude Code is logged in as s@x.co, which tagteam doesn't manage · press A to",
+                "   add it",
+            ]
         );
         snap.in_run_shell = true;
         state.accounts.apply(snap);
@@ -1856,10 +1960,11 @@ mod tests {
         state.accounts.apply(snap);
         let lines = draw(&state, 80, 24);
         assert_eq!(
-            lines[2..4],
+            lines[2..5],
             [
-                format!(" ! Live: {long} (not"),
-                "   managed by tagteam); press A to add it".to_owned(),
+                " ! Claude Code is logged in as".to_owned(),
+                format!("   {long}, which tagteam"),
+                "   doesn't manage · press A to add it".to_owned(),
             ]
         );
         let body = body_of(&state, 80, 24, NOW_MS);

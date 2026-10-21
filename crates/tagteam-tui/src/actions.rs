@@ -174,8 +174,9 @@ fn pause(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     } else {
         ("Resume", true)
     };
+    let display = state.names_of(&provider).display_name;
     state.overlay = Some(Overlay::Confirm {
-        question: format!("{verb} auto-switch for {provider}?"),
+        question: format!("{verb} auto for {display}?"),
         choice: false,
         then: ConfirmThen::Run(Action::Autoswitch { provider, on }),
     });
@@ -228,9 +229,10 @@ fn account_key(state: &mut State, c: char, now_ms: i64) -> Vec<Cmd> {
             vec![]
         }
         'x' => {
+            let display = state.names_of(&provider).display_name;
             state.overlay = Some(Overlay::Confirm {
                 question: format!(
-                    "Remove {named}? Its stored login is deleted; Claude Code is not changed."
+                    "Remove {named}? Its stored login is deleted; {display} is not changed."
                 ),
                 choice: false,
                 then: ConfirmThen::Run(Action::Remove(account)),
@@ -2257,13 +2259,13 @@ mod tests {
         };
         assert_eq!(
             asked(&state),
-            ("Pause auto-switch for claude-code?", false, &pause)
+            ("Pause auto for Claude Code?", false, &pause)
         );
         let drawn = draw(&state, 80, 24);
         assert!(
             drawn
                 .iter()
-                .any(|l| l.contains("Pause auto-switch for claude-code?")),
+                .any(|l| l.contains("Pause auto for Claude Code?")),
             "{drawn:?}"
         );
         assert!(
@@ -2297,7 +2299,7 @@ mod tests {
         };
         assert_eq!(
             asked(&state),
-            ("Resume auto-switch for claude-code?", false, &resume)
+            ("Resume auto for Claude Code?", false, &resume)
         );
     }
 
@@ -2377,7 +2379,7 @@ mod tests {
         };
         assert_eq!(
             asked(&state),
-            ("Resume auto-switch for fake-agent?", false, &resume)
+            ("Resume auto for FakeAgent?", false, &resume)
         );
     }
 
