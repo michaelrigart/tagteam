@@ -317,7 +317,7 @@ fn transport_failures_are_transient_and_change_nothing() {
         script(&fx);
         match gate(&fx, &a) {
             GateOutcome::Transient { kind, rescued } => {
-                assert_eq!((kind.as_str(), rescued), (want, false))
+                assert_eq!((&*kind.as_str(), rescued), (want, false))
             }
             other => panic!("{want}: {other:?}"),
         }
@@ -448,7 +448,7 @@ fn an_unreadable_or_absent_vault_is_transient_without_a_request() {
         .refresh_stored(fx.cc.as_ref(), &a, &snapshot)
         .unwrap();
     assert!(
-        matches!(&out, GateOutcome::Transient { kind, rescued: false } if kind == "vault-unreadable"),
+        matches!(&out, GateOutcome::Transient { kind, rescued: false } if kind.as_str() == "vault-unreadable"),
         "{out:?}"
     );
     fx.kc.set_unreadable(SERVICE, a.as_str(), false);
@@ -458,7 +458,7 @@ fn an_unreadable_or_absent_vault_is_transient_without_a_request() {
         .refresh_stored(fx.cc.as_ref(), &a, &snapshot)
         .unwrap();
     assert!(
-        matches!(&out, GateOutcome::Transient { kind, rescued: false } if kind == "vault-absent"),
+        matches!(&out, GateOutcome::Transient { kind, rescued: false } if kind.as_str() == "vault-absent"),
         "{out:?}"
     );
     assert_eq!(token_requests(&fx), 0);
@@ -474,7 +474,7 @@ fn an_unreadable_rescue_blocks_the_request() {
     fs::write(dir.join(format!("{a}-0-000000000000.json")), "not json").unwrap();
     let out = gate(&fx, &a);
     assert!(
-        matches!(&out, GateOutcome::Transient { kind, rescued: false } if kind == "rescue-unreadable"),
+        matches!(&out, GateOutcome::Transient { kind, rescued: false } if kind.as_str() == "rescue-unreadable"),
         "{out:?}"
     );
     assert_eq!(token_requests(&fx), 0);
@@ -533,7 +533,7 @@ mod hooked {
         );
         let out = gate(&fx, &a);
         assert!(
-            matches!(&out, GateOutcome::Transient { kind, rescued: false } if kind == "refresh-failed"),
+            matches!(&out, GateOutcome::Transient { kind, rescued: false } if kind.as_str() == "refresh-failed"),
             "{out:?}"
         );
         assert_eq!(quarantine_of(&fx, &a), (None, None));

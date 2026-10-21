@@ -85,7 +85,7 @@ fn a_vault_that_refuses_the_write_leaves_the_successor_in_rescue_for_the_next_pa
     fx.kc.set_fail_write(SERVICE, true);
     let out = refresh(&fx, &a, &snapshot);
     assert!(
-        matches!(&out, GateOutcome::Transient { kind, rescued: true } if kind == "vault-write"),
+        matches!(&out, GateOutcome::Transient { kind, rescued: true } if kind.as_str() == "vault-write"),
         "{out:?}"
     );
     assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
@@ -114,7 +114,7 @@ fn a_vault_that_stores_something_else_leaves_the_successor_in_rescue() {
         .refresh_stored(fx.cc.as_ref(), &a, &snapshot)
         .unwrap();
     assert!(
-        matches!(&out, GateOutcome::Transient { kind, rescued: true } if kind == "vault-write"),
+        matches!(&out, GateOutcome::Transient { kind, rescued: true } if kind.as_str() == "vault-write"),
         "{out:?}"
     );
     assert_eq!(rescued_refresh_tokens(&fx), ["rt-a2"]);
@@ -234,7 +234,7 @@ fn a_same_generation_rescue_is_deleted_and_never_adopted_over_a_newer_access_tok
     let out = refresh(&fx, &a, &snapshot);
     fx.kc.set_fail_write(SERVICE, false);
     assert!(
-        matches!(&out, GateOutcome::Transient { kind, rescued: true } if kind == "vault-write"),
+        matches!(&out, GateOutcome::Transient { kind, rescued: true } if kind.as_str() == "vault-write"),
         "{out:?}"
     );
     assert_eq!(rescue_files(&fx), 1);
@@ -455,7 +455,7 @@ mod hooked {
         let (out, logs) = capture_logs(|| refresh(&fx, &a, &snapshot));
         fx.kc.set_fail_write(SERVICE, false);
         assert!(
-            matches!(&out, GateOutcome::Transient { kind, rescued: true } if kind == "vault-write"),
+            matches!(&out, GateOutcome::Transient { kind, rescued: true } if kind.as_str() == "vault-write"),
             "{out:?}"
         );
         assert_eq!(

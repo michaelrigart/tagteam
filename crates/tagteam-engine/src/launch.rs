@@ -14,6 +14,7 @@ use crate::account_lock::AccountLock;
 use crate::bootstrap::{ProfileCtx, Trigger, refusal, refuse_linked_profile};
 use crate::engine::{Engine, GuardRequest};
 use crate::error::{EngineError, SessionOwner};
+use crate::failure::GateFailure;
 use crate::hooks;
 use crate::provenance::ProfileCheck;
 use crate::refresh::{GateOutcome, OwnedBy};
@@ -327,11 +328,14 @@ impl Engine {
             GateOutcome::Transient { rescued: true, .. } => refused(pending(
                 "the refresh succeeded, but the vault could not be written; the new token is in rescue/",
             )),
-            GateOutcome::Transient { kind, .. } if kind == "rescue-unreadable" => {
-                refused(pending("a pending rescue could not be adopted"))
-            }
+            GateOutcome::Transient {
+                kind: GateFailure::RescueUnreadable,
+                ..
+            } => refused(pending("a pending rescue could not be adopted")),
             // Nothing was spent: the stored credential goes on (§12.3 step 1).
-            GateOutcome::Transient { kind, .. } => warned(cannot_refresh(app, &row.label, &kind)),
+            GateOutcome::Transient { kind, .. } => {
+                warned(cannot_refresh(app, &row.label, &kind.as_str()))
+            }
             GateOutcome::Systemic(detail) => warned(cannot_refresh(app, &row.label, &detail)),
             GateOutcome::Conflict => refused(EngineError::ProfileConflict {
                 position: row.position,

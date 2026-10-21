@@ -4,6 +4,7 @@ use tagteam_provider::{Provider, Read};
 use crate::collect::CollectMode;
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::failure::GateFailure;
 use crate::hooks;
 use crate::provenance::ProfileCheck;
 use crate::refresh::{GateOutcome, OwnedBy};
@@ -155,7 +156,10 @@ impl Engine {
                     "the refresh succeeded, but the vault could not be written; the new token is in rescue/".into(),
                 ));
             }
-            GateOutcome::Transient { kind, .. } if kind == "rescue-unreadable" => {
+            GateOutcome::Transient {
+                kind: GateFailure::RescueUnreadable,
+                ..
+            } => {
                 // The gate reports both an unreadable rescue file and a failed adoption of a
                 // readable one under this kind; only unreadable files can be named. The error's
                 // own text adds "retry once the vault can be written".
@@ -177,9 +181,11 @@ impl Engine {
             // Nothing was spent, or what was spent is lost either way; once the account is
             // live, the gate leaves its refresh to CC (§7.3 step 2). A profile that cannot be
             // read (`profile-unreadable`) lands here too, and the transaction refuses it.
-            GateOutcome::Transient { kind, .. } => {
-                Freshened::Go(vec![cannot_refresh(p.display_name(), label, &kind)])
-            }
+            GateOutcome::Transient { kind, .. } => Freshened::Go(vec![cannot_refresh(
+                p.display_name(),
+                label,
+                &kind.as_str(),
+            )]),
             GateOutcome::Systemic(detail) => {
                 Freshened::Go(vec![cannot_refresh(p.display_name(), label, &detail)])
             }
@@ -254,7 +260,9 @@ impl Engine {
                         account = %row.id,
                         "a pending rescue could not be settled; the target is passed over"
                     );
-                    return Ok(AutoFreshened::Failed("rescue-unreadable".into()));
+                    return Ok(AutoFreshened::Failed(
+                        GateFailure::RescueUnreadable.as_str().into_owned(),
+                    ));
                 }
                 Err(EngineError::Unreadable(e)) => return Ok(AutoFreshened::Failed(e.to_string())),
                 Err(e) => return Err(e),
@@ -268,7 +276,9 @@ impl Engine {
                         account = %row.id,
                         "the session profile could not be read; the target is passed over"
                     );
-                    return Ok(AutoFreshened::Failed("profile-unreadable".into()));
+                    return Ok(AutoFreshened::Failed(
+                        GateFailure::ProfileUnreadable.as_str().into_owned(),
+                    ));
                 }
                 Ok(_) => {}
                 Err(EngineError::Unreadable(e)) => return Ok(AutoFreshened::Failed(e.to_string())),
@@ -301,7 +311,9 @@ impl Engine {
             GateOutcome::Transient { rescued: true, .. } => AutoFreshened::Failed(
                 "its refreshed token is in rescue/, not yet in the vault".into(),
             ),
-            GateOutcome::Transient { kind, .. } => AutoFreshened::Failed(kind),
+            GateOutcome::Transient { kind, .. } => {
+                AutoFreshened::Failed(kind.as_str().into_owned())
+            }
             GateOutcome::Systemic(detail) => AutoFreshened::Failed(detail),
             GateOutcome::Owned(OwnedBy::Session) | GateOutcome::Conflict => AutoFreshened::Skip,
         })

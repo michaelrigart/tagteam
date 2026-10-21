@@ -449,6 +449,7 @@ impl Store {
                 .saturating_add(1);
             let until = (now_s + failure_backoff_s(n, false, None)).max(next_free_at);
             ensure_state(&tx, id)?;
+            // The refusal is recorded as the `over-budget` usage failure (§8.6).
             tx.execute(
                 "UPDATE usage_state SET consecutive_failures = consecutive_failures + 1, \
                  last_error = ?2, last_attempt_at = ?3, backoff_until = ?4, next_poll_at = ?5 \

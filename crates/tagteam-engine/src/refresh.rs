@@ -14,6 +14,7 @@ use crate::account_lock::AccountLock;
 use crate::displace::displace;
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::failure::GateFailure;
 use crate::hooks;
 use crate::provenance::ProfileCheck;
 use crate::quarantine::QuarantineReason;
@@ -59,7 +60,7 @@ pub enum GateOutcome {
     /// Nothing decisive happened. `rescued` means a successor was received but is only in
     /// `rescue/`: the vault's generation is consumed, and the caller must not activate it.
     Transient {
-        kind: String,
+        kind: GateFailure,
         rescued: bool,
     },
     /// A successor was received and neither the vault nor `rescue/` could store it.
@@ -77,16 +78,20 @@ impl fmt::Debug for GateOutcome {
             GateOutcome::Dead(reason) => write!(f, "Dead({reason:?})"),
             GateOutcome::Systemic(m) => write!(f, "Systemic({m:?})"),
             GateOutcome::Transient { kind, rescued } => {
-                write!(f, "Transient {{ kind: {kind:?}, rescued: {rescued} }}")
+                write!(
+                    f,
+                    "Transient {{ kind: {:?}, rescued: {rescued} }}",
+                    kind.as_str()
+                )
             }
             GateOutcome::Unpersisted => f.write_str("Unpersisted"),
         }
     }
 }
 
-fn transient(kind: &str) -> GateOutcome {
+fn transient(kind: GateFailure) -> GateOutcome {
     GateOutcome::Transient {
-        kind: kind.to_owned(),
+        kind,
         rescued: false,
     }
 }
@@ -399,7 +404,7 @@ fn log_gate(id: &AccountId, result: &Result<GateOutcome, EngineError>) {
         Ok(GateOutcome::Transient { kind, rescued }) => tracing::info!(
             account = %id,
             outcome = "transient",
-            kind = kind.as_str(),
+            kind = &*kind.as_str(),
             rescued,
             "{OUTCOME}"
         ),
@@ -492,7 +497,7 @@ impl Engine {
         self.reconcile_replacement(&lock)?;
         let store = self.store()?;
         let Some(row) = store.account(id)? else {
-            return Ok(transient("vault-absent"));
+            return Ok(transient(GateFailure::VaultAbsent));
         };
         // §7.4: a quarantine holds while the vault still holds the generation it is bound to,
         // and, for the live account, while the live credential does (`quarantine_released`,
@@ -508,7 +513,7 @@ impl Engine {
             self.unquarantine(&row, CREDENTIALS_REPLACED, "cli")?;
         }
         if !p.kind_traits(&row.kind).refreshable {
-            return Ok(transient("not-refreshable"));
+            return Ok(transient(GateFailure::NotRefreshable));
         }
         // 2.
         if let Some(by) = self.owner_of(p, &store, &row)? {
@@ -518,12 +523,14 @@ impl Engine {
         // provenance, then the vault again.
         match self.vault.read(id) {
             Read::Present(b) if !b.is_empty() => {}
-            Read::Present(_) | Read::Absent => return Ok(transient("vault-absent")),
-            Read::Unreadable(_) => return Ok(transient("vault-unreadable")),
+            Read::Present(_) | Read::Absent => return Ok(transient(GateFailure::VaultAbsent)),
+            Read::Unreadable(_) => return Ok(transient(GateFailure::VaultUnreadable)),
         }
         match self.settle_rescues(p, &row, &lock) {
             Ok(()) => {}
-            Err(EngineError::RescuePending { .. }) => return Ok(transient("rescue-unreadable")),
+            Err(EngineError::RescuePending { .. }) => {
+                return Ok(transient(GateFailure::RescueUnreadable));
+            }
             Err(e) => return Err(e),
         }
         // §12.5 "Lazy capture": a rotation is adopted into the vault here, so the read below
@@ -537,16 +544,16 @@ impl Engine {
                     account = %row.id,
                     "the session profile could not be read; nothing is sent"
                 );
-                return Ok(transient("profile-unreadable"));
+                return Ok(transient(GateFailure::ProfileUnreadable));
             }
             Ok(_) => {}
-            Err(EngineError::Unreadable(_)) => return Ok(transient("vault-unreadable")),
+            Err(EngineError::Unreadable(_)) => return Ok(transient(GateFailure::VaultUnreadable)),
             Err(e) => return Err(e),
         }
         let current = match self.vault.read(id) {
             Read::Present(b) if !b.is_empty() => b,
-            Read::Present(_) | Read::Absent => return Ok(transient("vault-absent")),
-            Read::Unreadable(_) => return Ok(transient("vault-unreadable")),
+            Read::Present(_) | Read::Absent => return Ok(transient(GateFailure::VaultAbsent)),
+            Read::Unreadable(_) => return Ok(transient(GateFailure::VaultUnreadable)),
         };
         // 4.
         let now = self.now_ms();
@@ -641,7 +648,7 @@ impl Engine {
                     Read::Present(b) if fp_str(p, &b) == sent_fp
                 );
                 if !unchanged {
-                    return Ok(transient("refresh-failed"));
+                    return Ok(transient(GateFailure::RefreshFailed));
                 }
                 self.quarantine(row, QuarantineReason::InvalidGrant, sent_fp)?;
                 GateOutcome::Dead(QuarantineReason::InvalidGrant)
@@ -651,7 +658,7 @@ impl Engine {
                 GateOutcome::Dead(QuarantineReason::NoRefreshToken)
             }
             RefreshResult::Systemic(message) => GateOutcome::Systemic(message),
-            RefreshResult::Transient(kind) => transient(&kind.token()),
+            RefreshResult::Transient(kind) => transient(GateFailure::Provider(kind)),
         })
     }
 
@@ -760,7 +767,7 @@ impl Engine {
             Read::Absent | Read::Unreadable(_) => {
                 return Ok(match received.keep() {
                     Ok(()) => GateOutcome::Transient {
-                        kind: "vault-unreadable".into(),
+                        kind: GateFailure::VaultUnreadable,
                         rescued: true,
                     },
                     Err(e) => self.lose(row, sent_fp, e.kind()),
@@ -771,7 +778,7 @@ impl Engine {
         Ok(match self.persist_received(p, row, lock, received) {
             Persisted::Vault => GateOutcome::Refreshed(std::mem::take(&mut received.bytes)),
             Persisted::Rescued => GateOutcome::Transient {
-                kind: "vault-write".into(),
+                kind: GateFailure::VaultWrite,
                 rescued: true,
             },
             Persisted::Unpersisted => {

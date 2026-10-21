@@ -17,12 +17,13 @@ use tagteam_cc::ItemKind;
 use tagteam_core::AccountId;
 use tagteam_engine::EngineError;
 use tagteam_engine::active::{ActiveOutcome, ActiveTrigger};
+use tagteam_engine::failure::GateFailure;
 use tagteam_engine::oracle::{CachingOracle, HttpOracle};
 use tagteam_engine::quarantine::QuarantineReason;
 use tagteam_engine::store::Activation;
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::http::Method;
-use tagteam_provider::{Clock, Provider};
+use tagteam_provider::{Clock, Provider, TransientKind};
 
 fn bytes(v: &Value) -> Vec<u8> {
     v.to_string().into_bytes()
@@ -328,7 +329,7 @@ fn a_transient_failure_changes_nothing() {
     assert_eq!(
         out,
         ActiveOutcome::Transient {
-            kind: "pre-send".into()
+            kind: GateFailure::Provider(TransientKind::PreSend)
         }
     );
     assert_eq!(fx.kc.items(), before);

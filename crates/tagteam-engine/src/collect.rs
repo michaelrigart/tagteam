@@ -198,20 +198,20 @@ pub(crate) fn jitter() -> f64 {
 }
 
 impl Engine {
-    /// §8.3: the accounts `mode` selects, each on its own thread, and the call waits for them
-    /// all. Each account's role is decided before any thread starts (§8.1, `role_of`): the
-    /// account the live login names is the active one, any other that a `tagteam run` session
-    /// owns takes the session branch (§12.5), and the rest are inactive. A usage failure is
-    /// never an error here: it is recorded, and reported in the report's outcomes and warnings.
-    /// So is an error that ends one account's collection (the store failing under it): every
-    /// thread is joined and kept, and that account's outcome is `Errored` with
-    /// one warning naming it, so one account never costs the others' outcomes. A profile that
-    /// cannot be read is no such error: it decides a role too (`role_of`). `Err` only for an error outside the threads (opening the
-    /// store, reading the accounts, reading each provider's recorded active account and, for
-    /// `Scheduled`, the provider and the store between the phases), or for §14.1's cancel
-    /// token set during the collection: `Interrupted`, once every thread has joined and given
-    /// back the slot it held unsent. A `Scheduled` collection interrupted in phase 1 starts no
-    /// phase 2. IDs that name no account are skipped. Never creates the store.
+    /// §8.3: the accounts `mode` selects, each on its own thread, and the call waits for them all.
+    /// Each account's role is decided before any thread starts (§8.1, `role_of`): the account the
+    /// live login names is the active one, any other that a `tagteam run` session owns takes the
+    /// session branch (§12.5), and the rest are inactive. A usage failure is never an error here:
+    /// it is recorded, and reported in the report's outcomes and warnings. So is an error that ends
+    /// one account's collection (the store failing under it): every thread is joined and kept, and
+    /// that account's outcome is `Errored` with one warning naming it, so one account never costs
+    /// the others' outcomes. A profile that cannot be read is no such error: it decides a role too
+    /// (`role_of`). `Err` only for an error outside the threads (opening the store, reading the
+    /// accounts, reading each provider's recorded active account and, for `Scheduled`, the provider
+    /// and the store between the phases), or for §14.1's cancel token set during the collection:
+    /// `Interrupted`, once every thread has joined and given back the slot it held unsent. A
+    /// `Scheduled` collection interrupted in phase 1 starts no phase 2. IDs that name no account
+    /// are skipped. Never creates the store.
     pub fn collect_usage(&self, mode: CollectMode) -> Result<CollectReport, EngineError> {
         hooks::point(self, "usage-collect-start")?;
         let Some(shared) = self.existing_store()? else {
@@ -869,7 +869,7 @@ impl Collection<'_> {
                 Err(failed(FailureKind::RefreshFailed))
             }
             Ok(ActiveOutcome::Transient { kind }) => {
-                self.warn_refresh(&kind);
+                self.warn_refresh(&kind.as_str());
                 Err(failed(FailureKind::RefreshFailed))
             }
             Err(EngineError::ForeignLiveCredential { .. }) => {

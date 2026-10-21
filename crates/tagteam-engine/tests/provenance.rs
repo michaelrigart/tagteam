@@ -55,7 +55,7 @@ fn gate(fx: &Fx, id: &AccountId) -> GateOutcome {
 type Break = fn(&Fx, &Path);
 
 fn profile_unreadable(outcome: &GateOutcome) -> bool {
-    matches!(outcome, GateOutcome::Transient { kind, rescued: false } if kind == "profile-unreadable")
+    matches!(outcome, GateOutcome::Transient { kind, rescued: false } if kind.as_str() == "profile-unreadable")
 }
 
 #[test]
