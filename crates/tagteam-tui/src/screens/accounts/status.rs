@@ -54,18 +54,31 @@ fn problem_words(problem: Problem) -> Option<&'static str> {
     })
 }
 
-/// The first row of §6.3's table that applies, with T3-14's `▶ this session`.
+/// A problem's phrase, when it has one.
+fn problem_phrase(problem: Problem) -> Option<Phrase> {
+    let words = problem_words(problem)?.to_owned();
+    let (glyph, role) = mark(problem);
+    Some(Phrase { glyph, words, role })
+}
+
+/// The first row of §6.3's table that applies, with T3-14's `▶ this session`: a `✕` problem,
+/// then `○ disabled`, which every `!` problem gives way to (M-8), then the `!` problems.
 fn first(v: &AccountView, this: bool, best: bool) -> Option<Phrase> {
-    if let Some(problem) = words::problem(v) {
-        if let Some(words) = problem_words(problem) {
-            let (glyph, role) = mark(problem);
-            let words = words.to_owned();
-            return Some(Phrase { glyph, words, role });
-        }
+    let problem = words::problem(v).and_then(problem_phrase);
+    if problem.as_ref().is_some_and(|p| p.glyph == Some(NEEDS_YOU)) {
+        return problem;
     }
-    let (glyph, words, role) = if v.row.disabled {
-        (Some(DISABLED), "disabled".to_owned(), Role::Muted)
-    } else if this {
+    if v.row.disabled {
+        return Some(Phrase {
+            glyph: Some(DISABLED),
+            words: "disabled".to_owned(),
+            role: Role::Muted,
+        });
+    }
+    if problem.is_some() {
+        return problem;
+    }
+    let (glyph, words, role) = if this {
         (
             Some(words::IN_SESSION),
             "this session".to_owned(),

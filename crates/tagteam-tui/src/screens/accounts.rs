@@ -808,11 +808,14 @@ mod tests {
         let mut limited = read(60, 9.0, 12.0, false);
         limited.status = UsageStatus::Unavailable;
         limited.error = Some("http-429".into());
+        let mut off = account(5, "a5@x.co", read(840, 9.0, 12.0, false));
+        off.row.disabled = true;
         let accounts = vec![
             account(1, "alex@example.com", read(60, 9.0, 12.0, false)),
             account(2, "sam@corp.example", read(840, 9.0, 12.0, false)),
             account(3, "alex@personal.example", retrying),
             account(4, "a4@x.co", limited),
+            off,
         ];
         for theme in TIERS {
             let mut state = loaded(accounts.clone());
@@ -826,6 +829,8 @@ mod tests {
                 ("14m", "w", "! old reading"),
                 ("14m", "w", "! retrying"),
                 ("1m", "m", "! rate-limited"),
+                // M-8: disabled over the old reading, its age still in warn.
+                ("14m", "w", "○ disabled"),
             ];
             for (i, (age, role, phrase)) in rows.into_iter().enumerate() {
                 let row = &body[i + 1];
@@ -838,6 +843,10 @@ mod tests {
                 assert_eq!(got, want, "{theme:?}: {row}");
             }
         }
+        // Under 100 columns the disabled row's glyph is `○`, not its old reading's `!`.
+        let body = body_of(&loaded(accounts), 80, 24, NOW_MS);
+        assert!(body[2].ends_with("14m !"), "{}", body[2]);
+        assert!(body[5].ends_with("14m ○"), "{}", body[5]);
     }
 
     #[test]
@@ -924,7 +933,8 @@ mod tests {
                 "{theme:?}: {row}"
             );
         }
-        // Each problem comes before disabled, this session, in use and best.
+        // Each problem comes before this session, in use and best. Disabled comes after the
+        // `✕` problems and before every `!` one (M-8).
         let problems = [
             (
                 unread(UsageStatus::ReloginRequired, None, None),
@@ -972,15 +982,25 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, tagteam_engine::words::Problem::ALL);
+        let disabled = ("○ disabled".to_owned(), Role::Muted);
         for (usage, want) in problems {
             let mut v = account(1, "a1@x.co", usage);
             v.active = true;
+            let own = want.map(|(p, r)| (p.to_owned(), r));
+            // Enabled: its own phrase, over this session, in use and best.
+            if let Some(own) = &own {
+                assert_eq!(status::phrase(&v, true, true).as_ref(), Some(own));
+            }
             v.row.disabled = true;
-            let got = status::phrase(&v, true, true);
-            let want = want.map_or(("○ disabled".to_owned(), Role::Muted), |(p, r)| {
-                (p.to_owned(), r)
-            });
-            assert_eq!(got, Some(want.clone()));
+            let want = match own {
+                Some((p, r)) if r == Role::Crit => (p, r),
+                _ => disabled.clone(),
+            };
+            assert_eq!(
+                status::phrase(&v, true, true),
+                Some(want.clone()),
+                "{want:?}"
+            );
             let glyph = want.0.split(' ').next().unwrap().to_owned();
             assert_eq!(
                 status::glyph(&v, true, true).map(|(g, r)| (g.to_owned(), r)),
