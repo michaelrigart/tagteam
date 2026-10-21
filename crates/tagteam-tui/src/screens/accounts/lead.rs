@@ -27,9 +27,9 @@ const INDENT: &str = "    ";
 /// Between a row's parts (§4.3).
 const GAP: &str = "  ";
 /// The least room between the title's left part and the best pick (§4.3's group gap).
-const PICK_GAP: usize = 3;
+pub(crate) const PICK_GAP: usize = 3;
 /// The left part keeps this much room at least, or the best pick is dropped (T3-19).
-const LEFT_LEAST: usize = 16;
+pub(crate) const LEFT_LEAST: usize = 16;
 const FACT_SEP: &str = " · ";
 /// A login valid for less than this is warn, and says to log in again (§6.2, T3-10).
 const SOON_S: i64 = 7 * 86_400;
@@ -49,7 +49,7 @@ pub(crate) struct Lead {
 }
 
 /// Focus's provider and its account in use, when it has one.
-fn in_use(state: &State) -> Option<(&ProviderAccounts, &AccountView)> {
+pub(crate) fn in_use(state: &State) -> Option<(&ProviderAccounts, &AccountView)> {
     let view = state.view_of(&daemon::focus(state))?;
     let v = view.accounts.iter().find(|v| v.active)?;
     Some((view, v))

@@ -879,7 +879,7 @@ mod tests {
         });
         update(&mut state, Msg::Refreshed { result: failed }, NOW_MS);
         assert_eq!(
-            draw(&state, 80, 24)[2],
+            draw(&state, 80, 24)[3],
             " ! the token index was not refreshed: the store is locked"
         );
         update(&mut state, ch('r'), NOW_MS);
@@ -1058,10 +1058,10 @@ mod tests {
         let warn_row = |state: &State, words: &str| {
             let theme = TIERS[1];
             let buf = draw_buffer(state, 80, 24, NOW_MS);
-            assert_eq!(text_of(&buf)[2], format!(" ! {words}"));
+            assert_eq!(text_of(&buf)[3], format!(" ! {words}"));
             let warn = theme.role(crate::theme::Role::Warn);
             for x in [1, 3, 10] {
-                assert_eq!(buf[(x, 2)].fg, warn.fg.unwrap_or(Color::Reset), "{x}");
+                assert_eq!(buf[(x, 3)].fg, warn.fg.unwrap_or(Color::Reset), "{x}");
             }
         };
         let mut state = on_tokens();
@@ -1164,14 +1164,14 @@ mod tests {
         };
         check_with(&mut state, NOW_MS + 1_000, Err(failed()));
         assert_eq!(state.tokens.error(), Some(REPORT_FAILED));
-        assert_eq!(draw(&state, 80, 24)[2], format!(" ! {REPORT_FAILED}"));
+        assert_eq!(draw(&state, 80, 24)[3], format!(" ! {REPORT_FAILED}"));
         check_with(
             &mut state,
             NOW_MS + 6_100,
             Ok(index_changed_at(NOW_MS - 60_000)),
         );
         assert_eq!(state.tokens.error(), Some(REPORT_FAILED));
-        assert_eq!(draw(&state, 80, 24)[2], format!(" ! {REPORT_FAILED}"));
+        assert_eq!(draw(&state, 80, 24)[3], format!(" ! {REPORT_FAILED}"));
         assert!(
             row_is_dim(&state),
             "the index is unchanged, the report stale"

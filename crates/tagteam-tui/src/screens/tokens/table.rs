@@ -2118,7 +2118,7 @@ mod tests {
             assert!(!state.tokens.pending());
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
             assert_eq!(
-                text_of(&buf)[2],
+                text_of(&buf)[3],
                 " ! couldn't read the token index (the index is locked) · r retries"
             );
             for needle in [
@@ -2559,7 +2559,9 @@ mod tests {
 
     #[test]
     fn at_80x24_a_2000_column_model_leaves_the_table_three_rows_and_the_detail_reachable() {
-        // B29, by construction: under a full banner and toast the body is 16 rows, from row 5.
+        // B29, by construction: under the Now strip, a 2-row banner and a full toast the body is
+        // 16 rows, from row 5. The 80×24 worst case, a 15-row body under a full banner too, is
+        // the worst live stack's below.
         // The header takes three at most; the table's heading and total two; what lies below the total
         // half the body at most and never the table's last three. Below the total nothing is
         // cut: it scrolls, and J reaches every line of it.
@@ -2578,7 +2580,7 @@ mod tests {
             report.unpriced_models = vec![long.clone()];
         }
         let words = "the store could not be opened because another tagteam holds its lock";
-        state.raise_banner(BannerKind::Refusal, [words; 3].join("; "));
+        state.raise_banner(BannerKind::Refusal, [words; 2].join("; "));
         state.toast(crate::state::ToastKind::Info, [words; 3].join("; "), NOW_MS);
         let lines = draw(&state, 80, 24);
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
@@ -2621,8 +2623,9 @@ mod tests {
     #[test]
     fn the_worst_live_stack_at_80_by_24_keeps_three_table_rows_and_scrolls_to_a_2000_column_model_line()
      {
-        // The header, the auto line, a 3-row banner and a 3-row toast leave a 16-row body; the
-        // table keeps three rows, and J/K reach the model line, the footnote's last.
+        // The header, the auto line, the Now strip, a 3-row banner and a 3-row toast leave a
+        // 15-row body; the table keeps three rows, and J/K reach the model line, the footnote's
+        // last.
         let long = format!("claude-{}", "x".repeat(1993));
         let mut big = realistic();
         big.models = vec![long.clone(), "claude-sonnet-5-5".into()];
@@ -2651,7 +2654,8 @@ mod tests {
         let lines = draw(&state, 80, 24);
         assert_eq!(lines.len(), 24, "{lines:?}");
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
-        // The stack: the header, the auto line, the banner (3), a 16-row body, the toast (3).
+        // The stack: the header, the auto line, the Now strip, the banner (3), a 15-row body, the
+        // toast (3).
         assert!(
             lines[0].ends_with("! keychain locked 15:05   ? keys"),
             "{lines:?}"
@@ -2659,15 +2663,15 @@ mod tests {
         assert!(lines[1].starts_with(" ! 14:04  xxx"), "{lines:?}");
         assert!(lines[1].ends_with('…'), "{lines:?}");
         assert!(
-            lines[2..5]
+            lines[3..6]
                 .iter()
                 .all(|l| l.contains("the store could not be opened")
                     || l.contains("be opened because another tagteam holds its lock")),
             "{lines:?}"
         );
         assert!(
-            lines[5].starts_with(" Day Month"),
-            "the body starts at row 5: {lines:?}"
+            lines[6].starts_with(" Day Month"),
+            "the body starts at row 6: {lines:?}"
         );
         assert!(
             lines[21..]

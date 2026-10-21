@@ -138,15 +138,19 @@ impl Shown {
 /// the first long below 120 columns, every window from 120. The lead card picks its bars from
 /// them (T3-32).
 pub(crate) fn lead_keys(v: &AccountView, width: u16) -> Vec<String> {
-    let windows = windows_of(v);
     if width >= WIDE_FROM {
-        return windows.iter().map(|(w, _)| w.key.clone()).collect();
+        return windows_of(v).iter().map(|(w, _)| w.key.clone()).collect();
     }
+    short_and_long(v).map(|(w, _)| w.key.clone()).collect()
+}
+
+/// `v`'s first short and first long window, in that order: the lead card's below 120 columns
+/// and the Now strip's (§5.4, §6.2).
+pub(crate) fn short_and_long(v: &AccountView) -> impl Iterator<Item = &(Window, Pace)> {
+    let windows = windows_of(v);
     [WindowKind::Short, WindowKind::Long]
         .into_iter()
-        .filter_map(|kind| windows.iter().find(|(w, _)| w.kind == kind))
-        .map(|(w, _)| w.key.clone())
-        .collect()
+        .filter_map(move |kind| windows.iter().find(|(w, _)| w.kind == kind))
 }
 
 /// The card's lines at `width` with every window: what the layout gives it when it fits.
