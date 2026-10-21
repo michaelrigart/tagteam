@@ -20,15 +20,15 @@ use tagteam_engine::words::{self, Severity};
 use super::TokensState;
 use crate::state::State;
 use crate::theme::Theme;
-use crate::view::{fit, keep_visible, select, width_of, wrap};
+use crate::view::{centred_block, fit, keep_visible, select, width_of, wrap};
 
 /// From this width the table adds the cache, the response count and a cost bar (spec §5.3).
 pub const WIDE: usize = 120;
 /// Drawn while a query for a report not yet read runs.
 pub const LOADING: &str = "loading…";
-/// What an empty report says while the index has never completed a refresh: the usage is not
-/// missing from the range, it is not read in yet.
-const NOT_INDEXED: &str = "No token usage indexed yet.";
+/// What an empty report says while the index has never completed a refresh (redesign §5.7): the
+/// usage is not missing from the range, it is not read in yet.
+const NOT_INDEXED: &str = "No token usage yet";
 /// The cost bar's cells.
 const BAR: usize = 8;
 /// The table keeps this many rows at least; the detail and the notes below it scroll (B25).
@@ -1241,14 +1241,21 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     };
     if report.rows.is_empty() {
         let unbuilt = t.watch.state().is_some_and(|i| i.refreshed_at_ms.is_none());
-        let none = if unbuilt {
-            NOT_INDEXED
-        } else {
-            words::NO_TOKEN_USAGE
-        };
-        lines.push(Line::from(format!(" {none}")));
+        if !unbuilt {
+            lines.push(Line::from(format!(" {}", words::NO_TOKEN_USAGE)));
+        }
         lines.extend(empty_warnings(&report.index, width));
+        let used = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .min(area.height);
         frame.render_widget(Paragraph::new(lines), area);
+        if unbuilt {
+            let display = state.names_of(t.provider()).display_name;
+            let sentence =
+                format!("tagteam reads {display}'s transcripts; they appear here as you use it.");
+            let rest = Rect::new(area.x, area.y + used, area.width, area.height - used);
+            centred_block(frame, rest, NOT_INDEXED, Some(&sentence), state.theme);
+        }
         return;
     }
     let table = Table::new(report, &t.level().widths, width, state.theme, now_ms);
@@ -1796,8 +1803,17 @@ mod tests {
         let state = showing(vec![], |r| r.index = unbuilt);
         let lines = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(lines[2], " UTC · catching up");
-        assert_eq!(lines[3], " No token usage indexed yet.");
-        assert_eq!(lines[4], "");
+        let title = lines.iter().position(|l| l.trim() == "No token usage yet");
+        let sentence = "tagteam reads Claude Code's transcripts; they appear here as you use it.";
+        assert_eq!(
+            title.map(|n| lines[n + 1].trim()),
+            Some(sentence),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("indexed yet")),
+            "{lines:?}"
+        );
         let built = showing(vec![], |_| {});
         assert_eq!(
             body_of(&built, 80, 24, NOW_MS)[3],

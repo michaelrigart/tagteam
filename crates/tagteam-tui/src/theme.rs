@@ -363,6 +363,29 @@ mod tests {
         })
     }
 
+    /// The lines of `text` that are production code: each with its number, up to the file's
+    /// `#[cfg(test)]` test module, and none of them a comment.
+    fn production_lines(text: &str) -> Vec<(usize, &str)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut kept = Vec::new();
+        for (n, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed == "#[cfg(test)]" {
+                let next = lines[n + 1..]
+                    .iter()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty());
+                if next.is_some_and(|l| l.starts_with("mod ") && l.ends_with('{')) {
+                    break;
+                }
+            }
+            if !trimmed.starts_with("//") {
+                kept.push((n + 1, trimmed));
+            }
+        }
+        kept
+    }
+
     #[test]
     fn no_module_but_the_theme_names_a_colour_or_a_modifier() {
         let src = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
@@ -375,20 +398,32 @@ mod tests {
                 continue;
             }
             let text = fs::read_to_string(&path).unwrap();
-            let lines: Vec<&str> = text.lines().collect();
-            for (n, line) in lines.iter().enumerate() {
-                let trimmed = line.trim();
-                if trimmed == "#[cfg(test)]" {
-                    let next = lines[n + 1..]
-                        .iter()
-                        .map(|l| l.trim())
-                        .find(|l| !l.is_empty());
-                    if next.is_some_and(|l| l.starts_with("mod ") && l.ends_with('{')) {
-                        break;
-                    }
+            for (n, line) in production_lines(&text) {
+                if names_word(line) {
+                    flagged.push(format!("{}:{n}: {line}", path.display()));
                 }
-                if !trimmed.starts_with("//") && names_word(line) {
-                    flagged.push(format!("{}:{}: {trimmed}", path.display(), n + 1));
+            }
+        }
+        assert!(flagged.is_empty(), "{flagged:#?}");
+    }
+
+    /// ARCH-1: every word for a provider comes from its `ProviderNames`, so no production line
+    /// of the TUI names Claude Code or its maker (T2-6).
+    #[test]
+    fn no_production_line_names_the_provider() {
+        let src = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut files = Vec::new();
+        rust_files(src, &mut files);
+        let mut flagged = Vec::new();
+        for path in files {
+            if path.file_name().unwrap() == "testutil.rs" {
+                continue;
+            }
+            let text = fs::read_to_string(&path).unwrap();
+            for (n, line) in production_lines(&text) {
+                let lower = line.to_lowercase();
+                if lower.contains("claude") || lower.contains("anthropic") {
+                    flagged.push(format!("{}:{n}: {line}", path.display()));
                 }
             }
         }
