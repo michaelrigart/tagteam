@@ -11,9 +11,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{
-    API_KEY, FakeFx, Fx, access_fp, block_rescue, credential, due, failed, methods, quarantine_of,
-    refused, token_requests, two_accounts, unblock_rescue, usage_bearers, usage_fixture,
-    usage_requests,
+    API_KEY, FakeFx, Fx, access_fp, block_rescue, credential, due, failed, methods, plan_poll,
+    quarantine_of, refused, token_requests, two_accounts, unblock_rescue, usage_bearers,
+    usage_fixture, usage_requests,
 };
 use serde_json::{Value, json};
 use tagteam_cc::CLAUDE_CODE;
@@ -995,6 +995,79 @@ fn only_switchable_accounts_with_usage_are_candidates() {
         [(c, Collected::Recorded), (ok, Collected::Recorded)]
     );
     assert_eq!(usage_bearers(&fx), ["at-rt-c", "at-rt-ok"]);
+}
+
+#[test]
+fn the_earliest_poll_counts_the_live_account_and_a_candidate_planned_ahead() {
+    // §8.1, §8.6: the daemon wakes for the soonest plan a round could ever collect: the live
+    // account's (phase 1) or a candidate's (phase 2). A candidate 120 s ahead wakes it inside the
+    // live account's 300 s interval. Read-only: no request, and no store is created.
+    let fx = Fx::new();
+    let cc = ProviderId::new(CLAUDE_CODE);
+    assert_eq!(fx.engine.earliest_poll_at(&cc).unwrap(), None);
+    assert!(!fx.engine.store_file().exists(), "never creates the store");
+
+    let [a, b, c] = three_accounts(&fx);
+    plan_poll(&fx, &a, NOW_S + 120);
+    plan_poll(&fx, &b, NOW_S + 400);
+    plan_poll(&fx, &c, NOW_S + 300);
+    assert_eq!(fx.engine.earliest_poll_at(&cc).unwrap(), Some(NOW_S + 120));
+
+    plan_poll(&fx, &c, NOW_S + 90);
+    assert_eq!(fx.engine.earliest_poll_at(&cc).unwrap(), Some(NOW_S + 90));
+
+    // Phase 1 collects a disabled live account, so its plan still wakes the daemon.
+    fx.engine.set_disabled(&c, true).unwrap();
+    assert_eq!(fx.engine.earliest_poll_at(&cc).unwrap(), Some(NOW_S + 90));
+
+    // Once the live login names an account the store does not hold, `c` is a disabled
+    // candidate no round collects.
+    fx.login("z@x.co", "rt-z");
+    assert_eq!(fx.engine.earliest_poll_at(&cc).unwrap(), Some(NOW_S + 120));
+
+    assert_eq!(usage_requests(&fx), 0, "no request was sent");
+}
+
+#[test]
+fn the_earliest_poll_skips_what_a_round_skips_and_a_round_reads_what_it_counts() {
+    // §8.6: `earliest_poll_at` counts exactly the accounts a scheduled round can collect: the
+    // live account and the switchable candidates with usage, never a quarantined, a disabled
+    // or a managed-key one.
+    let fx = Fx::new();
+    let cc = ProviderId::new(CLAUDE_CODE);
+    let q = fx.add("q@x.co", "rt-q");
+    let d = fx.add("d@x.co", "rt-d");
+    let ok = fx.add("ok@x.co", "rt-ok");
+    let c = fx.add("c@x.co", "rt-c"); // live
+    let k = fx.add_api_key(API_KEY);
+    fx.quarantine(&q, "invalid_grant", "sha256:sent");
+    fx.engine.set_disabled(&d, true).unwrap();
+    plan_poll(&fx, &q, NOW_S + 60);
+    plan_poll(&fx, &d, NOW_S + 70);
+    plan_poll(&fx, &k, NOW_S + 80);
+    plan_poll(&fx, &ok, NOW_S + 200);
+    plan_poll(&fx, &c, NOW_S + 300);
+    assert_eq!(fx.engine.earliest_poll_at(&cc).unwrap(), Some(NOW_S + 200));
+
+    fx.clock.advance_ms(400_000);
+    fx.script_usage(200, usage_fixture());
+    let report = scheduled(&fx, 50.0);
+    assert_eq!(
+        report.outcomes,
+        [
+            (c.clone(), Collected::Recorded),
+            (ok.clone(), Collected::Recorded)
+        ],
+        "exactly the accounts the earliest poll counted"
+    );
+
+    // A quarantined live account is no longer collected, so its plan no longer counts.
+    fx.quarantine(&c, "invalid_grant", "sha256:sent");
+    plan_poll(&fx, &c, NOW_S + 410);
+    assert_eq!(
+        fx.engine.earliest_poll_at(&cc).unwrap(),
+        state(&fx, &ok).next_poll_at
+    );
 }
 
 #[test]
