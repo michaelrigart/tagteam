@@ -4,7 +4,6 @@
 //! (D4.2), and stops with exit 0 on a signal (§11.4, §14.1). `--once` runs one tick per provider
 //! instead, without the scheduler.
 
-use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 
 use tagteam_core::ProviderId;
@@ -114,20 +113,10 @@ pub fn providers(
         engine.provider(p)?;
         return Ok(vec![p.clone()]);
     }
-    let Some(store) = engine.existing_store()? else {
-        return Ok(Vec::new());
-    };
-    let mut switchable: BTreeMap<ProviderId, usize> = BTreeMap::new();
-    for row in store.all_accounts()? {
-        if !row.disabled && row.identity_json.is_object() && engine.provider(&row.provider).is_ok()
-        {
-            *switchable.entry(row.provider).or_default() += 1;
-        }
-    }
-    Ok(switchable
+    Ok(engine
+        .switchable_providers()?
         .into_iter()
-        .filter(|(_, n)| *n >= 2)
-        .map(|(p, _)| p)
+        .filter(|p| engine.provider(p).is_ok())
         .collect())
 }
 
@@ -344,11 +333,14 @@ fn engine_running(provider: ProviderId) -> AutoEvent {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use serde_json::json;
+    use tagteam_core::AccountId;
+    use tagteam_engine::store::NewAccount;
     use tagteam_engine::vault::SERVICE;
-    use tagteam_provider::{Clock, FakeClock, Method};
+    use tagteam_provider::{Clock, FakeClock, Identity, Method};
 
     use super::*;
     use crate::testutil::{CC_USAGE, FAR_MS, Fx, Slices, T0, cc, fake, two};
@@ -496,6 +488,45 @@ mod tests {
             providers(&fx.engine, Some(&ProviderId::new("nope"))),
             Err(EngineError::UnknownProvider(_))
         ));
+    }
+
+    #[test]
+    fn rows_of_a_provider_this_build_does_not_register_never_make_auto_run_it() {
+        let fx = Fx::new();
+        two(&fx);
+        let newer = ProviderId::new("newer-agent");
+        let store = fx.engine.store().unwrap();
+        for n in 1..=2 {
+            let id = AccountId::from_string(format!("newer-{n}"));
+            let email = format!("n{n}@x.co");
+            let key = format!("{email}\n");
+            let identity = Identity {
+                label: email.clone(),
+                email: Some(email.clone()),
+                org_uuid: String::new(),
+                org_name: None,
+                account_uuid: None,
+                raw: json!({"emailAddress": email}),
+            };
+            store
+                .insert_account(&NewAccount {
+                    id: &id,
+                    provider: &newer,
+                    position: n,
+                    identity_key: &key,
+                    identity: &identity,
+                    kind: "oauth",
+                    alias: None,
+                    login_expires_at: None,
+                    added_at: 1,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            fx.engine.switchable_providers().unwrap(),
+            [cc(), newer.clone()]
+        );
+        assert_eq!(providers(&fx.engine, None).unwrap(), [cc()]);
     }
 
     #[test]
