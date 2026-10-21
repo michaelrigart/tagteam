@@ -198,15 +198,16 @@ pub struct AccountRow {
 }
 
 impl AccountRow {
-    /// Enabled and with an identity: an account a switch can ever land on (§8.1).
+    /// Enabled and with an identity: an account a switch can ever land on (§9.3).
     pub fn is_switchable(&self) -> bool {
         !self.disabled && self.identity_json.is_object()
     }
 
     /// A rotation candidate by the store alone (§9.3 "Reading the vault lazily"): switchable and
-    /// not quarantined, which is also what a scheduled poll collects (§8.6). Whether its vault
-    /// holds a credential is read only when the walk reaches it. `Engine::switch_candidate` adds
-    /// the session rule, and every candidate list goes through that instead.
+    /// not quarantined, which is also what phase 2's scheduled poll collects (§8.6). Whether its
+    /// vault holds a credential is read only when the walk reaches it.
+    /// `Engine::switch_candidate` adds the session rule, and every candidate list goes through
+    /// that instead.
     pub fn is_poll_candidate(&self) -> bool {
         self.is_switchable() && self.quarantine_reason.is_none()
     }

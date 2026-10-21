@@ -330,8 +330,8 @@ impl Engine {
     /// `live` when its kind has usage and it is not quarantined; a disabled one stays, since
     /// phase 1 collects it. The candidates are the provider's switchable accounts (§9.3,
     /// `switch_candidate`: never a session-owned one, which no switch may target, §11.2 step 7)
-    /// other than `live`, whose kind has usage (a managed key has none, §13.2). The usage test
-    /// comes first, so a managed key or the live row costs no session read.
+    /// other than `live`, whose kind has usage (a managed key has none, §13.2). The live and
+    /// usage tests come first, so the live row or a managed key costs no session read.
     fn poll_rows<'r>(
         &self,
         p: &dyn Provider,
@@ -354,10 +354,13 @@ impl Engine {
         })
     }
 
-    /// The soonest `next_poll_at` (§8.6) among the accounts a scheduled round could collect
+    /// The soonest deadline (§8.6) among the accounts a scheduled round could collect
     /// (`poll_rows`): the live account, and each candidate, whether or not a round would find
-    /// it due. `None` when none has a plan, and without a store, which this never creates.
-    /// Read-only: it sends no request.
+    /// it due. An account's deadline is its `next_poll_at`, raised to its `backoff_until` while
+    /// that backoff holds, or the backoff alone when it has no plan. `None` when none has a
+    /// deadline, and without a store, which this never creates. `UnknownProvider` for a
+    /// provider this build does not register, as `collect_scheduled`. Read-only: it sends no
+    /// request.
     pub fn earliest_poll_at(&self, provider: &ProviderId) -> Result<Option<i64>, EngineError> {
         let p = self.provider(provider)?;
         let Some(store) = self.existing_store()? else {
@@ -367,9 +370,19 @@ impl Engine {
         let live_ids = self.live_accounts(&rows);
         let live = rows.iter().find(|r| live_ids.contains(&r.id));
         let polls = self.poll_rows(p.as_ref(), &rows, live)?;
+        let now_s = self.now_ms().div_euclid(1000);
         let mut earliest: Option<i64> = None;
         for row in polls.live.into_iter().chain(polls.candidates) {
-            let planned = store.usage_state(&row.id)?.and_then(|s| s.next_poll_at);
+            // Review refactor §8.1, §11: a held backoff is the account's real deadline, not a
+            // filter; a failed fetch leaves the plan in the past while a round skips the account.
+            let (planned, backoff) = store
+                .usage_state(&row.id)?
+                .map_or((None, None), |s| (s.next_poll_at, s.backoff_until));
+            let held = backoff.filter(|&until| backoff_holds(Some(until), now_s));
+            let planned = match (planned, held) {
+                (Some(plan), Some(until)) => Some(plan.max(until)),
+                (plan, until) => plan.or(until),
+            };
             earliest = match (earliest, planned) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),

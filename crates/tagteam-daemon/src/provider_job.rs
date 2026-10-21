@@ -540,7 +540,7 @@ impl<'e> ProviderJob<'e> {
             Err(e) if e.signal().is_some() => return None,
             Err(e) => self.failed(cx, &e),
         }
-        // A store that cannot be read plans nothing, and the floor applies.
+        // An engine error plans nothing: the round waits its interval, never under 60 s (D4.3).
         let earliest = self.engine.earliest_poll_at(&self.provider).unwrap_or(None);
         let delay = collect_delay_s(self.cfg.interval_s, self.now_s(), earliest, (cx.jitter)());
         Some(Worked {
