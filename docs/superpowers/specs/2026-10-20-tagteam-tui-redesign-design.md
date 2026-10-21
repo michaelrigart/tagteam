@@ -113,6 +113,7 @@ internal (`relogin required`, `pts/h (regression)`, `no-qualifying-candidate`).
 | M-6 | (2026-10-21, T2 review) A late DA1 reply cut short is held whole by crossterm 0.29, Ctrl-C included. Fix it or accept it? | **Accept, and amend §4.2**: a known residual. No crossterm upgrade, no byte pre-reader |
 | M-7 | (2026-10-21, T2 review) Before T4, should timer mode say `no switches in the last 30 days` without reading the store? | **Show nothing until T4**: rank 4's place stays empty in timer mode (§5.3) |
 | M-8 | (2026-10-21, T3 review) A daemon's or auto's scheduled polls skip disabled accounts, so a disabled account's reading goes stale while they collect, and a stored failure stays. Should STATUS say `! old reading` (or `! rate-limited`, …) or `○ disabled`? | **Disabled wins, over every `!`**: STATUS says `○ disabled` unless the account has a `✕` problem (new login, expired, no login). A stale reading, rate-limited, retrying, keychain and budget all give way. UPDATED keeps a stale age in warn (§6.3) |
+| M-9 | (2026-10-21, T3 review) When the selected account is the one in use and has a problem, the lead card and the card both show its sentence and remedy. Keep both? | **Drop duplicate rows**: the in-use card leaves out its problem rows too, as the lead card already shows them, and its minimum height shrinks to match. Any other selected account keeps its problem rows (§6.4) |
 
 **Inherited rulings:**
 - **D-2** (refactor §2): keep driving the CLI through argv, and fix its two string couplings with
@@ -566,7 +567,8 @@ account's card (§6.4). Content anchors to the top; spare rows go to the bottom 
 - **The sparklines** come from one `history` read for the selected account (TUI §4.4), on
   selection change, debounced to 250 ms, on the views lane.
 - **When the selected account is the one in use,** the card shows the sparklines and the facts but
-  not the reset and projection, which the lead card already shows.
+  not the reset and projection, nor the problem and its remedy, which the lead card already shows
+  (M-9).
 
 ### 6.5 Behaviour
 
