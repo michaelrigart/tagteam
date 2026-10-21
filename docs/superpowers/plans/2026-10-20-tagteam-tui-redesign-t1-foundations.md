@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/28
 **Goal:** Close the TUI clean-ups the refactor held for the redesign that need nothing new (CC-O-8, -9, -10, -16, -18, -19, -23c), fix PERF-R-9 and PERF-R-10b, and route every style through a theme module whose tier 1 is today's look, with nothing on screen changing.
 **Architecture:** The runtime keeps everything that is not state: prompt senders, by id; the shutdown and a refused hand-over reach `State` only as messages. Overlays move into `overlay/`, one module per kind, with their keys handled in place. The input thread blocks on the terminal, SIGWINCH and a waker instead of polling. Tokens lays its table out once a second. `theme.rs` becomes the only code that names a colour or a modifier.
 **Tech Stack:** Rust 1.88 (edition 2024), ratatui 0.30.2, crossterm 0.29.0, mio 1 and signal-hook-mio 0.2 (both already built for crossterm).
