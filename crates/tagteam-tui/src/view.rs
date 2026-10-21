@@ -398,14 +398,18 @@ pub(crate) fn tint(row: Line<'static>, width: usize, theme: Theme) -> Line<'stat
 }
 
 /// The selected row (spec §4.3): `▌` in accent over column 0, which `row`'s first span gives up
-/// the first cell of, its span `name` bold, and `sel-bg` across `width`. Data is never inverted.
+/// the first cell of, its first non-blank span from `name` on bold (a blank cell, as a repeated
+/// period is, bolds the next one), and `sel-bg` across `width`. Data is never inverted.
 pub(crate) fn select(
     mut row: Line<'static>,
     name: Option<usize>,
     width: usize,
     theme: Theme,
 ) -> Line<'static> {
-    if let Some(span) = name.and_then(|i| row.spans.get_mut(i)) {
+    let bold = name.and_then(|from| {
+        (from..row.spans.len()).find(|i| !row.spans[*i].content.trim().is_empty())
+    });
+    if let Some(span) = bold.and_then(|i| row.spans.get_mut(i)) {
         span.style = span.style.patch(theme.strong());
     }
     if let Some(first) = row.spans.first_mut() {

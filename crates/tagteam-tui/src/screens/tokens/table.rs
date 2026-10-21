@@ -2069,6 +2069,29 @@ mod tests {
     }
 
     #[test]
+    fn a_selected_row_with_a_repeated_period_bolds_its_first_non_empty_cell_alone() {
+        for theme in TIERS {
+            let mut state = showing(days(), |_| {});
+            state.theme = theme;
+            update(&mut state, key(KeyCode::Down), NOW_MS);
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            let (account, y) = locate(&buf, "2 spare").unwrap();
+            assert_eq!(buf[(0, y)].symbol(), "▌", "{theme:?}");
+            // Past column 0 (the bar is accent, and accent is bold without colour), the bold
+            // cells are one run, and it starts at the account: the period is blank.
+            let bold: Vec<u16> = (1..80)
+                .filter(|x| buf[(*x, y)].modifier.contains(Modifier::BOLD))
+                .collect();
+            assert_eq!(bold.first(), Some(&account), "{theme:?} {bold:?}");
+            assert!(
+                bold.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                "{theme:?} {bold:?}"
+            );
+            assert!(bold.len() >= "2 spare".len(), "{theme:?} {bold:?}");
+        }
+    }
+
+    #[test]
     fn a_long_report_scrolls_to_keep_the_selection_in_view_and_a_resize_keeps_it_there() {
         // R22: the stored scroll is clamped where it is used.
         let mut state = showing(many_days(30), |_| {});
@@ -2197,7 +2220,7 @@ mod tests {
         assert!(
             at_120
                 .iter()
-                .any(|l| l.contains("09-20 09:12  3 ")
+                .any(|l| l.contains("▌09-20 09:12  3 ")
                     && l.contains("claude-opus-5-5-with-a-very-l…")),
             "{at_120:?}"
         );
