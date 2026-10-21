@@ -13,7 +13,7 @@ use tagteam_engine::auto::AutoEvent;
 use tagteam_engine::settings::NotifyEvent;
 use tagteam_engine::tokens::IndexState;
 
-use crate::events::{Backoff, DaemonEvent, Mode, WaitingFor};
+use crate::events::{Backoff, DaemonEvent, Mode, StopReason, WaitingFor};
 use crate::status::{DaemonInfo, JobStatus, OutcomeKind, ProviderStatus, StatusSnapshot};
 
 /// D5.6: the protocol's version. New ops, kinds and fields are additive and keep it.
@@ -236,6 +236,7 @@ macro_rules! spelled {
 spelled!(
     Mode,
     WaitingFor,
+    StopReason,
     OutcomeKind,
     NoSwitchReason,
     Trigger,
@@ -631,7 +632,7 @@ pub enum Event {
         backoff: Option<StatusBackoff>,
     },
     /// The last event before the daemon closes: `signal`, `upgrade` or `schema`.
-    Stopping { reason: String },
+    Stopping { reason: Wire<StopReason> },
     /// D5.5's `token-index`; `raw` is the whole object, whose fields token report §12 defines.
     TokenIndex { provider: String, raw: Value },
     /// A kind this client does not know, or a known kind whose fields it cannot read (D5.6).
@@ -949,7 +950,7 @@ fn typed_event(kind: &str, o: &Map<String, Value>, raw: &Value) -> Option<Event>
             },
         },
         "stopping" => Event::Stopping {
-            reason: o.get("reason")?.as_str()?.to_owned(),
+            reason: Wire::from_wire(o.get("reason")?.as_str()?),
         },
         "token-index" => Event::TokenIndex {
             provider: provider()?,
@@ -1434,6 +1435,42 @@ mod tests {
         assert_eq!(Event::Changed.all_exhausted(), None);
         assert_eq!(Event::Changed.error(), None);
         assert_eq!(Event::Changed.config_warning(), None);
+    }
+
+    #[test]
+    fn a_stop_reason_reads_back_as_the_daemon_spelled_it() {
+        for reason in StopReason::ALL {
+            let v = daemon_event_json(&DaemonEvent::Stopping { reason }, T0);
+            assert_eq!(
+                v.to_string(),
+                format!(
+                    r#"{{"schemaVersion":1,"event":"stopping","ts":"2026-09-21T14:13:20Z","reason":"{}"}}"#,
+                    reason.as_str()
+                ),
+                "the wire is unchanged"
+            );
+            assert_eq!(
+                parse_event(&v),
+                Some(Event::Stopping {
+                    reason: Wire::Known(reason)
+                })
+            );
+        }
+        let later = json!({"schemaVersion": 1, "event": "stopping", "ts": "x", "reason": "power"});
+        let Some(Event::Stopping { reason }) = parse_event(&later) else {
+            panic!("a reason a later daemon adds is still `stopping`");
+        };
+        assert_eq!(reason, Wire::Other("power".into()));
+        assert_eq!(reason.as_str(), "power");
+        // As before the retype: a `stopping` without its reason is a kind this client cannot read.
+        let bare = json!({"schemaVersion": 1, "event": "stopping", "ts": "x"});
+        assert_eq!(
+            parse_event(&bare),
+            Some(Event::Unknown {
+                kind: "stopping".into(),
+                raw: bare.clone(),
+            })
+        );
     }
 
     #[test]
@@ -2283,7 +2320,7 @@ mod socket_protocol_tests {
                     reason: StopReason::Upgrade,
                 },
                 Event::Stopping {
-                    reason: "upgrade".into(),
+                    reason: Wire::from_wire("upgrade"),
                 },
             ),
             (
@@ -2291,7 +2328,7 @@ mod socket_protocol_tests {
                     reason: StopReason::Schema,
                 },
                 Event::Stopping {
-                    reason: "schema".into(),
+                    reason: Wire::from_wire("schema"),
                 },
             ),
         ];
@@ -2510,7 +2547,7 @@ mod socket_protocol_tests {
         assert_eq!(Event::Changed.mode(), None);
         assert_eq!(Event::Changed.waiting_for(), None);
         let stopping = Event::Stopping {
-            reason: "signal".into(),
+            reason: Wire::from_wire("signal"),
         };
         assert_eq!(stopping.mode(), None);
         assert_eq!(stopping.waiting_for(), None);
