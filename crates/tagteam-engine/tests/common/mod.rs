@@ -1505,6 +1505,18 @@ pub fn usage_requests(fx: &Fx) -> usize {
     slot_times(fx).len()
 }
 
+/// Plans `id`'s next poll for `at`, directly, as a recorded reading would (§8.6).
+pub fn plan_poll(fx: &Fx, id: &AccountId, at: i64) {
+    rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO usage_state (account_id, next_poll_at) VALUES (?1, ?2) \
+             ON CONFLICT(account_id) DO UPDATE SET next_poll_at = excluded.next_poll_at",
+            rusqlite::params![id.as_str(), at],
+        )
+        .unwrap();
+}
+
 /// The access-token fingerprint `rejected_fp` holds for `secret` (§8.1).
 pub fn access_fp(fx: &Fx, secret: &[u8]) -> String {
     fx.cc

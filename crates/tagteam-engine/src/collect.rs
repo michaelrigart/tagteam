@@ -192,6 +192,20 @@ struct Roles {
     live: HashSet<AccountId>,
 }
 
+/// The rows a scheduled round can ever collect, due or not (`Engine::poll_rows`).
+struct PollRows<'r> {
+    /// The live account, when phase 1 collects it.
+    live: Option<&'r AccountRow>,
+    /// The phase 2 candidates, in row order.
+    candidates: Vec<&'r AccountRow>,
+}
+
+/// Whether `row`'s kind has usage to collect: the provider reports it, and the kind is not a
+/// managed key (§13.2).
+fn has_usage(p: &dyn Provider, row: &AccountRow) -> bool {
+    p.capabilities().usage && !p.kind_traits(&row.kind).managed_key_axis
+}
+
 /// A jitter draw for the poll policy, uniform in [-1, 1) (Decision 6).
 pub(crate) fn jitter() -> f64 {
     fastrand::f64() * 2.0 - 1.0
@@ -297,27 +311,83 @@ impl Engine {
         let results = self.collect_each(store, &first, &roles, policy);
         self.check_cancel()?;
         report.add(results);
-        let picked =
-            self.scheduled_candidates(store, p.as_ref(), &rows, live, threshold, models)?;
+        let polls = self.poll_rows(p.as_ref(), &rows, live)?;
+        let picked = self.scheduled_candidates(
+            store,
+            p.as_ref(),
+            &polls.candidates,
+            live,
+            threshold,
+            models,
+        )?;
         let results = self.collect_each(store, &picked, &roles, policy);
         self.check_cancel()?;
         report.add(results);
         Ok(report)
     }
 
-    /// §8.6 phase 2's pick, read from the store. The candidates are the provider's switchable
-    /// accounts (§9.3, `switch_candidate`: never a session-owned one, which no switch may
-    /// target, §11.2 step 7) other than the live one, whose kind has usage (a managed key has
-    /// none, §13.2). One is due as `reserve_usage` would find it for a scheduled caller, leaving
-    /// the lease and the budget to the reservation: not in backoff, and a poll due or no
-    /// reading yet. Escalation reads the live account's decision-grade reading under `models`
-    /// (§8.4); without a managed live account, or without such a reading, the headroom is
-    /// unknown and the tick escalates.
+    /// §8.6's structural test: what a round could ever collect, due or not. The live row is
+    /// `live` when its kind has usage and it is not quarantined; a disabled one stays, since
+    /// phase 1 collects it. The candidates are the provider's switchable accounts (§9.3,
+    /// `switch_candidate`: never a session-owned one, which no switch may target, §11.2 step 7)
+    /// other than `live`, whose kind has usage (a managed key has none, §13.2). The usage test
+    /// comes first, so a managed key or the live row costs no session read.
+    fn poll_rows<'r>(
+        &self,
+        p: &dyn Provider,
+        rows: &'r [AccountRow],
+        live: Option<&'r AccountRow>,
+    ) -> Result<PollRows<'r>, EngineError> {
+        let mut candidates = Vec::new();
+        for row in rows {
+            if live.is_some_and(|l| l.id == row.id)
+                || !has_usage(p, row)
+                || !self.switch_candidate(p, row)?
+            {
+                continue;
+            }
+            candidates.push(row);
+        }
+        Ok(PollRows {
+            live: live.filter(|row| has_usage(p, row) && row.quarantine_reason.is_none()),
+            candidates,
+        })
+    }
+
+    /// The soonest `next_poll_at` (§8.6) among the accounts a scheduled round could collect
+    /// (`poll_rows`): the live account, and each candidate, whether or not a round would find
+    /// it due. `None` when none has a plan, and without a store, which this never creates.
+    /// Read-only: it sends no request.
+    pub fn earliest_poll_at(&self, provider: &ProviderId) -> Result<Option<i64>, EngineError> {
+        let p = self.provider(provider)?;
+        let Some(store) = self.existing_store()? else {
+            return Ok(None);
+        };
+        let rows = store.accounts(provider)?;
+        let live_ids = self.live_accounts(&rows);
+        let live = rows.iter().find(|r| live_ids.contains(&r.id));
+        let polls = self.poll_rows(p.as_ref(), &rows, live)?;
+        let mut earliest: Option<i64> = None;
+        for row in polls.live.into_iter().chain(polls.candidates) {
+            let planned = store.usage_state(&row.id)?.and_then(|s| s.next_poll_at);
+            earliest = match (earliest, planned) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        Ok(earliest)
+    }
+
+    /// §8.6 phase 2's pick, read from the store, among `candidates` (`poll_rows`). One is due as
+    /// `reserve_usage` would find it for a scheduled caller, leaving the lease and the budget to
+    /// the reservation: not in backoff, and a poll due or no reading yet. Escalation reads the
+    /// live account's decision-grade reading under `models` (§8.4); without a managed live
+    /// account, or without such a reading, the headroom is unknown and the tick escalates.
     fn scheduled_candidates<'r>(
         &self,
         store: &Store,
         p: &dyn Provider,
-        rows: &'r [AccountRow],
+        candidates: &[&'r AccountRow],
         live: Option<&AccountRow>,
         threshold: f64,
         models: &[String],
@@ -328,14 +398,7 @@ impl Engine {
         let budget = p.poll_budget();
         let now_s = self.now_ms().div_euclid(1000);
         let mut cands = Vec::new();
-        for row in rows {
-            let is_live = live.is_some_and(|l| l.id == row.id);
-            if is_live
-                || p.kind_traits(&row.kind).managed_key_axis
-                || !self.switch_candidate(p, row)?
-            {
-                continue;
-            }
+        for row in candidates {
             let state = store.usage_state(&row.id)?;
             let (fetched_at, backoff_until, next_poll_at) = state.map_or((None, None, None), |s| {
                 (s.fetched_at, s.backoff_until, s.next_poll_at)
@@ -356,7 +419,7 @@ impl Engine {
         let escalate = escalates(live_pct, threshold, budget.escalation_margin);
         Ok(scheduled_pick(&cands, escalate)
             .into_iter()
-            .filter_map(|position| rows.iter().find(|r| r.position == position))
+            .filter_map(|position| candidates.iter().copied().find(|r| r.position == position))
             .collect())
     }
 
@@ -459,7 +522,7 @@ impl Engine {
         let Some(p) = self.registry.get(&row.provider) else {
             return Ok(Role::Inactive);
         };
-        if !p.capabilities().usage || p.kind_traits(&row.kind).managed_key_axis {
+        if !has_usage(p.as_ref(), row) {
             return Ok(Role::Inactive);
         }
         let state = self.session_state(p.as_ref(), row)?;
@@ -486,7 +549,7 @@ impl Engine {
             return Ok(Outcome::unreserved(Collected::Unsupported));
         };
         let p = provider.as_ref();
-        if !p.capabilities().usage || p.kind_traits(&row.kind).managed_key_axis {
+        if !has_usage(p, row) {
             return Ok(Outcome::unreserved(Collected::Unsupported));
         }
         let budget = p.poll_budget();

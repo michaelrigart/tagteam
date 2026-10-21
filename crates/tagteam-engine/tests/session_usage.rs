@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::{
-    Fx, access_fp, credential, failed, refused, token_requests, two_accounts, usage_bearers,
-    usage_fixture, usage_requests,
+    Fx, access_fp, credential, failed, plan_poll, refused, token_requests, two_accounts,
+    usage_bearers, usage_fixture, usage_requests,
 };
 use serde_json::json;
 use tagteam_cc::CLAUDE_CODE;
@@ -505,6 +505,23 @@ fn a_scheduled_tick_picks_past_a_session_owned_candidate() {
         ["at-rt-p"],
         "on demand, the profile's token"
     );
+}
+
+#[test]
+fn the_earliest_poll_skips_a_session_owned_candidate() {
+    // §8.6, §11.2 step 7: a session-owned account is no candidate, so its plan wakes no round.
+    let fx = Fx::new();
+    let cc = ProviderId::new(CLAUDE_CODE);
+    let a = fx.add("a@x.co", "rt-a");
+    let c = fx.add("c@x.co", "rt-c");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    plan_poll(&fx, &a, NOW_S + 60);
+    plan_poll(&fx, &c, NOW_S + 200);
+    plan_poll(&fx, &b, NOW_S + 300);
+    assert_eq!(fx.engine.earliest_poll_at(&cc).unwrap(), Some(NOW_S + 60));
+
+    let _s = owned(&fx, &a, credential("a@x.co", "rt-p"));
+    assert_eq!(fx.engine.earliest_poll_at(&cc).unwrap(), Some(NOW_S + 200));
 }
 
 #[cfg(feature = "test-hooks")]
