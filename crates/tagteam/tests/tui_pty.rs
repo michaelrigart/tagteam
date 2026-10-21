@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::pty::{Finished, Pty, Screen};
 use common::{
@@ -1120,9 +1120,12 @@ fn p_pauses_the_daemon_s_auto_switch_and_resumes_it() {
         s.contains("Pause auto-switch for claude-code?")
     });
     tui.type_keys(b"y");
+    let confirmed = Instant::now();
     tui.wait_for(LONG, "the pause", |s| s.contains("‖ auto paused"));
     let config = fs::read_to_string(home.root().join("home/.config/tagteam/config.toml")).unwrap();
     assert!(config.contains("autoswitch = false"), "{config}");
+    // The `y` closed the dialog: an action key within 300 ms of it is dropped (§9.5).
+    thread::sleep(Duration::from_millis(350).saturating_sub(confirmed.elapsed()));
     tui.type_keys(b"P");
     tui.wait_for(LONG, "the question", |s| {
         s.contains("Resume auto-switch for claude-code?")

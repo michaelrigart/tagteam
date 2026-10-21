@@ -299,17 +299,11 @@ fn declined(to: AnswerTo, kind: &PromptKind) -> Cmd {
 /// Every view is re-read after every outcome (§7.3 step 4).
 pub fn on_done(state: &mut State, action: Action, outcome: ActionOutcome, now_ms: i64) -> Vec<Cmd> {
     let (exit, out, err) = match outcome {
-        // `run` always suspends at once (`start`): it never asks.
-        ActionOutcome::NeedsTerminal
-            if state.quitting.is_none() && matches!(action, Action::Run(_)) =>
-        {
-            state.running = Some(action.clone());
-            state.on_terminal = true;
-            return vec![Cmd::Suspend(action)];
-        }
         // The keychain is locked: ask before the terminal is handed over (§9.6, T2-19). The
         // flag `on_terminal` is set when `⏎` hands it over.
-        ActionOutcome::NeedsTerminal if state.quitting.is_none() => {
+        ActionOutcome::NeedsTerminal
+            if state.quitting.is_none() && !matches!(action, Action::Run(_)) =>
+        {
             state.running = Some(action.clone());
             state.dirty = true;
             state.overlay = Some(Overlay::Proceed {
@@ -320,6 +314,7 @@ pub fn on_done(state: &mut State, action: Action, outcome: ActionOutcome, now_ms
             });
             return vec![];
         }
+        // A shutdown, or `run`, which is already suspended and so never asks again.
         ActionOutcome::NeedsTerminal => {
             state.running = None;
             return vec![];
@@ -1563,6 +1558,20 @@ mod tests {
             assert_eq!(toast(&state), want, "{exit}");
             assert!(state.running.is_none() && !state.on_terminal, "{exit}");
         }
+    }
+
+    #[test]
+    fn a_suspended_run_that_asks_again_is_not_asked_about() {
+        let mut state = loaded(1);
+        update(&mut state, ch('R'), NOW_MS);
+        update(&mut state, key(KeyCode::Enter), NOW_MS);
+        let cmds = on_done(
+            &mut state,
+            Action::Run(sel(1)),
+            ActionOutcome::NeedsTerminal,
+            NOW_MS,
+        );
+        assert!(cmds.is_empty() && state.overlay.is_none() && state.running.is_none());
     }
 
     #[test]
