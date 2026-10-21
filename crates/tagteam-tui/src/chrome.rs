@@ -1173,7 +1173,7 @@ mod tests {
             at: "2026-09-21T14:11:20Z".into(),
             from: 1,
             to: 2,
-            trigger: "proactive".into(),
+            trigger: Wire::from_wire("proactive"),
         });
         job.next_tick_at = Some("2026-09-21T14:16:00Z".into());
         let timer_state = [("○", 'm'), (" auto off", 't'), (" · no daemon", 'm')];

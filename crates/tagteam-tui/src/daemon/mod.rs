@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use tagteam_core::autoswitch::NoSwitchReason;
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_daemon::protocol::{Event, PollPayload, Status, StatusProvider};
+use tagteam_daemon::protocol::{Event, PollPayload, Status, StatusProvider, parse_token_index};
 use tagteam_daemon::tokens::TOKEN_INDEX;
 
 use crate::live::{Live, StatusError};
@@ -293,10 +293,9 @@ fn on_event(state: &mut State, event: Event, now_ms: i64) -> Vec<Cmd> {
             state.daemon.stopping = Some((reason, now_ms + STOPPING_MS));
             state.dirty = true;
         }
-        Event::TokenIndex { ref provider, .. } => {
-            if let Some(index) = event.token_index() {
-                return screens::tokens::index::on_token_index(state, provider, &index, now_ms);
-            }
+        Event::TokenIndex { provider, raw } => {
+            let index = parse_token_index(&raw);
+            return screens::tokens::index::on_token_index(state, &provider, &index, now_ms);
         }
         Event::Unknown { .. } => {}
     }
@@ -813,6 +812,15 @@ mod tests {
         assert_eq!(
             draw(&state, 80, 24)[1],
             "   14:13  no switch needed (switches at 90%)"
+        );
+        let unmatched = json!({"active": {"number": 1}, "headroomPct": {"1": 23.0},
+            "windowsPct": {"1": {"5h": 40.0}}});
+        update(&mut state, auto_with("poll", unmatched), NOW_MS);
+        update(&mut state, below(), NOW_MS);
+        assert_eq!(
+            draw(&state, 80, 24)[1],
+            "   14:13  no switch needed (switches at 90%)",
+            "no window near the account's usage"
         );
         let poll = json!({"active": {"number": 1}, "headroomPct": {"1": 23.0},
             "windowsPct": {"1": {"5h": 40.0, "7d": 77.0}}});
