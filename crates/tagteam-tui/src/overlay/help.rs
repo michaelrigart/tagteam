@@ -83,14 +83,15 @@ pub(super) fn rows(state: &State, width: u16) -> Vec<Line<'static>> {
     } else {
         inner
     };
-    // Wide enough for the longest key, but never more than half a column: a longer one wraps.
-    let widest = KEYS.iter().map(|row| width_of(row.keys)).max().unwrap_or(1);
-    let keys_width = widest.min(column.saturating_sub(4) / 2).max(1);
     let theme = state.theme;
     let title = |name: &str| Line::from(Span::styled(name.to_owned(), theme.strong()));
+    // A key list never wraps: its column is as wide as the widest list in its own section.
     let keys_of = |screen: Option<Screen>| {
+        let rows = || KEYS.iter().filter(|row| row.screen == screen);
+        let widest = rows().map(|row| width_of(row.keys)).max().unwrap_or(1);
+        let keys_width = widest.min(column.saturating_sub(5)).max(1);
         let mut lines = vec![title(screen.map_or("Everywhere", screen_name))];
-        for row in KEYS.iter().filter(|row| row.screen == screen) {
+        for row in rows() {
             let accent = theme.role(Role::Accent);
             lines.extend(entry(row.keys, accent, row.does, keys_width, column));
         }
@@ -185,6 +186,45 @@ mod tests {
         state
     }
 
+    /// Every key list of `screen`'s help (its own rows and Everywhere's) is one span of one
+    /// row at `width` columns: none wraps onto a second row.
+    fn assert_key_lists_whole(screen: Screen, width: u16) {
+        let mut state = open(screen);
+        state.size = (width, 40);
+        let rows = rows(&state, width);
+        let spans: Vec<&str> = rows
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.trim_end())
+            .collect();
+        for row in KEYS.iter().filter(|r| r.screen.is_none_or(|s| s == screen)) {
+            assert!(
+                spans.contains(&row.keys),
+                "{screen:?} at {width}: {} wraps",
+                row.keys
+            );
+        }
+    }
+
+    #[test]
+    fn help_keys_stay_on_one_line_at_100_and_120_columns() {
+        // §9.2 brings in two columns at 100: the key lists must not break there (R21).
+        for screen in [Screen::Accounts, Screen::Tokens, Screen::History] {
+            for width in [80, 99, 100, 110, 120, 160] {
+                assert_key_lists_whole(screen, width);
+            }
+            for (width, height) in [(100, 30), (120, 40)] {
+                let lines = draw(&open(screen), width, height);
+                assert!(lines.iter().all(|l| width_of(l) <= usize::from(width)));
+                assert!(
+                    screen == Screen::History
+                        || lines.iter().any(|l| l.contains("PgUp PgDn Home End")),
+                    "{screen:?} {width}: the jump keys on one row: {lines:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_help_line_shows_whole_on_every_screen_at_80_columns() {
         // R21: the key column and the description both fit the help box, whichever the screen.
@@ -202,6 +242,7 @@ mod tests {
                 );
             }
             assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
+            assert_key_lists_whole(screen, 80);
         }
     }
 

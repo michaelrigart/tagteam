@@ -79,13 +79,18 @@ fn pause_label(state: &State) -> Option<&'static str> {
     on_account(state, if paused { "resume auto" } else { "pause auto" })
 }
 
-/// The movement keys of a list screen.
+/// The keys that move a list screen's selection by a row.
 #[cfg(test)]
-const MOVE: &[(KeyCode, KeyModifiers)] = &[
+const STEP: &[(KeyCode, KeyModifiers)] = &[
     plain('j'),
     plain('k'),
     named(KeyCode::Down),
     named(KeyCode::Up),
+];
+
+/// The keys that jump: a page, or to either end.
+#[cfg(test)]
+const JUMP: &[(KeyCode, KeyModifiers)] = &[
     named(KeyCode::PageDown),
     named(KeyCode::PageUp),
     named(KeyCode::Home),
@@ -137,11 +142,19 @@ pub(crate) const KEYS: &[KeyRow] = &[
     },
     KeyRow {
         screen: Some(Screen::Accounts),
-        keys: "j k ↑ ↓ PgUp PgDn Home End",
-        does: "move",
+        keys: "j k ↑ ↓",
+        does: "move up or down",
         footer: Footer::No,
         #[cfg(test)]
-        probes: MOVE,
+        probes: STEP,
+    },
+    KeyRow {
+        screen: Some(Screen::Accounts),
+        keys: "PgUp PgDn Home End",
+        does: "a page up or down, the first or last",
+        footer: Footer::No,
+        #[cfg(test)]
+        probes: JUMP,
     },
     KeyRow {
         screen: Some(Screen::Accounts),
@@ -194,7 +207,7 @@ pub(crate) const KEYS: &[KeyRow] = &[
     KeyRow {
         screen: Some(Screen::Tokens),
         keys: "⏎",
-        does: "drill down",
+        does: "drill down: sessions, then models",
         footer: Footer::Show {
             key: "⏎",
             label: |state| state.tokens.drill_to(),
@@ -206,7 +219,7 @@ pub(crate) const KEYS: &[KeyRow] = &[
     KeyRow {
         screen: Some(Screen::Tokens),
         keys: "p",
-        does: "period",
+        does: "period: day, month, session or block",
         footer: Footer::Show {
             key: "p",
             label: |_| Some("period"),
@@ -218,7 +231,7 @@ pub(crate) const KEYS: &[KeyRow] = &[
     KeyRow {
         screen: Some(Screen::Tokens),
         keys: "g",
-        does: "group",
+        does: "group: none, account, model, or both",
         footer: Footer::Show {
             key: "g",
             label: |_| Some("group"),
@@ -230,7 +243,7 @@ pub(crate) const KEYS: &[KeyRow] = &[
     KeyRow {
         screen: Some(Screen::Tokens),
         keys: "f",
-        does: "filter",
+        does: "filter accounts and models",
         footer: Footer::Show {
             key: "f",
             label: |_| Some("filter"),
@@ -242,7 +255,7 @@ pub(crate) const KEYS: &[KeyRow] = &[
     KeyRow {
         screen: Some(Screen::Tokens),
         keys: "[ ]",
-        does: "range",
+        does: "range: 7, 30 or 90 days, or all",
         footer: Footer::Show {
             key: "[ ]",
             label: |_| Some("range"),
@@ -265,11 +278,19 @@ pub(crate) const KEYS: &[KeyRow] = &[
     },
     KeyRow {
         screen: Some(Screen::Tokens),
-        keys: "j k ↑ ↓ PgUp PgDn Home End",
-        does: "move",
+        keys: "j k ↑ ↓",
+        does: "move up or down",
         footer: Footer::No,
         #[cfg(test)]
-        probes: MOVE,
+        probes: STEP,
+    },
+    KeyRow {
+        screen: Some(Screen::Tokens),
+        keys: "PgUp PgDn Home End",
+        does: "a page up or down, the first or last",
+        footer: Footer::No,
+        #[cfg(test)]
+        probes: JUMP,
     },
     KeyRow {
         screen: Some(Screen::Tokens),
