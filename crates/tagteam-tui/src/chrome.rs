@@ -298,8 +298,8 @@ pub(crate) fn footer(state: &State, width: u16, frame: &str) -> Vec<Line<'static
 /// The banner's words and role (T2-14), its rows as `banner_rows` wraps them. One shows at a
 /// time, the first of: held keys, the keyboard being unusable meanwhile; the state's banner (a
 /// failed read or a lane's death crit, a collection's warnings or a refused hand-over warn); on
-/// Tokens a failed token read; what the accounts view has to say (a run shell, an unmanaged live
-/// login).
+/// Tokens a failed token read; the start-up warnings, joined by ` · ` (T2-21); what the accounts
+/// view has to say (a run shell, an unmanaged live login).
 pub(crate) fn banner(state: &State) -> Option<(String, Role)> {
     if state.keys_held {
         return Some((KEYS_HELD.to_owned(), Role::Warn));
@@ -316,6 +316,9 @@ pub(crate) fn banner(state: &State) -> Option<(String, Role)> {
         .flatten();
     if let Some(error) = tokens {
         return Some((error.to_owned(), Role::Warn));
+    }
+    if !state.startup.warnings.is_empty() {
+        return Some((state.startup.warnings.join(" · "), Role::Warn));
     }
     screens::accounts::banner(state).map(|text| (text, Role::Warn))
 }
@@ -382,7 +385,8 @@ mod tests {
     use super::*;
     use crate::host::{AccountRef, Action};
     use crate::live::Live;
-    use crate::msg::Msg;
+    use crate::msg::{Cmd, Msg};
+    use crate::source::SourceError;
     use crate::testutil::*;
     use crate::theme::Theme;
     use crate::update::update;
@@ -974,6 +978,66 @@ mod tests {
                 assert_eq!(cell.modifier, modifier, "{theme:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_start_up_warnings_come_after_tokens_error_and_before_the_accounts_views() {
+        // T2-14: held keys, the state's banner, Tokens' error, the start-up warnings, then the
+        // accounts view's own (here a run shell).
+        let mut state = fresh(Screen::Accounts);
+        let mut snap = snapshot(many(1));
+        snap.in_run_shell = true;
+        state.accounts.apply(snap);
+        state.startup.warnings = vec![
+            "/cfg/config.toml: unknown key x (ignored)".to_owned(),
+            "/cfg/config.toml: unknown key y (ignored)".to_owned(),
+        ];
+        let warn = |state: &State| banner(state).map(|(text, role)| (text, role == Role::Warn));
+        let startup = "/cfg/config.toml: unknown key x (ignored) · \
+                       /cfg/config.toml: unknown key y (ignored)";
+        let on_tokens = update(&mut state, ch('2'), NOW_MS);
+        let Some(Cmd::LoadReport { r#gen, .. }) = on_tokens.first() else {
+            panic!("{on_tokens:?}");
+        };
+        update(
+            &mut state,
+            Msg::TokenReport {
+                r#gen: *r#gen,
+                result: Err(SourceError {
+                    kind: "store".into(),
+                    message: "the index is locked".into(),
+                }),
+            },
+            NOW_MS,
+        );
+        update(&mut state, Msg::KeysHeld { held: true }, NOW_MS);
+        state.raise_banner(BannerKind::Collect, "usage was not collected");
+        assert_eq!(warn(&state), Some((KEYS_HELD.to_owned(), true)));
+        state.keys_held = false;
+        assert_eq!(
+            warn(&state),
+            Some(("usage was not collected".to_owned(), true))
+        );
+        state.banner = None;
+        assert_eq!(
+            warn(&state),
+            Some((
+                "couldn't read the token index (the index is locked) · r retries".to_owned(),
+                true
+            )),
+            "Tokens' error"
+        );
+        update(&mut state, ch('1'), NOW_MS);
+        assert_eq!(
+            warn(&state),
+            Some((startup.to_owned(), true)),
+            "the warnings, joined, though the accounts view has a banner too"
+        );
+        state.startup.warnings.clear();
+        assert!(
+            warn(&state).is_some_and(|(text, _)| text.starts_with("inside a `tagteam run`")),
+            "the accounts view's, once they are gone"
+        );
     }
 
     #[test]

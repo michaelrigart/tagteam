@@ -32,6 +32,10 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
             state.dirty = true;
             match result {
                 Ok(snapshot) => {
+                    // The config file changed since start-up read it: its warnings are old.
+                    if snapshot.config_mtime != state.startup.mtime {
+                        state.startup.warnings.clear();
+                    }
                     state.accounts.apply(snapshot);
                     state.clear_banner(BannerKind::Accounts);
                     // The read after `r`'s collection: the toast needs what it shows.
@@ -331,12 +335,14 @@ fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     use super::*;
     use crate::host::ActionOutcome;
     use crate::source::{CollectSummary, SourceError};
-    use crate::state::GUARD_MS;
+    use crate::state::{GUARD_MS, Startup};
     use crate::testutil::*;
 
     fn quit_code(cmds: &[Cmd]) -> Option<i32> {
@@ -1110,5 +1116,89 @@ mod tests {
             state.banner_text(),
             Some("the views lane stopped unexpectedly")
         );
+    }
+
+    const WARNING: &str = "/cfg/config.toml: unknown key x (ignored)";
+
+    /// Accounts with `WARNING` as the one start-up warning, the config file last changed at
+    /// `mtime_s` seconds after the epoch.
+    fn warned(mtime_s: u64) -> State {
+        let mut state = fresh(Screen::Accounts);
+        state.startup = Startup {
+            warnings: vec![WARNING.to_owned()],
+            mtime: Some(UNIX_EPOCH + Duration::from_secs(mtime_s)),
+        };
+        state.accounts.apply(snapshot(many(2)));
+        state
+    }
+
+    #[test]
+    fn the_start_up_warnings_show_until_esc_on_accounts() {
+        // Redesign §5.6, T2-21: a warn banner as the CLI printed it, on every screen.
+        let shown = format!(" ! {WARNING}");
+        let mut state = warned(10);
+        assert_eq!(draw(&state, 80, 24)[2], shown);
+        update(&mut state, ch('2'), NOW_MS);
+        assert_eq!(draw(&state, 80, 24)[2], shown, "on Tokens too");
+        update(&mut state, key(KeyCode::Esc), NOW_MS);
+        assert_eq!(
+            draw(&state, 80, 24)[2],
+            shown,
+            "Esc on Tokens goes back a level, and it is at the top"
+        );
+        update(&mut state, ch('1'), NOW_MS);
+        assert_eq!(draw(&state, 80, 24)[2], shown);
+        update(&mut state, key(KeyCode::Esc), NOW_MS);
+        assert!(state.startup.warnings.is_empty());
+        assert!(
+            !draw(&state, 80, 24)
+                .iter()
+                .any(|l| l.contains("unknown key")),
+            "Esc on Accounts clears them"
+        );
+    }
+
+    #[test]
+    fn esc_closes_an_overlay_before_it_clears_the_start_up_warnings() {
+        let mut state = warned(10);
+        update(&mut state, ch('?'), NOW_MS);
+        update(&mut state, key(KeyCode::Esc), NOW_MS);
+        assert!(state.overlay.is_none());
+        assert_eq!(state.startup.warnings, [WARNING]);
+    }
+
+    #[test]
+    fn a_config_change_clears_the_start_up_warnings() {
+        // T2-21: a snapshot whose config mtime is the one `tui_cmd` read keeps them; a later one
+        // clears them.
+        let mut state = warned(10);
+        let mut same = snapshot(many(2));
+        same.config_mtime = Some(UNIX_EPOCH + Duration::from_secs(10));
+        let Cmd::LoadAccounts { r#gen } = state.load_accounts() else {
+            unreachable!()
+        };
+        update(
+            &mut state,
+            Msg::Accounts {
+                r#gen,
+                result: Ok(same),
+            },
+            NOW_MS,
+        );
+        assert_eq!(state.startup.warnings, [WARNING], "the same mtime");
+        let mut later = snapshot(many(2));
+        later.config_mtime = Some(UNIX_EPOCH + Duration::from_secs(11));
+        let Cmd::LoadAccounts { r#gen } = state.load_accounts() else {
+            unreachable!()
+        };
+        update(
+            &mut state,
+            Msg::Accounts {
+                r#gen,
+                result: Ok(later),
+            },
+            NOW_MS,
+        );
+        assert!(state.startup.warnings.is_empty(), "a later mtime");
     }
 }

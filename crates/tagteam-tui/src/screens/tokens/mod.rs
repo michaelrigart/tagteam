@@ -118,6 +118,8 @@ pub struct TokensState {
     again: bool,
     /// A failed read's words, the banner while Tokens is open (spec §10.4, B12).
     error: Option<String>,
+    /// The last report query failed: its report is drawn DIM (T2-22).
+    stale: bool,
     /// The index's state, its refresh, and the timers that read the report again (§6.4).
     watch: IndexWatch,
     /// How far what lies below the total is scrolled (`J`/`K`, B25), and for which row: another
@@ -142,6 +144,7 @@ impl TokensState {
             pending: false,
             again: false,
             error: None,
+            stale: false,
             watch: IndexWatch::default(),
             below_from: 0,
             below_for: None,
@@ -294,10 +297,10 @@ impl TokensState {
     }
 
     /// Back to the top level, whose report is read anew: the query changed (B8). The selected
-    /// key stays, for a row the new report still has.
+    /// key stays, for a row the new report still has, and so does the last report, until the
+    /// new one arrives (redesign §8, VIS-10).
     fn reset(&mut self) {
         self.levels.truncate(1);
-        self.levels[0].report = None;
         self.levels[0].widths = table::Widths::default();
         self.levels[0].layout = table::Layout::default();
     }
@@ -349,9 +352,16 @@ pub(crate) fn on_report(
     match result {
         Ok(report) => {
             t.error = None;
+            t.stale = false;
             t.apply(report);
         }
-        Err(e) => t.error = Some(e.message),
+        Err(e) => {
+            t.error = Some(format!(
+                "couldn't read the token index ({}) · r retries",
+                e.message
+            ));
+            t.stale = true;
+        }
     }
     index::on_report(state, now_ms);
     if state.screen == Screen::Tokens {
@@ -593,8 +603,10 @@ mod tests {
         answer(&mut state, &down, vec![session("s1", 1)]);
         assert_eq!(state.tokens.depth(), 1);
         let mut seen = vec![];
+        let mut last = vec![];
         for _ in 0..4 {
-            let (_, q) = asked(&update(&mut state, ch('g'), NOW_MS));
+            last = update(&mut state, ch('g'), NOW_MS);
+            let (_, q) = asked(&last);
             seen.push(q.grouping);
             assert_eq!((q.period, q.session), (TokenPeriod::Day, None));
         }
@@ -608,7 +620,22 @@ mod tests {
             ]
         );
         assert_eq!(state.tokens.depth(), 0, "back at the top (B8)");
-        assert!(state.tokens.report().is_none(), "`loading…` until it comes");
+        assert_eq!(
+            state.tokens.report().map(|r| r.rows.len()),
+            Some(3),
+            "the last report stays until the new one comes (VIS-10)"
+        );
+        assert!(state.tokens.pending());
+        answer(&mut state, &last, vec![row(day(1), 1)]);
+        assert_eq!(
+            state
+                .tokens
+                .report()
+                .map(|r| (r.rows.len(), r.query.grouping)),
+            Some((1, TokenGrouping::Account)),
+            "the next report replaces it"
+        );
+        assert!(!state.tokens.pending());
     }
 
     #[test]
@@ -759,7 +786,11 @@ mod tests {
             month: 9,
         };
         assert!(answer(&mut state, &older, vec![row(month, 1)]).is_empty());
-        assert!(state.tokens.report().is_none(), "the month report is stale");
+        assert_eq!(
+            state.tokens.report().map(|r| r.query.period),
+            Some(TokenPeriod::Day),
+            "the month report is dropped, and the last one stays"
+        );
         assert!(
             state.tokens.pending(),
             "the session report is still to come"
@@ -803,7 +834,10 @@ mod tests {
             NOW_MS,
         );
         assert_eq!(state.tokens.report().map(|r| r.rows.len()), Some(3));
-        assert_eq!(draw(&state, 80, 24)[2], " ! the store is locked");
+        assert_eq!(
+            draw(&state, 80, 24)[2],
+            " ! couldn't read the token index (the store is locked) · r retries"
+        );
         update(&mut state, ch('1'), NOW_MS);
         assert!(
             !draw(&state, 80, 24)

@@ -1259,7 +1259,15 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
         return;
     }
     let table = Table::new(report, &t.level().widths, width, state.theme, now_ms);
-    lines.push(table.header());
+    // A failed query keeps the last report, DIM (T2-22).
+    let dim = |line: Line<'static>| {
+        if t.stale {
+            line.patch_style(state.theme.dim())
+        } else {
+            line
+        }
+    };
+    lines.push(dim(table.header()));
     let laid = t.level().layout.rows(report, width, now_ms);
     let (items, starts) = (&laid.items, &laid.starts);
     let selected_at = t.selected_index();
@@ -1271,7 +1279,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
         None => t.level().offset.min(items.len().saturating_sub(plan.rows)),
     };
     for (n, (index, item)) in items.iter().skip(offset).take(plan.rows).enumerate() {
-        lines.push(match item {
+        lines.push(dim(match item {
             Item::Row { repeat } => {
                 let row = table.row(&report.rows[*index], *repeat && n > 0);
                 if Some(*index) == selected_at {
@@ -1281,9 +1289,9 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
                 }
             }
             Item::Figures(line) => line.clone(),
-        });
+        }));
     }
-    lines.push(table.total());
+    lines.push(dim(table.total()));
     lines.extend(plan.below);
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -1296,6 +1304,7 @@ mod tests {
 
     use super::*;
     use crate::msg::{Cmd, Msg};
+    use crate::source::SourceError;
     use crate::state::BannerKind;
     use crate::state::Screen;
     use crate::testutil::*;
@@ -2051,6 +2060,96 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn a_failed_report_keeps_the_last_one_dim_under_the_banner() {
+        // T2-22, redesign §5.7: the last report stays, DIM, under `! couldn't read the token
+        // index (<error>) · r retries`; the next good report clears both.
+        // Every cell the row's text takes, from its first column to its last.
+        let cells = |buf: &ratatui::buffer::Buffer, needle: &str| {
+            let (_, y) = locate(buf, needle).unwrap();
+            let used = text_of(buf)[usize::from(y)].trim_end().chars().count();
+            (0..used)
+                .map(|x| buf[(x as u16, y)].modifier.contains(Modifier::DIM))
+                .collect::<Vec<_>>()
+        };
+        let dim =
+            |buf: &ratatui::buffer::Buffer, needle: &str| cells(buf, needle).iter().all(|d| *d);
+        let plain =
+            |buf: &ratatui::buffer::Buffer, needle: &str| cells(buf, needle).iter().all(|d| !d);
+        for theme in TIERS {
+            let mut state = showing(many_days(3), |_| {});
+            state.theme = theme;
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            for needle in ["ACCOUNT", "2026-09-21", "2026-09-20", "TOTAL"] {
+                assert!(
+                    plain(&buf, needle),
+                    "{theme:?} {needle}: a good report is plain"
+                );
+            }
+            let asked = update(&mut state, ch('p'), NOW_MS);
+            let [Cmd::LoadReport { r#gen, .. }] = asked.as_slice() else {
+                panic!("{asked:?}");
+            };
+            let r#gen = *r#gen;
+            assert!(state.tokens.pending());
+            assert!(
+                plain(&draw_buffer(&state, 80, 24, NOW_MS), "2026-09-21"),
+                "{theme:?}: only a failure dims it"
+            );
+            let failed = Err(SourceError {
+                kind: "store".into(),
+                message: "the index is locked".into(),
+            });
+            update(
+                &mut state,
+                Msg::TokenReport {
+                    r#gen,
+                    result: failed,
+                },
+                NOW_MS,
+            );
+            assert_eq!(state.tokens.report().map(|r| r.rows.len()), Some(3));
+            assert_eq!(
+                state.tokens.report().map(|r| r.query.period),
+                Some(TokenPeriod::Day)
+            );
+            assert!(!state.tokens.pending());
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            assert_eq!(
+                text_of(&buf)[2],
+                " ! couldn't read the token index (the index is locked) · r retries"
+            );
+            for needle in ["ACCOUNT", "2026-09-21", "2026-09-20", "2026-09-19", "TOTAL"] {
+                assert!(dim(&buf, needle), "{theme:?} {needle}: DIM on every cell");
+            }
+            let again = update(&mut state, ch('p'), NOW_MS);
+            assert!(
+                dim(&draw_buffer(&state, 80, 24, NOW_MS), "2026-09-21"),
+                "{theme:?}: dim until the new report arrives"
+            );
+            let [Cmd::LoadReport { r#gen, query }] = again.as_slice() else {
+                panic!("{again:?}");
+            };
+            let result = Ok(token_report(query.clone(), many_days(3)));
+            update(
+                &mut state,
+                Msg::TokenReport {
+                    r#gen: *r#gen,
+                    result,
+                },
+                NOW_MS,
+            );
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            assert!(
+                !text_of(&buf).iter().any(|l| l.contains("couldn't read")),
+                "{theme:?}"
+            );
+            for needle in ["ACCOUNT", "2026-09-21", "TOTAL"] {
+                assert!(plain(&buf, needle), "{theme:?} {needle}: cleared");
+            }
+        }
     }
 
     #[test]

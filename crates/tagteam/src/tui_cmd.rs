@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tagteam_core::ProviderId;
 use tagteam_engine::EngineError;
 use tagteam_engine::daemon::daemon_socket_path;
+use tagteam_engine::settings::Settings;
 use tagteam_engine::views::ProviderNames;
 use tagteam_provider::Cancel;
 use tagteam_provider::profile::RunShell;
@@ -56,6 +57,10 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
     // the TUI starts. It refuses an unknown `--provider`, prints the settings warnings once,
     // before the alternate screen hides them, and reads `ui.color`. It reads the settings file
     // and nothing else.
+    //
+    // `Settings::mtime` is read before the engine loads the settings, as it advises: a write
+    // landing between the two then counts as one more change at the next accounts read.
+    let config_mtime = Settings::mtime(&env);
     let (probe, warnings) =
         app::build_engine(inside.clone(), registry, run_shell, env, provider.as_ref());
     for w in &warnings {
@@ -109,7 +114,8 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
             return app::EXIT_ERROR;
         }
     };
-    let host = Arc::new(CliHost::new(&ctx, shutdown.clone(), exe).with_startup_warnings(warnings));
+    let host =
+        Arc::new(CliHost::new(&ctx, shutdown.clone(), exe).with_startup_warnings(warnings.clone()));
     let screen = screen_for(cli);
     let opts = TuiOptions {
         screen,
@@ -125,6 +131,8 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
         shutdown,
         daemon: Some(daemon),
         names,
+        warnings,
+        config_mtime,
     };
     let exit = tagteam_tui::run(opts, sources(inside, provider), host);
     if let Some(report) = &exit.report {

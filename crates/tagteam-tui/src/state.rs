@@ -1,5 +1,7 @@
 //! Everything on screen (spec §4.2). `update` changes it, `view` draws it.
 
+use std::time::SystemTime;
+
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::views::{ProviderAccounts, ProviderNames};
 
@@ -93,6 +95,16 @@ pub struct State {
     /// The action keys are ignored until this instant: a key closed an overlay just before
     /// (T2-18).
     pub(crate) guard_until_ms: i64,
+    /// The settings warnings the CLI printed before the TUI started (redesign §5.6, T2-21).
+    pub(crate) startup: Startup,
+}
+
+/// The settings warnings of start-up, and the config file's mtime as read before the settings
+/// were: an accounts read that sees another mtime means the file changed, and clears them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Startup {
+    pub(crate) warnings: Vec<String>,
+    pub(crate) mtime: Option<SystemTime>,
 }
 
 /// A banner's words, and what raised them: a success of that same kind clears it, and a refusal
@@ -150,6 +162,7 @@ impl State {
         provider: Option<ProviderId>,
         tokens: TokensState,
         names: ProviderNames,
+        startup: Startup,
         now_ms: i64,
     ) -> State {
         State {
@@ -179,6 +192,7 @@ impl State {
             checked: None,
             on_terminal: false,
             guard_until_ms: 0,
+            startup,
         }
     }
 
