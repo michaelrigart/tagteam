@@ -1997,3 +1997,29 @@ fn data_version_moves_for_another_connections_commit_and_never_for_its_own() {
     assert_ne!(second, first, "another connection committed");
     assert_eq!(s.data_version().unwrap(), second, "and nothing since");
 }
+
+#[test]
+fn an_account_row_is_switchable_when_enabled_with_an_identity_and_a_poll_candidate_unless_quarantined()
+ {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let id = add(&s, &cc(), "a", "a@x.co", 1);
+    let row = s.account(&id).unwrap().unwrap();
+    let rules = |r: &tagteam_engine::store::AccountRow| (r.is_switchable(), r.is_poll_candidate());
+    assert_eq!(rules(&row), (true, true));
+    let disabled = tagteam_engine::store::AccountRow {
+        disabled: true,
+        ..row.clone()
+    };
+    assert_eq!(rules(&disabled), (false, false));
+    let no_identity = tagteam_engine::store::AccountRow {
+        identity_json: serde_json::Value::Null,
+        ..row.clone()
+    };
+    assert_eq!(rules(&no_identity), (false, false));
+    let quarantined = tagteam_engine::store::AccountRow {
+        quarantine_reason: Some("invalid_grant".into()),
+        ..row
+    };
+    assert_eq!(rules(&quarantined), (true, false));
+}

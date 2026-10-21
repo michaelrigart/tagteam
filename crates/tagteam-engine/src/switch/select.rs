@@ -18,14 +18,6 @@ use super::{
     SwitchReason, SwitchRequest, SwitchTarget, USAGE_UNAVAILABLE, UsageStrategy, noop,
 };
 
-/// A rotation candidate by the store alone (§9.3 "Reading the vault lazily"): enabled, not
-/// quarantined, and with an identity. Whether its vault holds a credential is read only when
-/// the walk reaches it. `Engine::switch_candidate` adds the session rule, and every candidate
-/// list goes through that instead.
-pub(crate) fn is_candidate(row: &AccountRow) -> bool {
-    !row.disabled && row.quarantine_reason.is_none() && row.identity_json.is_object()
-}
-
 /// A bare `switch` (§9.2, §9.3): where the rotation goes, or why it stays.
 #[allow(clippy::large_enum_variant)]
 pub(super) enum Rotation {
@@ -91,14 +83,14 @@ fn nothing_to_activate(live_row: Option<&AccountRow>) -> Ranked {
 }
 
 impl Engine {
-    /// §9.3: a candidate for every strategy. `is_candidate`, and not session-owned (§12.5): a
+    /// §9.3: a candidate for every strategy. `is_poll_candidate`, and not session-owned (§12.5): a
     /// live reservation, or a live or unreadable session record. The vault is not read.
     pub(crate) fn switch_candidate(
         &self,
         p: &dyn Provider,
         row: &AccountRow,
     ) -> Result<bool, EngineError> {
-        Ok(is_candidate(row) && !self.session_state(p, row)?.owned())
+        Ok(row.is_poll_candidate() && !self.session_state(p, row)?.owned())
     }
 
     /// §9.3: the rotation's candidates in walk order, from the store and each account's session
