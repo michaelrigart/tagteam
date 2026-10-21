@@ -822,6 +822,10 @@ fn under_r_a_sigterm_to_the_tui_is_forwarded_and_both_exit() {
     let mut tui = home.tui(&["tui"]);
     tui.wait_for(LONG, "the accounts table", accounts);
     tui.type_keys(b"R");
+    tui.wait_for(LONG, "the start question", |s| {
+        s.on_alt() && s.contains("in this terminal?")
+    });
+    tui.type_keys(b"\r");
     wait_for_session(&home, &mut tui);
     tui.signal(libc::SIGTERM);
     let f = tui.finish(LONG);
@@ -845,6 +849,10 @@ fn under_r_ctrl_backslash_ends_the_session_and_the_tui_survives_and_returns() {
     let mut tui = home.tui(&["tui"]);
     tui.wait_for(LONG, "the accounts table", accounts);
     tui.type_keys(b"R");
+    tui.wait_for(LONG, "the start question", |s| {
+        s.on_alt() && s.contains("in this terminal?")
+    });
+    tui.type_keys(b"\r");
     wait_for_session(&home, &mut tui);
     tui.type_keys(b"\x1c");
     tui.wait_for(LONG, "the wait for Enter", returning);
@@ -867,6 +875,10 @@ fn under_r_ctrl_c_ends_the_session_and_the_tui_carries_on() {
     let mut tui = home.tui(&["tui"]);
     tui.wait_for(LONG, "the accounts table", accounts);
     tui.type_keys(b"R");
+    tui.wait_for(LONG, "the start question", |s| {
+        s.on_alt() && s.contains("in this terminal?")
+    });
+    tui.type_keys(b"\r");
     wait_for_session(&home, &mut tui);
     tui.type_keys(b"\x03");
     tui.wait_for(LONG, "the wait for Enter", returning);
@@ -902,6 +914,10 @@ fn under_r_ctrl_c_ends_the_session_and_a_running_index_refresh_goes_on() {
         pause.join("paused").exists()
     });
     tui.type_keys(b"R");
+    tui.wait_for(LONG, "the start question", |s| {
+        s.on_alt() && s.contains("in this terminal?")
+    });
+    tui.type_keys(b"\r");
     wait_for_session(&home, &mut tui);
     tui.type_keys(b"\x03");
     tui.wait_for(LONG, "the wait for Enter", returning);
@@ -941,6 +957,10 @@ fn run_on_an_account_moved_elsewhere_is_refused_and_launches_nothing() {
     });
     cmd(home.root()).args(["move", "1", "2"]).assert().success();
     tui.type_keys(b"R");
+    tui.wait_for(LONG, "the start question", |s| {
+        s.on_alt() && s.contains("in this terminal?")
+    });
+    tui.type_keys(b"\r");
     let shown = tui.wait_for(LONG, "the wait for Enter", returning);
     assert!(
         shown.contains("tagteam: the selected account changed; nothing was done"),
@@ -959,13 +979,17 @@ fn run_on_an_account_moved_elsewhere_is_refused_and_launches_nothing() {
 
 #[test]
 fn a_locked_keychain_runs_the_action_on_the_terminal_and_returns() {
-    // Spec §4.5, §7.3: the TUI's dialogs cannot unlock it, so the switch runs again on the
-    // terminal, where the CLI asks itself. The file-backed fake Keychain cannot be unlocked.
+    // Spec §4.5, §7.3: the TUI's dialogs cannot unlock it, so it asks, and on Enter the switch
+    // runs again on the terminal, where the CLI asks itself. The file-backed fake Keychain cannot be unlocked.
     let home = Home::new();
     fs::write(home.root().join("keychain").join("LOCKED"), b"").unwrap();
     let mut tui = home.tui(&["tui"]);
     tui.wait_for(LONG, "the accounts table", accounts);
     tui.type_keys(b"s");
+    tui.wait_for(LONG, "the hand-over question", |s| {
+        s.on_alt() && s.contains("Your login keychain is locked.")
+    });
+    tui.type_keys(b"\r");
     tui.wait_for(LONG, "the CLI's unlock question", |s| {
         !s.on_alt() && s.contains("Unlock it now? [Y/n]")
     });
@@ -1068,6 +1092,10 @@ fn under_r_ctrl_c_ends_the_session_and_the_daemon_connection_stays_live() {
     let mut tui = home.tui(&["tui"]);
     tui.wait_for(LONG, "live mode", live);
     tui.type_keys(b"R");
+    tui.wait_for(LONG, "the start question", |s| {
+        s.on_alt() && s.contains("in this terminal?")
+    });
+    tui.type_keys(b"\r");
     wait_for_session(&home, &mut tui);
     tui.type_keys(b"\x03");
     tui.wait_for(LONG, "the wait for Enter", returning);

@@ -9,7 +9,7 @@ use tagteam_engine::words;
 use crate::daemon;
 use crate::host::{Action, ActionOutcome};
 use crate::msg::{Answer, AnswerTo, Cmd, Prompt, PromptKind};
-use crate::overlay::{ConfirmThen, Overlay, TextThen};
+use crate::overlay::{ConfirmThen, Overlay, ProceedThen, TextThen};
 use crate::screens;
 use crate::source::CollectSummary;
 use crate::state::{Screen, State, ToastKind};
@@ -209,15 +209,21 @@ fn account_key(state: &mut State, c: char, now_ms: i64) -> Vec<Cmd> {
             state.overlay = Some(Overlay::Text {
                 prompt: format!("Alias for {named} (empty clears):"),
                 input: alias.unwrap_or_default(),
+                error: None,
                 then: TextThen::Alias(account),
             });
             vec![]
         }
         'm' => {
+            let last = state.view_of(&provider).map_or(account.position, |v| {
+                u32::try_from(v.accounts.len()).unwrap_or(u32::MAX)
+            });
+            let short = state.short_name(&account);
             state.overlay = Some(Overlay::Text {
-                prompt: format!("Move {named} to position:"),
+                prompt: format!("Move {short} to position (1–{last}):"),
                 input: String::new(),
-                then: TextThen::Move(account),
+                error: None,
+                then: TextThen::Move { account, last },
             });
             vec![]
         }
@@ -231,7 +237,17 @@ fn account_key(state: &mut State, c: char, now_ms: i64) -> Vec<Cmd> {
             });
             vec![]
         }
-        'R' => start(state, Action::Run(account), now_ms),
+        'R' => {
+            let display = state.names_of(&provider).display_name;
+            let short = state.short_name(&account);
+            state.overlay = Some(Overlay::Proceed {
+                question: format!("Start {display} as {short} in this terminal?"),
+                detail: "tagteam steps aside until the session ends, then comes back.".to_owned(),
+                go: "starts",
+                then: ProceedThen::Start(Action::Run(account)),
+            });
+            vec![]
+        }
         _ => vec![],
     }
 }
@@ -269,8 +285,8 @@ fn declined(to: AnswerTo, kind: &PromptKind) -> Cmd {
     Cmd::Answer { to, answer }
 }
 
-/// An action's outcome (redesign §9.3, §9.6): a command that needs the terminal is run again
-/// suspended (§7.3); then, in this order:
+/// An action's outcome (redesign §9.3, §9.6): a command that needs the terminal asks first, then
+/// runs again suspended (§7.3); then, in this order:
 /// 1. a suspended action's return, worded by its exit code alone;
 /// 2. doctor's report, in its panel whatever the exit code;
 /// 3. `P`'s pause or resume with no stderr, in the provider's name;
@@ -283,10 +299,26 @@ fn declined(to: AnswerTo, kind: &PromptKind) -> Cmd {
 /// Every view is re-read after every outcome (§7.3 step 4).
 pub fn on_done(state: &mut State, action: Action, outcome: ActionOutcome, now_ms: i64) -> Vec<Cmd> {
     let (exit, out, err) = match outcome {
-        ActionOutcome::NeedsTerminal if state.quitting.is_none() => {
+        // `run` always suspends at once (`start`): it never asks.
+        ActionOutcome::NeedsTerminal
+            if state.quitting.is_none() && matches!(action, Action::Run(_)) =>
+        {
             state.running = Some(action.clone());
             state.on_terminal = true;
             return vec![Cmd::Suspend(action)];
+        }
+        // The keychain is locked: ask before the terminal is handed over (§9.6, T2-19). The
+        // flag `on_terminal` is set when `⏎` hands it over.
+        ActionOutcome::NeedsTerminal if state.quitting.is_none() => {
+            state.running = Some(action.clone());
+            state.dirty = true;
+            state.overlay = Some(Overlay::Proceed {
+                question: "Your login keychain is locked.".to_owned(),
+                detail: "tagteam hands you the terminal to unlock it, then comes back.".to_owned(),
+                go: "continue",
+                then: ProceedThen::Suspend(action),
+            });
+            return vec![];
         }
         ActionOutcome::NeedsTerminal => {
             state.running = None;
@@ -405,8 +437,10 @@ mod tests {
     use crate::host::AccountRef;
     use crate::msg::Msg;
     use crate::source::CollectSummary;
+    use crate::state::GUARD_MS;
     use crate::testutil::*;
     use crate::update::update;
+    use tagteam_engine::views::ProviderNames;
 
     fn loaded(n: u32) -> State {
         let mut state = fresh(Screen::Accounts);
@@ -475,13 +509,229 @@ mod tests {
     }
 
     #[test]
-    fn run_always_suspends() {
+    fn r_asks_before_it_starts_a_session() {
         let mut state = loaded(1);
+        assert!(update(&mut state, ch('R'), NOW_MS).is_empty());
+        assert!(state.running.is_none(), "nothing starts before the answer");
+        let Some(Overlay::Proceed {
+            question,
+            detail,
+            go,
+            then: ProceedThen::Start(action),
+        }) = &state.overlay
+        else {
+            panic!("{:?}", state.overlay);
+        };
+        assert_eq!(question, "Start Claude Code as 1 a1 in this terminal?");
         assert_eq!(
-            update(&mut state, ch('R'), NOW_MS),
+            detail,
+            "tagteam steps aside until the session ends, then comes back."
+        );
+        assert_eq!((*go, action), ("starts", &Action::Run(sel(1))));
+        let drawn = draw(&state, 80, 24);
+        assert!(
+            drawn
+                .iter()
+                .any(|l| l.contains("Start Claude Code as 1 a1 in this terminal?")),
+            "{drawn:?}"
+        );
+        assert!(
+            drawn
+                .iter()
+                .any(|l| l.contains("⏎ starts · Esc cancel") && l.contains('╯')),
+            "{drawn:?}"
+        );
+        assert_eq!(
+            update(&mut state, key(KeyCode::Enter), NOW_MS),
             [Cmd::Suspend(Action::Run(sel(1)))]
         );
         assert_eq!(state.running, Some(Action::Run(sel(1))));
+        assert!(state.on_terminal && state.overlay.is_none());
+        // Esc cancels and starts nothing.
+        let mut state = loaded(1);
+        update(&mut state, ch('R'), NOW_MS);
+        assert!(update(&mut state, key(KeyCode::Esc), NOW_MS).is_empty());
+        assert!(state.overlay.is_none() && state.running.is_none() && !state.on_terminal);
+    }
+
+    #[test]
+    fn the_r_question_names_the_provider_it_starts() {
+        let mut state = loaded(1);
+        let mut snap = snapshot(many(1));
+        snap.providers[0].names = ProviderNames {
+            display_name: "FakeAgent",
+            launch_command: "fake-agent",
+        };
+        state.accounts.apply(snap);
+        update(&mut state, ch('R'), NOW_MS);
+        let Some(Overlay::Proceed { question, .. }) = &state.overlay else {
+            panic!("{:?}", state.overlay);
+        };
+        assert_eq!(question, "Start FakeAgent as 1 a1 in this terminal?");
+    }
+
+    #[test]
+    fn a_locked_keychain_asks_before_it_hands_the_terminal_over() {
+        let mut state = loaded(1);
+        update(&mut state, ch('s'), NOW_MS);
+        let cmds = on_done(
+            &mut state,
+            Action::Switch(sel(1)),
+            ActionOutcome::NeedsTerminal,
+            NOW_MS,
+        );
+        assert!(cmds.is_empty());
+        let Some(Overlay::Proceed {
+            question,
+            detail,
+            go,
+            then: ProceedThen::Suspend(action),
+        }) = &state.overlay
+        else {
+            panic!("{:?}", state.overlay);
+        };
+        assert_eq!(question, "Your login keychain is locked.");
+        assert_eq!(
+            detail,
+            "tagteam hands you the terminal to unlock it, then comes back."
+        );
+        assert_eq!((*go, action), ("continue", &Action::Switch(sel(1))));
+        assert_eq!(
+            state.running,
+            Some(Action::Switch(sel(1))),
+            "still running while it asks"
+        );
+        assert!(!state.on_terminal, "the terminal is not handed over yet");
+        let drawn = draw(&state, 80, 24);
+        assert!(
+            drawn
+                .iter()
+                .any(|l| l.contains("⏎ continue · Esc cancel") && l.contains('╯')),
+            "{drawn:?}"
+        );
+        // ⏎ hands it over; the return toasts from the exit code.
+        assert_eq!(
+            update(&mut state, key(KeyCode::Enter), NOW_MS),
+            [Cmd::Suspend(Action::Switch(sel(1)))]
+        );
+        assert!(state.on_terminal && state.overlay.is_none());
+        on_done(&mut state, Action::Switch(sel(1)), done(0, "", ""), NOW_MS);
+        let toast = state.toast.as_ref().unwrap();
+        assert_eq!(
+            (toast.kind, toast.text.as_str()),
+            (ToastKind::Done, "switch finished")
+        );
+        assert!(state.running.is_none() && !state.on_terminal);
+        // Esc cancels silently: the command changed nothing.
+        let mut state = loaded(1);
+        update(&mut state, ch('s'), NOW_MS);
+        on_done(
+            &mut state,
+            Action::Switch(sel(1)),
+            ActionOutcome::NeedsTerminal,
+            NOW_MS,
+        );
+        assert!(update(&mut state, key(KeyCode::Esc), NOW_MS).is_empty());
+        assert!(state.overlay.is_none() && state.running.is_none() && !state.on_terminal);
+        assert!(state.toast.is_none());
+    }
+
+    #[test]
+    fn move_asks_for_a_position_in_range_and_refuses_one_outside_it() {
+        let mut state = loaded(3);
+        update(&mut state, ch('m'), NOW_MS);
+        let Some(Overlay::Text { prompt, .. }) = &state.overlay else {
+            panic!("{:?}", state.overlay);
+        };
+        assert_eq!(prompt, "Move 1 a1 to position (1–3):");
+        for wrong in ["4", "0", "000", "999999999"] {
+            for c in wrong.chars() {
+                update(&mut state, ch(c), NOW_MS);
+            }
+            assert!(update(&mut state, key(KeyCode::Enter), NOW_MS).is_empty());
+            let Some(Overlay::Text { error, .. }) = &state.overlay else {
+                panic!("{wrong}: {:?}", state.overlay);
+            };
+            assert_eq!(
+                error.as_deref(),
+                Some("Choose a position from 1 to 3."),
+                "{wrong}"
+            );
+            assert!(state.running.is_none(), "{wrong}");
+            let drawn = draw(&state, 80, 24);
+            assert!(
+                drawn
+                    .iter()
+                    .any(|l| l.contains("Choose a position from 1 to 3.")),
+                "{wrong}: {drawn:?}"
+            );
+            // The next key edits the input and the refusal goes.
+            for _ in wrong.chars() {
+                update(&mut state, key(KeyCode::Backspace), NOW_MS);
+            }
+            let Some(Overlay::Text { error, input, .. }) = &state.overlay else {
+                panic!("{:?}", state.overlay);
+            };
+            assert!(error.is_none() && input.is_empty(), "{wrong}");
+        }
+        update(&mut state, ch('2'), NOW_MS);
+        assert_eq!(
+            update(&mut state, key(KeyCode::Enter), NOW_MS),
+            [Cmd::Act(Action::Move {
+                account: sel(1),
+                position: 2
+            })]
+        );
+    }
+
+    #[test]
+    fn the_refusal_under_a_position_is_in_crit() {
+        for theme in TIERS {
+            let mut state = loaded(3);
+            state.theme = theme;
+            update(&mut state, ch('m'), NOW_MS);
+            update(&mut state, ch('7'), NOW_MS);
+            update(&mut state, key(KeyCode::Enter), NOW_MS);
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            let (x, y) = locate(&buf, "Choose a position").unwrap();
+            let crit = theme.role(crate::theme::Role::Crit);
+            assert_eq!(
+                buf[(x, y)].fg,
+                crit.fg.unwrap_or(ratatui::style::Color::Reset)
+            );
+            assert!(
+                buf[(x, y)].modifier.contains(crit.add_modifier),
+                "{theme:?}"
+            );
+        }
+    }
+
+    /// §9.5: `x` on the account in use asks as for any other; the CLI does not refuse it.
+    #[test]
+    fn remove_on_the_account_in_use_confirms_as_any_other() {
+        let mut views = many(2);
+        views[0].active = true;
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(views));
+        assert!(update(&mut state, ch('x'), NOW_MS).is_empty());
+        let Some(Overlay::Confirm {
+            question,
+            choice,
+            then: ConfirmThen::Run(Action::Remove(account)),
+        }) = &state.overlay
+        else {
+            panic!("{:?}", state.overlay);
+        };
+        assert_eq!(
+            question,
+            "Remove 1 a1@x.co? Its stored login is deleted; Claude Code is not changed."
+        );
+        assert!(!choice);
+        assert_eq!(*account, sel(1));
+        assert_eq!(
+            update(&mut state, ch('y'), NOW_MS),
+            [Cmd::Act(Action::Remove(sel(1)))]
+        );
     }
 
     #[test]
@@ -573,11 +823,14 @@ mod tests {
         // Enter takes the default: no.
         assert!(update(&mut state, key(KeyCode::Enter), NOW_MS).is_empty());
         assert!(state.overlay.is_none() && state.running.is_none());
-        update(&mut state, ch('x'), NOW_MS);
-        assert!(update(&mut state, key(KeyCode::Esc), NOW_MS).is_empty());
-        update(&mut state, ch('x'), NOW_MS);
+        // Each close holds the action keys for the guard (§9.5).
+        let later = NOW_MS + GUARD_MS;
+        update(&mut state, ch('x'), later);
+        assert!(update(&mut state, key(KeyCode::Esc), later).is_empty());
+        let later = later + GUARD_MS;
+        update(&mut state, ch('x'), later);
         assert_eq!(
-            update(&mut state, ch('y'), NOW_MS),
+            update(&mut state, ch('y'), later),
             [Cmd::Act(Action::Remove(sel(2)))]
         );
     }
@@ -606,15 +859,18 @@ mod tests {
         let mut aliased = many(1);
         aliased[0].row.alias = Some("w".into());
         state.accounts.apply(snapshot(aliased));
-        update(&mut state, ch('a'), NOW_MS);
-        update(&mut state, key(KeyCode::Backspace), NOW_MS);
+        // Each close holds the action keys for the guard (§9.5).
+        let later = NOW_MS + GUARD_MS;
+        update(&mut state, ch('a'), later);
+        update(&mut state, key(KeyCode::Backspace), later);
         assert_eq!(
-            update(&mut state, key(KeyCode::Enter), NOW_MS),
+            update(&mut state, key(KeyCode::Enter), later),
             [Cmd::Act(Action::ClearAlias(sel(1)))]
         );
         state.running = None;
-        update(&mut state, ch('a'), NOW_MS);
-        assert!(update(&mut state, key(KeyCode::Esc), NOW_MS).is_empty());
+        let later = later + GUARD_MS;
+        update(&mut state, ch('a'), later);
+        assert!(update(&mut state, key(KeyCode::Esc), later).is_empty());
         assert!(state.overlay.is_none() && state.running.is_none());
     }
 
@@ -1198,11 +1454,19 @@ mod tests {
             let (_, shown) = outcome_of(action, on_terminal, exit, out, err);
             assert_eq!(shown, want, "{case}");
         }
-        // 1. NeedsTerminal asks to run again suspended, and marks the outcome to come.
+        // 1. NeedsTerminal asks before it runs again suspended; the outcome is marked as the
+        // terminal's only once `⏎` hands it over.
         let mut state = loaded(1);
         let cmds = on_done(&mut state, switch(), ActionOutcome::NeedsTerminal, NOW_MS);
-        assert_eq!(cmds, [Cmd::Suspend(switch())]);
-        assert!(state.on_terminal && state.toast.is_none() && state.overlay.is_none());
+        assert!(cmds.is_empty());
+        assert!(!state.on_terminal && state.toast.is_none());
+        assert!(matches!(
+            state.overlay,
+            Some(Overlay::Proceed {
+                then: ProceedThen::Suspend(_),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1251,7 +1515,8 @@ mod tests {
         for exit in [0, 1, 130] {
             let mut state = loaded(1);
             state.history.select(id(1));
-            let started = update(&mut state, ch('R'), NOW_MS);
+            update(&mut state, ch('R'), NOW_MS);
+            let started = update(&mut state, key(KeyCode::Enter), NOW_MS);
             state.screen = Screen::History;
             assert_eq!(started, [Cmd::Suspend(Action::Run(sel(1)))]);
             assert!(state.on_terminal);
@@ -1287,6 +1552,7 @@ mod tests {
                 ActionOutcome::NeedsTerminal,
                 NOW_MS,
             );
+            update(&mut state, key(KeyCode::Enter), NOW_MS);
             let cmds = on_done(
                 &mut state,
                 Action::Switch(sel(1)),
@@ -1300,21 +1566,17 @@ mod tests {
     }
 
     #[test]
-    fn needs_terminal_runs_the_action_again_suspended() {
+    fn a_quitting_ui_does_not_ask_for_the_terminal() {
         let mut state = loaded(1);
         update(&mut state, ch('s'), NOW_MS);
+        state.quitting = Some(0);
         let cmds = on_done(
             &mut state,
             Action::Switch(sel(1)),
             ActionOutcome::NeedsTerminal,
             NOW_MS,
         );
-        assert_eq!(cmds, [Cmd::Suspend(Action::Switch(sel(1)))]);
-        assert_eq!(
-            state.running,
-            Some(Action::Switch(sel(1))),
-            "still running, suspended"
-        );
+        assert!(cmds.is_empty() && state.overlay.is_none() && state.running.is_none());
     }
 
     #[test]
@@ -2000,9 +2262,11 @@ mod tests {
             "no"
         );
         assert!(state.overlay.is_none() && state.running.is_none());
-        update(&mut state, ch('P'), NOW_MS);
+        // The guard (§9.5) has passed.
+        let later = NOW_MS + GUARD_MS;
+        update(&mut state, ch('P'), later);
         assert_eq!(
-            update(&mut state, ch('y'), NOW_MS),
+            update(&mut state, ch('y'), later),
             [Cmd::Act(pause.clone())]
         );
         assert_eq!(state.running, Some(pause));

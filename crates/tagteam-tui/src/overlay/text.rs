@@ -7,7 +7,8 @@ use super::{BOX_COLS, BoxSpec, KeyOutcome, TextThen, boxed, question_rows};
 use crate::actions::start;
 use crate::host::Action;
 use crate::state::State;
-use crate::view::width_of;
+use crate::theme::Role;
+use crate::view::{width_of, wrap_rows};
 
 /// The longest alias and position the text dialogs take.
 const ALIAS_MAX: usize = 64;
@@ -16,6 +17,7 @@ const POSITION_MAX: usize = 9;
 pub(super) fn key(
     state: &mut State,
     input: &mut String,
+    error: &mut Option<String>,
     then: &TextThen,
     key: KeyEvent,
     now_ms: i64,
@@ -23,17 +25,23 @@ pub(super) fn key(
     match key.code {
         KeyCode::Esc => KeyOutcome::Close,
         KeyCode::Enter => match submitted(then, input) {
-            Some(action) => KeyOutcome::CloseWith(start(state, action, now_ms)),
-            None => KeyOutcome::Keep,
+            Submitted::Action(action) => KeyOutcome::CloseWith(start(state, action, now_ms)),
+            Submitted::Refused(why) => {
+                *error = Some(why);
+                KeyOutcome::Keep
+            }
+            Submitted::Nothing => KeyOutcome::Keep,
         },
         KeyCode::Backspace => {
+            *error = None;
             input.pop();
             KeyOutcome::Keep
         }
         KeyCode::Char(c) if !c.is_control() => {
+            *error = None;
             let fits = match then {
                 TextThen::Alias(_) => input.chars().count() < ALIAS_MAX,
-                TextThen::Move(_) => c.is_ascii_digit() && input.len() < POSITION_MAX,
+                TextThen::Move { .. } => c.is_ascii_digit() && input.len() < POSITION_MAX,
             };
             if fits {
                 input.push(c);
@@ -44,7 +52,14 @@ pub(super) fn key(
     }
 }
 
-pub(super) fn render(state: &State, frame: &mut Frame, area: Rect, prompt: &str, input: &str) {
+pub(super) fn render(
+    state: &State,
+    frame: &mut Frame,
+    area: Rect,
+    prompt: &str,
+    input: &str,
+    error: Option<&str>,
+) {
     let w = 64u16.min(area.width.saturating_sub(4));
     let inner = usize::from(w).saturating_sub(BOX_COLS).max(1);
     let mut lines: Vec<Line<'static>> = question_rows(prompt, inner, area.height)
@@ -56,6 +71,13 @@ pub(super) fn render(state: &State, frame: &mut Frame, area: Rect, prompt: &str,
         Span::raw(shown),
         Span::styled(" ", state.theme.focus()),
     ]));
+    if let Some(error) = error {
+        lines.extend(
+            wrap_rows(error, inner, 2)
+                .into_iter()
+                .map(|row| Line::from(Span::styled(row, state.theme.role(Role::Crit)))),
+        );
+    }
     let spec = BoxSpec {
         title: "Input".to_owned(),
         keys: "Enter · Esc cancel",
@@ -65,21 +87,34 @@ pub(super) fn render(state: &State, frame: &mut Frame, area: Rect, prompt: &str,
     boxed(frame, state.theme, spec, lines);
 }
 
+/// What `Enter` made of a text dialog's input.
+enum Submitted {
+    Action(Action),
+    /// The input is refused, with the words to show under it.
+    Refused(String),
+    /// Nothing to submit yet.
+    Nothing,
+}
+
 /// The action a text dialog's input asks for: an empty alias clears it (spec §7.1), and a
-/// position must be a number.
-fn submitted(then: &TextThen, input: &str) -> Option<Action> {
+/// position must be a number from 1 to the provider's last (redesign §9.5, T2-20).
+fn submitted(then: &TextThen, input: &str) -> Submitted {
     match then {
         TextThen::Alias(account) if input.trim().is_empty() => {
-            Some(Action::ClearAlias(account.clone()))
+            Submitted::Action(Action::ClearAlias(account.clone()))
         }
-        TextThen::Alias(account) => Some(Action::SetAlias {
+        TextThen::Alias(account) => Submitted::Action(Action::SetAlias {
             account: account.clone(),
             alias: input.to_owned(),
         }),
-        TextThen::Move(account) => input.parse::<u32>().ok().map(|position| Action::Move {
-            account: account.clone(),
-            position,
-        }),
+        TextThen::Move { account, last } => match input.parse::<u32>() {
+            Ok(position) if (1..=*last).contains(&position) => Submitted::Action(Action::Move {
+                account: account.clone(),
+                position,
+            }),
+            Ok(_) => Submitted::Refused(format!("Choose a position from 1 to {last}.")),
+            Err(_) => Submitted::Nothing,
+        },
     }
 }
 
