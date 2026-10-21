@@ -9,9 +9,9 @@ use std::fs;
 use std::sync::Mutex;
 
 use common::{
-    API_KEY, FakeFx, Fx, Recorded, capture_logs, crashed_switch, cred_at, credential, fp,
-    quiescent, record_reading, sent_refresh_tokens, usage_requests, usage_window, vault_fp,
-    write_target_credential,
+    API_KEY, FakeFx, Fx, Recorded, block_rescue, capture_logs, crashed_switch, cred_at, credential,
+    fp, quarantine_of, quiescent, record_reading, sent_refresh_tokens, unblock_rescue,
+    usage_requests, usage_window, vault_fp, write_target_credential,
 };
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::autoswitch::{
@@ -1763,5 +1763,95 @@ fn a_target_with_an_unreadable_rescue_fails_freshening() {
         }]
     );
     assert!(sent_refresh_tokens(&fx).is_empty());
+    assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
+}
+
+/// §11.2 step 10 for an automatic switch, the gate's refusals that carry words: a successor
+/// only in `rescue/`, and the token endpoint's systemic refusal. Each fails the target with its
+/// reason, so with no other target the tick ends as step 12's error.
+#[test]
+fn a_target_whose_refresh_is_rescued_or_refused_fails_freshening_with_the_reason() {
+    for (case, message) in [
+        (
+            "rescued",
+            "could not freshen a@x.co (position 1): its refreshed token is in rescue/, not yet in the vault",
+        ),
+        (
+            "systemic",
+            "could not freshen a@x.co (position 1): invalid_client",
+        ),
+    ] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let c = fx.add("c@x.co", "rt-c"); // live, at its limit
+        read(&fx.engine, &a, &reading(false, 10.0, 20.0));
+        read(&fx.engine, &c, &reading(false, 100.0, 50.0));
+        fx.expire_access(&a);
+        match case {
+            "rescued" => {
+                fx.script_refresh(Some("rt-a-2"));
+                fx.kc.set_fail_write(SERVICE, true);
+            }
+            _ => fx.script_token_error(400, "invalid_client"),
+        }
+        let sink = Recorded::default();
+        let mut engine = fx
+            .engine
+            .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+            .unwrap()
+            .unwrap();
+        let (outcome, _) = engine.tick(&sink).unwrap();
+        fx.kc.set_fail_write(SERVICE, false);
+        assert_eq!(outcome, TickOutcome::Error, "{case}");
+        assert_eq!(
+            sink.take()[1..],
+            [AutoEvent::Error {
+                provider: fx.provider(),
+                message: message.into(),
+                transient: true,
+            }],
+            "{case}"
+        );
+        assert_eq!(fx.live_email().as_deref(), Some("c@x.co"), "{case}");
+    }
+}
+
+/// §7.3 step 6 for an automatic switch: a successor lost to a failed vault write and an
+/// unwritable `rescue/` quarantines the target as `successor_lost`, and with no other target
+/// the tick is blocked.
+#[test]
+fn an_unpersisted_target_is_quarantined_and_leaves_no_viable_target() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let c = fx.add("c@x.co", "rt-c"); // live, at its limit
+    read(&fx.engine, &a, &reading(false, 10.0, 20.0));
+    read(&fx.engine, &c, &reading(false, 100.0, 50.0));
+    fx.expire_access(&a);
+    fx.script_refresh(Some("rt-a-2"));
+    fx.kc.set_fail_write(SERVICE, true);
+    block_rescue(&fx);
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    let (outcome, _) = engine.tick(&sink).unwrap();
+    unblock_rescue(&fx);
+    fx.kc.set_fail_write(SERVICE, false);
+    assert_eq!(outcome, TickOutcome::Blocked);
+    assert_eq!(
+        sink.take()[1..],
+        [
+            AutoEvent::AccountQuarantined {
+                provider: fx.provider(),
+                number: 1,
+                email: "a@x.co".into(),
+                reason: "successor_lost".into(),
+            },
+            no_switch(&fx.provider(), "no-viable-target", ""),
+        ]
+    );
+    assert_eq!(quarantine_of(&fx, &a).0.as_deref(), Some("successor_lost"));
     assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
 }
