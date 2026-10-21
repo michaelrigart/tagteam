@@ -13,6 +13,7 @@ use tagteam_cc::live::Platform;
 use tagteam_core::WindowKind;
 use tagteam_core::autoswitch::{AutoConfig, AutoStrategy, Decision, NoSwitchReason};
 use tagteam_core::time::format_iso8601;
+use tagteam_engine::EventSource;
 use tagteam_engine::auto::TickOutcome;
 use tagteam_engine::collect::CollectMode;
 use tagteam_engine::switch::{SwitchOutcome, SwitchRequest};
@@ -495,12 +496,12 @@ fn run_the_daemon_s_work_on(fx: &Fx) {
     };
     record_reading(&fx.engine, &a, &reading(20.0), T0, T0 + 300);
     record_reading(&fx.engine, &b, &reading(95.0), T0, T0 + 300);
+    let daemon_engine = fx.engine_as(EventSource::Daemon);
     let daemon = || {
-        fx.engine
+        daemon_engine
             .auto(&provider, cfg.clone(), false)
             .unwrap()
             .unwrap()
-            .with_source("daemon")
     };
     check(fx, "daemon tick that switches", || {
         let (outcome, decision) = daemon().tick(&Recorded::default()).unwrap();

@@ -16,13 +16,13 @@ use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::poll::PollPlan;
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::AddTokenOptions;
 use tagteam_engine::store::{Activation, EventRow, NewAccount};
 use tagteam_engine::switch::{
     AutoPerform, SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget,
 };
 use tagteam_engine::vault::SERVICE;
+use tagteam_engine::{EngineError, EventSource};
 use tagteam_provider::{Keychain, Provider, SecretStore};
 
 fn request(fx: &Fx, target: SwitchTarget, force: bool) -> SwitchRequest {
@@ -30,7 +30,6 @@ fn request(fx: &Fx, target: SwitchTarget, force: bool) -> SwitchRequest {
         provider: fx.provider(),
         target,
         force,
-        source: "cli",
         auto: None,
     }
 }
@@ -1346,7 +1345,6 @@ fn auto_switch(fx: &Fx, from: &AccountId, target: &AccountId, trigger: Trigger) 
         provider: fx.provider(),
         target: to(target),
         force: false,
-        source: "auto",
         auto: Some(AutoPerform {
             expected_from: from.clone(),
             trigger,
@@ -1388,7 +1386,7 @@ fn an_automatic_switch_records_its_departure_in_the_commit() {
     let store = fx.engine.store().unwrap();
     store.set_unhealthy_ticks(&fx.provider(), 2).unwrap();
     let out = fx
-        .engine
+        .engine_as(EventSource::Auto)
         .switch(auto_switch(&fx, &b, &a, Trigger::Proactive))
         .unwrap();
     assert_eq!(

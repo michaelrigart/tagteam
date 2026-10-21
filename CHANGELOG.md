@@ -77,6 +77,9 @@ with the one before, so any release may contain breaking changes. Each section s
   provider the screen follows.
 - `tagteam tui`'s selection starts on the account in use. The banner and the one-account hint
   follow the selected account's provider.
+- Quarantines, quarantine releases and recovered switches that `tagteam auto` or the daemon
+  carries out are recorded with `auto` or `daemon` as their source, in the event history and the
+  log; some were recorded as `cli`.
 
 ### Security
 

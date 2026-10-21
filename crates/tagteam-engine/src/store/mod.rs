@@ -15,6 +15,7 @@ use tagteam_provider::atomic::ensure_private_dir;
 use tagteam_provider::{Clock, Identity, MutationGuard, ProcessStamp, SystemClock};
 
 use crate::account_lock::AccountLock;
+use crate::event::EventSource;
 
 mod tokens;
 mod usage;
@@ -1157,8 +1158,9 @@ impl Store {
 
     /// The replacement landed: installs its recorded metadata, clears any quarantine and the
     /// marker, all in one transaction. A quarantine it clears records its `unquarantine` event
-    /// in that transaction, at `at`, as `account-replaced` from `cli`: the epoch moved, and an
-    /// explicit replacement is a command's (§7.4, §11.4), whichever lock holder finishes it. A
+    /// in that transaction, at `at`, as `account-replaced` from `source`: the epoch moved, and
+    /// the holder that finishes the replacement is who records its release (§7.4, §11.4; review
+    /// refactor §8.7, §11). A
     /// missing `identity_key`, `label` or `kind` in the recorded metadata means the account and
     /// its marker are left exactly as they were (§12.5) rather than installing an empty
     /// identity: that is `ReplacementUnreadable`, as is metadata that is not JSON.
@@ -1171,7 +1173,12 @@ impl Store {
     /// store.
     ///
     /// The account is `lock.id()`: holding its lock is the proof (§6.2, §9.1).
-    pub fn finish_replacement(&self, lock: &AccountLock, at: i64) -> Result<(), StoreError> {
+    pub fn finish_replacement(
+        &self,
+        lock: &AccountLock,
+        source: EventSource,
+        at: i64,
+    ) -> Result<(), StoreError> {
         let id = lock.id();
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1207,7 +1214,7 @@ impl Store {
             };
             let login_expires_at = v["login_expires_at"].as_i64();
             apply_login(&tx, id, identity_key, &identity, kind, login_expires_at)?;
-            cleared = clear_quarantine_on(&tx, id, ACCOUNT_REPLACED, "cli", at)?;
+            cleared = clear_quarantine_on(&tx, id, ACCOUNT_REPLACED, source.as_str(), at)?;
             if v["from_live"].as_bool().unwrap_or(false) {
                 tx.execute(
                     "UPDATE active_accounts SET login_epoch = \

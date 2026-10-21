@@ -140,13 +140,13 @@ impl Engine {
     /// switch: the account locks of both accounts it names, then CC's locks. The live
     /// credential decides the direction; the row is cleared only once a fresh re-read of every
     /// surface names one account. Never writes an old credential back. An undecidable row
-    /// stays until `switch --force` settles it. A forward finish's event carries `source`.
+    /// stays until `switch --force` settles it. A forward finish's event carries this engine's source
+    /// (review refactor §8.7).
     pub(crate) fn recover_one(
         &self,
         guard: &MutationGuard,
         row: &JournalRow,
         hints: &[OracleHint],
-        source: &'static str,
     ) -> Result<(), EngineError> {
         let provider = self.provider(&row.provider)?;
         let p = provider.as_ref();
@@ -181,7 +181,7 @@ impl Engine {
             hints,
         };
         let activated = match direction {
-            Direction::Forward(fp) => self.finish_forward(p, &store, &rec, &fp, source)?,
+            Direction::Forward(fp) => self.finish_forward(p, &store, &rec, &fp)?,
             Direction::Backward(fp) => {
                 self.finish_backward(p, &store, &rec, &fp)?;
                 None
@@ -260,7 +260,6 @@ impl Engine {
         store: &Store,
         rec: &Recovery<'_, '_>,
         established: &str,
-        source: &'static str,
     ) -> Result<Option<Identity>, EngineError> {
         let Recovery {
             row, locks, live, ..
@@ -343,7 +342,7 @@ impl Engine {
                 from_id: row.from_id.clone(),
                 to_id: Some(to.id.clone()),
                 trigger: Some("recovery".into()),
-                source: source.into(),
+                source: self.source().as_str().into(),
                 detail: None,
             },
             // Never an auto-switch record: the row names neither the

@@ -6,6 +6,7 @@ use std::time::Duration;
 use common::{Fx, crashed_switch, credential, due, quarantine_of, token_requests, vault_fp};
 use serde_json::{Value, json};
 use tagteam_core::AccountId;
+use tagteam_engine::EventSource;
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::quarantine::QuarantineReason;
 use tagteam_engine::refresh::{GateOutcome, OwnedBy};
@@ -245,6 +246,28 @@ fn invalid_grant_quarantines_bound_to_the_generation_sent() {
     );
     let events = fx.engine.store().unwrap().events().unwrap();
     assert!(events.iter().any(|e| e.kind == "quarantine"), "{events:?}");
+}
+
+#[test]
+fn a_quarantine_the_gate_raises_under_the_daemon_records_the_daemon() {
+    let fx = Fx::new();
+    let a = due(&fx);
+    fx.script_token_error(400, "invalid_grant");
+    let daemon = fx.engine_as(EventSource::Daemon);
+    let snapshot = fx.vault_bytes(&a).unwrap();
+    assert!(matches!(
+        daemon
+            .refresh_stored(fx.cc.as_ref(), &a, &snapshot)
+            .unwrap(),
+        GateOutcome::Dead(QuarantineReason::InvalidGrant)
+    ));
+    let events = fx.engine.store().unwrap().events().unwrap();
+    let quarantine: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind.as_str() == "quarantine")
+        .collect();
+    assert_eq!(quarantine.len(), 1, "{events:?}");
+    assert_eq!(quarantine[0].source.as_str(), "daemon");
 }
 
 #[test]

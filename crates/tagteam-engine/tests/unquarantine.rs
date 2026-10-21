@@ -6,6 +6,7 @@ mod common;
 use common::{Fx, credential, due, vault_fp};
 use serde_json::json;
 use tagteam_core::AccountId;
+use tagteam_engine::EventSource;
 use tagteam_engine::store::EventRow;
 
 /// Every `unquarantine` event recorded so far, as (account, reason, source).
@@ -16,7 +17,7 @@ fn unquarantines(fx: &Fx) -> Vec<(AccountId, String, String)> {
         .events()
         .unwrap()
         .into_iter()
-        .filter(|e| e.kind == "unquarantine")
+        .filter(|e| e.kind.as_str() == "unquarantine")
         .map(|e: EventRow| {
             (
                 e.to_id.expect("an unquarantine names its account"),
@@ -24,7 +25,7 @@ fn unquarantines(fx: &Fx) -> Vec<(AccountId, String, String)> {
                     .as_str()
                     .unwrap()
                     .to_owned(),
-                e.source,
+                e.source.as_str().to_owned(),
             )
         })
         .collect()
@@ -87,22 +88,40 @@ fn a_landed_replacement_reconciled_by_the_next_lock_holder_records_account_repla
 }
 
 #[test]
+fn a_landed_replacement_reconciled_under_the_daemon_records_the_daemon() {
+    // The replacer died after its vault write; the daemon is the next lock holder, so the
+    // release it finishes is recorded as the daemon's, not as `cli` (review refactor §11).
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live
+    quarantine(&fx, &a);
+    fx.begin_replacement(
+        &a,
+        &credential("a@x.co", "rt-a9"),
+        &Fx::oauth_account("a@x.co"),
+        "oauth",
+    );
+    drop(fx.engine_as(EventSource::Daemon).lock_account(&a).unwrap());
+    assert_eq!(unquarantines(&fx), one(&a, "account-replaced", "daemon"));
+}
+
+#[test]
 fn the_switch_s_outgoing_capture_records_credentials_replaced_with_its_source() {
     // M2a's m-9: the capture wrote the vault and cleared the quarantine with no event.
-    for source in ["cli", "auto"] {
+    for source in [EventSource::Cli, EventSource::Auto] {
         let fx = Fx::new();
         let a = fx.add("a@x.co", "rt-a");
         let b = fx.add("b@x.co", "rt-b"); // live
         quarantine(&fx, &b);
         fx.rotate_live("rt-b2"); // CC refreshed b in place
-        let mut req = fx.switch_request(&a, false);
-        req.source = source;
-        fx.engine.switch(req).unwrap();
+        fx.engine_as(source)
+            .switch(fx.switch_request(&a, false))
+            .unwrap();
         assert_eq!(fx.vault_refresh_token(&b).as_deref(), Some("rt-b2"));
         assert_eq!(
             unquarantines(&fx),
-            one(&b, "credentials-replaced", source),
-            "{source}"
+            one(&b, "credentials-replaced", source.as_str()),
+            "{source:?}"
         );
     }
 }
@@ -135,6 +154,20 @@ fn a_refresh_after_the_gate_releases_a_stale_quarantine_records_one_event() {
 }
 
 #[test]
+fn the_gate_s_release_under_auto_records_auto() {
+    let fx = Fx::new();
+    let a = due(&fx);
+    fx.script_refresh(Some("rt-a3"));
+    fx.quarantine(&a, "invalid_grant", "sha256:an-older-generation");
+    let snapshot = fx.vault_bytes(&a).unwrap();
+    fx.engine_as(EventSource::Auto)
+        .refresh_stored(fx.cc.as_ref(), &a, &snapshot)
+        .unwrap();
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a3"));
+    assert_eq!(unquarantines(&fx), one(&a, "credentials-replaced", "auto"));
+}
+
+#[test]
 fn the_tick_s_release_of_a_landed_replacement_records_account_replaced_once() {
     // A replacement that landed moved the epoch before its marker was cleared: releasing the
     // quarantine it left is the replacement's clear, and the reconciliation after it finds
@@ -150,8 +183,8 @@ fn the_tick_s_release_of_a_landed_replacement_records_account_replaced_once() {
         "oauth",
     );
     assert_eq!(
-        fx.engine
-            .release_unbound_quarantines(&fx.provider(), "auto")
+        fx.engine_as(EventSource::Auto)
+            .release_unbound_quarantines(&fx.provider())
             .unwrap(),
         [a.clone()]
     );
@@ -167,8 +200,8 @@ fn the_tick_s_release_without_a_replacement_records_credentials_replaced() {
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b"); // live
     fx.quarantine(&a, "invalid_grant", "sha256:a-generation-long-gone");
-    fx.engine
-        .release_unbound_quarantines(&fx.provider(), "auto")
+    fx.engine_as(EventSource::Auto)
+        .release_unbound_quarantines(&fx.provider())
         .unwrap();
     assert_eq!(unquarantines(&fx), one(&a, "credentials-replaced", "auto"));
     let detail = fx

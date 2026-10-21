@@ -286,7 +286,8 @@ pub(crate) fn locate_run_shell(ctx: &Context) -> Result<Located, EngineError> {
     })
 }
 
-/// The engine for one command and its settings warnings, after the one lookup of the run shell.
+/// The engine for one command and its settings warnings, after the one lookup of the run shell,
+/// recording its events under `source` (review refactor §8.7).
 pub(crate) fn engine_for(
     ctx: Context,
     provider: Option<&ProviderId>,

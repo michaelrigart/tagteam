@@ -42,6 +42,11 @@ pub(crate) struct T {
 
 impl T {
     pub fn new() -> Self {
+        Self::sourced(EventSource::Cli)
+    }
+
+    /// An engine recording its events under `source` (review refactor §8.7).
+    pub(crate) fn sourced(source: EventSource) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::for_test(dir.path());
         let kc = Arc::new(FakeKeychain::new());
@@ -60,7 +65,7 @@ impl T {
             process: Arc::new(tagteam_provider::liveness::FakeProcessProbe::new()),
             spawner: Arc::new(tagteam_provider::process::ScriptedSpawner::new()),
             run_shell: RunShell::Outside,
-            source: EventSource::Cli,
+            source,
         });
         T {
             _dir: dir,

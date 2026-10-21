@@ -501,6 +501,7 @@ fn a_replacement_between_planning_and_freshening_stale_marks_the_profile() {
     // and the replacement wins (§12.5).
     use common::held_lock;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tagteam_engine::EventSource;
     use tagteam_engine::store::LoginMeta;
     let fx = Fx::new();
     let a = two_accounts(&fx);
@@ -532,7 +533,9 @@ fn a_replacement_between_planning_and_freshening_stale_marks_the_profile() {
             store
                 .begin_replacement(&lock, &seed_fp, &meta, false)
                 .unwrap();
-            store.finish_replacement(&lock, 0).unwrap();
+            store
+                .finish_replacement(&lock, EventSource::Cli, 0)
+                .unwrap();
         }),
     );
 

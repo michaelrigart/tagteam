@@ -245,9 +245,6 @@ pub struct AutoEngine<'e> {
     provider: ProviderId,
     cfg: AutoConfig,
     dry_run: bool,
-    /// What its switches, recoveries and quarantine releases record as `events.source`
-    /// (§6.1): `auto`, or the daemon's `daemon` (Decision 4).
-    source: &'static str,
     /// The engine lock, held for this engine's life; `None` in dry-run. `Drop` empties its
     /// record while it is still held (Decision 5).
     lock: Option<FlockGuard>,
@@ -368,7 +365,6 @@ impl Engine {
             provider: provider.clone(),
             cfg,
             dry_run,
-            source: "auto",
             lock,
             unhealthy: None,
             quarantines: QuarantineWatch::new(),
@@ -416,13 +412,6 @@ fn email_of(row: &AccountRow) -> String {
 }
 
 impl AutoEngine<'_> {
-    /// Decision 4: the source this engine's switches, recoveries and quarantine releases
-    /// record (§6.1). `Engine::auto` starts every engine at `auto`; the daemon passes `daemon`.
-    pub fn with_source(mut self, source: &'static str) -> Self {
-        self.source = source;
-        self
-    }
-
     /// The provider this engine drives.
     pub fn provider(&self) -> &ProviderId {
         &self.provider
@@ -480,8 +469,7 @@ impl AutoEngine<'_> {
         let released = if self.dry_run {
             Vec::new()
         } else {
-            self.engine
-                .release_unbound_quarantines(&self.provider, self.source)?
+            self.engine.release_unbound_quarantines(&self.provider)?
         };
         let store = self.engine.existing_store()?;
         let rows = match &store {
@@ -629,7 +617,6 @@ impl AutoEngine<'_> {
                 provider: self.provider.clone(),
                 target: SwitchTarget::Account(id.clone()),
                 force: false,
-                source: self.source,
                 auto: Some(AutoPerform {
                     expected_from: t.live.id.clone(),
                     trigger,
@@ -721,15 +708,16 @@ impl AutoEngine<'_> {
     }
 
     /// §11.2 step 2: an unresolved switch journal for the provider is recovered first, under
-    /// `MutationGuard`, its events carrying the engine's source (§9.6, Decision 4). `Some`
+    /// `MutationGuard`, its events carrying the engine's source (§9.6; review
+    /// refactor §8.7). `Some`
     /// with recovery's refusal while a row stays: one recovery could not decide, could not
     /// take the live locks or found its agent writing, or the mutation lock was held past its
     /// timeout.
     fn recover(&self) -> Result<Option<EngineError>, EngineError> {
-        match self.engine.settle_or_refuse(&GuardRequest {
-            source: self.source,
-            ..GuardRequest::refusing_one(&self.provider)
-        }) {
+        match self
+            .engine
+            .settle_or_refuse(&GuardRequest::refusing_one(&self.provider))
+        {
             Ok(()) => Ok(None),
             Err(e) if e.signal().is_some() => Err(e),
             Err(

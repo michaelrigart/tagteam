@@ -457,7 +457,7 @@ impl Engine {
         self.store()?
             .set_login_expires_at(&row.id, p.login_expires_at(bytes))?;
         if p.fingerprint(bytes) != before {
-            self.unquarantine(row, CREDENTIALS_REPLACED, "cli")?;
+            self.unquarantine(row, CREDENTIALS_REPLACED)?;
         }
         Ok(())
     }
@@ -510,7 +510,7 @@ impl Engine {
                     QuarantineReason::parse(reason).unwrap_or(QuarantineReason::InvalidGrant),
                 ));
             }
-            self.unquarantine(&row, CREDENTIALS_REPLACED, "cli")?;
+            self.unquarantine(&row, CREDENTIALS_REPLACED)?;
         }
         if !p.kind_traits(&row.kind).refreshable {
             return Ok(transient(GateFailure::NotRefreshable));

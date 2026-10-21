@@ -58,9 +58,6 @@ pub(crate) struct GuardRequest<'a> {
     /// Refuse, once recovery has run under the lock, for the first of `providers` whose
     /// interrupted switch is still unresolved (§9.6).
     pub(crate) refuse_interrupted: bool,
-    /// What each switch it recovers is recorded with (§9.4 step 9: `cli`, or `auto` for an
-    /// auto-switch engine, §11.2 step 2).
-    pub(crate) source: &'static str,
 }
 
 impl Default for GuardRequest<'_> {
@@ -70,7 +67,6 @@ impl Default for GuardRequest<'_> {
             timeout: MutationGuard::TIMEOUT,
             recovery: RecoveryMode::Oracle,
             refuse_interrupted: false,
-            source: "cli",
         }
     }
 }
@@ -472,7 +468,7 @@ impl Engine {
     /// by provider as `Blocked`, not refused. Under `FingerprintsOnly` the rows are recovered
     /// from fingerprints alone: no network call (§7.6, §9.6). A recovery interrupted at one of
     /// its lock waits ends the command with that interruption (§14.1). Each recovered switch is
-    /// recorded with `r.source`. The lock is waited for up to `r.timeout`. The rows are read
+    /// recorded with this engine's source (review refactor §8.7). The lock is waited for up to `r.timeout`. The rows are read
     /// before the lock and again under it; `DecodableOnly` (`purge`) reads them with
     /// `dead_decodable_journals`, so a row that does not decode is left for it to delete
     /// (§10.5 step 5) rather than ending it; every other mode reads them all, strictly.
@@ -505,7 +501,7 @@ impl Engine {
                 .iter()
                 .find(|(seen, _)| *seen == row)
                 .map_or(&[][..], |(_, h)| h.as_slice());
-            if let Err(e) = self.recover_one(&guard, &row, hint, r.source) {
+            if let Err(e) = self.recover_one(&guard, &row, hint) {
                 // CC wrote the entry recovery was clearing: nothing was cleared, the row stays,
                 // and a plain retry settles it.
                 let e = match e {
@@ -649,7 +645,7 @@ impl Engine {
         let provider = self.provider(&row.provider)?;
         match self.vault.read(lock.id()) {
             Read::Present(b) if provider.fingerprint(&b).is_some_and(|f| f.as_str() == fp) => {
-                match store.finish_replacement(lock, self.now_ms()) {
+                match store.finish_replacement(lock, self.source(), self.now_ms()) {
                     Ok(()) => {}
                     Err(StoreError::ReplacementUnreadable(_)) if mode == Reconcile::Removing => {}
                     Err(StoreError::ReplacementUnreadable(detail)) => {

@@ -21,7 +21,6 @@ fn request(fx: &Fx, target: SwitchTarget, force: bool) -> SwitchRequest {
         provider: fx.provider(),
         target,
         force,
-        source: "cli",
         auto: None,
     }
 }
