@@ -111,10 +111,10 @@ pub(crate) fn auto_line(state: &State, width: u16, now_ms: i64) -> Line<'static>
 /// ` ● {pos} {alias, else email}   {label} [{gauge} ]{pct:>4} {span}   …` for its account in
 /// use, its first short and first long window, the gauge from `WIDE` columns; a problem in their
 /// place as `{glyph} {status words} · see Accounts`, in its role; with no account in use
-/// `NO_ACCOUNT_IN_USE`, muted. On the right, one column in, `lead::pick_words`' Now strip form,
-/// dropped when it would leave the left part less than `lead::LEFT_LEAST` columns, or the hint
-/// with no account in use less than its whole width; the left part is cut to the room it
-/// leaves. Empty before the first snapshot and with no accounts.
+/// `NO_ACCOUNT_IN_USE`, muted. On the right, one column in, `lead::pick_words`' Now strip form.
+/// The name gives way first, down to its floor (`card::floored`); then the pick is dropped,
+/// rather than cut the windows or the problem, or the hint with no account in use; and only then
+/// are those cut, from their end. Empty before the first snapshot and with no accounts.
 pub(crate) fn now_strip(state: &State, width: u16, now_ms: i64) -> Line<'static> {
     let theme = state.theme;
     let Some(view) = state
@@ -123,16 +123,22 @@ pub(crate) fn now_strip(state: &State, width: u16, now_ms: i64) -> Line<'static>
     else {
         return Line::default();
     };
-    let mut left = vec![Span::raw(" ")];
-    // The hint is what to do, so it is never cut for the pick: the pick gives way instead.
-    let least = match lead::in_use(state) {
+    let (least, left): (usize, Box<dyn Fn(usize) -> Vec<Span<'static>>>) = match lead::in_use(state)
+    {
         Some((_, v)) => {
-            left.extend(in_use_spans(v, width, now_ms, theme));
-            lead::LEFT_LEAST
+            let (head, name, rest) = in_use_parts(v, width, now_ms, theme);
+            let least = card::floored_least(&head, &name, NOW_GAP, &rest).max(lead::LEFT_LEAST);
+            let left =
+                move |room| card::floored(head.clone(), name.clone(), NOW_GAP, rest.clone(), room);
+            (least, Box::new(left))
         }
         None => {
-            left.push(Span::styled(NO_ACCOUNT_IN_USE, theme.role(Role::Muted)));
-            spans_width(&left)
+            let hint = vec![
+                Span::raw(" "),
+                Span::styled(NO_ACCOUNT_IN_USE, theme.role(Role::Muted)),
+            ];
+            let least = spans_width(&hint);
+            (least, Box::new(move |room| fit_spans(hint.clone(), room)))
         }
     };
     let width = usize::from(width);
@@ -140,9 +146,9 @@ pub(crate) fn now_strip(state: &State, width: u16, now_ms: i64) -> Line<'static>
     let pick_w = spans_width(&pick);
     let room = width.checked_sub(pick_w + lead::PICK_GAP + keys::RIGHT_INSET);
     let Some(room) = room.filter(|&room| pick_w > 0 && room >= least) else {
-        return Line::from(fit_spans(left, width));
+        return Line::from(left(width));
     };
-    let mut spans = fit_spans(left, room);
+    let mut spans = left(room);
     let gap = width - keys::RIGHT_INSET - pick_w - spans_width(&spans);
     spans.push(Span::raw(" ".repeat(gap)));
     spans.extend(pick);
@@ -158,16 +164,22 @@ const NOW_GAUGE: usize = 10;
 /// Between the Now strip's name and windows, and between its windows (§4.3's group gap).
 const NOW_GAP: &str = "   ";
 
-/// The Now strip's account in use: `● {pos} {name}`, then its windows or its problem (T3-24).
-/// An old reading keeps its windows: they are still what was read, and its status words say
-/// nothing of its age.
-fn in_use_spans(v: &AccountView, width: u16, now_ms: i64, theme: Theme) -> Vec<Span<'static>> {
-    let name = v.row.alias.clone().unwrap_or_else(|| words::email(&v.row));
-    let mut spans = vec![
+/// The parts of the Now strip's account in use (T3-24): ` ● {pos} `, its name, and its windows
+/// or its problem, the gap before them left to `card::floored`. An old reading keeps its
+/// windows: they are still what was read, and its status words say nothing of its age.
+type NowParts = (Vec<Span<'static>>, Vec<Span<'static>>, Vec<Span<'static>>);
+
+fn in_use_parts(v: &AccountView, width: u16, now_ms: i64, theme: Theme) -> NowParts {
+    let head = vec![
+        Span::raw(" "),
         Span::styled(table::IN_USE, theme.role(Role::Accent)),
         Span::raw(format!(" {} ", v.row.position)),
-        Span::styled(name, theme.strong()),
     ];
+    let name = vec![Span::styled(
+        v.row.alias.clone().unwrap_or_else(|| words::email(&v.row)),
+        theme.strong(),
+    )];
+    let mut spans = Vec::new();
     if let Some(problem) = words::problem(v).filter(|p| *p != Problem::OldReading) {
         let (glyph, role) = status::mark(problem);
         let said = words::status_words(&v.usage);
@@ -175,14 +187,15 @@ fn in_use_spans(v: &AccountView, width: u16, now_ms: i64, theme: Theme) -> Vec<S
             Some(glyph) => format!("{glyph} {said}"),
             None => said,
         };
-        spans.push(Span::raw(NOW_GAP));
         spans.push(Span::styled(said, theme.role(role)));
         spans.push(Span::styled(SEE_ACCOUNTS, theme.role(Role::Muted)));
-        return spans;
+        return (head, name, spans);
     }
     let now_s = now_ms.div_euclid(1000);
-    for (w, p) in card::short_and_long(v) {
-        spans.push(Span::raw(NOW_GAP));
+    for (i, (w, p)) in card::short_and_long(v).enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(NOW_GAP));
+        }
         spans.push(Span::styled(w.label.clone(), theme.role(Role::Muted)));
         spans.push(Span::raw(" "));
         if width >= WIDE {
@@ -206,7 +219,7 @@ fn in_use_spans(v: &AccountView, width: u16, now_ms: i64, theme: Theme) -> Vec<S
             ));
         }
     }
-    spans
+    (head, name, spans)
 }
 
 /// `─` across `width`, faint: under the chrome from `RULE_FROM` rows (§4.3).
@@ -1149,6 +1162,64 @@ mod tests {
             row.starts_with(" ● 2 work   ! rate-limited · see Accounts"),
             "{row}"
         );
+    }
+
+    #[test]
+    fn the_now_strip_cuts_the_name_to_16_columns_then_drops_the_pick_and_cuts_the_windows_last() {
+        let windows = "   5h  53% 2h40m   7d   6% 3d09h";
+        let with_name = |email: &str, alex_used: f64| {
+            let mut state = fresh(Screen::Tokens);
+            let mut accounts = alex_and_work();
+            accounts[0].usage = read(60, alex_used, alex_used, false);
+            accounts[1].row.alias = None;
+            accounts[1].row.email = Some(email.into());
+            accounts[1].row.label = email.into();
+            state.accounts.apply(snapshot(accounts));
+            state
+        };
+        let strip = |state: &State, w: u16| -> String {
+            now_strip(state, w, NOW_MS)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        // At 80 columns `sam@corp.example` and its windows take 53, too many beside the pick:
+        // the pick goes and the windows stay whole.
+        let state = with_name("sam@corp.example", 5.0);
+        assert_eq!(
+            now_row(&state, 80, TIERS[1]).0,
+            format!(" ● 2 sam@corp.example{windows}")
+        );
+        for email in ["alex+work.team@example.com", "例のアカウント@example.com"] {
+            let state = with_name(email, 5.0);
+            assert_eq!(
+                now_row(&state, 80, TIERS[1]).0,
+                format!(" ● 2 {email}{windows}"),
+                "{email}"
+            );
+            // A shorter pick stays: the name gives way to it, the windows whole.
+            let best = with_name(email, 90.0);
+            let row = now_row(&best, 80, TIERS[1]).0;
+            assert!(
+                row.ends_with(&format!("{windows}   on the best account")),
+                "{row}"
+            );
+            assert_eq!(width_of(&row), 79, "{row}");
+            // With less room the name gives way to 16 columns before the windows are cut,
+            // and keeps them while they are.
+            let floor = fit(email, 16);
+            assert_eq!(width_of(&floor), 16, "{floor}");
+            assert_eq!(
+                strip(&state, 53),
+                format!(" ● 2 {floor}{windows}"),
+                "{email}"
+            );
+            let cut = strip(&state, 45);
+            assert!(cut.starts_with(&format!(" ● 2 {floor}   5h  53%")), "{cut}");
+            assert!(cut.ends_with('…'), "{cut}");
+            assert_eq!(width_of(&cut), 45, "{cut}");
+        }
     }
 
     #[test]
