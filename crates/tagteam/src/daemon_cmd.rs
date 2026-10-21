@@ -423,7 +423,10 @@ mod tests {
             }));
             sink.tick_done(&cc());
         });
-        assert_eq!(out, "t+0  #2 b@x.co  60%  no switch: below-threshold\n");
+        assert_eq!(
+            out,
+            "t+0  #2 b@x.co  60%  no switch needed (60%, switches at 90%)\n"
+        );
         assert_eq!(err, "t+0  warning: a warning\n");
     }
 

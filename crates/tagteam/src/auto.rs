@@ -9,7 +9,8 @@ use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::NoSwitchReason;
 use tagteam_daemon::protocol::event_json;
 use tagteam_engine::auto::{AutoEvent, EventSink};
-use tagteam_engine::words::{MISSING, duration};
+use tagteam_engine::settings::DEFAULT_THRESHOLD;
+use tagteam_engine::words::{self, MISSING, NoSwitchFacts, duration};
 use tagteam_provider::Cancel;
 
 use crate::render::{RESET, severity_code};
@@ -87,6 +88,8 @@ struct Polled {
     email: String,
     /// The highest relevant percentage (100 − headroom); `None` when unknown.
     used: Option<f64>,
+    /// The switch threshold, percent: what the poll decided by.
+    threshold: f64,
 }
 
 impl<'a> HumanSink<'a> {
@@ -200,6 +203,7 @@ impl EventSink for HumanSink<'_> {
                 provider,
                 active: Some((position, email)),
                 headroom_pct,
+                threshold,
                 ..
             } => {
                 let used = headroom_pct.get(position).copied().flatten();
@@ -207,6 +211,7 @@ impl EventSink for HumanSink<'_> {
                     position: *position,
                     email: email.clone(),
                     used: used.map(|h| 100.0 - h),
+                    threshold: *threshold,
                 };
                 self.polled.borrow_mut().insert(provider.clone(), polled);
             }
@@ -226,7 +231,7 @@ impl EventSink for HumanSink<'_> {
                 self.tick(
                     now,
                     provider,
-                    &format!("{verb} to #{to} ({})", trigger.as_str()),
+                    &format!("{verb} to #{to} ({})", words::trigger(*trigger)),
                 );
             }
             AutoEvent::NoSwitch {
@@ -244,7 +249,23 @@ impl EventSink for HumanSink<'_> {
                     }
                     // `all-exhausted` has its line at the event that follows, with its time.
                     Some(NoSwitchReason::AllExhausted) => {}
-                    _ => {
+                    Some(parsed) => {
+                        let (used_pct, threshold) = self
+                            .polled
+                            .borrow()
+                            .get(provider)
+                            .map_or((None, DEFAULT_THRESHOLD), |p| (p.used, p.threshold));
+                        let display_name = (self.names)(provider);
+                        let facts = NoSwitchFacts {
+                            detail,
+                            used_pct,
+                            threshold,
+                            frees_at: None,
+                            display_name: &display_name,
+                        };
+                        self.tick(now, provider, &words::no_switch(parsed, &facts));
+                    }
+                    None => {
                         let text = if detail.is_empty() {
                             format!("no switch: {reason}")
                         } else {
@@ -258,14 +279,17 @@ impl EventSink for HumanSink<'_> {
                 provider,
                 earliest_reset_at,
             } => {
-                let text = match earliest_reset_at {
-                    Some(at) => format!(
-                        "no switch: all-exhausted, the first back at {} ({})",
-                        (self.clock)(*at),
-                        duration(at - now)
-                    ),
-                    None => "no switch: all-exhausted".to_owned(),
+                let frees_at = earliest_reset_at
+                    .map(|at| format!("{} ({})", (self.clock)(at), duration(at - now)));
+                let display_name = (self.names)(provider);
+                let facts = NoSwitchFacts {
+                    detail: "",
+                    used_pct: None,
+                    threshold: DEFAULT_THRESHOLD,
+                    frees_at: frees_at.as_deref(),
+                    display_name: &display_name,
                 };
+                let text = words::no_switch(NoSwitchReason::AllExhausted, &facts);
                 self.tick(now, provider, &text);
             }
             AutoEvent::AccountQuarantined {
@@ -597,10 +621,10 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "t+0  #1 a@x.co unquarantined (credentials-replaced)\n\
-             t+0  #2 b@x.co  95%  switched to #1 (proactive)\n\
-             t+0  #1 a@x.co  —  no switch: active-usage-unknown (1/3)\n\
-             t+0  no switch: no-active-account\n\
-             t+0  #2 b@x.co  95%  no switch: all-exhausted, the first back at t+9630 (2h40m)\n\
+             t+0  #2 b@x.co  95%  switched to #1 (before it reached the limit)\n\
+             t+0  #1 a@x.co  —  can't read the account in use (1 of 3 tries)\n\
+             t+0  <claude-code> isn't logged in\n\
+             t+0  #2 b@x.co  95%  every account is near its limit; the first frees up at t+9630 (2h40m)\n\
              t+0  sleeping 10m until t+600\n\
              t+0  #1 a@x.co quarantined (invalid_grant)\n"
         );
@@ -641,7 +665,7 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "t+60  no switch: no-active-account\n"
+            "t+60  <claude-code> isn't logged in\n"
         );
         assert_eq!(
             String::from_utf8(err).unwrap(),
@@ -662,9 +686,117 @@ mod tests {
         drop(sink);
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "t+0  <claude-code>  #2 b@x.co  \x1b[31m95%\x1b[0m  no switch: below-threshold\n\
-             t+0  <claude-code>  #2 b@x.co  \x1b[33m75%\x1b[0m  no switch: below-threshold\n\
-             t+0  <claude-code>  #2 b@x.co  50%  no switch: below-threshold\n"
+            "t+0  <claude-code>  #2 b@x.co  \x1b[31m95%\x1b[0m  no switch needed (95%, switches at 90%)\n\
+             t+0  <claude-code>  #2 b@x.co  \x1b[33m75%\x1b[0m  no switch needed (75%, switches at 90%)\n\
+             t+0  <claude-code>  #2 b@x.co  50%  no switch needed (50%, switches at 90%)\n"
+        );
+    }
+
+    /// One line of stdout for `events`, on a fixed clock with provider names `<id>`.
+    fn lines_for(events: &[AutoEvent]) -> String {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let now = || T0 * 1000;
+        let names = |p: &ProviderId| format!("<{p}>");
+        let sink = human(&mut out, &mut err, &now, &names, false, false);
+        for e in events {
+            sink.emit(e);
+        }
+        drop(sink);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn each_no_switch_line_is_its_plain_sentence() {
+        assert_eq!(
+            lines_for(&[no_switch_event("cooldown", "4m")]),
+            "t+0  waiting 4m after the last switch\n"
+        );
+        assert_eq!(
+            lines_for(&[
+                poll(2, &[(2, Some(23.0))]),
+                no_switch_event("below-threshold", "")
+            ]),
+            "t+0  #2 b@x.co  77%  no switch needed (77%, switches at 90%)\n"
+        );
+        assert_eq!(
+            lines_for(&[no_switch_event("active-usage-unknown", "2/3")]),
+            "t+0  can't read the account in use (2 of 3 tries)\n"
+        );
+        assert_eq!(
+            lines_for(&[no_switch_event("no-active-account", "")]),
+            "t+0  <claude-code> isn't logged in\n"
+        );
+    }
+
+    #[test]
+    fn a_below_threshold_line_without_a_poll_says_the_default_threshold() {
+        assert_eq!(
+            lines_for(&[no_switch_event("below-threshold", "")]),
+            "t+0  no switch needed (switches at 90%)\n"
+        );
+    }
+
+    #[test]
+    fn a_below_threshold_line_says_the_threshold_of_its_poll() {
+        let mut p = poll(2, &[(2, Some(23.0))]);
+        if let AutoEvent::Poll { threshold, .. } = &mut p {
+            *threshold = 85.0;
+        }
+        assert_eq!(
+            lines_for(&[p, no_switch_event("below-threshold", "")]),
+            "t+0  #2 b@x.co  77%  no switch needed (77%, switches at 85%)\n"
+        );
+    }
+
+    #[test]
+    fn all_exhausted_says_when_the_first_frees_up_and_how_long_that_is() {
+        let exhausted = |earliest_reset_at| AutoEvent::AllExhausted {
+            provider: cc(),
+            earliest_reset_at,
+        };
+        assert_eq!(
+            lines_for(&[
+                poll(2, &[(2, Some(5.0))]),
+                no_switch_event("all-exhausted", "2h40m"),
+                exhausted(Some(T0 + 9_630)),
+            ]),
+            "t+0  #2 b@x.co  95%  every account is near its limit; the first frees up at t+9630 (2h40m)\n"
+        );
+        assert_eq!(
+            lines_for(&[
+                poll(2, &[(2, Some(5.0))]),
+                no_switch_event("all-exhausted", ""),
+                exhausted(None),
+            ]),
+            "t+0  #2 b@x.co  95%  every account is near its limit\n"
+        );
+    }
+
+    #[test]
+    fn a_switch_line_says_its_trigger_in_words() {
+        let switch = |dry_run| AutoEvent::Switch {
+            provider: cc(),
+            trigger: tagteam_core::autoswitch::Trigger::Proactive,
+            from: 2,
+            to: 2,
+            warnings: Vec::new(),
+            dry_run,
+        };
+        assert_eq!(
+            lines_for(&[switch(false)]),
+            "t+0  switched to #2 (before it reached the limit)\n"
+        );
+        let at_limit = AutoEvent::Switch {
+            provider: cc(),
+            trigger: tagteam_core::autoswitch::Trigger::AtLimit,
+            from: 1,
+            to: 2,
+            warnings: Vec::new(),
+            dry_run: true,
+        };
+        assert_eq!(
+            lines_for(&[at_limit]),
+            "t+0  would switch to #2 (at the limit)\n"
         );
     }
 
