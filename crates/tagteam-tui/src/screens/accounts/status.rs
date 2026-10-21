@@ -24,7 +24,7 @@ struct Phrase {
 
 /// A problem's glyph and role: `✕` crit for a login, `!` warn for what tagteam retries or an old
 /// reading; `NotChecked` has no glyph and is muted.
-fn mark(problem: Problem) -> (Option<&'static str>, Role) {
+pub(super) fn mark(problem: Problem) -> (Option<&'static str>, Role) {
     match problem {
         Problem::NeedsLogin | Problem::LoginExpired | Problem::NoLogin => {
             (Some(NEEDS_YOU), Role::Crit)

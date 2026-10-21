@@ -448,6 +448,18 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
                     };
                     let _ = self.lanes.views.submit(req);
                 }
+                Cmd::LoadCard {
+                    r#gen,
+                    account,
+                    since_s,
+                } => {
+                    let req = ViewsReq::Card {
+                        r#gen,
+                        account,
+                        since_s,
+                    };
+                    let _ = self.lanes.views.submit(req);
+                }
                 Cmd::CollectDue { r#gen, accounts } => {
                     let _ = self
                         .lanes
