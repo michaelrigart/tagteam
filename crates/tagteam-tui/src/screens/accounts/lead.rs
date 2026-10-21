@@ -62,7 +62,7 @@ pub(crate) fn in_use(state: &State) -> Option<(&ProviderAccounts, &AccountView)>
 /// rows under them.
 pub(crate) fn lead(state: &State, width: u16, rows: usize, now_ms: i64) -> Lead {
     let Some((view, v)) = in_use(state) else {
-        let mut lines = no_account(width, state.theme);
+        let mut lines = no_account(state, width);
         lines.truncate(rows);
         return Lead {
             lines,
@@ -93,7 +93,7 @@ pub(crate) fn height(state: &State, width: u16, now_ms: i64) -> usize {
         Some((_, v)) => {
             1 + card::lead_keys(v, width).len() + card::problem_rows(state, v, width, now_ms).len()
         }
-        None => no_account(width, state.theme).len(),
+        None => no_account(state, width).len(),
     }
 }
 
@@ -143,26 +143,57 @@ pub(crate) fn pick_words(
     }
 }
 
-/// `  No account in use` in bold, and what `s` does, muted (§6.2).
-fn no_account(width: u16, theme: Theme) -> Vec<Line<'static>> {
-    let width = usize::from(width);
-    [
-        (NO_ACCOUNT, theme.strong()),
-        (NO_ACCOUNT_HINT, theme.role(Role::Muted)),
-    ]
-    .into_iter()
-    .map(|(text, style)| {
-        Line::from(fit_spans(
-            vec![Span::raw(TITLE_INDENT), Span::styled(text, style)],
-            width,
-        ))
-    })
-    .collect()
+/// `  No account in use` in bold, with focus's best pick on the right as the title has it, and
+/// what `s` does, muted (§6.2).
+fn no_account(state: &State, width: u16) -> Vec<Line<'static>> {
+    let theme = state.theme;
+    let pick = state
+        .view_of(&daemon::focus(state))
+        .and_then(|view| pick_words(state, view, true))
+        .unwrap_or_default();
+    let head = with_pick(pick, usize::from(width), |room| {
+        fit_spans(
+            vec![
+                Span::raw(TITLE_INDENT),
+                Span::styled(NO_ACCOUNT, theme.strong()),
+            ],
+            room,
+        )
+    });
+    let hint = Line::from(fit_spans(
+        vec![
+            Span::raw(TITLE_INDENT),
+            Span::styled(NO_ACCOUNT_HINT, theme.role(Role::Muted)),
+        ],
+        usize::from(width),
+    ));
+    vec![head, hint]
+}
+
+/// `left`, laid out in the room it is given, and `pick` on the right edge of `width`, never cut
+/// (T3-19): the pick is dropped when it would leave the left part less than `LEFT_LEAST`
+/// columns, and `left` then takes the whole width.
+fn with_pick(
+    pick: Vec<Span<'static>>,
+    width: usize,
+    left: impl FnOnce(usize) -> Vec<Span<'static>>,
+) -> Line<'static> {
+    let pick_w: usize = pick.iter().map(|s| width_of(&s.content)).sum();
+    let Some(room) = width
+        .checked_sub(pick_w + PICK_GAP)
+        .filter(|&room| pick_w > 0 && room >= LEFT_LEAST)
+    else {
+        return Line::from(left(width));
+    };
+    let mut spans = left(room);
+    let drawn: usize = spans.iter().map(|s| width_of(&s.content)).sum();
+    spans.push(Span::raw(" ".repeat(width - pick_w - drawn)));
+    spans.extend(pick);
+    Line::from(spans)
 }
 
 /// The title (T3-19): `  ● {pos} {name}[ · {org}]    {facts}` on the left, laid out by
-/// `card::title_spans`, and the forecast's words on the right edge, never cut; they are dropped
-/// when they would leave the left part less than `LEFT_LEAST` columns.
+/// `card::title_spans`, and the forecast's words on the right edge, by `with_pick`.
 fn title(
     state: &State,
     view: &ProviderAccounts,
@@ -172,34 +203,32 @@ fn title(
 ) -> Line<'static> {
     let theme = state.theme;
     let name = card::name_spans(&v.row, width, theme);
-    let facts = card::fact_spans(facts_of(v, now_ms), theme);
-    let width = usize::from(width);
-    let pick = pick_words(state, view, true).unwrap_or_default();
-    let pick_w: usize = pick.iter().map(|s| width_of(&s.content)).sum();
-    let (left_w, pick) = match width.checked_sub(pick_w + PICK_GAP) {
-        Some(room) if pick_w > 0 && room >= LEFT_LEAST => (room, pick),
-        _ => (width, vec![]),
-    };
+    // With several providers' sections, the card says whose account is in use.
+    let several = state
+        .accounts
+        .snapshot()
+        .is_some_and(|snap| snap.providers.len() > 1);
+    let provider = several.then_some(view.names.display_name);
+    let facts = card::fact_spans(facts_of(v, provider, now_ms), theme);
     let head = vec![
         Span::raw(TITLE_INDENT),
         Span::styled(IN_USE, theme.role(Role::Accent)),
         Span::raw(format!(" {} ", v.row.position)),
     ];
-    let mut spans = card::title_spans(head, name, facts, left_w);
-    if !pick.is_empty() {
-        let drawn: usize = spans.iter().map(|s| width_of(&s.content)).sum();
-        spans.push(Span::raw(" ".repeat(width - pick_w - drawn)));
-        spans.extend(pick);
-    }
-    Line::from(spans)
+    let pick = pick_words(state, view, true).unwrap_or_default();
+    with_pick(pick, usize::from(width), |room| {
+        card::title_spans(head, name, facts, room)
+    })
 }
 
-/// The title's facts and their roles (T3-19): `in use`, the kind's display name, `in a session`
-/// and `login valid …`, muted. While the login has less than `SOON_S` left it is warn, followed by
-/// `log in again before then` (T3-10); once passed it is `login expired`, warn, alone.
-fn facts_of(v: &AccountView, now_ms: i64) -> Vec<(String, Role)> {
+/// The title's facts and their roles (T3-19): `in use`, the provider's display name when
+/// `provider` names it, the kind's display name, `in a session` and `login valid …`, muted. While
+/// the login has less than `SOON_S` left it is warn, followed by `log in again before then`
+/// (T3-10); once passed it is `login expired`, warn, alone.
+fn facts_of(v: &AccountView, provider: Option<&str>, now_ms: i64) -> Vec<(String, Role)> {
     let now_s = now_ms.div_euclid(1000);
     let mut facts = vec![("in use".to_owned(), Role::Muted)];
+    facts.extend(provider.map(|name| (name.to_owned(), Role::Muted)));
     facts.extend(v.kind.display.map(|d| (d.to_owned(), Role::Muted)));
     if v.in_session {
         facts.push(("in a session".to_owned(), Role::Muted));

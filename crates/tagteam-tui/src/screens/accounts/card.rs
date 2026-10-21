@@ -260,31 +260,62 @@ pub(super) fn fact_spans(facts: Vec<(String, Role)>, theme: Theme) -> Vec<Span<'
     spans
 }
 
-/// `{head}{name}    {facts}` in `room` columns. The name gives way first, down to
-/// `NAME_LEAST` columns (its whole width when narrower); then the facts are cut, from their
-/// end. Only when no room is left for them do they go, and the name below its floor.
+/// `{head}{name}    {facts}` in `room` columns, laid out by `floored`.
 pub(super) fn title_spans(
     head: Vec<Span<'static>>,
     name: Vec<Span<'static>>,
     facts: Vec<Span<'static>>,
     room: usize,
 ) -> Vec<Span<'static>> {
-    let width = |spans: &[Span<'static>]| spans.iter().map(|s| width_of(&s.content)).sum::<usize>();
-    let (head_w, name_w, facts_w) = (width(&head), width(&name), width(&facts));
+    floored(head, name, TITLE_GAP, facts, room)
+}
+
+fn spans_width(spans: &[Span<'static>]) -> usize {
+    spans.iter().map(|s| width_of(&s.content)).sum()
+}
+
+/// The fewest columns `floored` draws `head`, `name`, `gap` and `rest` in whole, the name cut to
+/// its floor.
+pub(crate) fn floored_least(
+    head: &[Span<'static>],
+    name: &[Span<'static>],
+    gap: &str,
+    rest: &[Span<'static>],
+) -> usize {
+    let rest_w = spans_width(rest);
+    let gap_w = if rest_w > 0 { width_of(gap) } else { 0 };
+    spans_width(head) + spans_width(name).min(NAME_LEAST) + gap_w + rest_w
+}
+
+/// `{head}{name}{gap}{rest}` in `room` columns, the shared rule of a name beside what follows it
+/// (the titles, the Now strip). The name gives way first, down to `NAME_LEAST` columns (its whole
+/// width when narrower); then `rest` is cut, from its end. Only when no room is left for it does
+/// it go, and the name below its floor.
+pub(crate) fn floored(
+    head: Vec<Span<'static>>,
+    name: Vec<Span<'static>>,
+    gap: &'static str,
+    rest: Vec<Span<'static>>,
+    room: usize,
+) -> Vec<Span<'static>> {
+    let (head_w, name_w, rest_w) = (spans_width(&head), spans_width(&name), spans_width(&rest));
     let floor = name_w.min(NAME_LEAST);
     let after_head = room.saturating_sub(head_w);
-    let name_room = after_head.saturating_sub(TITLE_GAP.len() + facts_w);
+    let gap_w = width_of(gap);
+    let name_room = after_head.saturating_sub(gap_w + rest_w);
     let mut spans = head;
-    if name_room >= floor {
+    if rest.is_empty() {
+        spans.extend(fit_spans(name, after_head));
+    } else if name_room >= floor {
         spans.extend(fit_spans(name, name_room));
-        spans.push(Span::raw(TITLE_GAP));
-        spans.extend(facts);
+        spans.push(Span::raw(gap));
+        spans.extend(rest);
     } else {
-        let facts_room = after_head.saturating_sub(floor + TITLE_GAP.len());
-        if facts_room > 0 && !facts.is_empty() {
+        let rest_room = after_head.saturating_sub(floor + gap_w);
+        if rest_room > 0 {
             spans.extend(fit_spans(name, floor));
-            spans.push(Span::raw(TITLE_GAP));
-            spans.extend(fit_spans(facts, facts_room));
+            spans.push(Span::raw(gap));
+            spans.extend(fit_spans(rest, rest_room));
         } else {
             spans.extend(fit_spans(name, after_head));
         }
@@ -328,13 +359,20 @@ fn facts_of(state: &State, v: &AccountView, now_ms: i64) -> Vec<(String, Role)> 
             let role = if old { Role::Warn } else { Role::Muted };
             facts.push((words::updated(age_now(age, read_at_s, now_s)), role));
         }
-        None => facts.push((words::NOT_CHECKED.to_owned(), Role::Muted)),
+        // Only an account never checked waits for a first reading: an API key has none to
+        // take, and a problem says why there is none.
+        None if words::problem(v) == Some(words::Problem::NotChecked) => {
+            facts.push((words::NOT_CHECKED.to_owned(), Role::Muted));
+        }
+        None => {}
     }
     if let Some(at) = u.next_poll_at.filter(|_| u.status == UsageStatus::Ok) {
         facts.push((words::next_update(at, now_s), Role::Muted));
     }
     if let Some(at_ms) = row.login_expires_at {
-        facts.push((words::login_valid(at_ms, now_s), Role::Muted));
+        let passed = at_ms.div_euclid(1000) <= now_s;
+        let role = if passed { Role::Warn } else { Role::Muted };
+        facts.push((words::login_valid(at_ms, now_s), role));
     }
     facts
 }

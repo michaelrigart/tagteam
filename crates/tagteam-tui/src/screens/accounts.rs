@@ -1328,7 +1328,7 @@ mod tests {
             assert_eq!(
                 card,
                 [
-                    "    3 spare  alex@personal.example    not in use · not checked yet",
+                    "    3 spare  alex@personal.example    not in use",
                     "    ✕ Needs a new login: its stored login was refused (invalid_grant), Sat 09:02.",
                     "      Log in to Claude Code as alex@personal.example, then press A here.",
                     "    ⏎ history of spare   e disable   a alias   x remove",
@@ -1754,7 +1754,7 @@ mod tests {
         assert_eq!(
             card_rows(&state, 80, 24).1,
             [
-                "    3 spare  alex@personal.example    not in use · not checked yet",
+                "    3 spare  alex@personal.example    not in use",
                 "    ✕ Needs a new login: its stored login was refused (invalid_grant).",
                 "      Log in to Claude Code as alex@personal.example, then press A here.",
             ]
@@ -1815,6 +1815,60 @@ mod tests {
                 "      tagteam tries again in 15m.",
             ]
         );
+    }
+
+    #[test]
+    fn only_an_account_never_checked_says_not_checked_yet() {
+        // An API key has no reading to wait for, and a problem says why there is none.
+        let mut api = account(4, "a4@x.co", unread(UsageStatus::ApiKey, None, None));
+        api.kind = API_KEY;
+        let mut accounts = three();
+        accounts.push(api);
+        let mut state = loaded(accounts);
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        assert_eq!(
+            card_rows(&state, 80, 24).1[0],
+            "    4 a4@x.co    not in use · api key"
+        );
+        let mut accounts = three();
+        accounts[2].usage = unread(UsageStatus::ReloginRequired, None, None);
+        accounts[2].row.quarantine_reason = Some("invalid_grant".into());
+        let mut state = loaded(accounts.clone());
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        assert_eq!(
+            card_rows(&state, 80, 24).1[0],
+            "    3 spare  alex@personal.example    not in use"
+        );
+        // Never read: it says so.
+        accounts[2].usage = unread(UsageStatus::Unavailable, None, None);
+        accounts[2].row.quarantine_reason = None;
+        let mut state = loaded(accounts);
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        assert_eq!(
+            card_rows(&state, 80, 24).1[0],
+            "    3 spare  alex@personal.example    not in use · not checked yet"
+        );
+    }
+
+    #[test]
+    fn a_selected_card_s_expired_login_is_warn() {
+        let mut accounts = three();
+        accounts[0].row.login_expires_at = Some((NOW_S - HOUR) * 1000);
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            update(&mut state, key(KeyCode::Home), NOW_MS);
+            let (y, card) = card_rows(&state, 120, 40);
+            assert_eq!(
+                card[0],
+                "    1 alex@example.com    not in use · updated 2m ago · login expired"
+            );
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let (got, want) = role_of(&buf, theme, y, "login expired", 'w');
+            assert_eq!(got, want, "{theme:?}");
+            let (got, want) = role_of(&buf, theme, y, "updated 2m ago", 'm');
+            assert_eq!(got, want, "{theme:?}");
+        }
     }
 
     /// The widest rows a card draws: a long scoped-model label, a spend value, and a reset, pace
@@ -2015,7 +2069,8 @@ mod tests {
             "{lines:?}"
         );
         assert_eq!(
-            lines[5], "  No account in use",
+            lines[5],
+            "  No account in use                      best now  1 alex@example.com   b switch",
             "the body starts at row 5: {lines:?}"
         );
         assert!(
@@ -3451,10 +3506,17 @@ mod tests {
             let mut state = loaded(many(3));
             state.theme = theme;
             let (y, lead) = lead_rows(&state, 80, 24);
-            assert_eq!(lead, NO_ACCOUNT_IN_USE);
+            let pick = "best now  1 a1@x.co   b switch";
+            let gap = " ".repeat(80 - width_of(NO_ACCOUNT_IN_USE[0]) - pick.len());
+            assert_eq!(lead[0], format!("{}{gap}{pick}", NO_ACCOUNT_IN_USE[0]));
+            assert_eq!(lead[1], NO_ACCOUNT_IN_USE[1]);
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
             let title: Vec<u16> = (2..19).filter(|x| ![4, 12, 15].contains(x)).collect();
-            assert_eq!(bold_cells(&buf, y), title, "{theme:?}");
+            let bold: Vec<u16> = bold_cells(&buf, y)
+                .into_iter()
+                .filter(|x| *x < 19)
+                .collect();
+            assert_eq!(bold, title, "{theme:?}");
             let (got, want) = role_of(
                 &buf,
                 theme,
@@ -3463,6 +3525,95 @@ mod tests {
                 'm',
             );
             assert_eq!(got, want, "{theme:?}");
+        }
+    }
+
+    #[test]
+    fn with_several_providers_the_lead_card_names_its_provider() {
+        let mut snap = snapshot(three());
+        let mut fake = fake_agent(
+            vec![fake_account(1, "a1@x.co"), fake_account(2, "a2@x.co")],
+            LiveLogin::Managed { position: 2 },
+        );
+        fake.accounts[1].active = true;
+        snap.providers.push(fake);
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snap);
+        for theme in TIERS {
+            state.theme = theme;
+            let (y, lead) = lead_rows(&state, 120, 40);
+            assert!(
+                lead[0].starts_with(
+                    "  ● 2 work  sam@corp.example · Example Corp    in use · Claude Code   "
+                ),
+                "{lead:?}"
+            );
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let (got, want) = role_of(&buf, theme, y, "in use · Claude Code", 'm');
+            assert_eq!(got, want, "{theme:?}");
+        }
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        let lead = lead_rows(&state, 120, 40).1;
+        assert!(
+            lead[0].starts_with("  ● 2 a2@x.co    in use · FakeAgent   "),
+            "{lead:?}"
+        );
+        // With one provider, nothing names it.
+        let lead = lead_rows(&loaded(three()), 120, 40).1;
+        assert!(
+            lead[0].starts_with("  ● 2 work  sam@corp.example · Example Corp    in use   "),
+            "{lead:?}"
+        );
+    }
+
+    #[test]
+    fn with_no_account_in_use_the_lead_card_carries_the_best_pick() {
+        let mut accounts = three();
+        accounts[1].active = false;
+        for theme in TIERS {
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            for w in [80, 120] {
+                let (y, lead) = lead_rows(&state, w, 24);
+                let pick = "best now  1 alex@example.com   b switch";
+                let gap = " ".repeat(usize::from(w) - width_of(NO_ACCOUNT_IN_USE[0]) - pick.len());
+                assert_eq!(
+                    lead,
+                    [
+                        format!("{}{gap}{pick}", NO_ACCOUNT_IN_USE[0]),
+                        NO_ACCOUNT_IN_USE[1].to_owned()
+                    ],
+                    "{theme:?} {w}"
+                );
+                let buf = draw_buffer(&state, w, 24, NOW_MS);
+                let (got, want) = role_of(&buf, theme, y, "best now", 'm');
+                assert_eq!(got, want, "{theme:?}");
+                let (got, want) = role_of(&buf, theme, y, "1 alex@example.com", 't');
+                assert_eq!(got, want, "{theme:?}");
+            }
+            // The pick is never cut: it goes where it would leave the left part under 16
+            // columns.
+            let mut state = loaded(accounts.clone());
+            state.theme = theme;
+            let title_at = |w: u16| -> String {
+                super::lead::lead(&state, w, 2, NOW_MS).lines[0]
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect()
+            };
+            assert_eq!(
+                title_at(61),
+                "  No account in use   best now  1 alex@example.com   b switch",
+                "{theme:?}"
+            );
+            assert_eq!(
+                title_at(58),
+                "  No account in…   best now  1 alex@example.com   b switch",
+                "{theme:?}"
+            );
+            assert_eq!(title_at(57), "  No account in use", "{theme:?}");
+            assert_eq!(title_at(40), "  No account in use", "{theme:?}");
         }
     }
 
@@ -3483,7 +3634,11 @@ mod tests {
             state.accounts.selected().unwrap().provider,
             ProviderId::new("fake-agent")
         );
-        assert_eq!(lead_rows(&state, 120, 40).1, NO_ACCOUNT_IN_USE);
+        let lead = lead_rows(&state, 120, 40).1;
+        let pick = "best now  1 a1@x.co   b switch";
+        let gap = " ".repeat(120 - width_of(NO_ACCOUNT_IN_USE[0]) - pick.len());
+        assert_eq!(lead[0], format!("{}{gap}{pick}", NO_ACCOUNT_IN_USE[0]));
+        assert_eq!(lead[1], NO_ACCOUNT_IN_USE[1]);
     }
 
     #[test]
