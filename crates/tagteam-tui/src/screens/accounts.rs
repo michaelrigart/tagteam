@@ -1700,9 +1700,12 @@ mod tests {
             models: vec![],
             live: LiveLogin::None,
         });
-        snap.providers[1].live = LiveLogin::Unmanaged {
-            email: "s@x.co".into(),
-        };
+        set_live(
+            &mut snap.providers[1],
+            LiveLogin::Unmanaged {
+                email: "s@x.co".into(),
+            },
+        );
         let mut state = fresh(Screen::Accounts);
         state.provider = Some(ProviderId::new("fake-agent"));
         state.accounts.apply(snap);
@@ -1954,9 +1957,12 @@ mod tests {
     #[test]
     fn a_run_shell_or_an_unmanaged_live_login_raises_a_banner() {
         let mut snap = snapshot(many(1));
-        snap.providers[0].live = LiveLogin::Unmanaged {
-            email: "s@x.co".into(),
-        };
+        set_live(
+            &mut snap.providers[0],
+            LiveLogin::Unmanaged {
+                email: "s@x.co".into(),
+            },
+        );
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snap.clone());
         assert_eq!(
@@ -1981,9 +1987,12 @@ mod tests {
         // Spec §5.1: at 80 columns the whole banner shows, its instruction included.
         let long = "a".repeat(48) + "@example.com";
         let mut snap = snapshot(many(1));
-        snap.providers[0].live = LiveLogin::Unmanaged {
-            email: long.clone(),
-        };
+        set_live(
+            &mut snap.providers[0],
+            LiveLogin::Unmanaged {
+                email: long.clone(),
+            },
+        );
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snap);
         let lines = draw(&state, 80, 24);

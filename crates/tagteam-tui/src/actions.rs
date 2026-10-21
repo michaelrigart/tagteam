@@ -45,12 +45,6 @@ fn busy(state: &mut State, now_ms: i64) -> bool {
     true
 }
 
-/// The provider `A` adds to: focus's (`daemon::focus`, T3-7), whose unmanaged login the
-/// banner names.
-fn add_provider(state: &State) -> Option<tagteam_core::ProviderId> {
-    Some(daemon::focus(state))
-}
-
 /// The action keys (spec §5.6, §7.1). `None` for any other key. An account key with no
 /// account selected does nothing (Review Focus 3).
 pub fn handle_action_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Option<Vec<Cmd>> {
@@ -58,10 +52,14 @@ pub fn handle_action_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Optio
         return None;
     };
     match c {
-        'A' => Some(match add_provider(state) {
-            Some(provider) => start(state, Action::AddLive { provider }, now_ms),
-            None => vec![],
-        }),
+        // T3-7: focus's live login, whose unmanaged login the banner names.
+        'A' => Some(start(
+            state,
+            Action::AddLive {
+                provider: daemon::focus(state),
+            },
+            now_ms,
+        )),
         'D' => {
             let provider = state.provider.clone();
             Some(start(
@@ -794,6 +792,12 @@ mod tests {
         assert_eq!(
             update(&mut unloaded, ch('A'), NOW_MS),
             [Cmd::Act(Action::AddLive { provider: fake })]
+        );
+        // Before the first accounts read and without `--provider`: the default's.
+        let mut unloaded = fresh(Screen::Accounts);
+        assert_eq!(
+            update(&mut unloaded, ch('A'), NOW_MS),
+            [Cmd::Act(Action::AddLive { provider: cc() })]
         );
     }
 

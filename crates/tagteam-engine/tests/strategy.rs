@@ -906,6 +906,9 @@ fn best_with_no_live_login_and_no_ranked_candidate_holding_a_login_is_usage_unav
 }
 
 /// §12.1's parity: what `switch --strategy best` does with `forecast`, the accounts view's.
+/// `UsageUnknown` maps to `UsageUnavailable` only while `best`'s collection fails and the
+/// unknown reading is past §8.4's hour: one younger is trusted again once its refresh fails,
+/// and `best` then ranks it.
 fn assert_best_does(case: &str, forecast: &BestForecast, out: &SwitchOutcome) {
     match forecast {
         BestForecast::Pick { order } => {
@@ -1055,4 +1058,57 @@ fn the_accounts_view_s_forecast_is_what_switch_best_picks() {
         let out = best(&fx).unwrap();
         assert_best_does(case, &forecast, &out);
     }
+}
+
+/// A 429 on `id`'s fetch at `at`, after its last good reading: backed off, and trusted after it
+/// only until the earliest relevant reset (§8.4).
+fn rate_limited_at(fx: &Fx, id: &AccountId, at: i64, backoff_until: i64) {
+    let store = fx.engine.store().unwrap();
+    let row = store.account(id).unwrap().unwrap();
+    let r = match store
+        .reserve_usage(
+            &row,
+            at * 1000,
+            Eligibility::Scheduled,
+            &PollBudget::STANDARD,
+        )
+        .unwrap()
+    {
+        Reserve::Reserved(r) => r,
+        other => panic!("not reserved at {at}: {other:?}"),
+    };
+    assert!(
+        store
+            .record_usage_failure(&r, "http-429", at, backoff_until, Some(backoff_until), None)
+            .unwrap()
+    );
+}
+
+#[test]
+fn the_forecast_judges_trust_and_headroom_under_the_models_best_will_use() {
+    // §12.1: one input for both. The TUI's engine started before `models` named Fable; `b` runs
+    // a fresh process, which reads it. a was read 4000 s ago and refused since: trusted only
+    // until its earliest relevant reset, and its Fable window has reset already. b is
+    // Fable-bound: ahead of the live c without Fable, behind it with.
+    let fx = Fx::new();
+    let config = tagteam_engine::settings::config_path(&fx.env);
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let (a, b, c) = three(&fx); // c is live
+    let stale = vec![
+        window("5h", "5h", WindowKind::Short, 10.0, T0 + 9_630),
+        window("7d", "7d", WindowKind::Long, 10.0, T0 + 291_630),
+        window("scoped:Fable", "Fable", WindowKind::Scoped, 10.0, T0 - 100),
+    ];
+    record_at(&fx, &a, &stale, T0 - 4_000, T0 - 3_500);
+    rate_limited_at(&fx, &a, T0 - 3_000, T0 + 600);
+    read(&fx, &b, &reading(10.0, 20.0, 95.0));
+    read(&fx, &c, &reading(10.0, 50.0, 0.0));
+    fs::write(&config, "[autoswitch]\nmodels = [\"Fable\"]\n").unwrap();
+    let forecast = fx.engine.accounts(Some(&fx.provider())).unwrap()[0]
+        .forecast
+        .clone();
+    assert_eq!(forecast, BestForecast::AlreadyBest);
+    fx.engine.reload_settings(&fx.provider());
+    let out = best(&fx).unwrap();
+    assert_best_does("models changed after start-up", &forecast, &out);
 }
