@@ -1954,9 +1954,11 @@ A `sleep` event is emitted when the delay is more than 1.5 × `interval`.
   any critical span in flight has finished (§14.1). The loop then exits 0. An interrupted
   `--once` exits as §14.1 says.
 - **Human output.** Each tick prints one line on stdout: the local time, the active account
-  (position and label), its relevant usage, and the outcome (the reason, or the switch).
-  Quarantine changes and long sleeps get lines of their own. Errors and config warnings go to
-  stderr.
+  (position and label), its relevant usage, and the outcome in plain words. A reason is its
+  sentence from the TUI redesign spec's §11.3 (`no switch needed (77%, switches at 90%)`), and a
+  switch names its trigger in §11.3's words (`before it reached the limit`). Quarantine changes
+  and long sleeps get lines of their own. Errors and config warnings go to stderr. *(Amended by
+  the TUI redesign spec §11.3.)*
 
 **`--once` exit codes:** `0` switched · `1` error · `2` no action · `3` blocked.
 
@@ -2569,19 +2571,21 @@ after a signal, `75` to be restarted on a new binary or schema, `1` when it cann
 **`list` text layout.** One row per account, in position order:
 
 ```
-    #  ACCOUNT                  5H           7D                    SPEND         FABLE   AGE
- *  1  michael@example.com       9%  2h40m   77%  3d09h  ▲ pace    €0 of €20      0%     2m
-    2  spare@example.com        31%  4h02m   12%  5d01h            —              —     14m
-    3  work (w@corp.com)        relogin required
+    #  ACCOUNT                  5H           7D                   SPEND      FABLE        UPDATED
+ *  1  alex@example.com           9%  2h40m   77%  3d09h  ▲ fast  €0 of €20    0%  3d09h  2m
+    2  alex@personal.example     31%  4h02m   12%  5d01h          —             —         14m
+    3  work (sam@corp.example)  needs a new login
 ```
 
-- A window shows its `pct` and the countdown to its reset. `▲ pace` marks a window that is
+- A window shows its `pct` and the countdown to its reset. `▲ fast` marks a window that is
   ahead of pace (§8.7).
 - A scoped window gets a column, headed by its model name, only when some account has it.
 - `pct` is coloured by §13.5's severities, off under `NO_COLOR` and `--no-color`.
-- A row without usage shows its `usageStatus` in words (`relogin required`, `api key`,
-  `unavailable (http-429, retry 4m)`, `over budget`, …) instead of the window columns.
-- `AGE` is the last good reading's age. A stale reading is still shown, with its age.
+- A row without usage shows its `usageStatus` in the TUI redesign spec's §11.1 words
+  (`needs a new login`, `api key`, `rate-limited (retry 4m)`, `paused to stay within the request
+  budget`, `not checked yet`, …) instead of the window columns.
+- `UPDATED` is the last good reading's age. A stale reading is still shown, with its age.
+  *(Amended by the TUI redesign spec §11.1.)*
 - A session-owned account (§12.5) is marked `▶` after its position, and in a run shell the
   session's own account `▶ this`.
 
@@ -2805,11 +2809,13 @@ warnings}`, where `outcome` is `created`, `replaced`, `skipped` or `failed`.
 
 ### 13.4 History
 
-`tagteam history` renders per-window sparklines, the current burn rate (points per hour), and
-an ETA with its projection method. `--csv` and `--json` dump the raw samples.
+`tagteam history` renders per-window sparklines and the current burn rate in `%/h`. `--csv` and
+`--json` dump the raw samples.
 
 - **Defaults:** the live account, its relevant windows (§8.2), and `--since 7d`.
-- For each window it also says whether the window will last to its reset (§8.7).
+- For each window it also says when the window is full (`full in 2d04h`), or that it lasts until
+  it resets (§8.7). The projection method is in `--json` only. *(Amended by the TUI redesign
+  spec §11.1.)*
 - It reads `usage_samples` only and never fetches.
 
 ### 13.5 Statusline
