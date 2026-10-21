@@ -11,6 +11,7 @@ pub mod displace;
 pub mod doctor;
 pub mod engine;
 pub mod error;
+pub mod event;
 pub mod export;
 pub mod failure;
 mod fsutil;
@@ -47,5 +48,6 @@ pub mod words;
 
 pub use engine::{Engine, EngineConfig};
 pub use error::{EngineError, SessionOwner, SplitCause};
+pub use event::{EventKind, EventSource};
 #[cfg(feature = "test-hooks")]
 pub use hooks::pause_at;
