@@ -2177,8 +2177,8 @@ mod tests {
                 None,
             )],
         );
-        let lines = draw(&day, 80, 24);
-        assert!(lines[5].starts_with(" 2026-09-20  3 山田"), "{}", lines[5]);
+        let lines = body_of(&day, 80, 24, NOW_MS);
+        assert!(lines[4].starts_with(" 2026-09-20  3 山田"), "{}", lines[4]);
     }
 
     /// A session as the engine gives one: a UUID, a long project, two models and the cache.
