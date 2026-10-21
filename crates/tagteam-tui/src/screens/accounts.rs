@@ -464,7 +464,11 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     frame.render_widget(Paragraph::new(shown), table_area);
     if let Some(v) = st.selected_view() {
         // The account in use leaves out what the lead card shows of it (§6.4, T3-32, M-9).
-        let on_lead = if card::on_lead(v) { lead.shown } else { vec![] };
+        let on_lead = if card::is_on_lead(v) {
+            lead.shown
+        } else {
+            vec![]
+        };
         let rows = usize::from(parts.card.height);
         let lines = card::lines(state, v, area.width, rows, st.card_from, &on_lead, now_ms);
         frame.render_widget(Paragraph::new(lines), parts.card);
@@ -3588,6 +3592,21 @@ mod tests {
         let lead = lead_rows(&loaded(three()), 120, 40).1;
         assert!(
             lead[0].starts_with("  ● 2 work  sam@corp.example · Example Corp    in use   "),
+            "{lead:?}"
+        );
+        // Nor when the default provider has no accounts: the table shows one section.
+        let mut snap = snapshot(vec![]);
+        let mut fake = fake_agent(
+            vec![fake_account(1, "a1@x.co"), fake_account(2, "a2@x.co")],
+            LiveLogin::Managed { position: 2 },
+        );
+        fake.accounts[1].active = true;
+        snap.providers.push(fake);
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snap);
+        let lead = lead_rows(&state, 120, 40).1;
+        assert!(
+            lead[0].starts_with("  ● 2 a2@x.co    in use   "),
             "{lead:?}"
         );
     }
