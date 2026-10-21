@@ -1,13 +1,16 @@
 mod common;
 
+use std::error::Error;
 use std::sync::Arc;
 
 use serde_json::json;
 use tagteam_core::AccountId;
 use tagteam_engine::account_lock::AccountLock;
-use tagteam_engine::vault::{FileVault, KeychainVault, Leftovers, SERVICE, Vault, VaultError};
+use tagteam_engine::vault::{
+    FileVault, KeychainVault, Leftovers, SERVICE, Vault, VaultBackend, VaultCause, VaultError,
+};
 use tagteam_fake::FakeAgent;
-use tagteam_provider::{Env, FakeKeychain, Read};
+use tagteam_provider::{Env, FakeKeychain, KeychainError, Read};
 
 /// A FakeAgent credential of generation `renew`, told apart within it by `token`. It has no
 /// machine-shared key, so its vault form is itself.
@@ -211,4 +214,41 @@ fn an_item_stored_before_this_branch_is_read_as_it_is_and_leaves_for_prev_in_vau
     assert_eq!(v.read(&id).present().unwrap(), old);
     v.store(&lock, &cred("gen2", "t"), &agent).unwrap();
     assert_eq!(v.read_prev(&id).present().unwrap(), cred("gen1", "t"));
+}
+
+/// §8.5: the Keychain's failure stays the source of a vault write or delete, so a caller can
+/// match it; the vault's message is what it always was.
+#[test]
+fn a_keychain_failure_stays_the_source_of_a_vault_write_or_delete() {
+    let kc = Arc::new(FakeKeychain::new());
+    let vault = KeychainVault::new(kc.clone());
+
+    kc.set_fail_write(SERVICE, true);
+    let e = vault.write("k", b"x").unwrap_err();
+    assert!(matches!(
+        e,
+        VaultError::Write(VaultCause::Keychain(KeychainError { rc: Some(25), .. }))
+    ));
+    assert_eq!(
+        e.to_string(),
+        "vault write failed: keychain operation failed (rc 25): injected write failure"
+    );
+    assert_eq!(
+        e.source().unwrap().to_string(),
+        "keychain operation failed (rc 25): injected write failure"
+    );
+
+    kc.set_fail_delete(SERVICE, true);
+    let e = vault.delete("k").unwrap_err();
+    assert!(matches!(
+        e,
+        VaultError::Delete(VaultCause::Keychain(KeychainError { rc: Some(25), .. }))
+    ));
+    assert!(e.to_string().ends_with("injected delete failure"));
+    assert!(
+        e.source()
+            .unwrap()
+            .to_string()
+            .ends_with("injected delete failure")
+    );
 }

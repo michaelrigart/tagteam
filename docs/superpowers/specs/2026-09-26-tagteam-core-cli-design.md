@@ -2602,6 +2602,8 @@ an additive `others: [ … ]` array.
   `type` is a stable kind (§14). `keychain-locked` means the login keychain is locked and was
   not unlocked (Appendix A.3).
 
+Kind values never change, but a refusal may move to a kind that describes it ([review refactor D-3, §8.5](2026-10-19-tagteam-review-refactor-design.md)), which adds `deletion-refused` and `profile-marker-missing`.
+
 **`list`** returns `{schemaVersion, activeAccountNumber, accounts:[row], displacedCredentials?}`.
 
 Each row:
@@ -3005,6 +3007,9 @@ store. The command needs no store and no Keychain.
 
 - **Library crates** use `thiserror` enums: `CcError`, `VaultError`, `StoreError`, `NetError`,
   `SwitchError`, and so on. Each variant has a stable `kind()` used as the JSON `error.type`.
+
+Kind values never change, but a refusal may move to a kind that describes it ([review refactor D-3, §8.5](2026-10-19-tagteam-review-refactor-design.md)), which adds `deletion-refused` and `profile-marker-missing`.
+
 - **The binary** maps them to exit codes and human messages that give the next action (for
   example, "log in with that account and run `tagteam add --position 3`").
 - **Panics** are bugs. Lock guards release in `Drop`, and the switch transaction's rollback
