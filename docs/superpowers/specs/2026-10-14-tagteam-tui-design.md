@@ -114,7 +114,7 @@ plan pins both versions.
 
 The TUI is an Elm-style loop.
 - **`State`** holds everything on screen: the current screen, each screen's data and selection,
-  the drill-down stack, the open overlay, the mode, the toast and the activity line.
+  the drill-down stack, the open overlay, the mode, the toast and the auto line. *(Amended by the TUI redesign spec §5.3.)*
 - **`update(&mut State, Msg) -> Vec<Cmd>`** is pure. A `Msg` is a key, a resize, a tick, a
   lane's result, or a live event. A `Cmd` is a lane request, a live-client request, a suspend,
   or quit.
@@ -226,7 +226,7 @@ pub enum ActionOutcome {
 
 ```
  tagteam   1 Accounts   2 Tokens   3 History                    ● auto on · switches at 90%   ? keys
- ⇄ 11:28  auto switched 1 alex → 2 work · alex's 5h reached 93% · next check 14:16      w why
+ ⇄ 11:28  auto switched 1 alex → 2 work · alex's 5h reached 93% · next check 14:16
  ────────────────────────────────────────────────────────────────────────────────────────────
  (banner, 0–3 rows)
  (body)
@@ -234,7 +234,7 @@ pub enum ActionOutcome {
 ```
 
 - **The chrome rows** are the header, the auto line, the Now strip on Tokens and History, a faint
-  rule from 30 rows, the banner, the body and the footer. Their content does not change with the
+  rule from 30 rows, the banner, the body and the footer. Which rows show does not change with the
   daemon's mode. The header shows the tabs and auto's state with its threshold (§7.4), the auto
   line shows auto's last action in plain words, the banner shows an unmanaged live login, a run
   shell, the start-up warnings or an error (§10.4), and the footer shows the screen's keys with
@@ -242,8 +242,8 @@ pub enum ActionOutcome {
   spinner with its label. *(Amended by the TUI redesign spec §5.1–§5.6.)*
 - **Colour.**
   - Three tiers: tier 0 under `NO_COLOR`, `--no-color` or `ui.color = never`; tier 1 with the 16
-    named ANSI colours; tier 2 in truecolor when the terminal reports its background. Each
-    colour is a role (`text`, `muted`, `faint`, `accent`, `warn`, `crit`, `ok`), and the theme is
+    named ANSI colours; tier 2 in truecolor when `COLORTERM` says so and the terminal reports its background. Each
+    colour is a role (`text`, `muted`, `faint`, `accent`, `warn`, `crit`, `ok`, `sel-bg`, `surface`), and the theme is
     the only place that names one.
   - Percentages and gauges take core §13.5's severities (≥ 70 % warning, ≥ 90 % critical).
   - The selection is `▌` in the first column with the name in bold. Without colour, emphasis is
@@ -372,15 +372,16 @@ pub enum ActionOutcome {
   input use a one-line text dialog. `Esc` declines. Dialogs and panels float over a dimmed
   screen in a rounded frame; panels cover the body. `q` closes the open overlay first, except in
   a text input, and quits only when nothing is open. *(Amended by the TUI redesign spec §9.1.)*
-- **The result panel** shows an action's captured output when it has warnings or more than one
-  line, and is dismissed with `Esc` or `Enter`.
+- **The result panel** shows an action's captured output when it does not fit a toast (§7.2), and
+  is dismissed with `Esc`, `Enter` or `q`. *(Amended by the TUI redesign spec §9.3.)*
 - **The doctor panel** (`D`) shows `doctor`'s report, scrollable. `o` re-runs it with
   `--online`.
 
 ### 5.6 Keys
 
-The keys are the key table of the TUI redesign spec §10, less `w` until T4. Accounts' `g` and
-`G` are dropped. *(Amended by the TUI redesign spec §10.)*
+The keys are the TUI's one key table (redesign §10's), without `w`, and with History keeping its
+account keys (`j`/`k` account, `[` `]` range, `J`/`K` scroll) until T4. Accounts' `g` and `G` are
+dropped. *(Amended by the TUI redesign spec §10.)*
 
 ## 6. Data and refresh
 
@@ -388,7 +389,7 @@ The keys are the key table of the TUI redesign spec §10, less `w` until T4. Acc
 
 The binary builds the context and engines as it does for `list`, then the UI thread enters the
 alternate screen. It waits up to 100 ms for the views lane's first `accounts` result, so it
-does not flash an empty table, and then draws. A slower result draws `loading…` first. The
+does not flash an empty table, and then draws. A slower result draws `Loading accounts…` first. *(Amended by the TUI redesign spec §5.7.)* The
 first frame never waits on a fetch: unlike `list`, the TUI collects after drawing (§6.2). The
 report lane starts the report's catch-up in the background (§6.4).
 
@@ -410,7 +411,7 @@ that is `idle`, or `waiting` with `waitingFor` `schema`, is collected for on the
 timer mode, since nothing else collects for it.
 - Each event names the views it affects (§8), and the TUI re-reads them, debounced to 250 ms.
   The store stays the source of truth: an event is a reason to re-read, never data to show,
-  except on the activity line.
+  except on the auto line (§8). *(Amended by the TUI redesign spec §5.3.)*
 - A 60 s timer still re-reads `accounts` and re-fetches the daemon's `status`, so a missed
   event, or a setting changed elsewhere, costs at most a minute.
 - Which providers `collect_due` skips is decided from the latest `status` reply (§8).
@@ -464,9 +465,9 @@ timer mode, since nothing else collects for it.
 ### 7.2 Running an action
 
 - **One at a time.** Actions and `collect_due` share the actions lane. While an action runs,
-  the footer shows its spinner. Another action key toasts `still <label> · wait for it to finish` and is
-  dropped, not queued. *(Amended by the TUI redesign spec §9.4.)* A suspended action counts as running (§7.3), and the timer's `collect_due` is skipped
-  while any action runs.
+  the footer shows its spinner. Another action key toasts `still <label> · wait for it to finish`
+  and is dropped, not queued. A suspended action counts as running (§7.3), and the timer's
+  `collect_due` is skipped while any action runs. *(Amended by the TUI redesign spec §9.4.)*
 - **Prompts.** A `confirm` or `choose` from the CLI path opens a dialog. The actions lane
   waits on a reply channel until the person answers, or until a shutdown declines it (§10.2).
   `Esc` answers as a decline, which the CLI reports as cancelled.
@@ -474,8 +475,8 @@ timer mode, since nothing else collects for it.
   deleted; Claude Code is not changed.` The default is no, because one key is easier to hit
   than a typed command. The CLI's own refusals (core §10.3: never the live login) still apply.
 - **The outcome** follows the redesign spec's table: a doctor report opens the doctor panel; a
-  clean exit 0 toasts the CLI's output when it fits; a warning or a failure toasts one line and
-  opens the result panel for more. The spinner and toasts use the action's label (`switching to 3
+  clean exit 0 toasts the CLI's output when it fits; a warning or a failure toasts when it is one
+  line that fits, and opens the result panel otherwise. The spinner and toasts use the action's label (`switching to 3
   spare…`). Each action is followed by a re-read of `accounts`. *(Amended by the TUI redesign
   spec §9.3, §9.4.)*
 - **Inside a run shell**, account-changing actions fail with the CLI's refusal (core §12.8),
@@ -517,13 +518,12 @@ runs (core §12.5):
 
 Pausing is the daemon's persistent setting `provider.<id>.daemon.autoswitch` (§8), so it
 survives a daemon restart.
-- **In live mode,** `P` asks `Pause auto for <display name>?` (or `Resume…`), from the
+- **In live mode,** `P` asks `Pause auto for <display name>?` (or `Resume…`) *(Amended by the TUI redesign spec §9.4.)*, from the
   effective `autoswitch` in the daemon's `status`. A yes runs
   `config set provider.<id>.daemon.autoswitch false` (or `true`) through `Host`, exactly as the
   CLI runs it. Two seconds later the TUI re-fetches `status`: the daemon applies a settings
   change within about a second (D4.2), and a pause need not change the mode, so no event may
-  follow (one switchable account is `collect` either way). The question
-  names the provider's display name. *(Amended by the TUI redesign spec §9.4.)*
+  follow (one switchable account is `collect` either way).
 - **The header** shows each provider's state from the latest `status` reply (D4.3, D5.4).
   Events never set it directly (§8). Its words, glyphs and 80-column forms are the redesign spec's
   §5.2 table. *(Amended by the TUI redesign spec §5.2.)*

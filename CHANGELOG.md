@@ -36,8 +36,8 @@ with the one before, so any release may contain breaking changes. Each section s
   where the terminal supports it and reports its background.
 - `tagteam tui`'s footer always shows `? keys` and `q quit`. Help lists every key and what each
   mark means.
-- `tagteam tui` reports a successful action in a toast. Only failures, warnings and doctor open a
-  panel. `r` says what it updated.
+- `tagteam tui` reports a successful action in a toast. Doctor, and output too long for a toast,
+  open a panel. `r` says what it updated.
 - `tagteam tui` asks before `R` starts a session and before it hands the terminal over to unlock
   the keychain. It ignores action keys for 300 ms after a dialog closes.
 - `tagteam tui` shows the settings warnings in a banner, and keeps the last token report on screen
