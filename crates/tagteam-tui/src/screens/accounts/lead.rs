@@ -26,16 +26,11 @@ const TITLE_INDENT: &str = "  ";
 const INDENT: &str = "    ";
 /// Between a row's parts (§4.3).
 const GAP: &str = "  ";
-/// Between the title's name and its facts.
-const TITLE_GAP: &str = "    ";
 /// The least room between the title's left part and the best pick (§4.3's group gap).
 const PICK_GAP: usize = 3;
 /// The left part keeps this much room at least, or the best pick is dropped (T3-19).
 const LEFT_LEAST: usize = 16;
 const FACT_SEP: &str = " · ";
-/// The label column's least width (T3-19); it takes a quarter of the card's at most, as the
-/// selected card's does.
-const LABEL_LEAST: usize = 4;
 /// A login valid for less than this is warn, and says to log in again (§6.2, T3-10).
 const SOON_S: i64 = 7 * 86_400;
 const LOG_IN_AGAIN: &str = "log in again before then";
@@ -165,8 +160,8 @@ fn no_account(width: u16, theme: Theme) -> Vec<Line<'static>> {
     .collect()
 }
 
-/// The title (T3-19): `  ● {pos} {name}[ · {org}]    {facts}` on the left, the name cut
-/// before the facts, and the forecast's words on the right edge, never cut; they are dropped
+/// The title (T3-19): `  ● {pos} {name}[ · {org}]    {facts}` on the left, laid out by
+/// `card::title_spans`, and the forecast's words on the right edge, never cut; they are dropped
 /// when they would leave the left part less than `LEFT_LEAST` columns.
 fn title(
     state: &State,
@@ -176,27 +171,8 @@ fn title(
     now_ms: i64,
 ) -> Line<'static> {
     let theme = state.theme;
-    let muted = theme.role(Role::Muted);
-    let row = &v.row;
-    let email = words::email(row);
-    let mut name = match &row.alias {
-        Some(alias) => vec![
-            Span::styled(alias.clone(), theme.strong()),
-            Span::raw(GAP),
-            Span::styled(email, muted),
-        ],
-        None => vec![Span::styled(email, theme.strong())],
-    };
-    if let Some(org) = row.org_name.as_deref().filter(|_| width >= WIDE_FROM) {
-        name.push(Span::styled(format!("{FACT_SEP}{org}"), muted));
-    }
-    let mut facts: Vec<Span<'static>> = Vec::new();
-    for (i, (text, role)) in facts_of(v, now_ms).into_iter().enumerate() {
-        if i > 0 {
-            facts.push(Span::styled(FACT_SEP, muted));
-        }
-        facts.push(Span::styled(text, theme.role(role)));
-    }
+    let name = card::name_spans(&v.row, width, theme);
+    let facts = card::fact_spans(facts_of(v, now_ms), theme);
     let width = usize::from(width);
     let pick = pick_words(state, view, true).unwrap_or_default();
     let pick_w: usize = pick.iter().map(|s| width_of(&s.content)).sum();
@@ -207,18 +183,9 @@ fn title(
     let head = vec![
         Span::raw(TITLE_INDENT),
         Span::styled(IN_USE, theme.role(Role::Accent)),
-        Span::raw(format!(" {} ", row.position)),
+        Span::raw(format!(" {} ", v.row.position)),
     ];
-    let head_w: usize = head.iter().map(|s| width_of(&s.content)).sum();
-    let facts_w: usize = facts.iter().map(|s| width_of(&s.content)).sum();
-    let room = left_w
-        .saturating_sub(head_w + TITLE_GAP.len() + facts_w)
-        .max(1);
-    let mut left = head;
-    left.extend(fit_spans(name, room));
-    left.push(Span::raw(TITLE_GAP));
-    left.extend(facts);
-    let mut spans = fit_spans(left, left_w);
+    let mut spans = card::title_spans(head, name, facts, left_w);
     if !pick.is_empty() {
         let drawn: usize = spans.iter().map(|s| width_of(&s.content)).sum();
         spans.push(Span::raw(" ".repeat(width - pick_w - drawn)));
@@ -228,8 +195,8 @@ fn title(
 }
 
 /// The title's facts and their roles (T3-19): `in use`, the kind's display name, `in a session`
-/// and `login valid …`, muted; the login warn under `SOON_S`, followed by `log in again before
-/// then` (T3-10).
+/// and `login valid …`, muted. While the login has less than `SOON_S` left it is warn, followed by
+/// `log in again before then` (T3-10); once passed it is `login expired`, warn, alone.
 fn facts_of(v: &AccountView, now_ms: i64) -> Vec<(String, Role)> {
     let now_s = now_ms.div_euclid(1000);
     let mut facts = vec![("in use".to_owned(), Role::Muted)];
@@ -240,7 +207,9 @@ fn facts_of(v: &AccountView, now_ms: i64) -> Vec<(String, Role)> {
     if let Some(at_ms) = v.row.login_expires_at {
         let left = at_ms.div_euclid(1000).saturating_sub(now_s);
         let login = words::login_valid(at_ms, now_s);
-        if left < SOON_S {
+        if left <= 0 {
+            facts.push((login, Role::Warn));
+        } else if left < SOON_S {
             facts.push((login, Role::Warn));
             facts.push((LOG_IN_AGAIN.to_owned(), Role::Warn));
         } else {
@@ -266,13 +235,7 @@ fn bar_rows(
         .flatten()
         .filter(|(w, _)| keys.contains(&w.key))
         .collect();
-    let label_w = windows
-        .iter()
-        .map(|(w, _)| width_of(&w.label))
-        .max()
-        .unwrap_or(0)
-        .max(LABEL_LEAST)
-        .min(usize::from(width) / 4);
+    let label_w = card::label_width(windows.iter().map(|(w, _)| w), width);
     let wide = width >= WIDE_FROM;
     let cells = if wide { BAR_WIDE } else { BAR };
     let now_s = now_ms.div_euclid(1000);

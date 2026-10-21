@@ -997,7 +997,8 @@ fn run_on_an_account_moved_elsewhere_is_refused_and_launches_nothing() {
         s.on_alt() && s.contains("pre-send")
     });
     cmd(home.root()).args(["move", "1", "2"]).assert().success();
-    tui.type_keys(b"R");
+    // The selection starts on the live login, `b` (T3-23): `k` selects `a`.
+    tui.type_keys(b"kR");
     tui.wait_for(LONG, "the start question", |s| {
         s.on_alt() && s.contains("in this terminal?")
     });
