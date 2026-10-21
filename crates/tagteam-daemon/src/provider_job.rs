@@ -270,19 +270,12 @@ impl<'e> ProviderJob<'e> {
                 ..ModeInputs::default()
             });
         }
-        let store = self.engine.existing_store()?;
-        let switchable = match &store {
-            Some(s) => s
-                .accounts(&self.provider)?
-                .iter()
-                .filter(|r| !r.disabled && r.identity_json.is_object())
-                .count(),
-            None => 0,
-        };
+        let has_store = self.engine.existing_store()?.is_some();
+        let switchable = self.engine.switchable_count(&self.provider)?;
         let holds_lock = self.auto.is_some();
         Ok(ModeInputs {
             schema_newer: false,
-            has_store: store.is_some(),
+            has_store,
             switchable,
             autoswitch: self.settings.daemon_autoswitch,
             // Holding the lock, the record is this job's own.

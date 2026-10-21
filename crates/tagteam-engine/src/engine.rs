@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
@@ -300,6 +301,39 @@ impl Engine {
     /// per provider (D4.3).
     pub fn provider_ids(&self) -> Vec<ProviderId> {
         self.registry.all().iter().map(|p| p.id()).collect()
+    }
+
+    /// How many of `provider`'s accounts are switchable (D4.3): 0 without a store, which this
+    /// never creates.
+    pub fn switchable_count(&self, provider: &ProviderId) -> Result<usize, EngineError> {
+        let Some(store) = self.existing_store()? else {
+            return Ok(0);
+        };
+        Ok(store
+            .accounts(provider)?
+            .iter()
+            .filter(|r| r.is_switchable())
+            .count())
+    }
+
+    /// Every provider in the store with at least two switchable accounts, in `ProviderId` order
+    /// (§11.1). It reads the store alone: a provider this build does not register is listed
+    /// too, and the caller applies any registry check.
+    pub fn switchable_providers(&self) -> Result<Vec<ProviderId>, EngineError> {
+        let Some(store) = self.existing_store()? else {
+            return Ok(Vec::new());
+        };
+        let mut switchable: BTreeMap<ProviderId, usize> = BTreeMap::new();
+        for row in store.all_accounts()? {
+            if row.is_switchable() {
+                *switchable.entry(row.provider).or_default() += 1;
+            }
+        }
+        Ok(switchable
+            .into_iter()
+            .filter(|(_, n)| *n >= 2)
+            .map(|(p, _)| p)
+            .collect())
     }
 
     /// The registry of every provider this build registers.

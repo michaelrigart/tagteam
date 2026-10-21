@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use common::Fx;
 use serde_json::json;
-use tagteam_core::{AccountId, OracleVerdict};
+use tagteam_core::{AccountId, OracleVerdict, ProviderId};
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::oracle::verdict;
 use tagteam_engine::store::{LoginMeta, NewAccount, Store};
@@ -296,4 +296,31 @@ fn the_spawner_is_the_port_the_engine_was_built_with() {
         "{ran:?}"
     );
     assert_eq!(fx.spawner.specs(), [spec]);
+}
+
+#[test]
+fn switchable_counts_read_the_store_alone_and_count_a_quarantine() {
+    let fx = Fx::new();
+    assert_eq!(fx.engine.switchable_count(&common::cc()).unwrap(), 0);
+    assert_eq!(fx.engine.switchable_providers().unwrap(), []);
+    assert!(!fx.engine.store_file().exists());
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.quarantine(&a, "invalid_grant", "sha256:x");
+    assert_eq!(
+        fx.engine.switchable_count(&common::cc()).unwrap(),
+        2,
+        "a quarantine still counts"
+    );
+    let newer = ProviderId::new("newer-agent");
+    let store = fx.engine.store().unwrap();
+    common::add(&store, &newer, "n-1", "n1@x.co", 1);
+    common::add(&store, &newer, "n-2", "n2@x.co", 2);
+    assert_eq!(
+        fx.engine.switchable_providers().unwrap(),
+        [common::cc(), newer.clone()]
+    );
+    fx.engine.set_disabled(&b, true).unwrap();
+    assert_eq!(fx.engine.switchable_count(&common::cc()).unwrap(), 1);
+    assert_eq!(fx.engine.switchable_providers().unwrap(), [newer]);
 }
