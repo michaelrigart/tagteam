@@ -54,7 +54,7 @@ pub(super) fn render(state: &State, frame: &mut Frame, area: Rect, prompt: &str,
     let shown = tail(input, inner.saturating_sub(1));
     lines.push(Line::from(vec![
         Span::raw(shown),
-        Span::styled(" ", state.theme.selection()),
+        Span::styled(" ", state.theme.focus()),
     ]));
     lines.push(Line::from("Enter · Esc cancel"));
     boxed(frame, area, " Input ", lines, w);

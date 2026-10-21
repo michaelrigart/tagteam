@@ -13,7 +13,7 @@ use tagteam_engine::words;
 
 use crate::msg::Cmd;
 use crate::state::{Screen, State};
-use crate::view::{fit, flow, furthest_scroll, pad, scrolled_windows, width_of, wrap_rows};
+use crate::view::{fit, flow, furthest_scroll, pad, scrolled_windows, select, width_of, wrap_rows};
 
 pub const NO_HISTORY: &str = "No usage history.";
 pub const NO_ACCOUNTS: &str = "No accounts yet.";
@@ -279,13 +279,17 @@ fn account_list(state: &State, rows: usize) -> Vec<Line<'static>> {
         }
         for v in &group.accounts {
             let marker = if v.active { '*' } else { ' ' };
-            let line = Line::from(pad(
-                &format!(" {marker} {} {}", v.row.position, words::name(&v.row)),
-                w,
-            ));
+            let lead = format!(" {marker} {} ", v.row.position);
+            let name = pad(&words::name(&v.row), w.saturating_sub(width_of(&lead)));
+            // Column 0 is the selection column; the name is the span the selection bolds.
+            let line = Line::from(vec![
+                Span::raw(" "),
+                Span::raw(lead[1..].to_owned()),
+                Span::raw(name),
+            ]);
             if state.history.account.as_ref() == Some(&v.row.id) {
                 shown_at = lines.len();
-                lines.push(line.style(state.theme.selection()));
+                lines.push(select(line, Some(2), w, state.theme));
             } else {
                 lines.push(line);
             }
@@ -397,6 +401,15 @@ fn window_lines(
 }
 #[cfg(test)]
 mod tests {
+    /// `line` from column 27, where the right-hand panel starts (by columns: the selected
+    /// account's `▌` is three bytes), as `str::get(27..)` shows it: none when `line` is shorter.
+    fn right_of(line: &str) -> Option<&str> {
+        match line.char_indices().nth(27) {
+            Some((at, _)) => Some(&line[at..]),
+            None => (line.chars().count() == 27).then_some(""),
+        }
+    }
+
     use ratatui::style::{Color, Modifier};
     use tagteam_core::{Pace, ProjectionMethod, WindowKind};
     use tagteam_engine::views::UsageStatus;
@@ -413,6 +426,41 @@ mod tests {
         let mut state = fresh(Screen::History);
         state.accounts.apply(snapshot(accounts));
         state
+    }
+
+    #[test]
+    fn the_shown_account_has_the_bar_and_a_bold_name_and_no_reverse_video() {
+        for theme in TIERS {
+            let mut state = on_history(many(2));
+            state.theme = theme;
+            state.history.select(id(2));
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            let (x, y) = locate(&buf, "▌  2 a2@x.co").unwrap();
+            assert_eq!(x, 0);
+            for i in 5..12 {
+                assert!(
+                    buf[(i, y)].modifier.contains(Modifier::BOLD),
+                    "{theme:?} {i}"
+                );
+            }
+            let (_, other) = locate(&buf, "   1 a1@x.co").unwrap();
+            for i in 0..26 {
+                assert!(
+                    !buf[(i, y)].modifier.contains(Modifier::REVERSED),
+                    "{theme:?} {i}"
+                );
+                assert!(
+                    !buf[(i, other)].modifier.contains(Modifier::BOLD),
+                    "{theme:?} {i}"
+                );
+                assert_eq!(
+                    buf[(i, y)].bg,
+                    theme.sel_bg().bg.unwrap_or(Color::Reset),
+                    "{theme:?} {i}"
+                );
+                assert_eq!(buf[(i, other)].bg, Color::Reset, "{theme:?} {i}");
+            }
+        }
     }
 
     /// 5h with three samples and no rate; 7d running out in 12 hours by regression.
@@ -508,10 +556,10 @@ mod tests {
             .apply(view_of(account(1, "a1@x.co", read(60, 9.0, 95.0, false))));
         let lines = body_of(&state, 80, 24, NOW_MS);
         assert!(lines[0].starts_with(" ACCOUNTS "), "{}", lines[0]);
-        assert!(lines[1].starts_with("   1 a1@x.co"), "{}", lines[1]);
+        assert!(lines[1].starts_with("▌  1 a1@x.co"), "{}", lines[1]);
         let right: Vec<&str> = lines[0..6]
             .iter()
-            .map(|l| l.get(27..).unwrap_or(""))
+            .map(|l| right_of(l).unwrap_or(""))
             .collect();
         let spark = 80 - 27 - 2 - 2 - 2 - 4;
         assert_eq!(
@@ -527,7 +575,7 @@ mod tests {
         assert_eq!(right[3], "    +5.0 pts/h · runs out in 12h00m (regression)");
         let last = lines.last().unwrap();
         assert_eq!(
-            last.get(27..).unwrap_or(""),
+            right_of(last).unwrap_or(""),
             "7 days  [ ] range",
             "on the body's last row"
         );
@@ -561,7 +609,7 @@ mod tests {
         let right = |width: u16| -> Vec<String> {
             body_of(&state, width, 24, NOW_MS)[0..4]
                 .iter()
-                .map(|l| l.get(27..).unwrap_or("").trim_end().to_owned())
+                .map(|l| right_of(l).unwrap_or("").trim_end().to_owned())
                 .collect()
         };
         let under = " ".repeat(19);
@@ -618,7 +666,7 @@ mod tests {
         ));
         let right: Vec<String> = body_of(&state, 80, 24, NOW_MS)[0..7]
             .iter()
-            .map(|l| l.get(27..).unwrap_or("").trim_end().to_owned())
+            .map(|l| right_of(l).unwrap_or("").trim_end().to_owned())
             .collect();
         assert!(
             right[0].starts_with(&format!("{:<17}  ", "5h")),
@@ -674,7 +722,7 @@ mod tests {
         state.toast(["Switched to a@x.co (position 1)"; 8].join(" "), NOW_MS);
         let right: Vec<String> = body_of(&state, 80, 24, NOW_MS)[0..16]
             .iter()
-            .map(|l| l.get(27..).unwrap_or("").trim_end().to_owned())
+            .map(|l| right_of(l).unwrap_or("").trim_end().to_owned())
             .collect();
         let label = right
             .iter()
@@ -713,10 +761,7 @@ mod tests {
         // and the rule. The panel's footer is the body's last row.
         state.size = (80, 25);
         let footer = |state: &State, h: u16| {
-            body_of(state, 80, h, NOW_MS)
-                .last()
-                .unwrap()
-                .get(27..)
+            right_of(body_of(state, 80, h, NOW_MS).last().unwrap())
                 .unwrap()
                 .to_owned()
         };
@@ -767,14 +812,13 @@ mod tests {
         let labels = |state: &State| -> Vec<String> {
             body_of(state, 80, 25, NOW_MS)[0..21]
                 .iter()
-                .filter_map(|l| l.get(27..))
+                .filter_map(|l| right_of(l))
                 .filter(|r| r.starts_with('M'))
                 .map(|r| r.split_whitespace().next().unwrap().to_owned())
                 .collect()
         };
         let footer = |state: &State| {
-            body_of(state, 80, 25, NOW_MS)[21]
-                .get(27..)
+            right_of(&body_of(state, 80, 25, NOW_MS)[21])
                 .unwrap()
                 .to_owned()
         };
@@ -797,7 +841,7 @@ mod tests {
         state.history.apply(twelve(2));
         assert_eq!(labels(&state), first);
         // A taller terminal shows them all: 42 rows give the body the 38 that 40 gave it.
-        assert!(body_of(&state, 80, 42, NOW_MS)[37].get(27..).unwrap() == "7 days  [ ] range");
+        assert!(right_of(&body_of(&state, 80, 42, NOW_MS)[37]).unwrap() == "7 days  [ ] range");
         // Help lists the keys.
         update(&mut state, ch('?'), NOW_MS);
         let help = draw(&state, 80, 24);
@@ -913,7 +957,7 @@ mod tests {
         long.history.select(id(35));
         let shown = left(&long);
         assert_eq!(shown[0], " ACCOUNTS");
-        assert_eq!(shown.last().unwrap(), "   35 a35@x.co", "{shown:?}");
+        assert_eq!(shown.last().unwrap(), "▌  35 a35@x.co", "{shown:?}");
     }
 
     #[test]

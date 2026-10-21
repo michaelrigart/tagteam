@@ -3,10 +3,10 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
-use super::{CHOICE_ROWS, KeyOutcome, boxed, question_rows};
+use super::{CHOICE_ROWS, GUTTER, KeyOutcome, boxed, gutter_rows, question_rows};
 use crate::msg::{Answer, AnswerTo, Cmd};
 use crate::state::State;
-use crate::view::{pad, scrolled_windows, width_of, wrap_rows};
+use crate::view::{scrolled_windows, width_of, wrap_rows};
 
 pub(super) fn key(
     options: &[String],
@@ -57,7 +57,7 @@ pub(super) fn render(
     let blocks: Vec<Vec<String>> = options
         .iter()
         .enumerate()
-        .map(|(i, option)| choice_rows(i, option, inner))
+        .map(|(i, option)| choice_rows(i, option, inner - GUTTER))
         .collect();
     let heights: Vec<usize> = blocks.iter().map(Vec::len).collect();
     // From the first choice that keeps the selected one in view, whole.
@@ -72,20 +72,13 @@ pub(super) fn render(
         if !shown.contains(&i) {
             continue;
         }
-        for row in block {
-            let line = Line::from(row);
-            lines.push(if i == *at {
-                line.style(state.theme.selection())
-            } else {
-                line
-            });
-        }
+        lines.extend(gutter_rows(block, i == *at, inner, state.theme));
     }
     lines.push(Line::from("↑ ↓ choose · Enter · Esc cancel"));
     boxed(frame, area, " Choose ", lines, w);
 }
 
-/// Choice `i`'s rows, `w` columns each: `N. ` and its text, which wraps at word boundaries under
+/// Choice `i`'s rows, `w` columns at most each: `N. ` and its text, which wraps at word boundaries under
 /// itself, onto `CHOICE_ROWS` at most; the rest is cut (`wrap_rows`).
 fn choice_rows(i: usize, option: &str, w: usize) -> Vec<String> {
     let number = format!("{}. ", i + 1);
@@ -99,7 +92,7 @@ fn choice_rows(i: usize, option: &str, w: usize) -> Vec<String> {
             } else {
                 " ".repeat(hang)
             };
-            pad(&format!("{lead}{text}"), w)
+            format!("{lead}{text}")
         })
         .collect()
 }
