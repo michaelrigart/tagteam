@@ -862,8 +862,9 @@ mod tests {
         assert_eq!(state.accounts.shown_ids(), [id(1), id(2)]);
         let drawn = draw(&state, 80, 24);
         assert_eq!(drawn[2], " ✕ the store is locked");
+        // Under the lead card's two rows and a blank one, the table's head, then row 1.
         let body = body_of(&state, 80, 24, NOW_MS);
-        assert!(body[1].contains("a1@x.co"), "{body:?}");
+        assert!(body[4].contains("a1@x.co"), "{body:?}");
         // The next good read clears it.
         update(&mut state, accounts_msg(r#gen, 2), NOW_MS);
         assert!(state.banner.is_none());

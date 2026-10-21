@@ -130,8 +130,8 @@ impl Shown {
 }
 
 /// §6.2's windows for the lead card at `width`, before any fold, by key: the first short and
-/// the first long below 120 columns, every window from 120. Until Task 13 draws the lead
-/// card, `render` passes these as `on_lead`; Task 13 picks its bars from them.
+/// the first long below 120 columns, every window from 120. The lead card picks its bars from
+/// them (T3-32).
 pub(crate) fn lead_keys(v: &AccountView, width: u16) -> Vec<String> {
     let windows = windows_of(v);
     if width >= WIDE_FROM {
@@ -376,45 +376,58 @@ impl Row<'_> {
             mark = Some(spans.len());
             spans.push(Span::styled(AHEAD, theme.role(Role::Warn)));
         }
-        if self.on_lead {
-            return (spans, mark);
-        }
-        let reset = match (w.resets_at, w.kind) {
-            (Some(at), _) if at > now_s => {
-                Some(format!("resets in {}", words::countdown(at, now_s)))
-            }
-            (Some(at), _) => Some(words::countdown(at, now_s)),
-            (None, WindowKind::Short | WindowKind::Long) => Some(NOT_STARTED.to_owned()),
-            (None, WindowKind::Scoped | WindowKind::Spend) => None,
-        };
-        let projection = p.rate_per_hour.map(|_| {
-            let hw = HistoryWindow {
-                window: w.clone(),
-                samples: vec![],
-                pace: *p,
-            };
-            let text = if wide {
-                words::projection_text(&hw, now_s)
-            } else {
-                words::projection_clause(&hw, now_s, true)
-            };
-            let role = if p.will_last_to_reset == Some(false) {
-                Role::Warn
-            } else {
-                Role::Text
-            };
-            Span::styled(text, theme.role(role))
-        });
-        if let Some(reset) = &reset {
-            spans.push(Span::raw(GAP));
-            spans.push(Span::raw(reset.clone()));
-        }
-        if let Some(projection) = projection {
-            spans.push(Span::raw(if reset.is_some() { FACT_SEP } else { GAP }));
-            spans.push(projection);
+        if !self.on_lead {
+            spans.extend(reset_tail(w, p, wide, now_s, theme));
         }
         (spans, mark)
     }
+}
+
+/// How a window's row ends on the card and on the lead card (T3-19, T3-20):
+/// `  {reset}[ · {projection}]`. The reset is `resets in {span}`, `reset` once passed, or `not
+/// started` for a short or long window without one. The projection shows only with a rate: from
+/// 120 columns with it, below as its clause; warn when the window fills before it resets.
+pub(super) fn reset_tail(
+    w: &Window,
+    p: &Pace,
+    wide: bool,
+    now_s: i64,
+    theme: Theme,
+) -> Vec<Span<'static>> {
+    let reset = match (w.resets_at, w.kind) {
+        (Some(at), _) if at > now_s => Some(format!("resets in {}", words::countdown(at, now_s))),
+        (Some(at), _) => Some(words::countdown(at, now_s)),
+        (None, WindowKind::Short | WindowKind::Long) => Some(NOT_STARTED.to_owned()),
+        (None, WindowKind::Scoped | WindowKind::Spend) => None,
+    };
+    let projection = p.rate_per_hour.map(|_| {
+        let hw = HistoryWindow {
+            window: w.clone(),
+            samples: vec![],
+            pace: *p,
+        };
+        let text = if wide {
+            words::projection_text(&hw, now_s)
+        } else {
+            words::projection_clause(&hw, now_s, true)
+        };
+        let role = if p.will_last_to_reset == Some(false) {
+            Role::Warn
+        } else {
+            Role::Text
+        };
+        Span::styled(text, theme.role(role))
+    });
+    let mut spans = Vec::new();
+    if let Some(reset) = &reset {
+        spans.push(Span::raw(GAP));
+        spans.push(Span::raw(reset.clone()));
+    }
+    if let Some(projection) = projection {
+        spans.push(Span::raw(if reset.is_some() { FACT_SEP } else { GAP }));
+        spans.push(projection);
+    }
+    spans
 }
 
 /// The ahead-of-pace mark on its own, below 120 columns or where its words do not fit.
