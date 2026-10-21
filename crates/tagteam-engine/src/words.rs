@@ -3,6 +3,7 @@
 //! `history.rs` and `tokens_cmd.rs` with their bodies unchanged; the CLI adds its ANSI colours
 //! around them.
 
+use tagteam_core::autoswitch::{NoSwitchReason, Trigger};
 use tagteam_core::{Window, WindowKind};
 
 use crate::store::AccountRow;
@@ -358,6 +359,112 @@ pub fn token_footnotes(report: &TokenReport, mark: &str, unreadable: bool) -> Ve
         )
     });
     notes
+}
+
+/// Every `NoSwitchReason`, until R3's `NoSwitchReason::ALL` (T2-27).
+pub const NO_SWITCH_REASONS: [NoSwitchReason; 17] = [
+    NoSwitchReason::UnmanagedActiveAccount,
+    NoSwitchReason::NoActiveAccount,
+    NoSwitchReason::ActiveApiKey,
+    NoSwitchReason::BelowThreshold,
+    NoSwitchReason::ActiveUsageUnknown,
+    NoSwitchReason::Cooldown,
+    NoSwitchReason::NoCandidates,
+    NoSwitchReason::NoComparison,
+    NoSwitchReason::ResetUnknown,
+    NoSwitchReason::AlreadyConsumingSoonest,
+    NoSwitchReason::NoQualifyingCandidate,
+    NoSwitchReason::StaleUsage,
+    NoSwitchReason::AllExhausted,
+    NoSwitchReason::EngineRunning,
+    NoSwitchReason::InterruptedSwitch,
+    NoSwitchReason::LiveChanged,
+    NoSwitchReason::NoViableTarget,
+];
+
+/// What a `no-switch` sentence says besides its reason (spec §11.3).
+#[derive(Debug, Clone, Copy)]
+pub struct NoSwitchFacts<'a> {
+    /// The decision's `detail` as `auto` reports it: `4m` (cooldown), `2/3` (active-usage-unknown); else empty.
+    pub detail: &'a str,
+    /// The account in use's usage at the tick, for `below-threshold`: 100 less its headroom.
+    pub used_pct: Option<f64>,
+    pub threshold: f64,
+    /// `all-exhausted`: when the first account frees up, in the caller's clock form (`16:40`).
+    pub frees_at: Option<&'a str>,
+    pub display_name: &'a str,
+}
+
+/// A threshold as the header and the sentences show it: `90%`, or `92.5%` with a fraction.
+pub fn threshold(pct: f64) -> String {
+    if pct.fract() == 0.0 {
+        format!("{pct:.0}%")
+    } else {
+        format!("{pct:.1}%")
+    }
+}
+
+/// Auto's decision in plain words (spec §11.3), for the auto line and `tagteam auto`.
+pub fn no_switch(reason: NoSwitchReason, facts: &NoSwitchFacts<'_>) -> String {
+    let t = threshold(facts.threshold);
+    let display = facts.display_name;
+    match reason {
+        NoSwitchReason::BelowThreshold => match facts.used_pct {
+            Some(u) => format!("no switch needed ({u:.0}%, switches at {t})"),
+            None => format!("no switch needed (switches at {t})"),
+        },
+        NoSwitchReason::Cooldown if facts.detail.is_empty() => {
+            "waiting after the last switch".into()
+        }
+        NoSwitchReason::Cooldown => format!("waiting {} after the last switch", facts.detail),
+        NoSwitchReason::AllExhausted => match facts.frees_at {
+            Some(at) => format!("every account is near its limit; the first frees up at {at}"),
+            None => "every account is near its limit".into(),
+        },
+        NoSwitchReason::NoQualifyingCandidate => "no other account has enough headroom".into(),
+        NoSwitchReason::NoCandidates => "no other account can be used".into(),
+        NoSwitchReason::NoComparison => "no other account has a reading to compare".into(),
+        NoSwitchReason::StaleUsage => {
+            "the best account's reading is too old; checking it first".into()
+        }
+        NoSwitchReason::ActiveUsageUnknown => match facts.detail.split_once('/') {
+            Some((n, m)) => format!("can't read the account in use ({n} of {m} tries)"),
+            None => "can't read the account in use".into(),
+        },
+        NoSwitchReason::UnmanagedActiveAccount => {
+            format!("{display} is logged in as an account tagteam doesn't manage")
+        }
+        NoSwitchReason::NoActiveAccount => format!("{display} isn't logged in"),
+        NoSwitchReason::ActiveApiKey => {
+            "the account in use is an API key, which auto leaves alone".into()
+        }
+        NoSwitchReason::ResetUnknown => "can't tell when the account in use resets".into(),
+        NoSwitchReason::AlreadyConsumingSoonest => {
+            "already on the account that resets first".into()
+        }
+        NoSwitchReason::EngineRunning => "auto already runs in another process".into(),
+        NoSwitchReason::InterruptedSwitch => "finishing an interrupted switch first".into(),
+        NoSwitchReason::LiveChanged => {
+            "the login changed meanwhile; trying again next check".into()
+        }
+        NoSwitchReason::NoViableTarget => "every target failed; trying again next check".into(),
+    }
+}
+
+/// §11.3's trigger words, for switches that predate `detail`.
+pub fn trigger(trigger: Trigger) -> &'static str {
+    match trigger {
+        Trigger::Proactive => "before it reached the limit",
+        Trigger::AtLimit => "at the limit",
+        Trigger::Failover => "its usage couldn't be read",
+        Trigger::ConsumeFirst => "to use up the account that resets first",
+    }
+}
+
+/// `<position> <alias, else the email's local part>`: `2 work`, `1 alex` (spec §5.3, §11.4).
+pub fn short_name(position: u32, alias: Option<&str>, email_or_label: &str) -> String {
+    let name = alias.unwrap_or_else(|| email_or_label.split('@').next().unwrap_or(email_or_label));
+    format!("{position} {name}")
 }
 
 #[cfg(test)]
@@ -1023,5 +1130,158 @@ mod tests {
             "1 transcript file could not be read; the next refresh tries again"
         );
         assert_eq!(plural(2, "subagent response"), "2 subagent responses");
+    }
+
+    fn facts(detail: &str) -> NoSwitchFacts<'_> {
+        NoSwitchFacts {
+            detail,
+            used_pct: Some(77.0),
+            threshold: 90.0,
+            frees_at: Some("16:40"),
+            display_name: "Claude Code",
+        }
+    }
+
+    #[test]
+    fn every_no_switch_reason_has_its_sentence() {
+        use NoSwitchReason::*;
+        let expected = [
+            (BelowThreshold, "no switch needed (77%, switches at 90%)"),
+            (Cooldown, "waiting 4m after the last switch"),
+            (
+                AllExhausted,
+                "every account is near its limit; the first frees up at 16:40",
+            ),
+            (
+                NoQualifyingCandidate,
+                "no other account has enough headroom",
+            ),
+            (NoCandidates, "no other account can be used"),
+            (NoComparison, "no other account has a reading to compare"),
+            (
+                StaleUsage,
+                "the best account's reading is too old; checking it first",
+            ),
+            (
+                ActiveUsageUnknown,
+                "can't read the account in use (2 of 3 tries)",
+            ),
+            (
+                UnmanagedActiveAccount,
+                "Claude Code is logged in as an account tagteam doesn't manage",
+            ),
+            (NoActiveAccount, "Claude Code isn't logged in"),
+            (
+                ActiveApiKey,
+                "the account in use is an API key, which auto leaves alone",
+            ),
+            (ResetUnknown, "can't tell when the account in use resets"),
+            (
+                AlreadyConsumingSoonest,
+                "already on the account that resets first",
+            ),
+            (EngineRunning, "auto already runs in another process"),
+            (InterruptedSwitch, "finishing an interrupted switch first"),
+            (
+                LiveChanged,
+                "the login changed meanwhile; trying again next check",
+            ),
+            (
+                NoViableTarget,
+                "every target failed; trying again next check",
+            ),
+        ];
+        assert_eq!(expected.len(), NO_SWITCH_REASONS.len());
+        for reason in NO_SWITCH_REASONS {
+            let detail = match reason {
+                Cooldown => "4m",
+                ActiveUsageUnknown => "2/3",
+                _ => "",
+            };
+            let want = expected.iter().find(|(r, _)| *r == reason).unwrap().1;
+            assert_eq!(no_switch(reason, &facts(detail)), want, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn a_sentence_without_its_facts_still_reads() {
+        let bare = NoSwitchFacts {
+            detail: "",
+            used_pct: None,
+            threshold: 90.0,
+            frees_at: None,
+            display_name: "Claude Code",
+        };
+        assert_eq!(
+            no_switch(NoSwitchReason::BelowThreshold, &bare),
+            "no switch needed (switches at 90%)"
+        );
+        assert_eq!(
+            no_switch(NoSwitchReason::Cooldown, &bare),
+            "waiting after the last switch"
+        );
+        assert_eq!(
+            no_switch(NoSwitchReason::AllExhausted, &bare),
+            "every account is near its limit"
+        );
+        assert_eq!(
+            no_switch(NoSwitchReason::ActiveUsageUnknown, &bare),
+            "can't read the account in use"
+        );
+    }
+
+    #[test]
+    fn the_reason_list_is_every_reason_once() {
+        use NoSwitchReason::*;
+        fn index(r: NoSwitchReason) -> usize {
+            match r {
+                UnmanagedActiveAccount => 0,
+                NoActiveAccount => 1,
+                ActiveApiKey => 2,
+                BelowThreshold => 3,
+                ActiveUsageUnknown => 4,
+                Cooldown => 5,
+                NoCandidates => 6,
+                NoComparison => 7,
+                ResetUnknown => 8,
+                AlreadyConsumingSoonest => 9,
+                NoQualifyingCandidate => 10,
+                StaleUsage => 11,
+                AllExhausted => 12,
+                EngineRunning => 13,
+                InterruptedSwitch => 14,
+                LiveChanged => 15,
+                NoViableTarget => 16,
+            }
+        }
+        assert_eq!(
+            NO_SWITCH_REASONS.map(index),
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+    }
+
+    #[test]
+    fn every_trigger_has_its_words() {
+        assert_eq!(trigger(Trigger::Proactive), "before it reached the limit");
+        assert_eq!(trigger(Trigger::AtLimit), "at the limit");
+        assert_eq!(trigger(Trigger::Failover), "its usage couldn't be read");
+        assert_eq!(
+            trigger(Trigger::ConsumeFirst),
+            "to use up the account that resets first"
+        );
+    }
+
+    #[test]
+    fn a_threshold_is_whole_unless_it_has_a_fraction() {
+        assert_eq!(threshold(90.0), "90%");
+        assert_eq!(threshold(92.5), "92.5%");
+        assert_eq!(threshold(50.0), "50%");
+    }
+
+    #[test]
+    fn a_short_name_is_the_alias_else_the_email_s_local_part() {
+        assert_eq!(short_name(2, Some("work"), "sam@corp.example"), "2 work");
+        assert_eq!(short_name(1, None, "alex@example.com"), "1 alex");
+        assert_eq!(short_name(3, None, "ci-label"), "3 ci-label");
     }
 }
