@@ -21,6 +21,8 @@ pub const REFRESH_MS: i64 = 30_000;
 pub const TOAST_MS: i64 = 5_000;
 /// A `Warn` or `Failed` toast, and a `Done` one that wraps, last this long (redesign §5.5).
 pub const TOAST_LONG_MS: i64 = 8_000;
+/// After a key closes an overlay, the action keys are ignored this long (redesign §9.5, T2-18).
+pub const GUARD_MS: i64 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -88,6 +90,9 @@ pub struct State {
     /// The action running now was handed the terminal: its outcome is worded by the exit code
     /// alone (T2-19).
     pub(crate) on_terminal: bool,
+    /// The action keys are ignored until this instant: a key closed an overlay just before
+    /// (T2-18).
+    pub(crate) guard_until_ms: i64,
 }
 
 /// A banner's words, and what raised them: a success of that same kind clears it, and a refusal
@@ -173,6 +178,7 @@ impl State {
             checking: None,
             checked: None,
             on_terminal: false,
+            guard_until_ms: 0,
         }
     }
 

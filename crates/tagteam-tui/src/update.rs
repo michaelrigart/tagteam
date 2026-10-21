@@ -229,8 +229,9 @@ fn on_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
             KeyCode::Char('z') => vec![Cmd::Stop],
             // Ctrl-U clears a text dialog's input; no other dialog has one.
             KeyCode::Char('u') => {
-                if let Some(Overlay::Text { input, .. }) = &mut state.overlay {
+                if let Some(Overlay::Text { input, error, .. }) = &mut state.overlay {
                     input.clear();
+                    *error = None;
                 }
                 vec![]
             }
@@ -250,6 +251,12 @@ fn on_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
         KeyCode::BackTab => show(state, state.screen.prev(), now_ms),
         KeyCode::Char('?') => {
             state.overlay = Some(Overlay::Help { scroll: 0 });
+            vec![]
+        }
+        // Right after an overlay closed, a repeated action key must not act (§9.5, T2-18).
+        KeyCode::Char('s' | 'b' | 'n' | 'e' | 'a' | 'm' | 'x' | 'R' | 'P' | 'A' | 'D' | 'r')
+            if now_ms < state.guard_until_ms =>
+        {
             vec![]
         }
         _ => match actions::handle_action_key(state, key, now_ms) {
@@ -318,6 +325,7 @@ mod tests {
 
     use super::*;
     use crate::source::{CollectSummary, SourceError};
+    use crate::state::GUARD_MS;
     use crate::testutil::*;
 
     fn quit_code(cmds: &[Cmd]) -> Option<i32> {
@@ -375,6 +383,64 @@ mod tests {
         update(&mut state, ch('?'), NOW_MS);
         assert_eq!(quit_code(&update(&mut state, ctrl('c'), NOW_MS)), Some(0));
         assert!(state.overlay.is_none());
+    }
+
+    /// Review Focus 5 (§9.5, T2-18): for 300 ms after a key closes an overlay only the action
+    /// keys are dropped.
+    #[test]
+    fn the_guard_drops_only_action_keys_and_only_for_300_ms() {
+        // Two accounts, Help opened and closed at `NOW_MS`.
+        let closed = || {
+            let mut state = fresh(Screen::Accounts);
+            state.accounts.apply(snapshot(many(2)));
+            update(&mut state, ch('?'), NOW_MS);
+            update(&mut state, ch('?'), NOW_MS);
+            assert!(state.overlay.is_none());
+            state
+        };
+        let selected = |state: &State| state.accounts.selected().map(|a| a.position);
+        // Every action key at 299 ms does nothing.
+        for c in "sbneamxRPADr".chars() {
+            let mut state = closed();
+            let cmds = update(&mut state, ch(c), NOW_MS + GUARD_MS - 1);
+            assert!(cmds.is_empty(), "{c}: {cmds:?}");
+            assert!(
+                state.overlay.is_none() && state.running.is_none() && state.toast.is_none(),
+                "{c}"
+            );
+        }
+        // The keys a person uses right after a dialog still act at once.
+        let mut state = closed();
+        update(&mut state, ch('j'), NOW_MS + 1);
+        assert_eq!(selected(&state), Some(2));
+        update(&mut state, ch('k'), NOW_MS + 1);
+        assert_eq!(selected(&state), Some(1));
+        update(&mut state, ch('?'), NOW_MS + 1);
+        assert!(matches!(state.overlay, Some(Overlay::Help { .. })));
+        update(&mut state, key(KeyCode::Esc), NOW_MS + 1);
+        assert!(state.overlay.is_none(), "Esc closes the next overlay");
+        for (c, screen) in [
+            ('1', Screen::Accounts),
+            ('2', Screen::Tokens),
+            ('3', Screen::History),
+        ] {
+            let mut state = closed();
+            update(&mut state, ch(c), NOW_MS + 1);
+            assert_eq!(state.screen, screen, "{c}");
+        }
+        let mut state = closed();
+        assert_eq!(quit_code(&update(&mut state, ch('q'), NOW_MS + 1)), Some(0));
+        // At 300 ms the guard is over.
+        let mut state = closed();
+        let cmds = update(&mut state, ch('n'), NOW_MS + GUARD_MS);
+        assert!(matches!(cmds.as_slice(), [Cmd::Act(_)]), "{cmds:?}");
+        // Any key that closes an overlay starts it: Esc on a dialog, too.
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(many(2)));
+        update(&mut state, ch('x'), NOW_MS);
+        update(&mut state, key(KeyCode::Esc), NOW_MS);
+        assert!(update(&mut state, ch('n'), NOW_MS + GUARD_MS - 1).is_empty());
+        assert!(!update(&mut state, ch('n'), NOW_MS + GUARD_MS).is_empty());
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod choose;
 mod confirm;
 mod help;
 mod panel;
+mod proceed;
 mod text;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -17,7 +18,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 use crate::host::{AccountRef, Action};
 use crate::msg::{Answer, AnswerTo, Cmd};
 use crate::screens::tokens::filter::{self, FilterDialog};
-use crate::state::State;
+use crate::state::{GUARD_MS, State};
 use crate::theme::{Role, Theme};
 use crate::view::{centered, select, tint, wrap_rows};
 
@@ -39,6 +40,8 @@ pub enum Overlay {
     Text {
         prompt: String,
         input: String,
+        /// What `Enter` refused, shown under the input until the next key (T2-20).
+        error: Option<String>,
         then: TextThen,
     },
     Result {
@@ -53,6 +56,14 @@ pub enum Overlay {
     },
     /// Tokens' filter (spec §5.3).
     Filter(FilterDialog),
+    /// A question before the terminal is given up or an action begins (§9.5, §9.6): `go` is
+    /// what `⏎` does, in the border.
+    Proceed {
+        question: String,
+        detail: String,
+        go: &'static str,
+        then: ProceedThen,
+    },
 }
 
 impl Overlay {
@@ -79,7 +90,8 @@ impl Overlay {
             | Overlay::Text { .. }
             | Overlay::Result { .. }
             | Overlay::Doctor { .. }
-            | Overlay::Filter(_) => None,
+            | Overlay::Filter(_)
+            | Overlay::Proceed { .. } => None,
         }
     }
 }
@@ -96,7 +108,20 @@ pub enum ConfirmThen {
 #[derive(Debug)]
 pub enum TextThen {
     Alias(AccountRef),
-    Move(AccountRef),
+    /// `last` is the number of accounts the provider has: the positions are 1 to `last`.
+    Move {
+        account: AccountRef,
+        last: u32,
+    },
+}
+
+/// What `⏎` does in a proceed dialog.
+#[derive(Debug)]
+pub enum ProceedThen {
+    /// `R`: `start` it.
+    Start(Action),
+    /// A hand-over: `running` is already set; `⏎` suspends it, `Esc` clears it (T2-19).
+    Suspend(Action),
 }
 
 /// The rows a choice takes, at most (R21): a CLI's `<provider> #<n> <name> [<org>]` fits.
@@ -177,10 +202,13 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
             reply,
             ..
         } => choose::key(options, selected, *reply, key),
-        Overlay::Text { input, then, .. } => text::key(state, input, then, key, now_ms),
+        Overlay::Text {
+            input, error, then, ..
+        } => text::key(state, input, error, then, key, now_ms),
         Overlay::Result { text, scroll, .. } => panel::result_key(state, text, scroll, key),
         Overlay::Doctor { text, scroll, .. } => panel::doctor_key(state, text, scroll, key, now_ms),
         Overlay::Filter(dialog) => filter::handle_key(state, dialog, key, now_ms),
+        Overlay::Proceed { then, .. } => proceed::key(state, then, key, now_ms),
     };
     match outcome {
         KeyOutcome::Keep => {
@@ -193,10 +221,12 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
         }
         KeyOutcome::Close => {
             state.overlay = None;
+            state.guard_until_ms = now_ms + GUARD_MS;
             vec![]
         }
         KeyOutcome::CloseWith(cmds) => {
             state.overlay = None;
+            state.guard_until_ms = now_ms + GUARD_MS;
             cmds
         }
     }
@@ -222,7 +252,12 @@ pub fn render(state: &State, frame: &mut Frame) {
             selected: at,
             ..
         } => choose::render(state, frame, area, question, options, at),
-        Overlay::Text { prompt, input, .. } => text::render(state, frame, area, prompt, input),
+        Overlay::Text {
+            prompt,
+            input,
+            error,
+            ..
+        } => text::render(state, frame, area, prompt, input, error.as_deref()),
         Overlay::Result {
             title,
             text,
@@ -234,6 +269,12 @@ pub fn render(state: &State, frame: &mut Frame) {
             online,
         } => panel::render_doctor(state, frame, text, scroll, online),
         Overlay::Filter(dialog) => filter::render(state, dialog, frame),
+        Overlay::Proceed {
+            question,
+            detail,
+            go,
+            ..
+        } => proceed::render(state, frame, area, question, detail, go),
     }
 }
 
@@ -499,6 +540,7 @@ mod tests {
         let mut state = with(Overlay::Text {
             prompt: "Alias".into(),
             input: "a".into(),
+            error: None,
             then: TextThen::Alias(AccountRef {
                 id: id(1),
                 provider: cc(),
@@ -519,6 +561,7 @@ mod tests {
         state.overlay = Some(Overlay::Text {
             prompt: "Alias".to_owned(),
             input: "ab".to_owned(),
+            error: None,
             then: TextThen::Alias(AccountRef {
                 id: id(1),
                 provider: cc(),
