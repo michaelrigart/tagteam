@@ -225,25 +225,33 @@ pub enum ActionOutcome {
 ### 5.1 Layout
 
 ```
- tagteam  [1 Accounts]  2 Tokens  3 History              ● live · auto running   ? help
- ┌──────────────────────────────────── body ────────────────────────────────────────┐
- └───────────────────────────────────────────────────────────────────────────────────┘
- s switch  b best  n next  e enable/disable  a alias  m move  x remove  r refresh
+ tagteam   1 Accounts   2 Tokens   3 History                    ● auto on · switches at 90%   ? keys
+ ⇄ 11:28  auto switched 1 alex → 2 work · alex's 5h reached 93% · next check 14:16      w why
+ ────────────────────────────────────────────────────────────────────────────────────────────
+ (banner, 0–3 rows)
+ (body)
+ s switch  b best  n next  ⏎ history  P pause auto  r refresh                    ? keys  q quit
 ```
 
-- **The header** shows the screen tabs and the mode: `● live` with the daemon's auto state, or
-  `○ refresh 30s`. It also shows a banner when there is one: an unmanaged live login, a run
-  shell, or an error (§10.4).
-- **The footer** shows the current screen's keys. A toast replaces it for 5 s after an action
-  or event. While an action runs, it shows a spinner with the action's name.
-- **The activity line** above the footer shows the daemon's latest event in live mode
-  (`12:04 auto: 1 → 2 (5h at 95%)`), and is hidden in timer mode.
+- **The chrome rows** are the header, the auto line, the Now strip on Tokens and History, a faint
+  rule from 30 rows, the banner, the body and the footer. Their content does not change with the
+  daemon's mode. The header shows the tabs and auto's state with its threshold (§7.4), the auto
+  line shows auto's last action in plain words, the banner shows an unmanaged live login, a run
+  shell, the start-up warnings or an error (§10.4), and the footer shows the screen's keys with
+  `? keys` and `q quit` pinned. A toast replaces the footer's keys, and a running action shows a
+  spinner with its label. *(Amended by the TUI redesign spec §5.1–§5.6.)*
 - **Colour.**
-  - Only the 16 named ANSI colours, so light and dark terminals both work.
+  - Three tiers: tier 0 under `NO_COLOR`, `--no-color` or `ui.color = never`; tier 1 with the 16
+    named ANSI colours; tier 2 in truecolor when the terminal reports its background. Each
+    colour is a role (`text`, `muted`, `faint`, `accent`, `warn`, `crit`, `ok`), and the theme is
+    the only place that names one.
   - Percentages and gauges take core §13.5's severities (≥ 70 % warning, ≥ 90 % critical).
-  - Without colour, emphasis is bold, and the selection is reverse video.
-- **Size.** Below 80×24 the body is replaced by `terminal too small (80×24 needed)`. Wider
-  terminals get more columns (§5.3).
+  - The selection is `▌` in the first column with the name in bold. Without colour, emphasis is
+    bold, underline or DIM.
+
+  *(Amended by the TUI redesign spec §4.1–§4.3.)*
+- **Size.** Below 80×24 the body is replaced by `Terminal W×H · tagteam needs 80×24`. Wider
+  terminals get more columns (§5.3). *(Amended by the TUI redesign spec §4.5.)*
 - **Providers.** With several providers, the Accounts and History lists are grouped by
   provider, as `list` groups them. With one, no provider is shown.
 
@@ -357,9 +365,13 @@ pub enum ActionOutcome {
 
 ### 5.5 Overlays
 
-- **Help** (`?`) lists every key for the current screen and the global keys.
+- **Help** (`?`) lists the keys of the current screen and then those of every screen, from one
+  key table, and ends with what each mark and colour means. Every key list is on one line.
+  *(Amended by the TUI redesign spec §9.2.)*
 - **Dialogs.** A CLI prompt shows as a confirm or choose dialog (§7.2). Alias and position
-  input use a one-line text dialog. `Esc` declines.
+  input use a one-line text dialog. `Esc` declines. Dialogs and panels float over a dimmed
+  screen in a rounded frame; panels cover the body. `q` closes the open overlay first, except in
+  a text input, and quits only when nothing is open. *(Amended by the TUI redesign spec §9.1.)*
 - **The result panel** shows an action's captured output when it has warnings or more than one
   line, and is dismissed with `Esc` or `Enter`.
 - **The doctor panel** (`D`) shows `doctor`'s report, scrollable. `o` re-runs it with
@@ -367,12 +379,8 @@ pub enum ActionOutcome {
 
 ### 5.6 Keys
 
-| Where | Keys |
-|---|---|
-| Everywhere | `1` `2` `3` or `Tab`/`Shift-Tab` screens · `?` help · `q`/Ctrl-C quit · Ctrl-Z suspend · `j`/`k`/arrows move · `A` add current login · `D` doctor · `P` pause/resume auto |
-| Accounts | `s` switch · `b` best · `n` next-available · `e` enable/disable · `a` alias · `m` move · `x` remove · `R` run session · `r` refresh · `Enter` history |
-| Tokens | `p` period · `g` group · `f` filter · `[` `]` range · `Enter` drill down · `Esc`/`Backspace` up · `r` index refresh |
-| History | `[` `]` range · `r` refresh |
+The keys are the key table of the TUI redesign spec §10, less `w` until T4. Accounts' `g` and
+`G` are dropped. *(Amended by the TUI redesign spec §10.)*
 
 ## 6. Data and refresh
 
@@ -456,8 +464,8 @@ timer mode, since nothing else collects for it.
 ### 7.2 Running an action
 
 - **One at a time.** Actions and `collect_due` share the actions lane. While an action runs,
-  the footer shows its spinner. Another action key shows `busy: <action>` and is dropped, not
-  queued. A suspended action counts as running (§7.3), and the timer's `collect_due` is skipped
+  the footer shows its spinner. Another action key toasts `still <label> · wait for it to finish` and is
+  dropped, not queued. *(Amended by the TUI redesign spec §9.4.)* A suspended action counts as running (§7.3), and the timer's `collect_due` is skipped
   while any action runs.
 - **Prompts.** A `confirm` or `choose` from the CLI path opens a dialog. The actions lane
   waits on a reply channel until the person answers, or until a shutdown declines it (§10.2).
@@ -465,8 +473,11 @@ timer mode, since nothing else collects for it.
 - **Remove's confirmation** is the TUI's own: `Remove 2 spare@example.com? Its stored login is
   deleted; Claude Code is not changed.` The default is no, because one key is easier to hit
   than a typed command. The CLI's own refusals (core §10.3: never the live login) still apply.
-- **The outcome.** One plain line shows as a toast. Warnings, several lines or a non-zero exit
-  open the result panel. Each action is followed by a re-read of `accounts`.
+- **The outcome** follows the redesign spec's table: a doctor report opens the doctor panel; a
+  clean exit 0 toasts the CLI's output when it fits; a warning or a failure toasts one line and
+  opens the result panel for more. The spinner and toasts use the action's label (`switching to 3
+  spare…`). Each action is followed by a re-read of `accounts`. *(Amended by the TUI redesign
+  spec §9.3, §9.4.)*
 - **Inside a run shell**, account-changing actions fail with the CLI's refusal (core §12.8),
   shown like any outcome.
 
@@ -506,28 +517,21 @@ runs (core §12.5):
 
 Pausing is the daemon's persistent setting `provider.<id>.daemon.autoswitch` (§8), so it
 survives a daemon restart.
-- **In live mode,** `P` asks `Pause auto-switch for <provider>?` (or `Resume…`), from the
+- **In live mode,** `P` asks `Pause auto for <display name>?` (or `Resume…`), from the
   effective `autoswitch` in the daemon's `status`. A yes runs
   `config set provider.<id>.daemon.autoswitch false` (or `true`) through `Host`, exactly as the
   CLI runs it. Two seconds later the TUI re-fetches `status`: the daemon applies a settings
   change within about a second (D4.2), and a pause need not change the mode, so no event may
-  follow (one switchable account is `collect` either way).
+  follow (one switchable account is `collect` either way). The question
+  names the provider's display name. *(Amended by the TUI redesign spec §9.4.)*
 - **The header** shows each provider's state from the latest `status` reply (D4.3, D5.4).
-  Events never set it directly (§8):
-
-  | Daemon state | Header |
-  |---|---|
-  | `auto` | `auto on` |
-  | `collect` with `autoswitch` false | `auto paused` |
-  | `collect` with `autoswitch` true (one switchable account) | `auto off (one account)` |
-  | `waiting` for `engine-lock` | `auto in pid N` (another `tagteam auto`) |
-  | `waiting` for `schema` | `daemon needs restart` |
-  | `idle` | `daemon idle` |
-  | any of these, with `backoff` | adds `· keychain locked until HH:MM` |
+  Events never set it directly (§8). Its words, glyphs and 80-column forms are the redesign spec's
+  §5.2 table. *(Amended by the TUI redesign spec §5.2.)*
 
   With several providers, the header shows the state of the selected account's provider.
-- **In timer mode,** `P` shows `no daemon running`. The TUI does not change a setting whose
-  effect it cannot show.
+- **In timer mode,** `P` behaves as the redesign spec's §10 says: without a daemon it says how to
+  install one, and the TUI does not change a setting whose effect it cannot show. *(Amended by
+  the TUI redesign spec §10.)*
 - **With several providers,** `P` acts on the selected account's provider.
 
 ## 8. Daemon socket client
@@ -580,8 +584,8 @@ The protocol is the daemon spec's D5 (`2026-10-14-tagteam-daemon-design.md`, App
   - `mode` re-fetches `status` (§7.4).
   - `token-index` re-runs `token_report` when Tokens is open and the event's `changedAt` is
     newer than the report on screen (§6.4).
-  - Every event except `sleep`, `changed` and `mode` also updates the activity line, using its
-    `ts`.
+  - The daemon's `no-switch`, `error` and `config-warning` events and its `status.lastSwitch`
+    feed the auto line. *(Amended by the TUI redesign spec §5.3.)*
 - **Disconnect** (an error, `stopping`, or a full queue). The TUI falls back to timer mode, and
   reconnects with backoff from 1 s up to 30 s. Each reconnection runs the connecting sequence
   above, so whatever the TUI missed is re-read (D5.5). The live thread forwards events to the
@@ -691,8 +695,9 @@ A suspended action writes to the terminal as the CLI does.
 
 - **A failed view read** keeps the last good data on screen and shows a banner with the error
   in the CLI's wording. The next refresh retries.
-- **No store, or no accounts:** the Accounts body says `No accounts yet. Log in with claude,
-  then press A to add the login.`
+- **No store, or no accounts:** the Accounts body shows the title `No accounts yet` and the
+  sentence `Log in with <launch command>, then press A to add that login.` *(Amended by the
+  TUI redesign spec §5.7.)*
 - **A failed collection** shows per account in its row (`usageStatus`, core §13.2), as in
   `list`.
 - **A lane that died**, or a terminal that can no longer be written, is fatal. The TUI shuts
