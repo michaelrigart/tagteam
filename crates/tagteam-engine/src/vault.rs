@@ -9,8 +9,8 @@ use tagteam_provider::{Keychain, KeychainError, Provider, Read, ReadError};
 
 use crate::account_lock::AccountLock;
 
-/// What a vault write or delete failed on (§8.5): the Keychain's own error, the file backend's
-/// I/O error, or one of the vault's own checks.
+/// What a vault write or delete failed on (review refactor §8.5): the Keychain's own error, the
+/// file backend's I/O error, or one of the vault's own checks.
 #[derive(Debug, thiserror::Error)]
 pub enum VaultCause {
     #[error(transparent)]

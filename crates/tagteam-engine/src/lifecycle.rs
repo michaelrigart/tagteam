@@ -420,9 +420,7 @@ impl Engine {
         p: &dyn Provider,
         entry: &Path,
     ) -> Result<(), EngineError> {
-        let unresolved = || EngineError::DeletionRefused {
-            why: DeletionRefusal::LiveLoginUnresolved(GuardScope::ProfileEntry),
-        };
+        let unresolved = || EngineError::from(LiveGuardError::Unresolved(GuardScope::ProfileEntry));
         let (Some(parent), Some(name)) = (entry.parent(), entry.file_name()) else {
             return Err(unresolved());
         };

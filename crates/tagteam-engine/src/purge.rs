@@ -89,7 +89,7 @@ pub struct PurgeReport {
     pub failures: Vec<(String, String)>,
 }
 
-/// What a purge leaves alone (§8.4), by filesystem identity.
+/// What a purge leaves alone (review refactor §8.4), by filesystem identity.
 #[derive(Debug, Default)]
 struct Spared {
     /// The profiles of the accounts it does not affect, unfollowed and followed.
@@ -873,8 +873,9 @@ impl Engine {
     /// scope: a full purge's `displaced/`, rescue path, `vault/` (Linux), dead temp files and
     /// log; a `--provider` purge's displaced files and its accounts' rescue files. The store
     /// file (emptied in place) and the lock files (kept) are not deleted, so not listed. A
-    /// listing that fails (§8.4 CC-E-20) fails this, so the pre-delete check refuses rather than
-    /// narrows: a rescue directory that cannot be listed is `RescueUnlistable`, as `remove` has it.
+    /// `--provider` purge's listing that fails (review refactor §8.4 CC-E-20) fails this, so the
+    /// pre-delete check refuses rather than narrows: a rescue directory that cannot be listed is
+    /// `RescueUnlistable`, as `remove` has it.
     fn deletion_targets(
         &self,
         plan: &PurgePlan,
@@ -951,9 +952,9 @@ impl Engine {
         }
         let spared = self.spared_ids(store, rows)?;
         for p in self.registry.all() {
-            // Each path a live file touches is judged on its own chain (§8.4): it refuses when
-            // the chain meets a wall, unless it meets a spared profile, or its own first id is
-            // a directory on the way to one.
+            // Each path a live file touches is judged on its own chain (review refactor §8.4): it
+            // refuses when the chain meets a wall, unless it meets a spared profile, or its own
+            // first id is a directory on the way to one.
             refuse_inside(
                 &live_files(p.as_ref(), &self.env),
                 GuardScope::Purge,

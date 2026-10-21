@@ -79,20 +79,20 @@ pub enum EngineError {
     },
     #[error("{0}")]
     InvalidInput(String),
-    /// §8.5, §12.2: a profile directory without its marker, so its recorded spelling and outer
-    /// home are unknown.
+    /// Review refactor §8.5; §12.2: a profile directory without its marker, so its recorded
+    /// spelling and outer home are unknown.
     #[error("{} has no profile marker", path.display())]
     ProfileMarkerMissing { path: PathBuf },
-    /// §8.5: `sync_profile_links` found no marker to take the outer home from.
+    /// Review refactor §8.5: `sync_profile_links` found no marker to take the outer home from.
     #[error("{} is missing, so the profile's outer home is unknown", marker.display())]
     OuterHomeUnknown { marker: PathBuf },
-    /// §8.5: an account with nothing in the vault to activate or start a session from. Only a
-    /// new login brings it back, as for `NeedsRelogin`. The text names the account and what to
-    /// run, and differs by site.
+    /// Review refactor §8.5: an account with nothing in the vault to activate or start a session
+    /// from. Only a new login brings it back, as for `NeedsRelogin`. The text names the account
+    /// and, where the site says so, what to run; the text differs by site.
     #[error("{0}")]
     NoStoredCredential(String),
-    /// §8.5, §7.5 step 2: the live login matches no stored account, so tagteam does not refresh
-    /// it.
+    /// Review refactor §8.5; §7.5 step 2: the live login matches no stored account, so tagteam
+    /// does not refresh it.
     #[error("the live login is not managed by tagteam; only {app} refreshes it")]
     UnmanagedLiveLogin { app: &'static str },
     #[error("no account matches {0:?}")]
@@ -280,7 +280,7 @@ pub enum EngineError {
     #[error("{why}")]
     DeletionRefused { why: DeletionRefusal },
     /// `source`, named by the path it concerns ("<path>: <source>"). It reads as `source` does:
-    /// its `kind()` and its `signal()` (D-3).
+    /// its `kind()` and its `signal()` (review refactor D-3).
     #[error("{}: {source}", path.display())]
     AtPath {
         path: PathBuf,
@@ -292,10 +292,11 @@ pub enum EngineError {
     Interrupted(i32),
 }
 
-/// Which guard refused, which decides its wording (§8.4).
+/// Which guard refused, which decides its wording (review refactor §8.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuardScope {
-    /// `refuse_live_files_at`: one profile or orphan entry of `sessions/`.
+    /// `refuse_live_files_at`: one entry it is given (a profile, an orphan, or one of purge's
+    /// targets).
     ProfileEntry,
     /// `refuse_live_in_envelope`: everything a purge deletes.
     Purge,
@@ -570,6 +571,7 @@ impl EngineError {
             EngineError::Provider(ProviderError::ConfigUnsplicable { .. }) => "config-unsplicable",
             EngineError::Provider(ProviderError::RestoreFailed { .. }) => "rollback-failed",
             EngineError::Provider(_) => "provider",
+            // unreachable: `lock_error()` above reads every lock carrier
             EngineError::Lock(_) | EngineError::Settings(SettingsError::Lock(_)) => "lock",
             EngineError::Vault(_) => "vault",
             EngineError::Unreadable(_) => "unreadable",
@@ -650,9 +652,9 @@ impl EngineError {
     }
 
     /// The lock failure behind this error, whichever carrier holds it: `Lock`,
-    /// `Provider(ProviderError::Lock)` or `Settings(SettingsError::Lock)` (§8.5). `kind()` and
-    /// `signal()` both read it, so a carrier cannot be read one way by one and another by the
-    /// other.
+    /// `Provider(ProviderError::Lock)` or `Settings(SettingsError::Lock)` (review refactor
+    /// §8.5). `kind()` and `signal()` both read it, so a carrier cannot be read one way by one
+    /// and another by the other.
     fn lock_error(&self) -> Option<&LockError> {
         match self {
             EngineError::Lock(e)
@@ -1098,7 +1100,7 @@ mod tests {
         for why in refusals {
             cases.push((EngineError::DeletionRefused { why }, "deletion-refused"));
         }
-        // A path in front changes nothing about what went wrong (D-3).
+        // A path in front changes nothing about what went wrong (review refactor D-3).
         let at = |source: EngineError| EngineError::AtPath {
             path: PathBuf::from("/data/displaced"),
             source: Box::new(source),
@@ -1151,7 +1153,8 @@ mod tests {
         }
     }
 
-    /// §8.5: a lock failure reads the same whichever error carries it, kind and signal alike.
+    /// Review refactor §8.5: a lock failure reads the same whichever error carries it, kind and
+    /// signal alike.
     #[test]
     fn a_lock_failure_reads_alike_whichever_carrier_holds_it() {
         let failures = || {
@@ -1210,7 +1213,8 @@ mod tests {
         );
     }
 
-    /// Each refusal reads exactly as the `Io` text it replaced did, at every site (D-3).
+    /// Each refusal reads exactly as the `Io` text it replaced did, at every site (review
+    /// refactor D-3).
     #[test]
     fn every_deletion_refusal_keeps_its_text() {
         let live = |position| DeletionRefusal::LiveLoginKeychain {
@@ -1262,6 +1266,24 @@ mod tests {
         assert_eq!(
             at.to_string(),
             "/data/sessions/x: a stored account's profile could not be resolved, so this entry cannot be told apart from it; it was left as it is"
+        );
+        assert_eq!(
+            EngineError::ProfileMarkerMissing {
+                path: PathBuf::from("/data/sessions/x")
+            }
+            .to_string(),
+            "/data/sessions/x has no profile marker"
+        );
+        assert_eq!(
+            EngineError::OuterHomeUnknown {
+                marker: PathBuf::from("/data/sessions/x/.marker")
+            }
+            .to_string(),
+            "/data/sessions/x/.marker is missing, so the profile's outer home is unknown"
+        );
+        assert_eq!(
+            EngineError::UnmanagedLiveLogin { app: "Claude Code" }.to_string(),
+            "the live login is not managed by tagteam; only Claude Code refreshes it"
         );
     }
 

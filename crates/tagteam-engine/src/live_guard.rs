@@ -1,7 +1,8 @@
-//! §8.4: the walk both never-delete-the-live-login guards share. `lifecycle.rs` decides what one
-//! profile or orphan entry would break, and `purge.rs` what a whole purge would delete; each
-//! keeps its own idea of what is doomed and spared, and its own refusal's wording and log line.
-//! What they share is how a live file is resolved and which filesystem identities it touches.
+//! Review refactor §8.4: the walk both never-delete-the-live-login guards share. `lifecycle.rs`
+//! decides what one profile or orphan entry would break, and `purge.rs` what a whole purge would
+//! delete; each keeps its own idea of what is doomed and spared, and its own refusal's wording and
+//! log line. What they share is how a live file is resolved and which filesystem identities it
+//! touches.
 
 use std::fs;
 use std::path::{Path, PathBuf};

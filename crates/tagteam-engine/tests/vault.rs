@@ -216,8 +216,8 @@ fn an_item_stored_before_this_branch_is_read_as_it_is_and_leaves_for_prev_in_vau
     assert_eq!(v.read_prev(&id).present().unwrap(), cred("gen1", "t"));
 }
 
-/// §8.5: the Keychain's failure stays the source of a vault write or delete, so a caller can
-/// match it; the vault's message is what it always was.
+/// Review refactor §8.5: the Keychain's failure stays the source of a vault write or delete, so
+/// a caller can match it; the vault's message is what it always was.
 #[test]
 fn a_keychain_failure_stays_the_source_of_a_vault_write_or_delete() {
     let kc = Arc::new(FakeKeychain::new());
@@ -244,11 +244,12 @@ fn a_keychain_failure_stays_the_source_of_a_vault_write_or_delete() {
         e,
         VaultError::Delete(VaultCause::Keychain(KeychainError { rc: Some(25), .. }))
     ));
-    assert!(e.to_string().ends_with("injected delete failure"));
-    assert!(
-        e.source()
-            .unwrap()
-            .to_string()
-            .ends_with("injected delete failure")
+    assert_eq!(
+        e.to_string(),
+        "vault delete failed: keychain operation failed (rc 25): injected delete failure"
+    );
+    assert_eq!(
+        e.source().unwrap().to_string(),
+        "keychain operation failed (rc 25): injected delete failure"
     );
 }

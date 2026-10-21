@@ -707,8 +707,8 @@ fn a_rescue_file_is_deleted_by_a_full_purge_and_refused_by_remove_and_a_provider
 #[cfg(feature = "test-hooks")]
 #[test]
 fn a_displaced_listing_that_fails_after_the_plan_refuses_the_provider_purge() {
-    // §8.4 CC-E-20, Review Focus 1: a listing that fails between `purge_plan` and `purge` must
-    // refuse before anything is deleted, not narrow the live-login check.
+    // Review refactor §8.4 CC-E-20, Review Focus 1: a listing that fails between `purge_plan`
+    // and `purge` must refuse before anything is deleted, not narrow the live-login check.
     use std::os::unix::fs::PermissionsExt as _;
 
     let fx = Fx::new();
@@ -731,6 +731,33 @@ fn a_displaced_listing_that_fails_after_the_plan_refuses_the_provider_purge() {
     let err = fx.engine.purge(&plan).unwrap_err();
     fs::set_permissions(&displaced, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(err.kind(), "io", "{err:?}");
+    assert!(fx.vault_bytes(&a).is_some(), "refused before the vault");
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_rescue_listing_that_fails_after_the_plan_refuses_the_provider_purge() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.plant_rescue(&a, &vault_fp(&fx, &a), &credential("a@x.co", "rt-a2"));
+    let plan = fx.engine.purge_plan(Some(&fx.provider())).unwrap();
+    let rescue = fx.env.data_dir().join("rescue");
+    let shut = rescue.clone();
+    fx.engine.on_point(
+        "purge-guarded",
+        Box::new(move || {
+            fs::set_permissions(&shut, fs::Permissions::from_mode(0o000)).unwrap();
+        }),
+    );
+    let err = fx.engine.purge(&plan).unwrap_err();
+    fs::set_permissions(&rescue, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        matches!(err, EngineError::RescueUnlistable { .. }),
+        "{err:?}"
+    );
+    assert_eq!(err.kind(), "rescue-unreadable");
     assert!(fx.vault_bytes(&a).is_some(), "refused before the vault");
 }
 
