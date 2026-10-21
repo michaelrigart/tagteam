@@ -199,6 +199,26 @@ impl Pty {
         }
     }
 
+    /// Polls every 10 ms until the program has written `needle`. Fails the test if the program
+    /// exits first, or if `within` passes.
+    pub fn wait_for_output(&mut self, within: Duration, what: &str, needle: &[u8]) {
+        let deadline = Instant::now() + within;
+        while !self.output().windows(needle.len()).any(|w| w == needle) {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "it exited ({status}) before {what}:\n{}",
+                    self.screen().text()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "it never got to {what}:\n{}",
+                self.screen().text()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// When what `ready` holds of was first on the terminal: the arrival of the chunk that put
     /// it there. Each chunk is emulated at the size `screen` uses.
     pub fn first_shown(&self, ready: impl Fn(&Screen) -> bool) -> Option<Instant> {
@@ -398,6 +418,19 @@ impl Screen {
                                 break;
                             }
                             params.push(c);
+                        }
+                    }
+                    // An operating system command (`ESC ] … BEL` or `… ESC \`), such as a
+                    // colour query: none of it is text.
+                    Some(']') => {
+                        while let Some(c) = chars.next() {
+                            if c == '\x07' {
+                                break;
+                            }
+                            if c == '\x1b' {
+                                chars.next();
+                                break;
+                            }
                         }
                     }
                     Some('7') => self.saved = (self.row, self.col),

@@ -6,6 +6,7 @@
 pub(crate) mod actions;
 mod ask;
 pub(crate) mod daemon;
+mod detect;
 pub mod host;
 mod input;
 pub(crate) mod lanes;

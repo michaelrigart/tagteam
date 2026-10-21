@@ -11,10 +11,18 @@ pub(crate) enum Role {
     Crit,
 }
 
+/// Whether the terminal's background is dark or light (spec §4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Background {
+    Dark,
+    Light,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tier {
     NoColor,
     Ansi,
+    True(Background),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,11 +37,33 @@ impl Theme {
         }
     }
 
+    /// Tier 2 on a terminal whose background is `background`; tier 0 stays tier 0 (spec §4.2).
+    pub(crate) fn truecolor(self, background: Background) -> Theme {
+        match self.tier {
+            Tier::NoColor => self,
+            Tier::Ansi | Tier::True(_) => Theme {
+                tier: Tier::True(background),
+            },
+        }
+    }
+
     /// Core §13.5's severities: yellow and red with colour, bold without (spec §5.1).
     pub(crate) fn role(self, role: Role) -> Style {
         match (self.tier, role) {
             (Tier::Ansi, Role::Warn) => Style::new().fg(Color::Yellow),
             (Tier::Ansi, Role::Crit) => Style::new().fg(Color::Red),
+            (Tier::True(Background::Dark), Role::Warn) => {
+                Style::new().fg(Color::Rgb(0xe5, 0xc0, 0x7b))
+            }
+            (Tier::True(Background::Light), Role::Warn) => {
+                Style::new().fg(Color::Rgb(0x9a, 0x67, 0x00))
+            }
+            (Tier::True(Background::Dark), Role::Crit) => {
+                Style::new().fg(Color::Rgb(0xf0, 0x71, 0x78))
+            }
+            (Tier::True(Background::Light), Role::Crit) => {
+                Style::new().fg(Color::Rgb(0xcf, 0x22, 0x2e))
+            }
             (Tier::NoColor, Role::Warn | Role::Crit) => self.strong(),
         }
     }
@@ -88,6 +118,28 @@ mod tests {
                 theme.selection(),
                 Style::new().add_modifier(Modifier::REVERSED)
             );
+        }
+    }
+
+    #[test]
+    fn tier_2_draws_warn_and_crit_in_its_own_hues() {
+        let rgb = |r, g, b| Some(Color::Rgb(r, g, b));
+        let dark = Theme::new(true).truecolor(Background::Dark);
+        let light = Theme::new(true).truecolor(Background::Light);
+        assert_eq!(dark.role(Role::Warn).fg, rgb(0xe5, 0xc0, 0x7b));
+        assert_eq!(dark.role(Role::Crit).fg, rgb(0xf0, 0x71, 0x78));
+        assert_eq!(light.role(Role::Warn).fg, rgb(0x9a, 0x67, 0x00));
+        assert_eq!(light.role(Role::Crit).fg, rgb(0xcf, 0x22, 0x2e));
+        for theme in [dark, light] {
+            assert_eq!(theme.strong(), Theme::new(true).strong());
+            assert_eq!(theme.selection(), Theme::new(true).selection());
+        }
+    }
+
+    #[test]
+    fn no_colour_stays_no_colour_whatever_the_background() {
+        for background in [Background::Dark, Background::Light] {
+            assert_eq!(Theme::new(false).truecolor(background), Theme::new(false));
         }
     }
 

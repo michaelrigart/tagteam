@@ -4,7 +4,7 @@
 //! frame is ever written to the main screen. `Tty` is what the loop needs of a terminal, so the
 //! loop's tests can use a `TestBackend` instead.
 
-use std::io;
+use std::io::{self, Write};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, Once, PoisonError};
@@ -142,6 +142,17 @@ fn give_back() {
 /// Gives the terminal back, once however often it is called.
 pub(crate) fn restore() {
     TERMINAL.restore_with(give_back);
+}
+
+/// Writes `bytes` to the terminal and flushes, under the ownership lock: never inside a
+/// frame, and not at all once the terminal is given back (false).
+pub(crate) fn query(bytes: &[u8]) -> bool {
+    TERMINAL
+        .while_entered(|| {
+            let mut out = io::stdout().lock();
+            out.write_all(bytes).and_then(|()| out.flush()).is_ok()
+        })
+        .unwrap_or(false)
 }
 
 /// §10.1: a panic on any thread restores the terminal, then goes on to the hook installed
@@ -320,6 +331,12 @@ mod tests {
         fn seen(&self) -> Vec<&'static str> {
             self.0.lock().unwrap().clone()
         }
+    }
+
+    #[test]
+    fn a_query_is_written_only_while_the_tui_holds_the_terminal() {
+        // No test enters the process's terminal, so it is not ours.
+        assert!(!query(b"\x1b[c"));
     }
 
     #[test]

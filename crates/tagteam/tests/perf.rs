@@ -39,6 +39,8 @@ const READINGS: usize = (48 * 3_600 / SPACING_S) as usize;
 /// What a machine that has run Claude Code for months has in `~/.claude.json`.
 const CLAUDE_JSON_BYTES: usize = 400 * 1024;
 const HOUR: i64 = 3_600;
+/// What the TUI writes to ask the terminal its background: OSC 11, then DA1.
+const COLOUR_QUERY: &[u8] = b"\x1b]11;?\x1b\\\x1b[c";
 
 /// The tests measure wall time, so they run one at a time: two binaries running at once would
 /// each measure the other.
@@ -564,15 +566,24 @@ fn list_p95_is_within_50_ms_when_nothing_is_due_while_a_daemon_runs() {
 
 /// The TUI's first frame, from the spawn to the arrival of the bytes that first put the
 /// accounts table on the screen, through a pty, over `RUNS` runs after `WARM_UP` untimed ones,
-/// with every endpoint pointed at `base`.
-fn first_frames(root: &Path, base: &str) -> Vec<Duration> {
+/// with every endpoint pointed at `base`. With `asked`, the terminal says it draws 24-bit
+/// colour, and the TUI asks it its background (spec §4.2): the first frame never waits for it.
+fn first_frames_with(root: &Path, base: &str, asked: bool) -> Vec<Duration> {
     let shown = |s: &Screen| s.on_alt() && s.contains("a@x.co");
     let run = || {
         let mut c = std_cmd(root);
         c.env("TAGTEAM_TEST_API_BASE", base).arg("tui");
+        if asked {
+            c.env("COLORTERM", "truecolor");
+        }
         let mut tui = Pty::spawn(c, true);
         tui.wait_for(Duration::from_secs(10), "the accounts table", shown);
         let took = tui.first_shown(shown).unwrap() - tui.started;
+        if asked {
+            tui.wait_for_output(Duration::from_secs(10), "the colour query", COLOUR_QUERY);
+            // DA1 alone: the terminal has no background to report.
+            tui.type_keys(b"\x1b[?62c");
+        }
         tui.type_keys(b"q");
         let f = tui.finish(Duration::from_secs(10));
         assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
@@ -582,6 +593,10 @@ fn first_frames(root: &Path, base: &str) -> Vec<Duration> {
         run();
     }
     (0..RUNS).map(|_| run()).collect()
+}
+
+fn first_frames(root: &Path, base: &str) -> Vec<Duration> {
+    first_frames_with(root, base, false)
 }
 
 #[test]
@@ -631,5 +646,24 @@ fn tui_first_frame_p95_is_within_50_ms_beside_a_daemon_that_never_answers() {
     assert!(
         p <= Duration::from_millis(50),
         "tui first frame beside a silent daemon p95 {p:?} over {RUNS} runs: {runs:?}"
+    );
+}
+
+#[test]
+#[ignore = "timing: run with --release on an idle machine"]
+fn tui_first_frame_p95_is_within_50_ms_while_the_terminal_is_asked_its_colours() {
+    // Redesign spec §4.2: detection runs on the input thread, and the first frame never waits
+    // for it.
+    let _one_at_a_time = serial();
+    let d = short_tempdir();
+    nothing_due(d.path());
+    let server = MockServer::start();
+    let runs = first_frames_with(d.path(), &server.base_url(), true);
+    let p = p95(&runs);
+    eprintln!("tui first frame while the terminal is asked its colours p95 {p:?} over {RUNS} runs");
+    assert_eq!(server.requests().len(), 0, "a fetch was due");
+    assert!(
+        p <= Duration::from_millis(50),
+        "tui first frame while the terminal is asked its colours p95 {p:?} over {RUNS} runs: {runs:?}"
     );
 }

@@ -11,12 +11,14 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use mio::unix::SourceFd;
 use mio::{Interest, Poll, Token};
 use signal_hook_mio::v1_0::Signals;
 
+use crate::detect::{self, Control as Typed};
 use crate::msg::Msg;
+use crate::term;
 
 /// How long the thread rests after the terminal fails it, before it tries again.
 const SLICE: Duration = Duration::from_millis(50);
@@ -305,12 +307,30 @@ pub(crate) struct Input {
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
+/// How the input thread asks for the background (spec §4.2): `ask` writes the query, and the
+/// replies come on `fd`.
+pub(crate) struct Detection {
+    pub(crate) ask: Box<dyn FnOnce() -> bool + Send>,
+    pub(crate) fd: RawFd,
+}
+
 impl Input {
-    pub(crate) fn spawn(tx: Sender<Msg>) -> io::Result<Input> {
-        Input::spawn_with(tx, Terminal::stdin()?)
+    /// With `detect`, the thread asks the terminal its background before its first read, unless
+    /// the terminal is not the one this process controls in the foreground (§4.2).
+    pub(crate) fn spawn(tx: Sender<Msg>, detect: bool) -> io::Result<Input> {
+        let detection = (detect && tagteam_provider::term::stdin_is_our_foreground_terminal())
+            .then(|| Detection {
+                ask: Box::new(|| term::query(detect::QUERY)),
+                fd: libc::STDIN_FILENO,
+            });
+        Input::spawn_with(tx, Terminal::stdin()?, detection)
     }
 
-    pub(crate) fn spawn_with(tx: Sender<Msg>, events: impl Events) -> io::Result<Input> {
+    pub(crate) fn spawn_with(
+        tx: Sender<Msg>,
+        events: impl Events,
+        detection: Option<Detection>,
+    ) -> io::Result<Input> {
         let control = Arc::new(Control {
             mode: Mutex::new(Mode::Reading),
             changed: Condvar::new(),
@@ -319,7 +339,7 @@ impl Input {
         let theirs = Arc::clone(&control);
         thread::Builder::new()
             .name("tagteam-tui-input".into())
-            .spawn(move || read(&theirs, events, &tx))?;
+            .spawn(move || read(&theirs, events, &tx, detection))?;
         Ok(Input { control, wake })
     }
 
@@ -330,9 +350,40 @@ impl Input {
     }
 }
 
+/// Asks the terminal its background, reads what it says before the first crossterm read, and
+/// sends it as `Detected` (§4.2). A Ctrl-C or Ctrl-Z that ended the reading is sent after it, as
+/// the key crossterm would have read. False once the UI thread is gone.
+fn ask_background(control: &Control, tx: &Sender<Msg>, detection: Detection) -> bool {
+    let Detection { ask, fd } = detection;
+    let stop = || *control.lock() != Mode::Reading;
+    let replies = ask().then(|| detect::read(fd, Instant::now(), &stop));
+    let background = replies.as_ref().and_then(detect::Replies::background);
+    if tx.send(Msg::Detected { background }).is_err() {
+        return false;
+    }
+    let key = match replies.and_then(|replies| replies.control()) {
+        Some(Typed::Interrupt) => 'c',
+        Some(Typed::Suspend) => 'z',
+        None => return true,
+    };
+    let key = KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL);
+    tx.send(Msg::Key(key)).is_ok()
+}
+
 /// The thread: reads while the mode is `Reading`, and between two calls into the terminal
 /// acknowledges a pause or a stop.
-fn read(control: &Control, mut events: impl Events, tx: &Sender<Msg>) {
+fn read(
+    control: &Control,
+    mut events: impl Events,
+    tx: &Sender<Msg>,
+    detection: Option<Detection>,
+) {
+    if let Some(detection) = detection {
+        if !ask_background(control, tx, detection) {
+            control.set(&mut control.lock(), Mode::Stopped);
+            return;
+        }
+    }
     // crossterm may hold events from before.
     let mut more = true;
     loop {
@@ -680,7 +731,7 @@ mod tests {
         }
         script.resize(100, 30);
         let (tx, rx) = mpsc::channel();
-        let _input = Input::spawn_with(tx, script.clone()).unwrap();
+        let _input = Input::spawn_with(tx, script.clone(), None).unwrap();
         let within = Duration::from_secs(2);
         assert!(matches!(
             rx.recv_timeout(within),
@@ -700,7 +751,7 @@ mod tests {
     fn a_pause_returns_once_the_thread_reads_no_more_and_resume_reads_again() {
         let script = Script::default();
         let (tx, rx) = mpsc::channel();
-        let input = Input::spawn_with(tx, script.clone()).unwrap();
+        let input = Input::spawn_with(tx, script.clone(), None).unwrap();
         thread::sleep(Duration::from_millis(30));
         assert!(input.pause());
         assert!(!script.reading.load(Ordering::SeqCst), "between two calls");
@@ -723,7 +774,7 @@ mod tests {
         let gate = Gate::default();
         gate.script.push(Event::Key(key('x')));
         let (tx, rx) = mpsc::channel();
-        let input = Input::spawn_with(tx, gate.clone()).unwrap();
+        let input = Input::spawn_with(tx, gate.clone(), None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !gate.waiting.load(Ordering::SeqCst) {
             assert!(
@@ -750,7 +801,7 @@ mod tests {
     fn dropping_the_input_stops_its_thread_before_it_returns() {
         let script = Script::default();
         let (tx, _rx) = mpsc::channel();
-        let input = Input::spawn_with(tx, script.clone()).unwrap();
+        let input = Input::spawn_with(tx, script.clone(), None).unwrap();
         thread::sleep(Duration::from_millis(30));
         drop(input);
         let calls = script.calls();
@@ -763,7 +814,7 @@ mod tests {
     fn stuck_input() -> (Input, Gate) {
         let gate = Gate::default();
         let (tx, _rx) = mpsc::channel();
-        let input = Input::spawn_with(tx, gate.clone()).unwrap();
+        let input = Input::spawn_with(tx, gate.clone(), None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !gate.waiting.load(Ordering::SeqCst) {
             assert!(
@@ -802,7 +853,7 @@ mod tests {
     fn with_the_ui_gone_the_thread_stops_and_a_pause_never_hangs() {
         let script = Script::default();
         let (tx, rx) = mpsc::channel();
-        let input = Input::spawn_with(tx, script.clone()).unwrap();
+        let input = Input::spawn_with(tx, script.clone(), None).unwrap();
         drop(rx);
         script.push(Event::Key(key('q')));
         thread::sleep(Duration::from_millis(200));
@@ -817,7 +868,7 @@ mod tests {
     fn an_idle_thread_waits_without_waking() {
         let script = Script::default();
         let (tx, _rx) = mpsc::channel();
-        let _input = Input::spawn_with(tx, script.clone()).unwrap();
+        let _input = Input::spawn_with(tx, script.clone(), None).unwrap();
         thread::sleep(Duration::from_millis(300));
         assert_eq!(
             script.nexts.load(Ordering::SeqCst),
@@ -835,7 +886,7 @@ mod tests {
     fn a_pause_is_acknowledged_within_50_ms_while_idle() {
         let script = Script::default();
         let (tx, _rx) = mpsc::channel();
-        let input = Input::spawn_with(tx, script.clone()).unwrap();
+        let input = Input::spawn_with(tx, script.clone(), None).unwrap();
         script.idle(1);
         let started = Instant::now();
         assert!(input.pause());
@@ -881,13 +932,13 @@ mod tests {
         let script = Script::default();
         script.queue([Next::Closed]);
         let (tx, _rx) = mpsc::channel();
-        let input = Input::spawn_with(tx, script.clone()).unwrap();
+        let input = Input::spawn_with(tx, script.clone(), None).unwrap();
         assert_stopped(&input, &script, 1, 0);
 
         // The drain after a resume.
         let script = Script::default();
         let (tx, _rx) = mpsc::channel();
-        let input = Input::spawn_with(tx, script.clone()).unwrap();
+        let input = Input::spawn_with(tx, script.clone(), None).unwrap();
         script.idle(1);
         assert!(input.pause());
         script.queue([Next::Closed]);
@@ -897,7 +948,7 @@ mod tests {
         // A drain after a wait, two events in.
         let script = Script::default();
         let (tx, rx) = mpsc::channel();
-        let input = Input::spawn_with(tx, script.clone()).unwrap();
+        let input = Input::spawn_with(tx, script.clone(), None).unwrap();
         script.idle(1);
         script.queue([
             Next::Event(Event::Key(key('a'))),
@@ -915,7 +966,7 @@ mod tests {
         // The wait, idle.
         let script = Script::default();
         let (tx, _rx) = mpsc::channel();
-        let input = Input::spawn_with(tx, script.clone()).unwrap();
+        let input = Input::spawn_with(tx, script.clone(), None).unwrap();
         script.idle(1);
         script.hang_up();
         assert_stopped(&input, &script, 1, 1);
@@ -949,7 +1000,7 @@ mod tests {
         script.push(Event::Key(key('x')));
         let (tx, _rx) = mpsc::channel();
         let started = Instant::now();
-        let input = Input::spawn_with(tx, script.clone()).unwrap();
+        let input = Input::spawn_with(tx, script.clone(), None).unwrap();
         assert_tried_a_slice_apart(&script.nexts, started, "reads");
         drop(input);
 
@@ -958,7 +1009,7 @@ mod tests {
         script.fail_wait();
         let (tx, _rx) = mpsc::channel();
         let started = Instant::now();
-        let _input = Input::spawn_with(tx, script.clone()).unwrap();
+        let _input = Input::spawn_with(tx, script.clone(), None).unwrap();
         assert_tried_a_slice_apart(&script.waits, started, "waits");
         assert_eq!(
             script.nexts.load(Ordering::SeqCst),
@@ -972,7 +1023,7 @@ mod tests {
         // The thread's own SIGWINCH woke it, and crossterm has no `Resize` to read yet.
         let script = Script::default();
         let (tx, rx) = mpsc::channel();
-        let _input = Input::spawn_with(tx, script.clone()).unwrap();
+        let _input = Input::spawn_with(tx, script.clone(), None).unwrap();
         script.idle(1);
         script.resize(100, 30);
         assert!(matches!(
@@ -983,6 +1034,94 @@ mod tests {
             })
         ));
         assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    /// A detection over a socket pair: `ask` records that it ran and says the query was
+    /// written. The peer's end is what the terminal answers on; `ours` must outlive the thread.
+    fn detection() -> (Detection, UnixStream, UnixStream, Arc<AtomicBool>) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let asked = Arc::new(AtomicBool::new(false));
+        let detection = Detection {
+            ask: Box::new({
+                let asked = Arc::clone(&asked);
+                move || {
+                    asked.store(true, Ordering::SeqCst);
+                    true
+                }
+            }),
+            fd: ours.as_raw_fd(),
+        };
+        (detection, ours, theirs, asked)
+    }
+
+    #[test]
+    fn detection_runs_before_the_first_terminal_read() {
+        let script = Script::default();
+        let (detection, _ours, mut theirs, asked) = detection();
+        let (tx, rx) = mpsc::channel();
+        let _input = Input::spawn_with(tx, script.clone(), Some(detection)).unwrap();
+        script.push(Event::Key(key('q')));
+        thread::sleep(Duration::from_millis(200));
+        assert!(asked.load(Ordering::SeqCst), "the query was written");
+        assert_eq!(script.calls(), 0, "no call into the terminal before DA1");
+        assert!(rx.try_recv().is_err(), "nothing sent before DA1");
+        theirs.write_all(b"\x1b[?62;22c").unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Msg::Detected { background: None })
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Msg::Key(k)) if k.code == KeyCode::Char('q')
+        ));
+    }
+
+    #[test]
+    fn a_ctrl_c_during_detection_reaches_update_right_after_it() {
+        let gate = Gate::default();
+        let (detection, _ours, mut theirs, _asked) = detection();
+        let (tx, rx) = mpsc::channel();
+        let input = Input::spawn_with(tx, gate.clone(), Some(detection)).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        theirs.write_all(b"\x03").unwrap();
+        let within = Duration::from_secs(2);
+        assert!(matches!(
+            rx.recv_timeout(within),
+            Ok(Msg::Detected { background: None })
+        ));
+        assert!(matches!(
+            rx.recv_timeout(within),
+            Ok(Msg::Key(k)) if k.code == KeyCode::Char('c') && k.modifiers == KeyModifiers::CONTROL
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gate.waiting.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the thread never read on");
+            thread::yield_now();
+        }
+        assert_eq!(
+            gate.script.calls(),
+            0,
+            "the keys came before the first call"
+        );
+        gate.open();
+        drop(input);
+    }
+
+    #[test]
+    fn a_pause_during_detection_is_acknowledged_within_a_slice() {
+        let script = Script::default();
+        let (detection, _ours, _theirs, _asked) = detection();
+        let (tx, _rx) = mpsc::channel();
+        let input = Input::spawn_with(tx, script.clone(), Some(detection)).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        assert!(input.pause());
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        input.resume();
     }
 
     /// Held by each test that makes a `Wait`. A SIGWINCH reaches every `Wait` in the process,

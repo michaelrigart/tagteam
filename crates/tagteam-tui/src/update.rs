@@ -144,6 +144,13 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
             state.dirty = true;
             vec![]
         }
+        Msg::Detected { background } => {
+            if let Some(background) = background {
+                state.theme = state.theme.truecolor(background);
+                state.dirty = true;
+            }
+            vec![]
+        }
     }
 }
 

@@ -42,6 +42,9 @@ const NOT_PAUSED: &str = "the TUI's key reader did not pause in time; try again"
 pub struct TuiOptions {
     pub screen: Screen,
     pub color: bool,
+    /// `COLORTERM` says the terminal draws 24-bit colour: with `color`, detection may take the
+    /// theme to tier 2 (spec §4.2).
+    pub truecolor: bool,
     pub provider: Option<ProviderId>,
     /// The provider Tokens reports on: `--provider`'s, else the default (spec §5.3).
     pub tokens_provider: ProviderId,
@@ -68,12 +71,13 @@ pub struct TuiExit {
 /// Runs the TUI on the process's terminal until it is quit, signalled, or fails. It returns
 /// once every lane has been joined and the terminal restored (§10.2).
 pub fn run(opts: TuiOptions, sources: SourceFactory, host: Arc<dyn Host>) -> TuiExit {
+    let detect = opts.color && opts.truecolor;
     run_with(
         opts,
         sources,
         host,
         RealTty::enter,
-        Input::spawn,
+        move |tx| Input::spawn(tx, detect),
         term::restore,
     )
 }
@@ -669,6 +673,7 @@ mod tests {
     use crate::source::{AccountsSnapshot, CollectSummary, Source, SourceError};
     use crate::state::BannerKind;
     use crate::term::repaint;
+    use crate::theme::Background;
 
     /// What the fake terminal and input were asked to do, in order.
     #[derive(Clone, Default)]
@@ -1064,6 +1069,7 @@ mod tests {
         TuiOptions {
             screen: Screen::Accounts,
             color: false,
+            truecolor: false,
             provider: None,
             tokens_provider: ProviderId::new("claude-code"),
             tz: TimeZone::UTC,
@@ -1185,6 +1191,41 @@ mod tests {
             );
             fx.key('q');
             ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    #[test]
+    fn the_first_frame_draws_before_detection_and_the_next_in_tier_2() {
+        let opts = TuiOptions {
+            color: true,
+            ..options()
+        };
+        let fx = Fixture::with(opts, quick(), |_| idle());
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            assert_eq!(fx.frames.seen(), ["draw"], "the first frame, undetected");
+            assert_eq!(ui.state.theme, Theme::new(true));
+            let background = Some(Background::Dark);
+            fx.tx.send(Msg::Detected { background }).unwrap();
+            // What the lanes sent first is applied; none of it draws.
+            while ui.state.theme == Theme::new(true) {
+                let msg = fx.rx.recv_timeout(Duration::from_secs(5));
+                ui.deliver(msg.expect("the detection arrived"));
+            }
+            assert_eq!(ui.state.theme, Theme::new(true).truecolor(Background::Dark));
+            assert!(ui.state.dirty, "the next frame is due");
+            let drawn = fx.frames.seen().len();
+            let (tx, q) = (
+                fx.tx.clone(),
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            );
+            ui.tty.on_draw = Some(Box::new(move || tx.send(Msg::Key(q)).unwrap()));
+            let ending = ui.run();
+            // The frame in tier 2, and the one `q` ends on (§10.2 step 1).
+            assert_eq!(fx.frames.seen().len(), drawn + 2);
+            ending
         };
         assert_eq!(fx.finish(ending).code, 0);
     }
