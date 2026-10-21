@@ -777,7 +777,7 @@ mod tests {
         let switch = |dry_run| AutoEvent::Switch {
             provider: cc(),
             trigger: tagteam_core::autoswitch::Trigger::Proactive,
-            from: 2,
+            from: 1,
             to: 2,
             warnings: Vec::new(),
             dry_run,
@@ -811,6 +811,21 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "t+0  no switch: some-new-reason\n"
+        );
+        assert_eq!(String::from_utf8(err).unwrap(), "");
+    }
+
+    #[test]
+    fn an_unknown_no_switch_reason_is_printed_with_its_detail() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let now = || T0 * 1000;
+        let names = |p: &ProviderId| format!("<{p}>");
+        let sink = human(&mut out, &mut err, &now, &names, false, false);
+        sink.emit(&no_switch_event("some-new-reason", "2/3"));
+        drop(sink);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "t+0  no switch: some-new-reason (2/3)\n"
         );
         assert_eq!(String::from_utf8(err).unwrap(), "");
     }
