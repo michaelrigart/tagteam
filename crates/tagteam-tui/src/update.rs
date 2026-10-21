@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::actions;
 use crate::daemon;
 use crate::msg::{Cmd, Msg};
-use crate::overlay::{self, Overlay};
+use crate::overlay::{self, Overlay, ProceedThen};
 use crate::screens;
 use crate::state::{BannerKind, REFRESH_MS, Screen, State, ToastKind};
 
@@ -201,9 +201,19 @@ pub fn drawn(state: &mut State) -> Vec<Cmd> {
 }
 
 /// Starts the shutdown (spec §10.2) with `code`. An open dialog is dropped with it, and the
-/// runtime declines the prompt waiting on it when the shutdown begins.
+/// runtime declines the prompt waiting on it when the shutdown begins. A hand-over dialog dropped
+/// with it leaves nothing running.
 pub(crate) fn quit(state: &mut State, code: i32) -> Vec<Cmd> {
     state.quitting = Some(code);
+    if matches!(
+        state.overlay,
+        Some(Overlay::Proceed {
+            then: ProceedThen::Suspend(_),
+            ..
+        })
+    ) {
+        state.running = None;
+    }
     state.overlay = None;
     state.dirty = true;
     vec![Cmd::Quit { code }]
@@ -324,6 +334,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     use super::*;
+    use crate::host::ActionOutcome;
     use crate::source::{CollectSummary, SourceError};
     use crate::state::GUARD_MS;
     use crate::testutil::*;
@@ -441,6 +452,46 @@ mod tests {
         update(&mut state, key(KeyCode::Esc), NOW_MS);
         assert!(update(&mut state, ch('n'), NOW_MS + GUARD_MS - 1).is_empty());
         assert!(!update(&mut state, ch('n'), NOW_MS + GUARD_MS).is_empty());
+    }
+
+    /// Every close starts the guard, not only `Esc`: a confirming `y` and a `q` as well.
+    #[test]
+    fn a_confirming_key_and_q_start_the_guard_too() {
+        let loaded = || {
+            let mut state = fresh(Screen::Accounts);
+            state.accounts.apply(snapshot(many(2)));
+            state
+        };
+        // `x`, then `y` (a `CloseWith`) at T: the removal starts, and `n` at T + 299 does not.
+        let mut state = loaded();
+        update(&mut state, ch('x'), NOW_MS);
+        let started = update(&mut state, ch('y'), NOW_MS);
+        assert!(matches!(started.as_slice(), [Cmd::Act(_)]), "{started:?}");
+        state.running = None;
+        assert!(update(&mut state, ch('n'), NOW_MS + GUARD_MS - 1).is_empty());
+        assert!(state.running.is_none());
+        // `q` closing Help at T: the same.
+        let mut state = loaded();
+        update(&mut state, ch('?'), NOW_MS);
+        update(&mut state, ch('q'), NOW_MS);
+        assert!(state.overlay.is_none() && state.quitting.is_none());
+        assert!(update(&mut state, ch('n'), NOW_MS + GUARD_MS - 1).is_empty());
+        assert!(state.running.is_none());
+        assert!(!update(&mut state, ch('n'), NOW_MS + GUARD_MS).is_empty());
+    }
+
+    #[test]
+    fn quitting_with_the_hand_over_open_leaves_nothing_running() {
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(many(1)));
+        update(&mut state, ch('s'), NOW_MS);
+        let switch = state.running.clone().unwrap();
+        crate::actions::on_done(&mut state, switch, ActionOutcome::NeedsTerminal, NOW_MS);
+        assert!(matches!(state.overlay, Some(Overlay::Proceed { .. })));
+        assert!(state.running.is_some());
+        assert_eq!(quit_code(&update(&mut state, ctrl('c'), NOW_MS)), Some(0));
+        assert!(state.overlay.is_none() && state.running.is_none());
+        assert!(!state.on_terminal);
     }
 
     #[test]
