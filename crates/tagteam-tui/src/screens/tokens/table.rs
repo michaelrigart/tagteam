@@ -41,9 +41,8 @@ const NOT_INDEXED: &str = "No token usage yet";
 const SHARE: usize = 8;
 /// The table keeps this many rows at least; the detail and the notes below it scroll (B25).
 const TABLE_MIN: usize = 3;
-/// The control bar's filter is cut no narrower than this before the index's words give way
-/// (T5-7).
-const FILTER_LEAST: usize = 20;
+/// The control bar's filter gives way to the index's words down to this many columns (T5-7).
+const FILTER_MIN: usize = 10;
 /// The account column is cut no narrower than this while a more compact period can make room
 /// (B24)...
 const TEXT_MIN: usize = 6;
@@ -963,8 +962,9 @@ fn grouping_text(g: TokenGrouping) -> &'static str {
 }
 
 /// The filter's words on the control bar (T5-6): `all accounts · all models`, else what it
-/// keeps, an account by its short name.
-fn filter_text(state: &State) -> String {
+/// keeps, an account by its short name; one model in full, or with `short` by the shown level's
+/// short form (T5-22).
+fn filter_text(state: &State, short: bool) -> String {
     let t = &state.tokens;
     let accounts = match t.accounts.as_deref() {
         None => "all accounts".to_owned(),
@@ -989,6 +989,11 @@ fn filter_text(state: &State) -> String {
     };
     let models = match t.models.as_deref() {
         None => "all models".to_owned(),
+        Some([one]) if short => t
+            .level()
+            .short_models()
+            .map_or(one.as_str(), |m| m.get(one))
+            .to_owned(),
         Some([one]) => one.clone(),
         Some(list) => words::plural(list.len() as u64, "model"),
     };
@@ -1083,7 +1088,8 @@ fn index_words(t: &TokensState, now_ms: i64, updating: bool) -> String {
 
 /// The control bar (T5-6): ` p` and the periods, `[ ]` and the range, `g` and the top level's
 /// applied grouping, `f` and the filter, and the index's state on the right, `RIGHT_INSET` in.
-/// It gives way as T5-7 orders, in the first of its forms that fits.
+/// It gives way as T5-7 orders, in the first of its forms that fits; a filter it must cut names
+/// one model by its short form, and gives way to the index's words down to `FILTER_MIN`.
 fn bar(state: &State, width: usize, now_ms: i64) -> Line<'static> {
     let t = &state.tokens;
     let theme = state.theme;
@@ -1125,7 +1131,7 @@ fn bar(state: &State, width: usize, now_ms: i64) -> Line<'static> {
     let fits = |left: &[Span], right: &str| {
         used(left) + BAR_RIGHT_GAP + width_of(right) + RIGHT_INSET <= width
     };
-    let filter = filter_text(state);
+    let filter = filter_text(state, false);
     let unfiltered = t.accounts.is_none() && t.models.is_none();
     let short = if unfiltered {
         "all".to_owned()
@@ -1143,10 +1149,15 @@ fn bar(state: &State, width: usize, now_ms: i64) -> Line<'static> {
     let (mut spans, right) = match forms.into_iter().find(|(l, r)| fits(l, r)) {
         Some((left, right)) => (left, vec![Span::styled(right.clone(), muted)]),
         None => {
+            let cut = if unfiltered {
+                short
+            } else {
+                filter_text(state, true)
+            };
             let bare = used(&left(BAR_GAP_NARROW, false, String::new()));
             let room = width.saturating_sub(bare + BAR_RIGHT_GAP + width_of(&quiet) + RIGHT_INSET);
-            let least = FILTER_LEAST.min(width_of(&short));
-            let left = left(BAR_GAP_NARROW, false, fit(&short, room.max(least)));
+            let least = FILTER_MIN.min(width_of(&cut));
+            let left = left(BAR_GAP_NARROW, false, fit(&cut, room.max(least)));
             let room = width.saturating_sub(used(&left) + BAR_RIGHT_GAP + RIGHT_INSET);
             let right = if room < 2 {
                 vec![]
@@ -3103,8 +3114,17 @@ mod tests {
             reads(&lines[total + 1..], "claude-opus-4-5-20251101"),
             "the selected row's detail: {lines:?}"
         );
-        // At 80 the bar cuts a long filter (T5-7's form 6); at 120 it has room for it whole.
+        // At 80 the bar names a model it must cut by its short form (T5-7's form 6); at 120 it
+        // has room for it whole.
         state.tokens.models = Some(vec![MODELS[0].into()]);
+        assert_eq!(
+            body_of(&state, 80, 24, NOW_MS)[0],
+            bar_row(
+                " p Day   [ ] 30 days   g by account   f all accounts · opus-4-5",
+                "indexed 14:12",
+                80
+            )
+        );
         let bar = &body_of(&state, 120, 40, NOW_MS)[0];
         assert!(
             bar.contains("f all accounts · claude-opus-4-5-20251101"),
@@ -3675,8 +3695,8 @@ mod tests {
 
     #[test]
     fn the_bar_cuts_a_long_filter_and_keeps_its_keys() {
-        // T5-7 form 7: the filter, which its dialog shows whole, is cut to `FILTER_LEAST`, then
-        // the index's words from their end; every key keeps its place.
+        // T5-7 form 6: the filter, which its dialog shows whole, gives way to the index's words
+        // down to `FILTER_MIN`; every key keeps its place.
         let alias = "a-rather-long-alias-for-the-work-account";
         let label = "averyveryverylongname.with.a.long.tail@example.com";
         let model = "claude-opus-5-5-with-a-very-long-suffix-and-then-some-more-of-it-yet";
@@ -3696,15 +3716,33 @@ mod tests {
         };
         update(&mut state, Msg::IndexProgress(progress), NOW_MS);
         let lines = body_of(&state, 80, 24, NOW_MS);
-        assert!(
-            lines[0].starts_with(" p Day   [ ] 30 days   g by account   f 2 a-rather-long-ali…"),
-            "{lines:?}"
+        assert_eq!(
+            lines[0],
+            " p Day   [ ] 30 days   g by account   f 2 a-rather-lon…   indexing 1.2 / 3.3 GB"
         );
-        assert!(width_of(&lines[0]) <= 79, "{lines:?}");
-        assert!(lines[0].ends_with('…'), "{lines:?}");
         assert!(lines[1].starts_with(" $50.95 at API prices"), "{lines:?}");
         assert_eq!(lines[2], "");
         assert!(lines[3].starts_with(" DAY"), "{lines:?}");
+    }
+
+    #[test]
+    fn the_filter_gives_way_before_the_index_words() {
+        // T5-7 forms 6 and 7: the filter is cut to the room the index's words leave, down to
+        // `FILTER_MIN`; only where that leaves them no room are they cut.
+        let model = "claude-opus-5-5-with-a-very-long-suffix";
+        let bar = |keys: &str| {
+            let mut state = showing_after(keys, vec![session("3f2a9c1d", row_account(1))]);
+            state.tokens.models = Some(vec![model.into()]);
+            body_of(&state, 80, 24, NOW_MS)[0].clone()
+        };
+        assert_eq!(
+            bar("pp"),
+            " p Session   [ ] 30 days   g by account   f all accounts · cla…   indexed 14:12"
+        );
+        assert_eq!(
+            bar("ppgg"),
+            " p Session   [ ] 30 days   g by account and model   f all accou…   indexed 14:…"
+        );
     }
 
     #[test]
@@ -3712,9 +3750,9 @@ mod tests {
         // B29, by construction: under the Now strip, a 2-row banner and a full toast the body is
         // 16 rows, from row 5. The 80×24 worst case, a 15-row body under a full banner too, is
         // the worst live stack's below.
-        // The rows above the table take three; the table's heading and total two; what lies below the total
-        // half the body at most and never the table's last three. Below the total nothing is
-        // cut: it scrolls, and J reaches every line of it.
+        // The rows above the table take three; the table's heading and total two; what lies
+        // below the total half the body at most and never the table's last three. Below the
+        // total nothing is cut: it scrolls, and J reaches every line of it.
         let long = format!("claude-{}", "x".repeat(1993));
         let project = format!("/Users/alex/{}", "p".repeat(600));
         let mut big = realistic();
@@ -3734,12 +3772,11 @@ mod tests {
         state.toast(crate::state::ToastKind::Info, [words; 3].join("; "), NOW_MS);
         let lines = draw(&state, 80, 24);
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
-        assert!(
-            lines[5]
-                .starts_with(" p Session   [ ] 30 days   g by account   f all accounts · clau…"),
-            "{lines:?}"
+        assert_eq!(
+            lines[5],
+            " p Session   [ ] 30 days   g by account   f all accounts · xxx…   indexed 14:12",
+            "the filter names the model by its short form, and gives way to the index's words"
         );
-        assert!(lines[5].ends_with('…'), "{lines:?}");
         assert!(lines[6].starts_with(" $"), "{lines:?}");
         assert_eq!(lines[7], "", "{lines:?}");
         assert!(lines[8].starts_with(" SESSION"), "{lines:?}");
