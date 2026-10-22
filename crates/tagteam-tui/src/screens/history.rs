@@ -20,7 +20,7 @@ use crate::source::SourceError;
 use crate::state::{BannerKind, Screen, State};
 use crate::theme::Role;
 use crate::update;
-use crate::view::{centered, centred_block, width_of};
+use crate::view::{centered, centred_block, fit, width_of};
 
 /// T4-21: drawn under the scope row until the first view of a scope and range arrives.
 const LOADING: &str = "loading…";
@@ -250,23 +250,21 @@ fn nothing_in_range(view: &TimelineView) -> bool {
 }
 
 /// ` f {scope}   [ ] {range}`, the choices beside it from `WIDE` columns, and `cursor now` on
-/// the right, one column in (§7.1, §7.2): the keys accent, the words muted, the time bold.
+/// the right, one column in (§7.1, §7.2): the keys accent, the words muted, the time bold. The
+/// scope's name alone is cut to what the rest leaves, a group gap before `cursor` kept, so the
+/// range and the right part always keep their place.
 fn scope_line(state: &State, width: u16) -> Line<'static> {
     let theme = state.theme;
     let (accent, muted) = (theme.role(Role::Accent), theme.role(Role::Muted));
-    let mut left = vec![
-        Span::raw(" "),
-        Span::styled("f", accent),
-        Span::raw(" "),
-        Span::styled(scope_name(state), muted),
+    let mut range = vec![
         Span::raw(GAP),
         Span::styled("[ ]", accent),
         Span::raw(" "),
         Span::styled(state.history.range.label(), muted),
     ];
     if width >= WIDE {
-        left.push(Span::raw(GAP));
-        left.push(Span::styled(CHOICES, muted));
+        range.push(Span::raw(GAP));
+        range.push(Span::styled(CHOICES, muted));
     }
     let right = [
         Span::styled("cursor", muted),
@@ -274,6 +272,12 @@ fn scope_line(state: &State, width: u16) -> Line<'static> {
         Span::styled("now", theme.strong()),
     ];
     let used = |spans: &[Span]| spans.iter().map(|s| width_of(&s.content)).sum::<usize>();
+    let head = [Span::raw(" "), Span::styled("f", accent), Span::raw(" ")];
+    let fixed = used(&head) + used(&range) + width_of(GAP) + used(&right) + RIGHT_INSET;
+    let name = fit(&scope_name(state), usize::from(width).saturating_sub(fixed));
+    let mut left: Vec<Span<'static>> = head.into();
+    left.push(Span::styled(name, muted));
+    left.extend(range);
     let gap = usize::from(width).saturating_sub(used(&left) + used(&right) + RIGHT_INSET);
     left.push(Span::raw(" ".repeat(gap)));
     left.extend(right);
@@ -295,6 +299,7 @@ fn scope_name(state: &State) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::KeyCode;
     use tagteam_engine::timeline::{IN_USE, Series};
 
     use super::*;
@@ -607,5 +612,93 @@ mod tests {
             [Cmd::LoadAccounts { r#gen: g + 1 }],
             "before the first accounts read (T4-19)"
         );
+    }
+
+    #[test]
+    fn a_long_scoped_name_is_cut_and_the_range_and_the_cursor_keep_their_place() {
+        let alias = "work".repeat(15);
+        let mut accounts = many(3);
+        accounts[1].row.alias = Some(alias.clone());
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(accounts));
+        update(&mut state, ch('j'), NOW_MS);
+        update(&mut state, key(KeyCode::Enter), NOW_MS);
+        let row = body_of(&state, 80, 24, NOW_MS).remove(0);
+        // 80 less ` f `, `   [ ] 7 days`, the gap before `cursor now`, it and the inset: 50.
+        let name = crate::view::fit(&format!("2 {alias}"), 50);
+        assert!(name.ends_with('…') && width_of(&name) == 50, "{name:?}");
+        let left = format!(" f {name}   [ ] 7 days");
+        assert_eq!(
+            row,
+            format!("{left}{}cursor now", " ".repeat(79 - width_of(&left) - 10))
+        );
+        assert_eq!(width_of(&row), 79, "cursor now ends at column 78");
+    }
+
+    /// Claude Code's three accounts, then FakeAgent's one, `fake-1`.
+    fn two_providers() -> crate::source::AccountsSnapshot {
+        use tagteam_engine::switch::LiveLogin;
+        use tagteam_engine::views::{ProviderAccounts, ProviderNames, forecast_of};
+        let fake = ProviderId::new("fake-agent");
+        let mut other = account(1, "ci@example.com", read(60, 10.0, 20.0, false));
+        other.row.provider = fake.clone();
+        other.row.id = AccountId::from_string("fake-1");
+        let mut snap = snapshot(many(3));
+        snap.providers.push(ProviderAccounts {
+            provider: fake,
+            active_position: None,
+            forecast: forecast_of(std::slice::from_ref(&other), &LiveLogin::None, &[]),
+            accounts: vec![other],
+            threshold: 90.0,
+            strategy: tagteam_core::autoswitch::AutoStrategy::Best,
+            names: ProviderNames {
+                display_name: "FakeAgent",
+                launch_command: "fakeagent",
+            },
+            models: vec![],
+            live: LiveLogin::None,
+        });
+        snap
+    }
+
+    #[test]
+    fn history_reads_the_provider_focus_follows_and_a_change_of_it_reads_again() {
+        // T4-18: the FakeAgent account selected on Accounts makes FakeAgent focus's provider.
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(two_providers());
+        for _ in 0..3 {
+            update(&mut state, ch('j'), NOW_MS);
+        }
+        let fake = ProviderId::new("fake-agent");
+        let read_for = |r#gen, provider: &ProviderId| Cmd::LoadTimeline {
+            r#gen,
+            provider: provider.clone(),
+            scope: Scope::All,
+            since_s: NOW_S - WEEK,
+            columns: 70,
+        };
+        assert_eq!(update(&mut state, ch('3'), NOW_MS), [read_for(1, &fake)]);
+        arrived(&mut state, nothing(70));
+        assert!(state.history.view.is_some());
+        // An accounts read without FakeAgent's account moves the selection, and focus, to
+        // Claude Code: the view goes, and Claude Code's timeline is read.
+        let Cmd::LoadAccounts { r#gen } = state.load_accounts() else {
+            unreachable!()
+        };
+        let cmds = update(&mut state, accounts_msg(r#gen, 3), NOW_MS);
+        assert_eq!(cmds, [read_for(2, &cc())]);
+        assert_eq!(state.history.view, None);
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert!(body.iter().any(|l| l.trim() == "loading…"), "{body:?}");
+    }
+
+    #[test]
+    fn loading_is_muted() {
+        let (mut state, _) = opened(1);
+        let theme = Theme::new(true);
+        state.theme = theme;
+        let buf = draw_buffer(&state, 80, 24, NOW_MS);
+        let (_, y) = locate(&buf, "loading…").unwrap();
+        assert_eq!(roles(&buf, theme, y).trim(), canon(theme, &"m".repeat(8)));
     }
 }
