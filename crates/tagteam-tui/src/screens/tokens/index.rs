@@ -26,9 +26,11 @@ pub const CHECK_MS: i64 = 5_000;
 const CHECK_FAILED: &str = "the token index's state was not read: ";
 /// `r` while the TUI's own refresh runs.
 pub const ALREADY: &str = "the token index is already being refreshed";
-/// Spec §6.4 in live mode: the daemon's `token-index` events read the report again at most this
-/// often, the 5 s of a refresh's checks. During a cold catch-up they come about once a second.
-pub const LIVE_REQUERY_MS: i64 = 5_000;
+/// Spec §6.4 in live mode, C-13: a `token-index` event reads the report again at most this
+/// often. During a cold catch-up they come about once a second...
+pub const LIVE_REQUERY_MS: i64 = 30_000;
+/// ... and while the TUI's own refresh runs, at the checks' pace.
+pub const LIVE_REFRESHING_MS: i64 = CHECK_MS;
 
 /// An account as the report's rows name it (`RowAccount::Account`): its ID, position, label
 /// and alias.
@@ -57,9 +59,9 @@ pub struct IndexWatch {
     accounts: Option<Vec<AccountKey>>,
     /// The end of the active block the report was last read again for.
     ended: Option<i64>,
-    /// When a `token-index` event may next read the report again (`LIVE_REQUERY_MS`).
-    live_next_ms: i64,
-    /// One came sooner: the report is read again at `live_next_ms`.
+    /// When a `token-index` event last read the report again: `None` before any, or after `r`.
+    live_read_ms: Option<i64>,
+    /// One came sooner: the report is read again at `live_due_at`.
     live_due: bool,
 }
 
@@ -79,7 +81,7 @@ impl Default for IndexWatch {
             next_check_ms: 0,
             accounts: None,
             ended: None,
-            live_next_ms: 0,
+            live_read_ms: None,
             live_due: false,
         }
     }
@@ -104,6 +106,17 @@ impl IndexWatch {
     pub(super) fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
+
+    /// When a held or new event may read the report: `i64::MIN` after `r` or before any. The
+    /// pace is judged now, so a refresh that starts or ends moves it (C-13).
+    fn live_due_at(&self) -> i64 {
+        let pace = if self.refreshing.is_some() {
+            LIVE_REFRESHING_MS
+        } else {
+            LIVE_REQUERY_MS
+        };
+        self.live_read_ms.map_or(i64::MIN, |read| read + pace)
+    }
 }
 
 /// A refresh of the index on the index lane (spec §6.4).
@@ -125,8 +138,10 @@ pub(crate) fn first_refresh(state: &mut State) -> Vec<Cmd> {
     refresh(state)
 }
 
-/// `r` on Tokens (spec §7.1): a refresh at once, on the index lane, so no action holds it up.
+/// `r` on Tokens (spec §7.1): a refresh at once, on the index lane, so no action holds it up. A
+/// `token-index` event held, or the next newer one, reads the report at once (C-13).
 pub(crate) fn refresh_now(state: &mut State, now_ms: i64) -> Vec<Cmd> {
+    state.tokens.watch.live_read_ms = None;
     // The banner of a failed report promises "r retries": the report is read again, whether or
     // not the index moved (T2-22).
     let mut cmds = if state.tokens.stale() {
@@ -280,8 +295,8 @@ pub(crate) fn on_link_down(state: &mut State) {
 
 /// Spec §6.4 in live mode, §8: the daemon's `token-index` event for `provider`. While Tokens shows
 /// that provider's report, a `changedAt` newer than the report's reads it again, at most every
-/// `LIVE_REQUERY_MS`: an event that comes sooner waits for then, and the report read then has
-/// every change since. `changedAt` is to the second, so a change in the second the report's
+/// `LIVE_REQUERY_MS` (`LIVE_REFRESHING_MS` while the TUI's own refresh runs; at once after `r`):
+/// an event that comes sooner waits for then, and the report read then has every change since. `changedAt` is to the second, so a change in the second the report's
 /// was in counts as newer.
 pub(crate) fn on_token_index(
     state: &mut State,
@@ -301,11 +316,11 @@ pub(crate) fn on_token_index(
         return vec![];
     }
     let watch = &mut state.tokens.watch;
-    if now_ms < watch.live_next_ms {
+    if now_ms < watch.live_due_at() {
         watch.live_due = true;
         return vec![];
     }
-    watch.live_next_ms = now_ms + LIVE_REQUERY_MS;
+    watch.live_read_ms = Some(now_ms);
     watch.live_due = false;
     requery(state, now_ms)
 }
@@ -364,7 +379,7 @@ fn active_end(report: &TokenReport) -> Option<i64> {
 /// Spec §6.4 on the UI's tick, while Tokens is open: the refresh every 60 s, unless the daemon
 /// keeps the index current; the index's state every 5 s while a refresh runs here or elsewhere
 /// (`Busy`); the report again every 60 s, once at the active block's end, and when a
-/// `token-index` event waited for `LIVE_REQUERY_MS`.
+/// `token-index` event waited for its due time (`live_due_at`).
 pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     if state.screen != Screen::Tokens || state.quitting.is_some() {
         return vec![];
@@ -376,9 +391,9 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
         cmds.extend(refresh(state));
     }
     let watch = &mut state.tokens.watch;
-    if watch.live_due && now_ms >= watch.live_next_ms {
+    if watch.live_due && now_ms >= watch.live_due_at() {
         watch.live_due = false;
-        watch.live_next_ms = now_ms + LIVE_REQUERY_MS;
+        watch.live_read_ms = Some(now_ms);
         cmds.extend(requery(state, now_ms));
     }
     let watch = &state.tokens.watch;
@@ -1380,39 +1395,125 @@ mod tests {
         assert!(token_cmds(update(&mut state, later, at + 10_000)).is_empty());
     }
 
+    /// The report reads among `cmds`: the checks and refreshes beside them are left out.
+    fn reads(cmds: Vec<Cmd>) -> Vec<Cmd> {
+        cmds.into_iter()
+            .filter(|c| matches!(c, Cmd::LoadReport { .. }))
+            .collect()
+    }
+
     #[test]
-    fn a_catch_up_s_stream_of_events_reads_the_report_every_5_s_and_reads_the_last_change() {
-        // During a cold catch-up `changedAt` moves about once a second: the report lane is
+    fn a_catch_up_s_stream_of_events_reads_the_report_every_30_s_and_reads_the_last_change() {
+        // C-13: during a cold catch-up `changedAt` moves about once a second: the report lane is
         // asked at most every `LIVE_REQUERY_MS`, and the change that came last is read.
         let mut state = live_on_tokens(with_index_job(None));
         let mut read_at = Vec::new();
         let mut changed = NOW_MS;
         let mut serve = |state: &mut State, cmds: Vec<Cmd>, at: i64, changed: i64| {
-            if !cmds.is_empty() {
-                answer(state, &cmds, vec![], changed, at);
+            let read = reads(cmds);
+            if !read.is_empty() {
+                answer(state, &read, vec![], changed, at);
                 read_at.push(at - NOW_MS);
             }
         };
-        for s in 1..=12 {
+        for s in 1..=62 {
             let at = NOW_MS + s * 1_000;
             changed = at;
             let cmds = token_cmds(update(&mut state, token_index("claude-code", Some(at)), at));
             serve(&mut state, cmds, at, changed);
             for quarter in 1..4 {
-                let cmds = tick(&mut state, at + quarter * 250);
+                let cmds = live_tick(&mut state, at + quarter * 250);
                 serve(&mut state, cmds, at + quarter * 250, changed);
             }
         }
-        for quarter in 1..=72 {
-            let at = NOW_MS + 12_750 + quarter * 250;
-            let cmds = tick(&mut state, at);
+        for at in (NOW_MS + 63_000..=NOW_MS + 100_000).step_by(250) {
+            let cmds = live_tick(&mut state, at);
             serve(&mut state, cmds, at, changed);
         }
-        assert_eq!(read_at, [1_000, 6_000, 11_000, 16_000]);
+        assert!(state.daemon.live(), "the daemon answered throughout");
+        assert_eq!(read_at, [1_000, 31_000, 61_000, 91_000], "none at 6_000");
         assert_eq!(
             state.tokens.report().and_then(|r| r.index.changed_at_ms),
-            Some(NOW_MS + 12_000),
+            Some(NOW_MS + 62_000),
             "the last change is on screen"
+        );
+    }
+
+    #[test]
+    fn while_the_tui_s_own_refresh_runs_events_read_the_report_every_5_s() {
+        // C-13: while the TUI's own refresh runs, events read the report at the checks' pace;
+        // once it returns, 30 s after the last read.
+        let mut state = live_on_tokens(with_index_job(None));
+        let t0 = NOW_MS + 500;
+        assert_eq!(
+            update(&mut state, ch('r'), t0),
+            [Cmd::RefreshIndex { provider: cc() }]
+        );
+        let mut read_at = Vec::new();
+        let mut serve = |state: &mut State, cmds: Vec<Cmd>, at: i64, changed: i64| {
+            let read = reads(cmds);
+            if !read.is_empty() {
+                answer(state, &read, vec![], changed, at);
+                read_at.push(at - t0);
+            }
+        };
+        for s in 1..=45 {
+            let at = t0 + s * 1_000;
+            let cmds = token_cmds(update(&mut state, token_index("claude-code", Some(at)), at));
+            serve(&mut state, cmds, at, at);
+            for quarter in 1..4 {
+                if at + quarter * 250 == t0 + 12_500 {
+                    update(&mut state, Msg::Refreshed { result: done() }, t0 + 12_500);
+                }
+                let cmds = live_tick(&mut state, at + quarter * 250);
+                serve(&mut state, cmds, at + quarter * 250, at);
+            }
+        }
+        assert!(state.daemon.live(), "the daemon answered throughout");
+        assert_eq!(read_at, [1_000, 6_000, 11_000, 41_000]);
+    }
+
+    #[test]
+    fn r_reads_a_held_token_index_event_at_the_next_tick() {
+        // T5-3: after `r` on Tokens, an event held for `LIVE_REQUERY_MS` reads the report at the
+        // next tick, and the 30 s count from that read.
+        let mut state = live_on_tokens(with_index_job(None));
+        let t = NOW_MS + 1_000;
+        let first = reads(update(&mut state, token_index("claude-code", Some(t)), t));
+        answer(&mut state, &first, vec![], t, t);
+        let held = update(
+            &mut state,
+            token_index("claude-code", Some(t + 1_000)),
+            t + 1_000,
+        );
+        assert!(reads(held).is_empty(), "held");
+        update(&mut state, ch('r'), t + 2_000);
+        update(
+            &mut state,
+            Msg::Refreshed {
+                result: Ok(RefreshOutcome::Busy),
+            },
+            t + 2_100,
+        );
+        let read = reads(live_tick(&mut state, t + 2_250));
+        assert!(
+            matches!(read.as_slice(), [Cmd::LoadReport { .. }]),
+            "{read:?}"
+        );
+        answer(&mut state, &read, vec![], t + 1_000, t + 2_250);
+        let newer = update(
+            &mut state,
+            token_index("claude-code", Some(t + 3_000)),
+            t + 3_000,
+        );
+        assert!(reads(newer).is_empty(), "held again");
+        for at in (t + 2_500..t + 32_250).step_by(250) {
+            assert!(reads(live_tick(&mut state, at)).is_empty(), "{}", at - t);
+        }
+        let read = reads(live_tick(&mut state, t + 32_250));
+        assert!(
+            matches!(read.as_slice(), [Cmd::LoadReport { .. }]),
+            "{read:?}"
         );
     }
 
@@ -1512,7 +1613,7 @@ mod tests {
     fn a_waiting_event_is_forgotten_when_the_link_goes() {
         let (mut state, at) = with_a_waiting_event();
         update(&mut state, Msg::Live(Live::Down), at + 2_000);
-        assert!(token_cmds(tick(&mut state, at + 5_250)).is_empty());
+        assert!(token_cmds(tick(&mut state, at + 30_250)).is_empty());
     }
 
     #[test]
@@ -1521,6 +1622,6 @@ mod tests {
         update(&mut state, ch('1'), at + 2_000);
         let open = token_cmds(update(&mut state, ch('2'), at + 3_000));
         answer(&mut state, &open, vec![], NOW_MS + 1_000, at + 3_000);
-        assert!(token_cmds(tick(&mut state, at + 5_250)).is_empty());
+        assert!(token_cmds(tick(&mut state, at + 30_250)).is_empty());
     }
 }
