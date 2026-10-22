@@ -350,6 +350,10 @@ fn tui_history_opens_on_history() {
     tui.wait_for(LONG, "History", |s| {
         s.on_alt() && s.contains(" f all accounts   [ ] 7 days")
     });
+    // The timeline read comes back: EngineSource, the views lane, `Msg::Timeline`, the frame.
+    tui.wait_for(LONG, "the timeline read", |s| {
+        s.on_alt() && s.contains(" f all accounts") && !s.contains("loading…")
+    });
     tui.type_keys(b"q");
     assert_eq!(tui.finish(LONG).status.code(), Some(0));
 }
