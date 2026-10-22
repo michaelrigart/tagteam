@@ -198,6 +198,11 @@ impl TokensState {
         self.level().failed.is_some()
     }
 
+    /// T2-22's words while the shown report is the last one read.
+    pub(crate) fn stale_words(&self) -> Option<&str> {
+        self.level().failed.as_deref()
+    }
+
     /// A failed read's words, for the banner (B12): the shown report's first, so the DIM report
     /// never loses them to a check, then a check's, else the last refresh's.
     pub fn error(&self) -> Option<&str> {
