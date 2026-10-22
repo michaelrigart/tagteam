@@ -611,7 +611,10 @@ impl AutoEngine<'_> {
                 trigger,
                 ref targets,
                 ..
-            } => self.perform(p, &ticked, trigger, targets, &decided.decision, sink),
+            } => {
+                let (outcome, instead) = self.perform(p, &ticked, trigger, targets, sink)?;
+                Ok((outcome, instead.unwrap_or(decided.decision)))
+            }
             decision => {
                 self.count(&ticked)?;
                 self.announce(sink, &decision)?;
@@ -620,133 +623,156 @@ impl AutoEngine<'_> {
         }
     }
 
-    /// Steps 10 to 12 for a `Switch` decision: each target in order, freshened (§7.2) and
-    /// then switched to through the ordinary transaction, with the tick's preconditions.
+    /// What one target of a `Switch` decision comes to: freshened (§7.2), then switched to
+    /// through the ordinary transaction, with the tick's preconditions (steps 10 and 11).
+    fn try_target(
+        &mut self,
+        p: &dyn Provider,
+        t: &Ticked<'_>,
+        trigger: Trigger,
+        id: &AccountId,
+        sink: &dyn EventSink,
+    ) -> Result<TargetStep, EngineError> {
+        let Some(row) = t.store.account(id)? else {
+            return Ok(TargetStep::Next(None));
+        };
+        if self.dry_run {
+            // §11.1: it freshens and switches nothing.
+            self.count(t)?;
+            self.emit(sink, |provider| AutoEvent::Switch {
+                provider,
+                trigger,
+                from: t.live.position,
+                to: row.position,
+                warnings: Vec::new(),
+                dry_run: true,
+            });
+            return Ok(TargetStep::Stop(TickOutcome::Switched));
+        }
+        let fresh = match self.engine.freshen_auto(p, &row) {
+            Ok(fresh) => fresh,
+            Err(e) if fatal(&e) => return Err(e),
+            Err(e) => AutoFreshened::Failed(FreshenFailure::Text(e.to_string())),
+        };
+        match fresh {
+            AutoFreshened::Ready => {}
+            AutoFreshened::Quarantined => {
+                if let Some(now) = t.store.account(id)? {
+                    self.quarantines
+                        .note_quarantined(&self.provider, &now, sink);
+                }
+                return Ok(TargetStep::Next(None));
+            }
+            AutoFreshened::Failed(why) => {
+                return Ok(TargetStep::Next(Some(format!(
+                    "{} (position {}): {why}",
+                    row.label, row.position
+                ))));
+            }
+            AutoFreshened::Skip => return Ok(TargetStep::Next(None)),
+        }
+        // Step 11.
+        let req = SwitchRequest {
+            provider: self.provider.clone(),
+            target: SwitchTarget::Account(id.clone()),
+            force: false,
+            auto: Some(AutoPerform {
+                expected_from: t.live.id.clone(),
+                trigger,
+                cooldown_s: self.cfg.cooldown_s,
+                departure: departure(&t.snap, &self.cfg, &t.live.id, trigger),
+                cause: cause(&t.snap, &self.cfg, &t.live.id),
+            }),
+        };
+        match self.engine.switch(req) {
+            Ok(out) if out.switched => {
+                // The commit reset `unhealthy_ticks` (Decision 4): nothing to count.
+                self.live = Some(id.clone());
+                self.judged = Some(id.clone());
+                self.emit(sink, |provider| AutoEvent::Switch {
+                    provider,
+                    trigger,
+                    from: t.live.position,
+                    to: row.position,
+                    warnings: out.warnings,
+                    dry_run: false,
+                });
+                Ok(TargetStep::Stop(TickOutcome::Switched))
+            }
+            Ok(out) => match out.reason {
+                SwitchReason::NotCandidate => Ok(TargetStep::Next(None)),
+                SwitchReason::Cooldown => {
+                    self.count(t)?;
+                    let left = self.cooldown_left(t.store)?;
+                    let (outcome, decision) =
+                        self.no_switch(sink, NoSwitchReason::Cooldown, left)?;
+                    Ok(TargetStep::NoSwitch(outcome, decision))
+                }
+                SwitchReason::LiveChanged => {
+                    // The count belonged to the account this tick judged, which is no
+                    // longer live: the new live account starts from 0 (Decision 4).
+                    if t.stored != 0 {
+                        t.store.set_unhealthy_ticks(&self.provider, 0)?;
+                    }
+                    let (outcome, decision) =
+                        self.no_switch(sink, NoSwitchReason::LiveChanged, String::new())?;
+                    Ok(TargetStep::NoSwitch(outcome, decision))
+                }
+                // No other no-op answers a direct switch to an account other than the live
+                // one; should one ever, it is reported, never taken for a switch.
+                _ => {
+                    self.count(t)?;
+                    self.error(sink, out.message, false);
+                    Ok(TargetStep::Stop(TickOutcome::Error))
+                }
+            },
+            Err(e) if fatal(&e) => Err(e),
+            // §12.5: the target's quiescent profile and its vault both moved, so nothing of
+            // it can be activated until an explicit replacement resolves it. Freshening
+            // finds a conflict that is already there (`Skip`); this is one that arose since,
+            // found by the switch's own lazy capture under its locks. Either way it is
+            // passed over for the next target, never an error that ends the tick.
+            Err(EngineError::ProfileConflict { .. }) => {
+                tracing::warn!(
+                    position = row.position,
+                    account = %row.id,
+                    "the target's session profile conflicts with its vault; trying the next target"
+                );
+                Ok(TargetStep::Next(None))
+            }
+            Err(e) => {
+                self.count(t)?;
+                self.error(
+                    sink,
+                    format!(
+                        "could not switch to {} (position {}): {e}",
+                        row.label, row.position
+                    ),
+                    transient(&e),
+                );
+                self.switch_failed(&t.live.id, id, &e)?;
+                Ok(TargetStep::Stop(TickOutcome::Error))
+            }
+        }
+    }
+
+    /// Steps 10 to 12 for a `Switch` decision: each target in order, tried by `try_target`.
+    /// `Some` is a no-switch reported in the `Switch` decision's place.
     fn perform(
         &mut self,
         p: &dyn Provider,
         t: &Ticked<'_>,
         trigger: Trigger,
         targets: &[AccountId],
-        decision: &Decision,
         sink: &dyn EventSink,
-    ) -> Result<(TickOutcome, Decision), EngineError> {
+    ) -> Result<(TickOutcome, Option<Decision>), EngineError> {
         let mut failed = Vec::new();
         for id in targets {
-            let Some(row) = t.store.account(id)? else {
-                continue;
-            };
-            if self.dry_run {
-                // §11.1: it freshens and switches nothing.
-                self.count(t)?;
-                self.emit(sink, |provider| AutoEvent::Switch {
-                    provider,
-                    trigger,
-                    from: t.live.position,
-                    to: row.position,
-                    warnings: Vec::new(),
-                    dry_run: true,
-                });
-                return Ok((TickOutcome::Switched, decision.clone()));
-            }
-            let fresh = match self.engine.freshen_auto(p, &row) {
-                Ok(fresh) => fresh,
-                Err(e) if fatal(&e) => return Err(e),
-                Err(e) => AutoFreshened::Failed(FreshenFailure::Text(e.to_string())),
-            };
-            match fresh {
-                AutoFreshened::Ready => {}
-                AutoFreshened::Quarantined => {
-                    if let Some(now) = t.store.account(id)? {
-                        self.quarantines
-                            .note_quarantined(&self.provider, &now, sink);
-                    }
-                    continue;
-                }
-                AutoFreshened::Failed(why) => {
-                    failed.push(format!("{} (position {}): {why}", row.label, row.position));
-                    continue;
-                }
-                AutoFreshened::Skip => continue,
-            }
-            // Step 11.
-            let req = SwitchRequest {
-                provider: self.provider.clone(),
-                target: SwitchTarget::Account(id.clone()),
-                force: false,
-                auto: Some(AutoPerform {
-                    expected_from: t.live.id.clone(),
-                    trigger,
-                    cooldown_s: self.cfg.cooldown_s,
-                    departure: departure(&t.snap, &self.cfg, &t.live.id, trigger),
-                    cause: cause(&t.snap, &self.cfg, &t.live.id),
-                }),
-            };
-            match self.engine.switch(req) {
-                Ok(out) if out.switched => {
-                    // The commit reset `unhealthy_ticks` (Decision 4): nothing to count.
-                    self.live = Some(id.clone());
-                    self.judged = Some(id.clone());
-                    self.emit(sink, |provider| AutoEvent::Switch {
-                        provider,
-                        trigger,
-                        from: t.live.position,
-                        to: row.position,
-                        warnings: out.warnings,
-                        dry_run: false,
-                    });
-                    return Ok((TickOutcome::Switched, decision.clone()));
-                }
-                Ok(out) => match out.reason {
-                    SwitchReason::NotCandidate => continue,
-                    SwitchReason::Cooldown => {
-                        self.count(t)?;
-                        let left = self.cooldown_left(t.store)?;
-                        return self.no_switch(sink, NoSwitchReason::Cooldown, left);
-                    }
-                    SwitchReason::LiveChanged => {
-                        // The count belonged to the account this tick judged, which is no
-                        // longer live: the new live account starts from 0 (Decision 4).
-                        if t.stored != 0 {
-                            t.store.set_unhealthy_ticks(&self.provider, 0)?;
-                        }
-                        return self.no_switch(sink, NoSwitchReason::LiveChanged, String::new());
-                    }
-                    // No other no-op answers a direct switch to an account other than the live
-                    // one; should one ever, it is reported, never taken for a switch.
-                    _ => {
-                        self.count(t)?;
-                        self.error(sink, out.message, false);
-                        return Ok((TickOutcome::Error, decision.clone()));
-                    }
-                },
-                Err(e) if fatal(&e) => return Err(e),
-                // §12.5: the target's quiescent profile and its vault both moved, so nothing of
-                // it can be activated until an explicit replacement resolves it. Freshening
-                // finds a conflict that is already there (`Skip`); this is one that arose since,
-                // found by the switch's own lazy capture under its locks. Either way it is
-                // passed over for the next target, never an error that ends the tick.
-                Err(EngineError::ProfileConflict { .. }) => {
-                    tracing::warn!(
-                        position = row.position,
-                        account = %row.id,
-                        "the target's session profile conflicts with its vault; trying the next target"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    self.count(t)?;
-                    self.error(
-                        sink,
-                        format!(
-                            "could not switch to {} (position {}): {e}",
-                            row.label, row.position
-                        ),
-                        transient(&e),
-                    );
-                    self.switch_failed(&t.live.id, id, &e)?;
-                    return Ok((TickOutcome::Error, decision.clone()));
-                }
+            match self.try_target(p, t, trigger, id, sink)? {
+                TargetStep::Next(None) => {}
+                TargetStep::Next(Some(line)) => failed.push(line),
+                TargetStep::Stop(outcome) => return Ok((outcome, None)),
+                TargetStep::NoSwitch(outcome, decision) => return Ok((outcome, Some(decision))),
             }
         }
         // Step 12.
@@ -757,9 +783,11 @@ impl AutoEngine<'_> {
                 format!("could not freshen {}", failed.join("; ")),
                 true,
             );
-            return Ok((TickOutcome::Error, decision.clone()));
+            return Ok((TickOutcome::Error, None));
         }
-        self.no_switch(sink, NoSwitchReason::NoViableTarget, String::new())
+        let (outcome, decision) =
+            self.no_switch(sink, NoSwitchReason::NoViableTarget, String::new())?;
+        Ok((outcome, Some(decision)))
     }
 
     /// §11.2 step 2: an unresolved switch journal for the provider is recovered first, under
@@ -1139,6 +1167,16 @@ impl Drop for AutoEngine<'_> {
             );
         }
     }
+}
+
+/// What one target of a `Switch` decision came to (§11.2 steps 10 and 11).
+enum TargetStep {
+    /// Passed over; with the line step 12's error names when freshening failed.
+    Next(Option<String>),
+    /// The tick ends with this outcome, reporting the `Switch` decision.
+    Stop(TickOutcome),
+    /// The tick ends with this no-switch, reported in the `Switch` decision's place.
+    NoSwitch(TickOutcome, Decision),
 }
 
 /// What a tick has read by the time it decided.
