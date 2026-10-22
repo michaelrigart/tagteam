@@ -179,7 +179,9 @@ toward the earliest due time. This is §11.4's loop, generalized:
   changed, the settings are reloaded (D3 change 1), each warning becomes a `config-warning`
   event, and every provider job re-evaluates its mode (D4.3) before the next job runs. A
   setting therefore takes effect within about a second, unless a job is running, in which case
-  it takes effect when that job ends.
+  it takes effect when that job ends. A reload that changes a provider's `daemon.autoswitch`,
+  and a start whose setting differs from the provider's latest stored pause or resume, records
+  `autoswitch-paused` or `autoswitch-resumed`. *(Amended by the TUI redesign spec §12.4.)*
 
 A job is:
 

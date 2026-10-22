@@ -14,6 +14,9 @@ with the one before, so any release may contain breaking changes. Each section s
 - A WARN when an API key is written into a `~/.claude.json` that other users can read.
 - `tagteam add-token <TOKEN>` prints a one-line warning on stderr that the token was visible on
   the command line; `tagteam add-token -` and the prompt avoid that.
+- The event history records failed switches, when every account is exhausted, and when the daemon
+  pauses or resumes auto; an automatic switch records the window that triggered it, and a removed
+  account its label.
 
 ### Changed
 
@@ -80,6 +83,11 @@ with the one before, so any release may contain breaking changes. Each section s
 - Quarantines, quarantine releases and recovered switches that `tagteam auto` or the daemon
   carries out are recorded with `auto` or `daemon` as their source, in the event history and the
   log; some were recorded as `cli`.
+- `tagteam tui`'s History is a timeline: usage charts with auto's switches, pauses and failures on
+  the same time axis, a lane per account, and an event list that follows a time cursor. `f` picks
+  one account, and `⏎` on Accounts opens its history.
+- `tagteam tui`'s auto line reads auto's last action from the store, also without the daemon, and
+  `w` opens History at it.
 
 ### Security
 
