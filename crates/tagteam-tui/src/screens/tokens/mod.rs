@@ -894,9 +894,13 @@ mod tests {
         assert_eq!(state.tokens.depth(), 0);
         assert_eq!(state.tokens.error(), None);
         let buf = draw_buffer(&state, 80, 24, NOW_MS);
-        let (x, y) = locate(&buf, "TOTAL").unwrap();
+        // The total line's `TOTAL`: the head's is muted, which tiers 0 and 1 draw DIM.
+        let y = text_of(&buf)
+            .iter()
+            .position(|l| l.starts_with(" TOTAL"))
+            .unwrap() as u16;
         assert!(
-            (x..x + 5).all(|x| !buf[(x, y)].modifier.contains(ratatui::style::Modifier::DIM)),
+            (1..6).all(|x| !buf[(x, y)].modifier.contains(ratatui::style::Modifier::DIM)),
             "the top report is plain"
         );
     }
