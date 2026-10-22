@@ -52,6 +52,17 @@ fn in_use(fx: &Fx, id: &AccountId, at_s: i64) {
         .unwrap();
 }
 
+/// No account was active from `at_s`.
+fn nobody(fx: &Fx, at_s: i64) {
+    raw(fx)
+        .execute(
+            "INSERT INTO active_history (provider, at, account_id, recorded_at) \
+             VALUES (?1, ?2, NULL, ?2)",
+            rusqlite::params![fx.provider().as_str(), at_s * 1000],
+        )
+        .unwrap();
+}
+
 /// `id`'s window `key` was at `pct` at `at_s`.
 fn sample(fx: &Fx, id: &AccountId, key: &str, at_s: i64, pct: f64) {
     raw(fx)
@@ -182,6 +193,64 @@ fn a_column_spanning_a_switch_shows_its_peak() {
     assert_eq!(v.charts[0].peaks, peaks(&[(2, 93.0)]));
     assert_eq!(v.lanes[0].in_use, flags("tttffff"));
     assert_eq!(v.lanes[1].in_use, flags("ffttttt"));
+}
+
+#[test]
+fn a_change_at_the_instant_of_the_one_before_marks_nothing_for_it() {
+    // `a` then `b` at one `at`: `a`'s span is empty.
+    let (fx, a, b, _) = fixture();
+    in_use(&fx, &a, day(2, 0));
+    in_use(&fx, &b, day(2, 0));
+    sample(&fx, &a, "5h", day(2, 0), 60.0);
+    sample(&fx, &b, "5h", day(2, 1), 10.0);
+    let v = timeline(&fx, Scope::All);
+    assert_eq!(ids(&v.lanes), ["b"]);
+    assert_eq!(v.lanes[0].in_use, flags("ffttttt"));
+    assert_eq!(v.charts[0].peaks, peaks(&[(2, 10.0)]));
+}
+
+#[test]
+fn a_sample_at_a_switch_counts_for_the_new_account() {
+    let (fx, a, b, _) = fixture();
+    in_use(&fx, &a, SINCE - 3_600);
+    in_use(&fx, &b, day(3, 0));
+    sample(&fx, &a, "5h", day(3, 0), 90.0);
+    sample(&fx, &b, "5h", day(3, 0), 15.0);
+    let v = timeline(&fx, Scope::All);
+    assert_eq!(v.charts[0].peaks, peaks(&[(3, 15.0)]));
+    assert_eq!(v.lanes[0].in_use, flags("tttffff"));
+    assert_eq!(v.lanes[0].peaks, peaks(&[(3, 90.0)]));
+}
+
+#[test]
+fn no_account_in_use_ends_the_span_before_it() {
+    let (fx, a, _, _) = fixture();
+    in_use(&fx, &a, SINCE - 3_600);
+    nobody(&fx, day(2, 0));
+    sample(&fx, &a, "5h", day(1, 0), 40.0);
+    sample(&fx, &a, "5h", day(4, 0), 70.0);
+    let v = timeline(&fx, Scope::All);
+    assert_eq!(ids(&v.lanes), ["a"]);
+    assert_eq!(v.lanes[0].in_use, flags("ttfffff"));
+    assert_eq!(v.lanes[0].peaks, peaks(&[(1, 40.0), (4, 70.0)]));
+    assert_eq!(v.charts[0].peaks, peaks(&[(1, 40.0)]));
+}
+
+#[test]
+fn removed_accounts_follow_the_current_ones_in_order_of_first_use() {
+    let (fx, a, b, c) = fixture();
+    in_use(&fx, &c, SINCE - 3_600);
+    in_use(&fx, &b, day(1, 0));
+    in_use(&fx, &a, day(2, 0));
+    let store = fx.engine.store().unwrap();
+    store.delete_account(&b).unwrap();
+    store.delete_account(&c).unwrap();
+    let v = timeline(&fx, Scope::All);
+    assert_eq!(ids(&v.lanes), ["a", "c", "b"]);
+    let removed: Vec<bool> = v.lanes.iter().map(|l| l.account.removed).collect();
+    assert_eq!(removed, [false, true, true]);
+    assert_eq!(v.lanes[1].in_use, flags("tffffff"));
+    assert_eq!(v.lanes[2].in_use, flags("ftfffff"));
 }
 
 #[test]

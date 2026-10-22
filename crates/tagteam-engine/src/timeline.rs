@@ -45,7 +45,9 @@ impl Grid {
         Some((column as usize).min(self.columns - 1))
     }
 
-    /// Where `column` ends, exclusive, and the next one starts; `now_ms` for the last.
+    /// Where `column` ends, exclusive, and the next one starts; `now_ms` for the last. While
+    /// the span is at least the column count, as a day or more over a screen's columns always
+    /// is, `column_of(end_ms(c)) == c + 1`.
     pub fn end_ms(&self, column: usize) -> i64 {
         if column + 1 >= self.columns {
             return self.now_ms;
@@ -370,6 +372,23 @@ mod tests {
         let g = Grid { columns: 0, ..g };
         for t in [-1, 0, 5, 10, 11] {
             assert_eq!(g.column_of(t), None, "{t}");
+        }
+
+        // Each column starts where the one before it ends, over the grids History draws.
+        let now_ms = 1_790_000_000_000;
+        for days in [1, 7, 30] {
+            for columns in [70, 110, 200] {
+                let g = Grid {
+                    since_ms: now_ms - days * 86_400_000,
+                    now_ms,
+                    columns,
+                };
+                for c in 0..columns - 1 {
+                    let end = g.end_ms(c);
+                    assert_eq!(g.column_of(end), Some(c + 1), "{days}d {columns} {c}");
+                    assert_eq!(g.column_of(end - 1), Some(c), "{days}d {columns} {c}");
+                }
+            }
         }
     }
 }

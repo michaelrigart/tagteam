@@ -1770,4 +1770,9 @@ fn active_history_since_is_the_rows_since_and_the_last_one_before() {
     ];
     assert_eq!(since(100), all);
     assert_eq!(since(50), all);
+    assert_eq!(
+        since(301),
+        [(300, Some("a".into()))],
+        "the later of two rows at one time"
+    );
 }
