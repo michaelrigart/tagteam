@@ -139,14 +139,13 @@ pub struct EventView {
 }
 
 impl EventView {
-    /// `e` at `at_ms`, with its accounts named by `name` and no usage beside it.
+    /// `e`, with its accounts named by `name` and no usage beside it.
     fn of(
         e: EventRow,
-        at_ms: i64,
         mut name: impl FnMut(&AccountId) -> Result<AccountRef, StoreError>,
     ) -> Result<Self, StoreError> {
         Ok(EventView {
-            at_ms,
+            at_ms: e.at,
             kind: e.kind,
             source: e.source,
             trigger: e.trigger,
@@ -399,16 +398,15 @@ impl Engine {
             if !keeps(&e) || grid.placed(e.at) > grid.now_ms {
                 continue;
             }
-            let at_ms = e.at;
             let switch = matches!(e.kind, EventKind::Switch | EventKind::SwitchRecovered);
             let (from_id, to_id) = (e.from_id.clone(), e.to_id.clone());
-            let mut event = EventView::of(e, at_ms, &mut name)?;
+            let mut event = EventView::of(e, &mut name)?;
             if switch {
                 if let Some(id) = &from_id {
-                    event.before_pct = readings.before(id, at_ms)?;
+                    event.before_pct = readings.before(id, event.at_ms)?;
                 }
                 if let Some(id) = &to_id {
-                    event.after_pct = readings.after(id, at_ms)?;
+                    event.after_pct = readings.after(id, event.at_ms)?;
                 }
             }
             view.events.push(event);
@@ -430,12 +428,11 @@ impl Engine {
         let Some(e) = store.latest_event(provider, &AUTO_LINE_KINDS, Some(since_ms), None)? else {
             return Ok(None);
         };
-        let at_ms = e.at;
         let name = |id: &AccountId| {
             let row = store.account(id)?.filter(|r| &r.provider == provider);
             name_of(&store, provider, id, row.as_ref())
         };
-        Ok(Some(EventView::of(e, at_ms, name)?))
+        Ok(Some(EventView::of(e, name)?))
     }
 }
 
