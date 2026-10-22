@@ -605,8 +605,9 @@ The protocol is the daemon spec's D5 (`2026-10-14-tagteam-daemon-design.md`, App
 - **What each event does.**
   - `poll`, `switch`, `usage`, `changed`, `account-quarantined` and `account-unquarantined`
     re-read `accounts`. History's timeline re-reads on a `switch`, `account-quarantined`,
-    `account-unquarantined`, `usage` or `changed` event, in live mode at most every 30 s for
-    `usage` and `changed`. *(Amended by the TUI redesign spec §7.7.)*
+    `account-unquarantined`, `poll`, `usage` or `changed` event and on the 60 s live poll, in
+    live mode at most every 30 s for `poll`, `usage`, `changed` and the 60 s poll. *(Amended by
+    the TUI redesign spec §7.7.)*
   - `mode` re-fetches `status` (§7.4).
   - `token-index` re-runs `token_report` when Tokens is open and the event's `changedAt` is
     newer than the report on screen (§6.4).
