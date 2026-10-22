@@ -169,7 +169,7 @@ impl QuarantineWatch {
             };
             let cleared = released.contains(&row.id)
                 || (was.is_some_and(|s| s.reason.is_some()) && row.quarantine_reason.is_none());
-            let set = before.is_some() && was.is_none_or(|s| s.reason.is_none());
+            let was_clear = before.is_some() && was.is_none_or(|s| s.reason.is_none());
             if cleared {
                 sink.emit(&AutoEvent::AccountUnquarantined {
                     provider: provider.clone(),
@@ -177,7 +177,7 @@ impl QuarantineWatch {
                     email: email_of(row),
                     reason: reason(),
                 });
-            } else if let Some(reason) = row.quarantine_reason.as_ref().filter(|_| set) {
+            } else if let Some(reason) = row.quarantine_reason.as_ref().filter(|_| was_clear) {
                 sink.emit(&AutoEvent::AccountQuarantined {
                     provider: provider.clone(),
                     number: row.position,

@@ -1,7 +1,6 @@
 //! ISO 8601 UTC, as tagteam's JSON spells a time (§13.2) and as the endpoints and an export
 //! file write one (§8.1, §13.3). Only `Z` and numeric offsets are read, and only UTC is
-//! written. Also the one conversion from epoch milliseconds to whole seconds (review refactor
-//! §8.9).
+//! written. Also the conversions from epoch milliseconds to whole seconds (review refactor §8.9).
 
 /// The value of `n` ASCII digits, or `None` if any byte is not one.
 fn digits(b: &[u8]) -> Option<i64> {
