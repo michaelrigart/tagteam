@@ -1,40 +1,42 @@
-//! What the auto line says (redesign §5.3, T2-7). Before T4 the store's events are not read:
-//! a switch comes from the daemon's `status.lastSwitch`, worded from its trigger, and auto's
-//! other decisions from this link's events, or `status.lastOutcome` until one arrives. Timer
-//! mode says nothing (M-7): without the store it cannot know there were no switches.
+//! What the auto line says (redesign §5.3, T4-30): the store's last auto-line event, which the
+//! accounts read carries (§12.2), in the words History's list gives it; auto's other decisions
+//! from this link's events in live mode, or `status.lastOutcome` until one arrives; and, with
+//! nothing stored in the last 30 days, that there were no switches, in both modes (M-7 lifted).
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::NoSwitchReason;
 use tagteam_daemon::events::Mode;
-use tagteam_daemon::protocol::{StatusOutcome, StatusProvider, StatusSwitch};
+use tagteam_daemon::protocol::{StatusOutcome, StatusProvider};
 use tagteam_daemon::status::OutcomeKind;
+use tagteam_engine::EventKind;
 use tagteam_engine::settings::DEFAULT_THRESHOLD;
+use tagteam_engine::timeline::EventView;
 use tagteam_engine::views::ProviderAccounts;
 use tagteam_engine::words::{self, MISSING, NoSwitchFacts};
 
 use crate::chrome::WIDE;
 use crate::daemon::words::{clock, iso_ms};
 use crate::daemon::{self, Noted, NotedWhat};
+use crate::screens::history::{list, marks};
 use crate::state::State;
 use crate::theme::Role;
 
-/// A switch this recent leads the line (rank 1).
+/// A stored event this recent leads the line (rank 1).
 const RECENT_MS: i64 = 30 * 60 * 1000;
-/// A switch this recent still shows, as the last one (rank 3): History's longest range.
-const MONTH_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+/// A stored event this recent still shows (rank 3): History's longest range, and what the
+/// accounts read asks the store for.
+pub(crate) const MONTH_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// Rank 4's words.
 const NO_SWITCHES: &str = "no switches in the last 30 days";
-/// A switch by auto or the daemon (§7.4).
-const SWITCH: (&str, Role) = ("⇄", Role::Accent);
 
 /// The auto line's parts, which `chrome::auto_line` lays out.
 #[derive(Debug)]
 pub(crate) struct Said {
-    /// The glyph, in its role (T2-13).
+    /// The glyph, in its role (T2-13): a stored event's `marks::mark`.
     pub(crate) mark: Option<(&'static str, Role)>,
-    /// When it happened (`when`), for ranks 1 and 2.
+    /// When it happened (`when`), for ranks 1 and 2, and rank 3's events other than a switch.
     pub(crate) when: Option<String>,
     /// Rank 3's `last switch {when} · `, muted and run straight into `text`.
     pub(crate) lead: Option<String>,
@@ -43,17 +45,19 @@ pub(crate) struct Said {
     pub(crate) muted: bool,
     /// `next check HH:MM`: from 120 columns, in live mode with the provider's job in `auto`.
     pub(crate) next: Option<String>,
+    /// Ranks 1 and 3: the event `w` opens (T4-15).
+    pub(crate) pin: Option<(i64, EventKind)>,
 }
 
-/// What the line says for the focus provider (`daemon::focus`), first match: a switch of the
-/// last 30 minutes; the daemon's latest decision; a switch of the last 30 days; else, in live
-/// mode, that there was none. Timer mode reaches none of them, and until T4 reads the store its
-/// line stays empty (M-7).
+/// What the line says for the focus provider (`daemon::focus`), first match (§5.3): its stored
+/// event of the last 30 minutes; in live mode, the daemon's latest decision; its stored event of
+/// the last 30 days, a switch as the last one; else that there was none. Nothing before the
+/// first accounts read.
 pub(crate) fn said(state: &State, width: u16, now_ms: i64) -> Option<Said> {
+    let snapshot = state.accounts.snapshot()?;
     let provider = daemon::focus(state);
     let job = state.daemon.job(&provider);
     let tz = state.tokens.tz();
-    let view = state.view_of(&provider);
     let next = job
         .filter(|j| width >= WIDE && j.mode.known() == Some(Mode::Auto))
         .and_then(|j| iso_ms(j.next_tick_at.as_deref()?))
@@ -65,28 +69,44 @@ pub(crate) fn said(state: &State, width: u16, now_ms: i64) -> Option<Said> {
         text,
         muted: false,
         next: next.clone(),
+        pin: None,
     };
-    let switch = job
-        .and_then(|j| j.last_switch.as_ref())
-        .and_then(|s| Some((iso_ms(&s.at)?, s)));
-    if let Some((at, s)) = switch.filter(|(at, _)| now_ms - at <= RECENT_MS) {
-        return Some(said(
-            Some(SWITCH),
-            Some(when(at, now_ms, tz)),
-            switched(view, s),
-        ));
+    let stored = |within: i64| {
+        snapshot
+            .last_auto
+            .iter()
+            .find(|(p, e)| *p == provider && now_ms - e.at_ms <= within)
+            .map(|(_, e)| e)
+    };
+    let of = |e: &EventView| {
+        let mark = marks::mark(e);
+        Said {
+            pin: Some((e.at_ms, e.kind)),
+            ..said(
+                Some((mark.glyph, mark.role)),
+                Some(when(e.at_ms, now_ms, tz)),
+                list::sentence(e, tz),
+            )
+        }
+    };
+    if let Some(e) = stored(RECENT_MS) {
+        return Some(of(e));
     }
     if let Some(noted) = decision(state, &provider, job) {
         let (mark, text) = decided(state, &provider, &noted);
         return Some(said(mark, Some(when(noted.at_ms, now_ms, tz)), text));
     }
-    if let Some((at, s)) = switch.filter(|(at, _)| now_ms - at <= MONTH_MS) {
-        return Some(Said {
-            lead: Some(format!("last switch {} · ", when(at, now_ms, tz))),
-            ..said(Some(SWITCH), None, switched(view, s))
+    if let Some(e) = stored(MONTH_MS) {
+        return Some(match e.kind {
+            EventKind::Switch | EventKind::SwitchRecovered => Said {
+                when: None,
+                lead: Some(format!("last switch {} · ", when(e.at_ms, now_ms, tz))),
+                ..of(e)
+            },
+            _ => of(e),
         });
     }
-    state.daemon.live().then(|| Said {
+    Some(Said {
         muted: true,
         ..said(None, None, NO_SWITCHES.to_owned())
     })
@@ -109,19 +129,6 @@ pub(crate) fn when(at_ms: i64, now_ms: i64, tz: &TimeZone) -> String {
         _ => "%b %-d %H:%M",
     };
     at.strftime(format).to_string()
-}
-
-/// `auto switched {from} → {to} ({trigger})`, each account by its short name.
-fn switched(view: Option<&ProviderAccounts>, s: &StatusSwitch) -> String {
-    let moved = format!(
-        "auto switched {} → {}",
-        named(view, s.from),
-        named(view, s.to)
-    );
-    match s.trigger.known() {
-        Some(trigger) => format!("{moved} ({})", words::trigger(trigger)),
-        None => moved,
-    }
 }
 
 /// The account at `position` by `words::short_name`, else the position alone.
@@ -200,10 +207,13 @@ fn decided(
 mod tests {
     use serde_json::{Value, json};
     use tagteam_daemon::protocol::{Event, Wire};
+    use tagteam_engine::EventSource;
+    use tagteam_engine::timeline::EventView;
 
     use super::*;
     use crate::live::Live;
     use crate::msg::Msg;
+    use crate::screens::history::{account_ref, event_at};
     use crate::state::Screen;
     use crate::testutil::*;
     use crate::update::update;
@@ -221,25 +231,55 @@ mod tests {
         state
     }
 
-    fn switch(at: &str, from: u32, to: u32, trigger: &str) -> StatusSwitch {
-        StatusSwitch {
-            at: at.into(),
-            from,
-            to,
-            trigger: Wire::from_wire(trigger),
-        }
+    /// Timer mode, on Accounts, with `many(3)` read.
+    fn timer() -> State {
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(many(3)));
+        state
     }
 
-    fn with_switch(at: &str, from: u32, to: u32) -> StatusProvider {
-        let mut job = auto_on();
-        job.last_switch = Some(switch(at, from, to, "proactive"));
-        job
+    fn at(iso: &str) -> i64 {
+        iso.parse::<Timestamp>().unwrap().as_millisecond()
+    }
+
+    /// Auto's switch 1 → 2 stored at `iso`, as a1's 5h reached 93%.
+    fn stored_switch(iso: &str) -> EventView {
+        let mut e = event_at(at(iso), EventKind::Switch, EventSource::Auto);
+        e.trigger = Some("proactive".into());
+        e.from = Some(account_ref(1));
+        e.to = Some(account_ref(2));
+        e.detail = Some(json!({"window": "5h", "label": "5h", "pct": 93.0, "threshold": 90.0}));
+        e
+    }
+
+    /// Its words.
+    const SWITCHED: &str = "auto switched 1 a1 → 2 a2 · a1's 5h reached 93%";
+
+    /// `many(3)` read again, with `e` Claude Code's last auto-line event.
+    fn store(state: &mut State, e: EventView) {
+        let mut snap = snapshot(many(3));
+        snap.last_auto = vec![(cc(), e)];
+        state.accounts.apply(snap);
     }
 
     /// The auto line at `w` columns.
     fn line(state: &State, w: u16) -> String {
         draw(state, w, if w >= WIDE { 40 } else { 24 })[1].clone()
     }
+
+    /// `left`, then `w why` ending one column in, on a row `w` wide (§5.3).
+    fn hinted(left: &str, w: u16) -> String {
+        let gap = usize::from(w) - 1 - HINT.len() - crate::view::width_of(left);
+        format!("{left}{}{HINT}", " ".repeat(gap))
+    }
+
+    /// `hinted` in role letters: `w` accent, `why` muted.
+    fn hinted_letters(left: &str, w: u16) -> String {
+        let gap = usize::from(w) - 1 - HINT.len() - crate::view::width_of(left);
+        format!("{left}{}a mmm", " ".repeat(gap))
+    }
+
+    const HINT: &str = "w why";
 
     /// One of auto's kinds for `provider`, at 14:13:20 unless `fields` says otherwise.
     fn auto_of(provider: &str, kind: &str, fields: Value) -> Msg {
@@ -282,93 +322,85 @@ mod tests {
             .collect()
     }
 
-    /// Row 1's letters in tier 1.
-    fn letters(state: &mut State) -> String {
+    /// Row 1's letters in tier 1, at `w` columns.
+    fn letters_at(state: &mut State, w: u16) -> String {
         state.theme = crate::theme::Theme::new(true);
-        let buf = draw_buffer(state, 80, 24, NOW_MS);
+        let buf = draw_buffer(state, w, if w >= WIDE { 40 } else { 24 }, NOW_MS);
         roles(&buf, state.theme, 1).trim_end().to_owned()
     }
 
-    #[test]
-    fn the_daemon_s_last_switch_is_worded_from_its_trigger() {
-        // T2-7, C-14: from its trigger; the window a poll names is no longer looked up.
-        let mut state = live_with(with_switch("2026-09-21T14:11:20Z", 1, 2));
-        let poll = json!({"active": {"number": 1}, "headroomPct": {"1": 5.0}, "windowsPct": {"1": {"5h": 95.0}}});
-        update(&mut state, auto("poll", poll), NOW_MS);
-        assert_eq!(
-            line(&state, 80),
-            " ⇄ 14:11  auto switched 1 a1 → 2 a2 (before it reached the limit)"
-        );
-        let text = "auto switched 1 a1 → 2 a2 (before it reached the limit)";
-        assert_eq!(letters(&mut state), format!(" a mmmmm  {}", all(text, 't')));
-        for (trigger, words) in [
-            ("at-limit", " (at the limit)"),
-            ("failover", " (its usage couldn't be read)"),
-            (
-                "consume-first",
-                " (to use up the account that resets first)",
-            ),
-            ("added-later", ""),
-        ] {
-            let mut job = auto_on();
-            job.last_switch = Some(switch("2026-09-21T14:11:20Z", 3, 9, trigger));
-            let state = live_with(job);
-            assert_eq!(
-                line(&state, 120),
-                format!(" ⇄ 14:11  auto switched 3 a3 → 9{words}"),
-                "{trigger}: an account the view does not list is its position"
-            );
-        }
+    fn letters(state: &mut State) -> String {
+        letters_at(state, 80)
     }
 
     #[test]
-    fn rank_3_mutes_the_last_switch_time_and_leaves_the_event_in_the_text_role() {
-        // §5.3: the time is muted; the event's words are text.
-        let mut job = auto_on();
-        job.last_switch = Some(switch("2026-09-19T15:38:00Z", 3, 1, "added-later"));
-        let mut state = live_with(job);
+    fn a_stored_event_of_the_last_30_minutes_leads_the_line() {
+        // §5.3 rank 1, T4-30: in both modes, from the store; in live mode a later decision, a
+        // poll or a usage never replaces it (UX-3).
+        let row = hinted(&format!(" ⇄ 14:11  {SWITCHED}"), 80);
+        let mut timer = timer();
+        store(&mut timer, stored_switch("2026-09-21T14:11:20Z"));
+        assert_eq!(line(&timer, 80), row);
         assert_eq!(
-            line(&state, 80),
-            " ⇄ last switch Sat 15:38 · auto switched 3 a3 → 1 a1"
+            letters(&mut timer),
+            hinted_letters(&format!(" a mmmmm  {}", all(SWITCHED, 't')), 80)
         );
-        assert_eq!(
-            letters(&mut state),
-            format!(
-                " a {}{}",
-                all("last switch Sat 15:38 · ", 'm'),
-                all("auto switched 3 a3 → 1 a1", 't')
-            )
-        );
-    }
-
-    #[test]
-    fn a_poll_or_usage_never_replaces_a_recent_switch() {
-        // §5.3, UX-3: a switch of the last 30 minutes leads the line.
-        let mut state = live_with(with_switch("2026-09-21T14:11:20Z", 1, 2));
-        let before = line(&state, 80);
+        let mut live = live_with(auto_on());
+        store(&mut live, stored_switch("2026-09-21T14:11:20Z"));
+        assert_eq!(line(&live, 80), row);
         let poll = json!({"active": {"number": 2}, "headroomPct": {"2": 60.0}});
-        update(&mut state, auto("poll", poll), NOW_MS);
-        update(&mut state, usage(), NOW_MS);
-        update(&mut state, no_switch("cooldown", "4m"), NOW_MS);
-        assert_eq!(line(&state, 80), before);
+        update(&mut live, no_switch("cooldown", "4m"), NOW_MS);
+        update(&mut live, auto("poll", poll), NOW_MS);
+        update(&mut live, usage(), NOW_MS);
+        assert_eq!(line(&live, 80), row);
+        let said = said(&live, 80, NOW_MS).unwrap();
+        assert_eq!(
+            said.pin,
+            Some((at("2026-09-21T14:11:20Z"), EventKind::Switch)),
+            "w opens this event"
+        );
+    }
+
+    #[test]
+    fn a_decision_shows_without_a_recent_stored_event() {
+        // §5.3 rank 2, live mode only; timer mode reads the same store as rank 3.
+        let mut live = live_with(auto_on());
+        store(&mut live, stored_switch("2026-09-21T12:13:20Z"));
+        update(&mut live, no_switch("cooldown", "4m"), NOW_MS);
+        assert_eq!(
+            line(&live, 80),
+            hinted("   14:13  waiting 4m after the last switch", 80)
+        );
+        assert_eq!(said(&live, 80, NOW_MS).unwrap().pin, None, "w opens at now");
+        let mut timer = timer();
+        store(&mut timer, stored_switch("2026-09-21T12:13:20Z"));
+        assert_eq!(
+            line(&timer, 80),
+            hinted(&format!(" ⇄ last switch 12:13 · {SWITCHED}"), 80)
+        );
+        assert_eq!(
+            said(&timer, 80, NOW_MS).unwrap().pin,
+            Some((at("2026-09-21T12:13:20Z"), EventKind::Switch))
+        );
     }
 
     #[test]
     fn a_no_switch_shows_in_words_without_a_recent_switch() {
         let mut state = live_with(auto_on());
         update(&mut state, no_switch("cooldown", "4m"), NOW_MS);
-        assert_eq!(
-            line(&state, 80),
-            "   14:13  waiting 4m after the last switch"
-        );
+        let left = "   14:13  waiting 4m after the last switch";
+        assert_eq!(line(&state, 80), hinted(left, 80));
         let text = "waiting 4m after the last switch";
-        assert_eq!(letters(&mut state), format!("   mmmmm  {}", all(text, 't')));
+        assert_eq!(
+            letters(&mut state),
+            hinted_letters(&format!("   mmmmm  {}", all(text, 't')), 80)
+        );
         let poll = json!({"active": {"number": 1}, "headroomPct": {"1": 23}, "windowsPct": {"1": {"5h": 77.0}}});
         update(&mut state, auto("poll", poll), NOW_MS);
         update(&mut state, no_switch("below-threshold", ""), NOW_MS);
         assert_eq!(
             line(&state, 80),
-            "   14:13  no switch needed (77%, switches at 90%)"
+            hinted("   14:13  no switch needed (77%, switches at 90%)", 80)
         );
     }
 
@@ -378,13 +410,16 @@ mod tests {
         update(&mut state, no_switch("all-exhausted", ""), NOW_MS);
         assert_eq!(
             line(&state, 80),
-            " ✕ 14:13  every account is near its limit"
+            hinted(" ✕ 14:13  every account is near its limit", 80)
         );
         let reset = json!({"earliestResetAt": "2026-09-21T16:40:00Z"});
         update(&mut state, auto("all-exhausted", reset), NOW_MS);
         assert_eq!(
             line(&state, 80),
-            " ✕ 14:13  every account is near its limit; the first frees up at 16:40"
+            hinted(
+                " ✕ 14:13  every account is near its limit; the first frees up at 16:40",
+                80
+            )
         );
         assert_eq!(&letters(&mut state)[..3], " c ");
     }
@@ -395,13 +430,16 @@ mod tests {
         let mut state = live_with(auto_on());
         let error = json!({"message": "the store is locked", "transient": true});
         update(&mut state, auto("error", error), NOW_MS);
-        assert_eq!(line(&state, 80), " ! 14:13  the store is locked");
+        assert_eq!(
+            line(&state, 80),
+            hinted(" ! 14:13  the store is locked", 80)
+        );
         assert_eq!(&letters(&mut state)[..3], " w ");
         let warning = json!({"message": "unknown key autoswitch.treshold (ignored)"});
         update(&mut state, auto("config-warning", warning), NOW_MS);
         assert_eq!(
             line(&state, 80),
-            " ! 14:13  unknown key autoswitch.treshold (ignored)"
+            hinted(" ! 14:13  unknown key autoswitch.treshold (ignored)", 80)
         );
     }
 
@@ -416,21 +454,18 @@ mod tests {
         let mut job = auto_on();
         job.last_outcome = Some(outcome("no-switch", "cooldown", "2026-09-21T14:10:00Z"));
         let mut state = live_with(job.clone());
-        assert_eq!(line(&state, 80), "   14:10  waiting after the last switch");
+        let waiting = hinted("   14:10  waiting after the last switch", 80);
+        assert_eq!(line(&state, 80), waiting);
         let older = auto(
             "no-switch",
             json!({"reason": "below-threshold", "detail": "", "ts": "2026-09-21T14:05:00Z"}),
         );
         update(&mut state, older, NOW_MS);
-        assert_eq!(
-            line(&state, 80),
-            "   14:10  waiting after the last switch",
-            "an event older than the outcome"
-        );
+        assert_eq!(line(&state, 80), waiting, "an event older than the outcome");
         update(&mut state, no_switch("below-threshold", ""), NOW_MS);
         assert_eq!(
             line(&state, 80),
-            "   14:13  no switch needed (switches at 90%)"
+            hinted("   14:13  no switch needed (switches at 90%)", 80)
         );
         job.last_outcome = Some(outcome(
             "error",
@@ -439,51 +474,98 @@ mod tests {
         ));
         assert_eq!(
             line(&live_with(job.clone()), 80),
-            " ! 14:10  the store is locked"
+            hinted(" ! 14:10  the store is locked", 80)
         );
         for kind in ["switch", "collect"] {
             job.last_outcome = Some(outcome(kind, "x", "2026-09-21T14:10:00Z"));
             assert_eq!(
                 line(&live_with(job.clone()), 80),
-                "   no switches in the last 30 days",
+                hinted("   no switches in the last 30 days", 80),
                 "{kind} is no decision of rank 2"
             );
         }
     }
 
     #[test]
-    fn an_older_switch_reads_as_the_last_switch_with_its_day() {
-        let mut job = with_switch("2026-09-19T15:38:00Z", 3, 1);
-        let mut state = live_with(job.clone());
+    fn an_older_event_reads_as_the_last_switch_with_its_day() {
+        // §5.3 rank 3: a switch as `last switch {when} · …`, the lead muted and the words text;
+        // any other kind as rank 1 lays it out.
+        let mut state = timer();
+        store(&mut state, stored_switch("2026-09-19T15:38:00Z"));
+        let lead = "last switch Sat 15:38 · ";
         assert_eq!(
             line(&state, 120),
-            " ⇄ last switch Sat 15:38 · auto switched 3 a3 → 1 a1 (before it reached the limit)"
+            hinted(&format!(" ⇄ {lead}{SWITCHED}"), 120)
         );
-        job.last_switch = Some(switch("2026-09-13T15:38:00Z", 3, 1, "proactive"));
+        assert_eq!(
+            letters_at(&mut state, 120),
+            hinted_letters(&format!(" a {}{}", all(lead, 'm'), all(SWITCHED, 't')), 120)
+        );
+        store(&mut state, stored_switch("2026-09-13T15:38:00Z"));
         assert!(
-            line(&live_with(job), 120).starts_with(" ⇄ last switch Sep 13 15:38 · auto switched"),
+            line(&state, 120).starts_with(" ⇄ last switch Sep 13 15:38 · auto switched"),
+            "{}",
+            line(&state, 120)
         );
-        update(&mut state, no_switch("cooldown", "4m"), NOW_MS);
+        let mut refused = event_at(
+            at("2026-09-19T08:58:00Z"),
+            EventKind::Quarantine,
+            EventSource::Auto,
+        );
+        refused.to = Some(account_ref(3));
+        refused.detail = Some(json!({"reason": "invalid_grant"}));
+        let words = words::event(&refused, None);
+        assert!(words.starts_with("3 a3 needs a new login · "), "{words}");
+        store(&mut state, refused);
         assert_eq!(
             line(&state, 120),
-            "   14:13  waiting 4m after the last switch",
+            hinted(&format!(" ✕ Sat 08:58  {words}"), 120)
+        );
+        assert_eq!(&letters_at(&mut state, 120)[..3], " c ");
+        let mut live = live_with(auto_on());
+        store(&mut live, stored_switch("2026-09-19T15:38:00Z"));
+        update(&mut live, no_switch("cooldown", "4m"), NOW_MS);
+        assert_eq!(
+            line(&live, 120),
+            hinted("   14:13  waiting 4m after the last switch", 120),
             "a decision comes before an older switch"
         );
     }
 
     #[test]
-    fn with_nothing_live_mode_says_no_switches_in_the_last_30_days_and_timer_mode_nothing() {
-        // M-7: without the store, timer mode cannot know there were none, so rank 4's place
-        // stays empty there until T4; the row itself stays (UX-5).
-        let mut timer = fresh(Screen::Accounts);
-        timer.accounts.apply(snapshot(many(3)));
+    fn timer_mode_says_there_were_no_switches_when_the_store_has_none() {
+        // M-7 lifted (T4-30): the store says there were none, in timer and in live mode; the
+        // row stays empty only before the first snapshot.
+        let mut timer = timer();
         for w in [80, 120] {
-            assert_eq!(line(&timer, w), "", "timer mode at {w}");
+            assert_eq!(
+                line(&timer, w),
+                hinted("   no switches in the last 30 days", w),
+                "timer mode at {w}"
+            );
         }
-        assert_eq!(letters(&mut timer), "");
-        let mut live = live_with(with_switch("2026-08-21T14:00:00Z", 1, 2));
-        assert_eq!(line(&live, 80), "   no switches in the last 30 days");
-        assert_eq!(letters(&mut live), format!("   {}", all(NO_SWITCHES, 'm')));
+        assert_eq!(
+            letters(&mut timer),
+            hinted_letters(&format!("   {}", all(NO_SWITCHES, 'm')), 80)
+        );
+        assert_eq!(said(&timer, 80, NOW_MS).unwrap().pin, None);
+        let mut live = live_with(auto_on());
+        store(&mut live, stored_switch("2026-08-21T14:00:00Z"));
+        assert_eq!(
+            line(&live, 80),
+            hinted("   no switches in the last 30 days", 80),
+            "a switch older than 30 days"
+        );
+        assert_eq!(
+            letters(&mut live),
+            hinted_letters(&format!("   {}", all(NO_SWITCHES, 'm')), 80)
+        );
+        let empty = fresh(Screen::Accounts);
+        assert_eq!(line(&empty, 80), "", "before the first snapshot");
+        let mut linked = fresh(Screen::Accounts);
+        go_live(&mut linked, daemon_status(vec![auto_on()], vec![]));
+        update(&mut linked, no_switch("cooldown", "4m"), NOW_MS);
+        assert_eq!(line(&linked, 80), "", "live, before the first snapshot");
     }
 
     #[test]
@@ -493,13 +575,67 @@ mod tests {
         let state = live_with(job.clone());
         assert_eq!(
             line(&state, 120),
-            "   no switches in the last 30 days · next check 14:16"
+            hinted("   no switches in the last 30 days · next check 14:16", 120)
         );
-        assert_eq!(line(&state, 80), "   no switches in the last 30 days");
+        assert_eq!(
+            line(&state, 80),
+            hinted("   no switches in the last 30 days", 80)
+        );
         job.mode = Wire::from_wire("collect");
         assert_eq!(
             line(&live_with(job), 120),
-            "   no switches in the last 30 days"
+            hinted("   no switches in the last 30 days", 120)
+        );
+    }
+
+    #[test]
+    fn the_hint_s_w_is_accent_and_its_why_muted_in_every_tier() {
+        // §5.3's roles: `w` accent.
+        for theme in TIERS {
+            let mut state = timer();
+            state.theme = theme;
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            let row = roles(&buf, theme, 1);
+            // `w why` ends one column in: columns 74 to 78 of 80.
+            assert_eq!(&row[74..], canon(theme, "a mmm "), "{theme:?}");
+            assert_eq!(&text_of(&buf)[1][74..], HINT);
+        }
+    }
+
+    /// The auto line drawn alone, `width` wide, as text.
+    fn alone(state: &State, width: u16) -> String {
+        crate::chrome::auto_line(state, width, NOW_MS)
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_narrow_line_cuts_the_sentence_and_keeps_the_hint_whole() {
+        // The sentence gives way first; the hint is never cut.
+        let mut state = timer();
+        store(&mut state, stored_switch("2026-09-21T14:11:20Z"));
+        // 40 columns leave the left part 40 − 5 − 3 − 1 = 31.
+        let left = crate::view::fit(&format!(" ⇄ 14:11  {SWITCHED}…"), 31);
+        assert!(left.ends_with('…'), "{left}");
+        assert_eq!(alone(&state, 40), format!("{left}   {HINT}"));
+    }
+
+    #[test]
+    fn a_very_narrow_line_drops_the_hint() {
+        // The hint goes only when keeping it would leave the left part under 16 columns: at 25
+        // columns it keeps 16, at 24 it would keep 15.
+        let mut state = timer();
+        store(&mut state, stored_switch("2026-09-21T14:11:20Z"));
+        let kept = alone(&state, 25);
+        assert!(kept.ends_with(&format!("   {HINT}")), "{kept:?}");
+        assert_eq!(crate::view::width_of(&kept), 24, "ending one column in");
+        let dropped = alone(&state, 24);
+        assert!(!dropped.contains(HINT), "{dropped:?}");
+        assert_eq!(
+            dropped,
+            crate::view::fit(&format!(" ⇄ 14:11  {SWITCHED}…"), 24)
         );
     }
 
@@ -512,7 +648,7 @@ mod tests {
         other.row.id = tagteam_core::AccountId::from_string("fake-1");
         let mut snap = snapshot(many(3));
         snap.providers.push(ProviderAccounts {
-            provider: fake,
+            provider: fake.clone(),
             active_position: None,
             forecast: tagteam_engine::views::forecast_of(
                 std::slice::from_ref(&other),
@@ -529,34 +665,41 @@ mod tests {
             models: vec![],
             live: tagteam_engine::switch::LiveLogin::None,
         });
+        let mut refused = event_at(
+            at("2026-09-21T14:12:00Z"),
+            EventKind::Quarantine,
+            EventSource::Daemon,
+        );
+        refused.to = Some(tagteam_engine::timeline::AccountRef {
+            id: tagteam_core::AccountId::from_string("fake-1"),
+            position: Some(1),
+            alias: None,
+            email: Some("f@x.co".into()),
+            removed: false,
+        });
+        snap.last_auto = vec![
+            (cc(), stored_switch("2026-09-21T14:11:20Z")),
+            (fake, refused),
+        ];
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snap);
-        let jobs = vec![
-            with_switch("2026-09-21T14:11:20Z", 1, 2),
-            daemon_job("fake-agent", "auto", true),
-        ];
-        go_live(&mut state, daemon_status(jobs, vec![]));
-        let fake_said = auto_of(
-            "fake-agent",
-            "no-switch",
-            json!({"reason": "no-active-account", "detail": ""}),
+        assert_eq!(
+            line(&state, 80),
+            hinted(&format!(" ⇄ 14:11  {SWITCHED}"), 80)
         );
-        update(&mut state, fake_said, NOW_MS);
-        assert!(line(&state, 80).starts_with(" ⇄ 14:11  auto switched 1 a1 → 2 a2"));
         for _ in 0..3 {
             update(&mut state, ch('j'), NOW_MS);
         }
         assert_eq!(
             line(&state, 80),
-            "   14:13  FakeAgent isn't logged in",
-            "the fake account's provider, in its own name"
+            hinted(&format!(" ✕ 14:12  1 f {}", words::NEEDS_LOGIN), 80),
+            "the fake account's provider's stored event"
         );
     }
 
     #[test]
     fn times_read_hh_mm_today_the_weekday_this_week_and_the_date_before() {
         // T2-24, from Monday 2026-09-21 14:13:20 UTC.
-        let at = |iso: &str| iso.parse::<Timestamp>().unwrap().as_millisecond();
         let utc = TimeZone::UTC;
         for (iso, want) in [
             ("2026-09-21T14:11:00Z", "14:11"),
@@ -583,10 +726,8 @@ mod tests {
         let mut state = live_with(auto_on());
         let at_14_04 = json!({"reason": "cooldown", "detail": "4m", "ts": "2026-09-21T14:04:00Z"});
         update(&mut state, auto("no-switch", at_14_04), NOW_MS);
-        assert_eq!(
-            line(&state, 80),
-            "   14:04  waiting 4m after the last switch"
-        );
+        let waiting = hinted("   14:04  waiting 4m after the last switch", 80);
+        assert_eq!(line(&state, 80), waiting);
         let unknown = Msg::Live(Live::Event(Event::Unknown {
             kind: "added-later".into(),
             raw: json!({"event": "added-later"}),
@@ -622,10 +763,7 @@ mod tests {
             no_switch("a-reason-added-later", ""),
         ] {
             update(&mut state, other, NOW_MS);
-            assert_eq!(
-                line(&state, 80),
-                "   14:04  waiting 4m after the last switch"
-            );
+            assert_eq!(line(&state, 80), waiting);
         }
         let mut raw = json!({"event": "error", "provider": "claude-code", "message": "x"});
         raw.as_object_mut().unwrap().remove("ts");
@@ -635,15 +773,20 @@ mod tests {
             raw,
         }));
         update(&mut state, untimed, NOW_MS);
-        assert_eq!(line(&state, 80), " ! 14:13  x", "now, without a ts");
+        assert_eq!(
+            line(&state, 80),
+            hinted(" ! 14:13  x", 80),
+            "now, without a ts"
+        );
         update(&mut state, Msg::Live(Live::Down), NOW_MS);
-        assert_eq!(line(&state, 80), "", "timer mode: empty until T4 (M-7)");
+        let none = hinted("   no switches in the last 30 days", 80);
+        assert_eq!(line(&state, 80), none, "timer mode: rank 4 (M-7 lifted)");
         go_live(&mut state, daemon_status(vec![auto_on()], vec![]));
         update(&mut state, no_switch("cooldown", "4m"), NOW_MS);
         go_live(&mut state, daemon_status(vec![auto_on()], vec![]));
         assert_eq!(
             line(&state, 80),
-            "   no switches in the last 30 days",
+            none,
             "a new link starts with none of the last one's, even with no Down between"
         );
     }
@@ -668,7 +811,11 @@ mod tests {
         ] {
             let mut state = live_with(auto_on());
             update(&mut state, no_switch(reason, detail), NOW_MS);
-            assert_eq!(line(&state, 80), format!("   14:13  {words}"), "{reason}");
+            assert_eq!(
+                line(&state, 80),
+                hinted(&format!("   14:13  {words}"), 80),
+                "{reason}"
+            );
         }
     }
 
@@ -684,7 +831,7 @@ mod tests {
         update(&mut state, no_switch("below-threshold", ""), NOW_MS);
         assert_eq!(
             line(&state, 80),
-            "   14:13  no switch needed (switches at 90%)",
+            hinted("   14:13  no switch needed (switches at 90%)", 80),
             "the poll was the last link's"
         );
     }

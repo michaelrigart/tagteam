@@ -49,7 +49,7 @@ pub(super) fn window(
 }
 
 /// `e` in plain words (§11.4), `all-exhausted`'s earliest reset in the TUI's clock form (T4-29).
-fn sentence(e: &EventView, tz: &TimeZone) -> String {
+pub(crate) fn sentence(e: &EventView, tz: &TimeZone) -> String {
     let frees_at = e
         .detail
         .as_ref()

@@ -190,6 +190,7 @@ pub(crate) fn snapshot(accounts: Vec<AccountView>) -> AccountsSnapshot {
         read_at_s: NOW_S,
         auto_holders: vec![],
         config_mtime: None,
+        last_auto: vec![],
     }
 }
 

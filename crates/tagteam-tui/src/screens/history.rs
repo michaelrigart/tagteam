@@ -30,8 +30,8 @@ use crate::view::{body_at, centered, centred_block, fit, width_of};
 mod chart;
 mod lanes;
 mod layout;
-mod list;
-mod marks;
+pub(crate) mod list;
+pub(crate) mod marks;
 
 /// T4-21: drawn under the scope row until the first view of a scope and range arrives.
 const LOADING: &str = "loading…";
@@ -116,6 +116,10 @@ pub(crate) enum Cursor {
 enum Place {
     /// On open, a scope change or a range change: the newest auto-line event, else now.
     Open,
+    /// `w` on ranks 1 and 3: the auto line's event, else the newest at or before it.
+    Event { at_ms: i64, kind: EventKind },
+    /// `w` on ranks 2 and 4.
+    Now,
 }
 
 pub struct HistoryState {
@@ -189,7 +193,9 @@ impl HistoryState {
     }
 
     /// The new view's cursor and selection (T4-15): placed on the newest auto-line event, else
-    /// now, after an open, a scope or a range change; else kept, the selection read from it.
+    /// now, after an open, a scope or a range change; through `w`, on the auto line's event (the
+    /// first with its time and kind, else the newest at or before it) or at now; else kept, the
+    /// selection read from it.
     fn place(&mut self) {
         let Some(view) = &self.view else {
             return;
@@ -212,6 +218,23 @@ impl HistoryState {
                         self.selected = at_or_before(view, Cursor::Now);
                     }
                 }
+            }
+            Some(Place::Event { at_ms, kind }) => {
+                self.list_from = 0;
+                self.cursor = Cursor::At(at_ms);
+                let exact = view
+                    .events
+                    .iter()
+                    .position(|e| e.at_ms == at_ms && e.kind == kind);
+                self.selected = match exact {
+                    Some(j) => Some(len - 1 - j),
+                    None => at_or_before(view, self.cursor),
+                };
+            }
+            Some(Place::Now) => {
+                self.list_from = 0;
+                self.cursor = Cursor::Now;
+                self.selected = at_or_before(view, Cursor::Now);
             }
             None => self.selected = at_or_before(view, self.cursor),
         }
@@ -417,6 +440,32 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     state.history.resized_ms = None;
     state.history.paced_due_ms = None;
     reload(state, now_ms).into_iter().collect()
+}
+
+/// `w` (C-4): History at the auto line's event, or at now (§5.3, T4-15, T4-16). The scope
+/// becomes all accounts; the range changes only when it does not hold the event, to the
+/// shortest that does. The cursor is placed once the view it reads arrives.
+pub(crate) fn why(state: &mut State, now_ms: i64) -> Vec<Cmd> {
+    let pin = autoline::said(state, state.size.0, now_ms).and_then(|said| said.pin);
+    state.history.set_scope(Scope::All);
+    let now_s = now_ms.div_euclid(1000);
+    let h = &mut state.history;
+    if let Some((at_ms, _)) = pin
+        && h.since_s(now_s) * 1000 > at_ms
+    {
+        let holds = |r: &Range| (now_s - r.days() * 86_400) * 1000 <= at_ms;
+        h.range = Range::ALL.into_iter().find(holds).unwrap_or(Range::Month);
+        h.view = None;
+    }
+    let mut cmds = update::show(state, Screen::History, now_ms);
+    if cmds.is_empty() {
+        cmds.extend(reload(state, now_ms));
+    }
+    state.history.place = Some(match pin {
+        Some((at_ms, kind)) => Place::Event { at_ms, kind },
+        None => Place::Now,
+    });
+    cmds
 }
 
 /// `⏎` on Accounts: History, scoped to `account` (§7.2), opened from Accounts (T4-17).
@@ -2107,5 +2156,100 @@ mod tests {
                 80
             )
         );
+    }
+
+    /// Accounts once the first read arrived, `stored` Claude Code's last auto-line event.
+    fn accounts_with(stored: Option<EventView>) -> State {
+        let mut state = fresh(Screen::Accounts);
+        state.start();
+        let mut snap = snapshot(many(3));
+        snap.last_auto = stored.into_iter().map(|e| (cc(), e)).collect();
+        let result = Ok(snap);
+        update(&mut state, Msg::Accounts { r#gen: 1, result }, NOW_MS);
+        state
+    }
+
+    #[test]
+    fn w_opens_history_at_the_auto_line_s_event_widening_the_range() {
+        // §5.3, T4-15, T4-16: all accounts; the range widened only when it does not hold the
+        // event, to the shortest that does; the cursor on the event once its view arrives.
+        const DAY_MS: i64 = 86_400_000;
+        let old = switch_at(NOW_MS - 10 * DAY_MS);
+        let mut state = accounts_with(Some(old.clone()));
+        let cmds = update(&mut state, ch('w'), NOW_MS);
+        assert_eq!(state.screen, Screen::History);
+        let r#gen = state.gens.history;
+        assert_eq!(cmds, [read_of(r#gen, Scope::All, NOW_S - 14 * 86_400, 70)]);
+        assert_eq!(scope_row(&state).split("   ").nth(1), Some("[ ] 14 days"));
+        let older = of_three(NOW_MS - 12 * DAY_MS, EventKind::Add);
+        let refused = of_three(NOW_MS - DAY_MS, EventKind::Quarantine);
+        let added = of_three(NOW_MS - 3_600_000, EventKind::Add);
+        let events = vec![older, old.clone(), refused.clone(), added];
+        arrived(&mut state, with(drawn(70), events.clone()));
+        assert_eq!(state.history.cursor, Cursor::At(old.at_ms));
+        assert_eq!(
+            state.history.selected,
+            Some(2),
+            "the switch's row, not the newer quarantine opening would pick"
+        );
+        // Two days old: the 7 days hold it.
+        let recent = switch_at(NOW_MS - 2 * DAY_MS);
+        let mut state = accounts_with(Some(recent.clone()));
+        let cmds = update(&mut state, ch('w'), NOW_MS);
+        let r#gen = state.gens.history;
+        assert_eq!(cmds, [read_of(r#gen, Scope::All, NOW_S - WEEK, 70)]);
+        // Not in the view as stored: the newest event at or before it.
+        let before = of_three(NOW_MS - 3 * DAY_MS, EventKind::Add);
+        let after = of_three(NOW_MS - DAY_MS, EventKind::Quarantine);
+        arrived(&mut state, with(drawn(70), vec![before, after]));
+        assert_eq!(state.history.cursor, Cursor::At(recent.at_ms));
+        assert_eq!(state.history.selected, Some(1), "the add before it");
+        // From a History scoped to an account at 30 days: all accounts, the range kept.
+        update(&mut state, ch(']'), NOW_MS);
+        update(&mut state, ch(']'), NOW_MS);
+        update(&mut state, ch('f'), NOW_MS);
+        update(&mut state, ch('1'), NOW_MS);
+        assert_eq!(state.history.scope, Scope::Account(id(1)));
+        let cmds = update(&mut state, ch('w'), NOW_MS);
+        let r#gen = state.gens.history;
+        assert_eq!(cmds, [read_of(r#gen, Scope::All, NOW_S - 30 * 86_400, 70)]);
+        assert_eq!(state.screen, Screen::History);
+    }
+
+    #[test]
+    fn w_without_a_stored_event_puts_the_cursor_at_now() {
+        // §5.3: rank 2 (a live decision) or rank 4 (nothing stored) opens at now.
+        let mut state = accounts_with(None);
+        let cmds = update(&mut state, ch('w'), NOW_MS);
+        let r#gen = state.gens.history;
+        assert_eq!(cmds, [read_of(r#gen, Scope::All, NOW_S - WEEK, 70)]);
+        arrived(&mut state, with(drawn(70), three_events()));
+        assert_eq!(state.history.cursor, Cursor::Now);
+        assert_eq!(cursor_said(&state), "now");
+        assert_eq!(
+            state.history.selected,
+            Some(0),
+            "the newest, at or before now"
+        );
+        let mut state = accounts_with(Some(switch_at(NOW_MS - 2 * 86_400_000)));
+        go_live(
+            &mut state,
+            daemon_status(vec![daemon_job("claude-code", "auto", true)], vec![]),
+        );
+        let cooldown = serde_json::json!({
+            "schemaVersion": 1, "event": "no-switch", "ts": "2026-09-21T14:13:20Z",
+            "provider": "claude-code", "reason": "cooldown", "detail": "4m",
+        });
+        let decided = Msg::Live(crate::live::Live::Event(
+            tagteam_daemon::protocol::Event::Auto {
+                kind: "no-switch".into(),
+                provider: "claude-code".into(),
+                raw: cooldown,
+            },
+        ));
+        update(&mut state, decided, NOW_MS);
+        update(&mut state, ch('w'), NOW_MS);
+        arrived(&mut state, with(drawn(70), three_events()));
+        assert_eq!(cursor_said(&state), "now", "rank 2");
     }
 }

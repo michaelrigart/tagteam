@@ -2084,7 +2084,7 @@ mod tests {
             "{lines:?}"
         );
         assert!(lines[1].starts_with(" ! 14:04  xxx"), "{lines:?}");
-        assert!(lines[1].ends_with('…'), "{lines:?}");
+        assert!(lines[1].ends_with("…   w why"), "{lines:?}");
         assert!(
             lines[2..5]
                 .iter()

@@ -82,7 +82,9 @@ pub(crate) fn header(state: &State, width: u16) -> Line<'static> {
 
 /// The auto line (§5.3): ` {mark} {when}  {text}`, with no `when` ` {mark} {text}`, then
 /// ` · next check HH:MM`; the mark in its role, the time, rank 3's `last switch … · ` and the
-/// suffix muted, cut to `width`. Empty when there is nothing to say (M-7): the row stays.
+/// suffix muted. On the right, ending one column in, `w why`, `w` accent: never cut, it is
+/// dropped only when it would leave the rest under `lead::LEFT_LEAST` columns (T3-19's rule),
+/// and the rest is cut to the room it leaves. Empty before the first snapshot: the row stays.
 pub(crate) fn auto_line(state: &State, width: u16, now_ms: i64) -> Line<'static> {
     let theme = state.theme;
     let Some(said) = autoline::said(state, width, now_ms) else {
@@ -106,7 +108,23 @@ pub(crate) fn auto_line(state: &State, width: u16, now_ms: i64) -> Line<'static>
     if let Some(next) = said.next {
         spans.push(Span::styled(format!(" · {next}"), theme.role(Role::Muted)));
     }
-    Line::from(fit_spans(spans, usize::from(width)))
+    let width = usize::from(width);
+    let hint = vec![
+        Span::styled("w", theme.role(Role::Accent)),
+        Span::styled(" why", theme.role(Role::Muted)),
+    ];
+    let hint_w = spans_width(&hint);
+    let Some(room) = width
+        .checked_sub(hint_w + lead::PICK_GAP + keys::RIGHT_INSET)
+        .filter(|&room| room >= lead::LEFT_LEAST)
+    else {
+        return Line::from(fit_spans(spans, width));
+    };
+    let mut spans = fit_spans(spans, room);
+    let gap = width - keys::RIGHT_INSET - hint_w - spans_width(&spans);
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(hint);
+    Line::from(spans)
 }
 
 /// §5.4's Now strip for focus's provider (T3-24): on Tokens and History only.
@@ -504,7 +522,7 @@ mod tests {
     use ratatui::style::{Color, Modifier};
     use tagteam_core::ProviderId;
     use tagteam_core::autoswitch::AutoStrategy;
-    use tagteam_daemon::protocol::{Event, Status, StatusBackoff, StatusSwitch, Wire};
+    use tagteam_daemon::protocol::{Event, Status, StatusBackoff, Wire};
     use tagteam_engine::views::{AccountView, UsageStatus};
 
     use super::*;
@@ -1611,31 +1629,40 @@ mod tests {
     #[test]
     fn every_screen_s_chrome_in_each_tier() {
         // The header, the auto line and (at 120×40) the rule, in their roles, on every screen:
-        // in timer mode, and in live mode with a recent switch and the next check.
+        // in timer mode and in live mode, with a stored switch of the last 30 minutes (T4-30)
+        // and, live, the next check.
         let mut job = daemon_job("claude-code", "auto", true);
-        job.last_switch = Some(StatusSwitch {
-            at: "2026-09-21T14:11:20Z".into(),
-            from: 1,
-            to: 2,
-            trigger: Wire::from_wire("proactive"),
-        });
         job.next_tick_at = Some("2026-09-21T14:16:00Z".into());
         let timer_state = [("○", 'm'), (" auto off", 't'), (" · no daemon", 'm')];
-        // M-7: timer mode's auto line is empty until T4 reads the store.
-        let timer_line = String::new();
+        let text = "auto switched 1 a1 → 2 a2 · a1's 5h reached 93%";
+        let auto_line = |width: usize, next: bool| {
+            let mut line = vec![(" ", ' '), ("⇄", 'a'), (" ", ' ')];
+            line.extend([("14:11", 'm'), ("  ", ' '), (text, 't')]);
+            if next {
+                line.push((" · next check 14:16", 'm'));
+            }
+            let left = width_of(&line.iter().map(|(t, _)| *t).collect::<String>());
+            let gap = " ".repeat(width - 1 - 5 - left);
+            let mut letters = spell(&line);
+            letters.push_str(&gap);
+            letters.push_str("a mmm");
+            letters
+        };
         for theme in TIERS {
             for screen in [Screen::Accounts, Screen::Tokens, Screen::History] {
                 for (w, h) in [(80, 24), (120, 40)] {
                     let mut state = fresh(screen);
                     state.theme = theme;
-                    state.accounts.apply(snapshot(many(2)));
+                    let mut snap = snapshot(many(2));
+                    snap.last_auto = vec![(cc(), stored_switch())];
+                    state.accounts.apply(snap);
                     let width = usize::from(w);
                     let buf = draw_buffer(&state, w, h, NOW_MS);
                     let want = header_letters(screen, width, &timer_state);
                     assert_eq!(roles(&buf, theme, 0), canon(theme, &want), "{screen:?}");
                     assert_eq!(
                         roles(&buf, theme, 1).trim_end(),
-                        canon(theme, &timer_line),
+                        canon(theme, &auto_line(width, false)),
                         "{screen:?} {w}"
                     );
                     if h >= RULE_FROM {
@@ -1653,21 +1680,30 @@ mod tests {
                     };
                     let want = header_letters(screen, width, live_state);
                     assert_eq!(roles(&buf, theme, 0), canon(theme, &want), "{screen:?}");
-                    let text = "auto switched 1 a1 → 2 a2 (before it reached the limit)";
-                    let mut line = vec![(" ", ' '), ("⇄", 'a'), (" ", ' ')];
-                    line.extend([("14:11", 'm'), ("  ", ' '), (text, 't')]);
-                    if w >= WIDE {
-                        line.push((" · next check 14:16", 'm'));
-                    }
                     assert_eq!(
                         roles(&buf, theme, 1).trim_end(),
-                        canon(theme, &spell(&line)),
+                        canon(theme, &auto_line(width, w >= WIDE)),
                         "{screen:?} {w}"
                     );
                 }
             }
         }
     }
+
+    /// Auto's switch 1 → 2 stored at 14:11:20, as a1's 5h reached 93%.
+    fn stored_switch() -> tagteam_engine::timeline::EventView {
+        use tagteam_engine::{EventKind, EventSource};
+        let at = NOW_MS - 120_000;
+        let mut e = crate::screens::history::event_at(at, EventKind::Switch, EventSource::Auto);
+        e.trigger = Some("proactive".into());
+        e.from = Some(crate::screens::history::account_ref(1));
+        e.to = Some(crate::screens::history::account_ref(2));
+        e.detail = Some(
+            serde_json::json!({"window": "5h", "label": "5h", "pct": 93.0, "threshold": 90.0}),
+        );
+        e
+    }
+
     /// Row `y` of `state` drawn at `w` columns, and its role letters under `theme`.
     fn footer_of(state: &State, w: u16, theme: Theme) -> (String, String) {
         let h = if w >= WIDE { 40 } else { 24 };

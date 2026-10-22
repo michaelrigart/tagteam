@@ -270,6 +270,7 @@ fn on_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
             state.overlay = Some(Overlay::Help { scroll: 0 });
             vec![]
         }
+        KeyCode::Char('w') => screens::history::why(state, now_ms),
         // Right after an overlay closed, a repeated action key must not act (§9.5, T2-18).
         KeyCode::Char('s' | 'b' | 'n' | 'e' | 'a' | 'm' | 'x' | 'R' | 'P' | 'A' | 'D' | 'r')
             if now_ms < state.guard_until_ms =>
