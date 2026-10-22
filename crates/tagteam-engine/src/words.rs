@@ -10,6 +10,7 @@ use tagteam_provider::TransientKind;
 
 use crate::failure::FailureKind;
 use crate::store::AccountRow;
+use crate::timeline::AccountRef;
 use crate::tokens::TokenReport;
 use crate::views::{AccountView, HistoryWindow, NO_DATA, ProviderNames, UsageStatus, UsageView};
 
@@ -29,6 +30,8 @@ pub const IN_SESSION: &str = "▶";
 pub const THIS: &str = "this";
 /// `list` always has a spend column once any account has a reading (§13.1).
 pub const SPEND_HEAD: &str = "SPEND";
+/// An account with neither a place nor a label left to name it by (T4-28).
+const AN_ACCOUNT: &str = "an account";
 /// A projection further out than this is not worth a countdown: it will not run out.
 const A_YEAR_S: i64 = 365 * 86_400;
 
@@ -534,6 +537,18 @@ pub fn trigger(trigger: Trigger) -> &'static str {
 pub fn short_name(position: u32, alias: Option<&str>, email_or_label: &str) -> String {
     let name = alias.unwrap_or_else(|| email_or_label.split('@').next().unwrap_or(email_or_label));
     format!("{position} {name}")
+}
+
+/// An account as the timeline names it (T4-28): `short_name` while it is current, its stored
+/// label once removed, else `an account`.
+pub fn account_name(r: &AccountRef) -> String {
+    match (r.position, r.email.as_deref()) {
+        (Some(position), email) if !r.removed => {
+            short_name(position, r.alias.as_deref(), email.unwrap_or_default())
+        }
+        (_, Some(label)) if r.removed => label.to_owned(),
+        _ => AN_ACCOUNT.to_owned(),
+    }
 }
 
 /// What needs attention on an account (redesign §6.3, §11.2, T3-11).
@@ -1701,6 +1716,26 @@ mod tests {
         assert_eq!(short_name(2, Some("work"), "sam@corp.example"), "2 work");
         assert_eq!(short_name(1, None, "alex@example.com"), "1 alex");
         assert_eq!(short_name(3, None, "ci-label"), "3 ci-label");
+    }
+
+    #[test]
+    fn an_account_is_named_by_position_and_alias_or_by_its_stored_label() {
+        let named = |position, alias: Option<&str>, email: Option<&str>| {
+            account_name(&AccountRef {
+                id: AccountId::from_string("id-1"),
+                position,
+                alias: alias.map(str::to_owned),
+                email: email.map(str::to_owned),
+                removed: position.is_none(),
+            })
+        };
+        assert_eq!(named(Some(1), None, Some("alex@example.com")), "1 alex");
+        assert_eq!(
+            named(Some(2), Some("work"), Some("sam@corp.example")),
+            "2 work"
+        );
+        assert_eq!(named(None, None, Some("ci@example.com")), "ci@example.com");
+        assert_eq!(named(None, None, None), "an account");
     }
 
     const NAMES: ProviderNames = ProviderNames {

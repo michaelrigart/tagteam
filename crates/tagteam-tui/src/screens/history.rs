@@ -9,9 +9,9 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_engine::timeline::{Scope, TimelineView};
+use tagteam_engine::timeline::{AccountRef, Scope, TimelineView};
+use tagteam_engine::words;
 
-use crate::autoline;
 use crate::chrome::{WIDE, fit_spans};
 use crate::daemon;
 use crate::keys::RIGHT_INSET;
@@ -22,14 +22,16 @@ use crate::theme::Role;
 use crate::update;
 use crate::view::{centered, centred_block, fit, width_of};
 
+mod chart;
+mod lanes;
+mod layout;
+
 /// T4-21: drawn under the scope row until the first view of a scope and range arrives.
 const LOADING: &str = "loading…";
 /// The empty state's sentence (§5.7), left out at 30 days.
 const LONGER: &str = "[ ] picks a longer range.";
 /// The scope row's name for every account (§7.2).
 const ALL_ACCOUNTS: &str = "all accounts";
-/// A scoped account the accounts view no longer lists.
-const AN_ACCOUNT: &str = "an account";
 /// The ranges, muted beside the current one from `WIDE` columns (§7.2).
 const CHOICES: &str = "1 · 7 · 14 · 30";
 /// Between the scope row's groups (§4.3's group gap).
@@ -37,7 +39,7 @@ const GAP: &str = "   ";
 /// T4-19: a resize re-reads the timeline this long after the last one.
 pub(crate) const RESIZE_DEBOUNCE_MS: i64 = 250;
 /// T4-10: the marker column, the 8-column gutter, and the column kept at the right.
-const CHART_MARGIN: u16 = 10;
+const CHART_MARGIN: u16 = layout::CHART_X + 1;
 
 /// The ranges `[` and `]` cycle through (§7.2); 7 days is `history`'s default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -214,8 +216,8 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
     reload(state, now_ms).into_iter().collect()
 }
 
-/// The scope row, then `loading…` before a view, or the empty state when nothing is in range
-/// (T4-21).
+/// The scope row, then `loading…` before a view, the empty state when nothing is in range
+/// (T4-21), or the charts, the lanes and the axis in their rows (T4-8).
 pub fn render(state: &State, frame: &mut Frame, area: Rect, _now_ms: i64) {
     if area.is_empty() {
         return;
@@ -236,8 +238,55 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, _now_ms: i64) {
             let sentence = (h.range != Range::Month).then_some(LONGER);
             centred_block(frame, under, &h.range.nothing(), sentence, state.theme);
         }
-        Some(_) => {}
+        Some(view) => draw_view(state, frame, view, area),
     }
+}
+
+/// The cursor's column: the last, now's, until the cursor moves.
+fn cursor_column(view: &TimelineView) -> usize {
+    view.columns.saturating_sub(1)
+}
+
+/// `view`'s charts under their titles, its lanes, the more row and the axis (T4-8 to T4-12).
+/// A view read at another width is drawn from the left and clipped until its re-read (T4-19).
+fn draw_view(state: &State, frame: &mut Frame, view: &TimelineView, body: Rect) {
+    let theme = state.theme;
+    let h = &state.history;
+    let all = h.scope == Scope::All;
+    let at = layout::layout(view, &h.scope, body, frame.area().height, 0);
+    let line_pct = if all {
+        view.threshold
+    } else {
+        chart::ONE_ACCOUNT_LINE
+    };
+    let cursor = cursor_column(view);
+    for (i, rect) in &at.charts {
+        let series = &view.charts[*i];
+        let mut lines = vec![chart::title_row(state, series, all, body.width)];
+        let rows = rect.height.saturating_sub(1);
+        lines.extend(chart::chart_rows(
+            &series.peaks,
+            rows,
+            line_pct,
+            cursor,
+            theme,
+        ));
+        frame.render_widget(Paragraph::new(lines), *rect);
+    }
+    for (i, rect) in &at.lanes {
+        let lane = &view.lanes[*i];
+        let line = if all {
+            lanes::lane_row(lane, theme)
+        } else {
+            lanes::in_use_row(lane, theme)
+        };
+        frame.render_widget(Paragraph::new(line), *rect);
+    }
+    if let Some((rect, n)) = at.more {
+        frame.render_widget(Paragraph::new(lanes::more_row(n, theme)), rect);
+    }
+    let axis = lanes::axis_row(view.grid(), h.range.days(), state.tokens.tz(), theme);
+    frame.render_widget(Paragraph::new(axis), at.axis);
 }
 
 /// No lanes and no chart value (T4-21).
@@ -284,17 +333,33 @@ fn scope_line(state: &State, width: u16) -> Line<'static> {
     Line::from(fit_spans(left, usize::from(width)))
 }
 
-/// `all accounts`, or the scoped account's short name in focus's accounts (§7.2).
+/// `all accounts`, or the scoped account named as the timeline names it (§7.2, T4-28): by
+/// its short name while focus's accounts list it.
 fn scope_name(state: &State) -> String {
     let Scope::Account(id) = &state.history.scope else {
         return ALL_ACCOUNTS.to_owned();
     };
     let view = state.view_of(&daemon::focus(state));
-    view.and_then(|v| v.accounts.iter().find(|a| &a.row.id == id))
-        .map_or_else(
-            || AN_ACCOUNT.to_owned(),
-            |a| autoline::named(view, a.row.position),
-        )
+    let row = view
+        .and_then(|v| v.accounts.iter().find(|a| &a.row.id == id))
+        .map(|a| &a.row);
+    words::account_name(&AccountRef {
+        id: id.clone(),
+        position: row.map(|r| r.position),
+        alias: row.and_then(|r| r.alias.clone()),
+        email: row.map(words::email),
+        removed: row.is_none(),
+    })
+}
+
+/// `lines` drawn by a `Paragraph` on a buffer `width` wide and as tall as they are.
+#[cfg(test)]
+fn buffer_of(lines: Vec<Line<'static>>, width: u16) -> ratatui::buffer::Buffer {
+    use ratatui::widgets::Widget;
+    let area = Rect::new(0, 0, width, u16::try_from(lines.len()).unwrap_or(u16::MAX));
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    Paragraph::new(lines).render(area, &mut buf);
+    buf
 }
 
 #[cfg(test)]
@@ -700,5 +765,128 @@ mod tests {
         let buf = draw_buffer(&state, 80, 24, NOW_MS);
         let (_, y) = locate(&buf, "loading…").unwrap();
         assert_eq!(roles(&buf, theme, y).trim(), canon(theme, &"m".repeat(8)));
+    }
+
+    /// Every account's three lanes in use throughout, and the in-use chart, over `columns`
+    /// columns: each column's peak its index, up to 99.
+    fn drawn(columns: usize) -> TimelineView {
+        let peaks: Vec<Option<f64>> = (0..columns).map(|c| Some((c % 100) as f64)).collect();
+        let chart = Series {
+            label: IN_USE.into(),
+            peaks: peaks.clone(),
+        };
+        let lanes = (1..=3)
+            .map(|p| lane_of(p, peaks.clone(), vec![true; columns]))
+            .collect();
+        timeline_view(columns, vec![chart], lanes)
+    }
+
+    fn text(line: Line<'_>) -> String {
+        line.to_string().trim_end().to_owned()
+    }
+
+    #[test]
+    fn history_draws_its_chart_lanes_and_axis_in_their_rows() {
+        let utc = jiff::tz::TimeZone::UTC;
+        for theme in TIERS {
+            // Width, height, columns; the title's row, the chart's rows, the first lane's row
+            // and the axis's row, in the body.
+            for (w, h, columns, title, rows, lane, axis) in [
+                (80, 24, 70, 1, 2..=10, 12, 15),
+                (120, 40, 110, 2, 3..=14, 16, 19),
+            ] {
+                let (mut state, _) = opened(3);
+                state.theme = theme;
+                let view = drawn(columns);
+                arrived(&mut state, view.clone());
+                let body = body_of(&state, w, h, NOW_MS);
+                let series = &view.charts[0];
+                assert_eq!(
+                    body[title],
+                    text(chart::title_row(&state, series, true, w)),
+                    "{w}×{h}"
+                );
+                assert!(body[title].starts_with(" in use"), "{body:?}");
+                let n = u16::try_from(rows.clone().count()).unwrap();
+                let chart = chart::chart_rows(&series.peaks, n, 90.0, columns - 1, theme);
+                assert_eq!(
+                    body[rows],
+                    chart.into_iter().map(text).collect::<Vec<_>>(),
+                    "{w}×{h}"
+                );
+                for (i, name) in [" 1 a1 ", " 2 a2 ", " 3 a3 "].into_iter().enumerate() {
+                    assert!(body[lane + i].starts_with(name), "{body:?}");
+                    assert_eq!(body[lane + i], text(lanes::lane_row(&view.lanes[i], theme)));
+                }
+                assert_eq!(
+                    body[axis],
+                    text(lanes::axis_row(view.grid(), 7, &utc, theme)),
+                    "{w}×{h}"
+                );
+                assert!(body[axis].ends_with("now"), "{body:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn lanes_past_the_cap_leave_a_more_row() {
+        let (mut state, _) = opened(3);
+        let lanes = (1..=12)
+            .map(|p| lane_of(p, vec![Some(10.0); 70], vec![true; 70]))
+            .collect();
+        arrived(&mut state, timeline_view(70, vec![], lanes));
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert!(body[8].starts_with(" 1 a1 "), "{body:?}");
+        assert!(body[13].starts_with(" 6 a6 "), "{body:?}");
+        assert_eq!(body[14], " +6 more · f picks one");
+    }
+
+    #[test]
+    fn one_account_draws_a_chart_per_window_and_its_in_use_lane() {
+        let (mut state, _) = opened(3);
+        state.history.scope = Scope::Account(id(1));
+        let chart = |label: &str| Series {
+            label: label.into(),
+            peaks: vec![Some(10.0); 70],
+        };
+        let in_use = (0..70).map(|c| c >= 35).collect();
+        let view = timeline_view(
+            70,
+            vec![chart("5h"), chart("7d")],
+            vec![lane_of(1, vec![Some(10.0); 70], in_use)],
+        );
+        arrived(&mut state, view);
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert!(body[1].starts_with(" 5h "), "{body:?}");
+        assert!(body[1].ends_with("at cursor  10%   now  10%"), "{body:?}");
+        assert!(body[7].starts_with(" 7d "), "{body:?}");
+        assert!(body[7].ends_with("now  20%"), "{body:?}");
+        assert_eq!(
+            body[14],
+            format!("{}{}{}", " ".repeat(9), "─".repeat(35), "━".repeat(35))
+        );
+        assert!(body[15].ends_with("now"), "{body:?}");
+    }
+
+    #[test]
+    fn a_view_wider_than_the_screen_draws_clipped_until_the_re_read() {
+        let (mut state, _) = opened(3);
+        arrived(&mut state, drawn(110));
+        let rows = draw(&state, 80, 24);
+        assert!(rows.iter().all(|r| width_of(r) <= 80), "{rows:?}");
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert!(
+            body[10].starts_with("      0  ▁▁▁"),
+            "the chart starts at column 9: {body:?}"
+        );
+        let resize = Msg::Resize {
+            width: 80,
+            height: 24,
+        };
+        assert!(update(&mut state, resize, NOW_MS).is_empty());
+        assert_eq!(
+            update(&mut state, Msg::Tick, NOW_MS + RESIZE_DEBOUNCE_MS),
+            [read_of(2, Scope::All, NOW_S - WEEK, 70)]
+        );
     }
 }
