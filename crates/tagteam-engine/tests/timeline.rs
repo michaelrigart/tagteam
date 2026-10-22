@@ -8,9 +8,11 @@ mod common;
 use std::fs;
 
 use common::{Fx, add};
+use serde_json::json;
 use tagteam_core::AccountId;
-use tagteam_engine::EngineError;
-use tagteam_engine::timeline::{AccountRef, IN_USE, Lane, Scope, Series, TimelineView};
+use tagteam_engine::event::AUTO_LINE_KINDS;
+use tagteam_engine::timeline::{AccountRef, EventView, IN_USE, Lane, Scope, Series, TimelineView};
+use tagteam_engine::{EngineError, EventKind, EventSource};
 
 /// The fixture clock's start (`Fx`), in seconds.
 const T0: i64 = 1_790_000_000;
@@ -370,4 +372,450 @@ fn the_threshold_is_the_provider_s_effective_setting() {
     let fx = Fx::new();
     write_config(&fx, "[autoswitch]\nthreshold = 85\n");
     assert_eq!(timeline(&fx, Scope::All).threshold, 85.0);
+}
+
+/// An `events` row as written raw: by `auto`, at `at_ms`, with nothing else set.
+#[derive(Clone, Copy)]
+struct Raw<'a> {
+    at_ms: i64,
+    kind: &'a str,
+    source: &'a str,
+    from: Option<&'a str>,
+    to: Option<&'a str>,
+    trigger: Option<&'a str>,
+    detail: Option<&'a str>,
+}
+
+/// A `kind` row by `auto` at `at_s`.
+fn raw_event(at_s: i64, kind: &str) -> Raw<'_> {
+    Raw {
+        at_ms: at_s * 1000,
+        kind,
+        source: "auto",
+        from: None,
+        to: None,
+        trigger: None,
+        detail: None,
+    }
+}
+
+/// Writes `e` past the store's typing, so a test sets its spellings itself.
+fn put(fx: &Fx, e: Raw<'_>) {
+    raw(fx)
+        .execute(
+            "INSERT INTO events (at, provider, kind, from_id, to_id, trigger, source, detail) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                e.at_ms,
+                fx.provider().as_str(),
+                e.kind,
+                e.from,
+                e.to,
+                e.trigger,
+                e.source,
+                e.detail
+            ],
+        )
+        .unwrap();
+}
+
+/// A current account as the timeline names it.
+fn named(id: &AccountId, position: u32, alias: Option<&str>, email: &str) -> AccountRef {
+    AccountRef {
+        id: id.clone(),
+        position: Some(position),
+        alias: alias.map(str::to_owned),
+        email: Some(email.to_owned()),
+        removed: false,
+    }
+}
+
+fn kinds(events: &[EventView]) -> Vec<EventKind> {
+    events.iter().map(|e| e.kind).collect()
+}
+
+/// The fixture's events: a switch `a → b` just before the range and on day 0, a quarantine of
+/// `c` on day 2, and a pause and a resume on days 4 and 5.
+fn events_fixture() -> (Fx, AccountId, AccountId, AccountId) {
+    let (fx, a, b, c) = fixture();
+    let switch = Raw {
+        from: Some("a"),
+        to: Some("b"),
+        trigger: Some("proactive"),
+        ..raw_event(SINCE - 1, "switch")
+    };
+    put(&fx, switch);
+    put(
+        &fx,
+        Raw {
+            at_ms: day(0, 1) * 1000,
+            ..switch
+        },
+    );
+    put(
+        &fx,
+        Raw {
+            to: Some("c"),
+            detail: Some(r#"{"reason":"invalid_grant"}"#),
+            ..raw_event(day(2, 0), "quarantine")
+        },
+    );
+    put(&fx, raw_event(day(4, 0), "autoswitch-paused"));
+    put(&fx, raw_event(day(5, 0), "autoswitch-resumed"));
+    (fx, a, b, c)
+}
+
+#[test]
+fn the_timeline_lists_the_scope_s_events_in_the_range_oldest_first() {
+    let (fx, a, b, c) = events_fixture();
+    let v = timeline(&fx, Scope::All);
+    assert_eq!(
+        v.events,
+        [
+            EventView {
+                at_ms: day(0, 1) * 1000,
+                kind: EventKind::Switch,
+                source: EventSource::Auto,
+                trigger: Some("proactive".into()),
+                from: Some(AccountRef {
+                    id: a.clone(),
+                    position: Some(1),
+                    alias: None,
+                    email: Some("alex@example.com".into()),
+                    removed: false,
+                }),
+                to: Some(named(&b, 2, Some("work"), "sam@corp.example")),
+                detail: None,
+                before_pct: None,
+                after_pct: None,
+            },
+            EventView {
+                at_ms: day(2, 0) * 1000,
+                kind: EventKind::Quarantine,
+                source: EventSource::Auto,
+                trigger: None,
+                from: None,
+                to: Some(named(&c, 3, Some("spare"), "alex@personal.example")),
+                detail: Some(json!({"reason": "invalid_grant"})),
+                before_pct: None,
+                after_pct: None,
+            },
+            EventView {
+                at_ms: day(4, 0) * 1000,
+                kind: EventKind::AutoswitchPaused,
+                source: EventSource::Auto,
+                trigger: None,
+                from: None,
+                to: None,
+                detail: None,
+                before_pct: None,
+                after_pct: None,
+            },
+            EventView {
+                at_ms: day(5, 0) * 1000,
+                kind: EventKind::AutoswitchResumed,
+                source: EventSource::Auto,
+                trigger: None,
+                from: None,
+                to: None,
+                detail: None,
+                before_pct: None,
+                after_pct: None,
+            },
+        ]
+    );
+    assert!(!v.paused_at_start);
+
+    let pause_and_resume = [EventKind::AutoswitchPaused, EventKind::AutoswitchResumed];
+    let v = timeline(&fx, Scope::Account(c));
+    assert_eq!(
+        kinds(&v.events),
+        [&[EventKind::Quarantine][..], &pause_and_resume].concat()
+    );
+    let v = timeline(&fx, Scope::Account(a));
+    assert_eq!(
+        kinds(&v.events),
+        [&[EventKind::Switch][..], &pause_and_resume].concat()
+    );
+    assert_eq!(v.events[0].at_ms, day(0, 1) * 1000);
+}
+
+#[test]
+fn a_pause_that_began_before_the_range_draws_from_its_first_column() {
+    let (fx, ..) = fixture();
+    put(&fx, raw_event(SINCE - 3_600, "autoswitch-paused"));
+    let v = timeline(&fx, Scope::All);
+    assert!(v.paused_at_start);
+    assert!(v.events.is_empty(), "{:?}", v.events);
+
+    put(&fx, raw_event(SINCE - 60, "autoswitch-resumed"));
+    let v = timeline(&fx, Scope::All);
+    assert!(!v.paused_at_start);
+    assert!(v.events.is_empty(), "{:?}", v.events);
+}
+
+#[test]
+fn an_event_later_in_the_current_second_is_in_the_last_column() {
+    let (fx, ..) = fixture();
+    put(
+        &fx,
+        Raw {
+            at_ms: T0 * 1000 + 300,
+            ..raw_event(T0, "autoswitch-paused")
+        },
+    );
+    put(
+        &fx,
+        Raw {
+            at_ms: (T0 + 1) * 1000,
+            ..raw_event(T0, "autoswitch-resumed")
+        },
+    );
+    let v = timeline(&fx, Scope::All);
+    assert_eq!(kinds(&v.events), [EventKind::AutoswitchPaused]);
+    assert_eq!(v.grid().column_of(v.events[0].at_ms), Some(COLUMNS - 1));
+}
+
+#[test]
+fn a_switch_carries_the_usage_just_before_and_just_after_it() {
+    let (fx, a, b, c) = fixture();
+    in_use(&fx, &a, SINCE - 3_600);
+    in_use(&fx, &b, day(2, 12));
+    sample(&fx, &a, "5h", day(2, 10), 91.0);
+    sample(&fx, &a, "7d", day(2, 10), 40.0);
+    sample(&fx, &a, "5h", day(2, 11), 93.0);
+    sample(&fx, &a, "7d", day(2, 11), 41.0);
+    sample(&fx, &b, "5h", day(2, 13), 3.0);
+    sample(&fx, &b, "7d", day(2, 13), 2.0);
+    put(
+        &fx,
+        Raw {
+            from: Some("a"),
+            to: Some("b"),
+            ..raw_event(day(2, 12), "switch")
+        },
+    );
+    put(
+        &fx,
+        Raw {
+            to: Some("a"),
+            ..raw_event(day(3, 0), "quarantine")
+        },
+    );
+    // `b`'s only reading is after it, and `c` has none.
+    put(
+        &fx,
+        Raw {
+            from: Some("b"),
+            to: Some("c"),
+            ..raw_event(day(1, 0), "switch")
+        },
+    );
+    let v = timeline(&fx, Scope::All);
+    let at = |at_s: i64| {
+        let e = v.events.iter().find(|e| e.at_ms == at_s * 1000).unwrap();
+        (e.kind, e.before_pct, e.after_pct)
+    };
+    assert_eq!(at(day(2, 12)), (EventKind::Switch, Some(93.0), Some(3.0)));
+    assert_eq!(at(day(3, 0)), (EventKind::Quarantine, None, None));
+    assert_eq!(at(day(1, 0)), (EventKind::Switch, None, None));
+
+    // At the range's edge, `from`'s last reading is from before it.
+    sample(&fx, &c, "5h", SINCE - 60, 91.0);
+    put(
+        &fx,
+        Raw {
+            from: Some("c"),
+            to: Some("a"),
+            ..raw_event(SINCE + 60, "switch")
+        },
+    );
+    let v = timeline(&fx, Scope::All);
+    let edge = v
+        .events
+        .iter()
+        .find(|e| e.at_ms == (SINCE + 60) * 1000)
+        .unwrap();
+    assert_eq!((edge.before_pct, edge.after_pct), (Some(91.0), Some(91.0)));
+}
+
+#[test]
+fn a_removed_account_is_named_by_the_label_its_remove_event_stored() {
+    let (fx, a, _, c) = fixture();
+    in_use(&fx, &a, SINCE - 3_600);
+    in_use(&fx, &c, day(1, 0));
+    put(
+        &fx,
+        Raw {
+            from: Some("a"),
+            to: Some("c"),
+            ..raw_event(day(1, 0), "switch")
+        },
+    );
+    put(
+        &fx,
+        Raw {
+            from: Some("c"),
+            detail: Some(r#"{"label":"alex@personal.example"}"#),
+            source: "cli",
+            ..raw_event(day(2, 0), "remove")
+        },
+    );
+    fx.engine.store().unwrap().delete_account(&c).unwrap();
+    let removed = AccountRef {
+        id: c.clone(),
+        position: None,
+        alias: None,
+        email: Some("alex@personal.example".into()),
+        removed: true,
+    };
+    let v = timeline(&fx, Scope::All);
+    assert_eq!(kinds(&v.events), [EventKind::Switch, EventKind::Remove]);
+    assert_eq!(v.events[0].to.as_ref(), Some(&removed));
+    assert_eq!(v.events[1].from.as_ref(), Some(&removed));
+    assert_eq!(ids(&v.lanes), ["a", "c"]);
+    assert_eq!(v.lanes[1].account, removed);
+
+    let (fx, _, _, c) = fixture();
+    put(
+        &fx,
+        Raw {
+            from: Some("a"),
+            to: Some("c"),
+            ..raw_event(day(1, 0), "switch")
+        },
+    );
+    put(
+        &fx,
+        Raw {
+            from: Some("c"),
+            ..raw_event(day(2, 0), "remove")
+        },
+    );
+    fx.engine.store().unwrap().delete_account(&c).unwrap();
+    let v = timeline(&fx, Scope::All);
+    assert_eq!(
+        v.events[0].to,
+        Some(AccountRef {
+            id: c,
+            position: None,
+            alias: None,
+            email: None,
+            removed: true,
+        })
+    );
+}
+
+/// The provider's last auto-line event of the 30 days to `T0`.
+fn last_auto(fx: &Fx) -> Option<EventView> {
+    fx.engine
+        .last_auto_event(&fx.provider(), (T0 - 30 * 86_400) * 1000)
+        .unwrap()
+}
+
+#[test]
+fn rows_a_newer_build_wrote_are_left_out_of_the_timeline_and_the_auto_line() {
+    let (fx, ..) = fixture();
+    put(
+        &fx,
+        Raw {
+            to: Some("c"),
+            ..raw_event(T0 - 3_600, "quarantine")
+        },
+    );
+    put(
+        &fx,
+        Raw {
+            source: "cli",
+            ..raw_event(T0 - 60, "x-new-kind")
+        },
+    );
+    put(
+        &fx,
+        Raw {
+            source: "menubar",
+            ..raw_event(T0 - 120, "switch")
+        },
+    );
+    let v = timeline(&fx, Scope::All);
+    assert_eq!(kinds(&v.events), [EventKind::Quarantine]);
+    let last = last_auto(&fx).unwrap();
+    assert_eq!(
+        (last.kind, last.at_ms),
+        (EventKind::Quarantine, (T0 - 3_600) * 1000)
+    );
+}
+
+#[test]
+fn last_auto_event_is_the_newest_auto_line_kind_in_its_bound() {
+    let fx = Fx::new();
+    assert_eq!(last_auto(&fx), None, "no store");
+    assert!(!fx.env.data_dir().exists(), "no data directory");
+
+    let (fx, ..) = fixture();
+    let clear = || raw(&fx).execute("DELETE FROM events", []).unwrap();
+    for kind in AUTO_LINE_KINDS {
+        clear();
+        put(&fx, raw_event(T0 - 60, kind.as_str()));
+        let last = last_auto(&fx).unwrap();
+        assert_eq!(
+            (last.kind, last.at_ms),
+            (kind, (T0 - 60) * 1000),
+            "{kind:?}"
+        );
+    }
+    for kind in ["add", "import", "remove"] {
+        clear();
+        put(&fx, raw_event(T0 - 60, kind));
+        assert_eq!(last_auto(&fx), None, "{kind}");
+    }
+
+    clear();
+    put(&fx, raw_event(T0 - 31 * 86_400, "switch"));
+    assert_eq!(last_auto(&fx), None, "older than its bound");
+
+    clear();
+    put(&fx, raw_event(T0 - 120, "switch"));
+    put(&fx, raw_event(T0 - 60, "add"));
+    assert_eq!(last_auto(&fx).unwrap().kind, EventKind::Switch);
+
+    put(&fx, raw_event(T0 - 30, "quarantine"));
+    put(&fx, raw_event(T0 - 30, "unquarantine"));
+    assert_eq!(last_auto(&fx).unwrap().kind, EventKind::Unquarantine);
+}
+
+#[test]
+fn last_auto_event_names_its_accounts_as_they_read_now() {
+    let (fx, a, b, _) = fixture();
+    put(
+        &fx,
+        Raw {
+            from: Some("a"),
+            to: Some("b"),
+            trigger: Some("proactive"),
+            detail: Some(r#"{"window":"5h","label":"5h","pct":93.0,"threshold":90.0}"#),
+            ..raw_event(T0 - 60, "switch")
+        },
+    );
+    let store = fx.engine.store().unwrap();
+    store.set_alias(&b, None).unwrap();
+    let last = last_auto(&fx).unwrap();
+    assert_eq!(last.to, Some(named(&b, 2, None, "sam@corp.example")));
+
+    store.set_alias(&b, Some("work")).unwrap();
+    store.move_to(&b, 5).unwrap();
+    assert_eq!(
+        last_auto(&fx).unwrap(),
+        EventView {
+            at_ms: (T0 - 60) * 1000,
+            kind: EventKind::Switch,
+            source: EventSource::Auto,
+            trigger: Some("proactive".into()),
+            from: Some(named(&a, 1, None, "alex@example.com")),
+            to: Some(named(&b, 5, Some("work"), "sam@corp.example")),
+            detail: Some(json!({"window": "5h", "label": "5h", "pct": 93.0, "threshold": 90.0})),
+            before_pct: None,
+            after_pct: None,
+        }
+    );
 }

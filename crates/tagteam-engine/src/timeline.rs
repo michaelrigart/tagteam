@@ -3,14 +3,16 @@
 
 use std::collections::HashMap;
 
+use serde_json::Value;
 use tagteam_core::usage::is_relevant;
 use tagteam_core::{AccountId, ProviderId, Sample, Window};
 use tagteam_provider::Provider;
 
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::event::{AUTO_LINE_KINDS, EventKind, EventSource};
 use crate::settings::Settings;
-use crate::store::{AccountRow, Store};
+use crate::store::{AccountRow, EventRow, Store, StoreError};
 
 /// The all-accounts chart's label (§7.3).
 pub const IN_USE: &str = "in use";
@@ -94,14 +96,65 @@ impl AccountRef {
         }
     }
 
-    fn removed(id: &str) -> Self {
+    /// A removed account, named by the label its `remove` event stored (T4-27).
+    fn removed(id: &AccountId, label: Option<String>) -> Self {
         AccountRef {
-            id: AccountId::from_string(id),
+            id: id.clone(),
             position: None,
             alias: None,
-            email: None,
+            email: label,
             removed: true,
         }
+    }
+}
+
+/// `id` as it reads now (T4-28): its row when it is the provider's, else removed and named by
+/// its `remove` label. `row` is the caller's lookup of the current account.
+fn name_of(
+    store: &Store,
+    provider: &ProviderId,
+    id: &AccountId,
+    row: Option<&AccountRow>,
+) -> Result<AccountRef, StoreError> {
+    match row {
+        Some(row) => Ok(AccountRef::of(row)),
+        None => Ok(AccountRef::removed(id, store.removed_label(provider, id)?)),
+    }
+}
+
+/// One stored event as History shows it (§12.3), its accounts resolved at read time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventView {
+    pub at_ms: i64,
+    pub kind: EventKind,
+    pub source: EventSource,
+    pub trigger: Option<String>,
+    pub from: Option<AccountRef>,
+    pub to: Option<AccountRef>,
+    pub detail: Option<Value>,
+    /// For `switch` and `switch-recovered`: the binding usage just before and just after (below).
+    pub before_pct: Option<f64>,
+    pub after_pct: Option<f64>,
+}
+
+impl EventView {
+    /// `e` at `at_ms`, with its accounts named by `name` and no usage beside it.
+    fn of(
+        e: EventRow,
+        at_ms: i64,
+        mut name: impl FnMut(&AccountId) -> Result<AccountRef, StoreError>,
+    ) -> Result<Self, StoreError> {
+        Ok(EventView {
+            at_ms,
+            kind: e.kind,
+            source: e.source,
+            trigger: e.trigger,
+            from: e.from_id.as_ref().map(&mut name).transpose()?,
+            to: e.to_id.as_ref().map(&mut name).transpose()?,
+            detail: e.detail,
+            before_pct: None,
+            after_pct: None,
+        })
     }
 }
 
@@ -130,6 +183,11 @@ pub struct TimelineView {
     pub charts: Vec<Series>,
     /// All: one per account in use in some column. Account: that account's.
     pub lanes: Vec<Lane>,
+    /// The range's events, oldest first. All: every one. Account: those naming it, and every
+    /// pause and resume.
+    pub events: Vec<EventView>,
+    /// The latest pause or resume before the range is a pause: the range starts paused.
+    pub paused_at_start: bool,
 }
 
 impl TimelineView {
@@ -188,7 +246,7 @@ fn peaks_of<'s>(grid: &Grid, samples: impl IntoIterator<Item = &'s Sample>) -> V
 }
 
 impl Engine {
-    /// §12.3, reading only, never creating the store: `scope`'s charts and lanes over
+    /// §12.3, reading only, never creating the store: `scope`'s charts, lanes and events over
     /// `columns` columns from `since_s` to now (T4-4 to T4-7). Never fetches.
     pub fn timeline(
         &self,
@@ -207,6 +265,8 @@ impl Engine {
             columns,
             charts: Vec::new(),
             lanes: Vec::new(),
+            events: Vec::new(),
+            paused_at_start: false,
         };
         let grid = view.grid();
         let missing = |id: &AccountId| EngineError::NoSuchAccount(id.to_string());
@@ -223,6 +283,28 @@ impl Engine {
             };
         };
         let current = store.accounts(provider)?;
+        let by_id: HashMap<&str, &AccountRow> =
+            current.iter().map(|r| (r.id.as_str(), r)).collect();
+        let mut removed: HashMap<AccountId, AccountRef> = HashMap::new();
+        let mut name = |id: &AccountId| -> Result<AccountRef, StoreError> {
+            if let Some(known) = removed.get(id) {
+                return Ok(known.clone());
+            }
+            let named = name_of(&store, provider, id, by_id.get(id.as_str()).copied())?;
+            if named.removed {
+                removed.insert(id.clone(), named.clone());
+            }
+            Ok(named)
+        };
+        let mut readings = Readings {
+            p: p.as_ref(),
+            store: &store,
+            models: &settings.models,
+            since_s,
+            now_ms: grid.now_ms,
+            read: HashMap::new(),
+            before_range: HashMap::new(),
+        };
         let history = store.active_history_since(provider, grid.since_ms)?;
         let spans = spans(&history, &grid);
         let in_use = |id: &str| {
@@ -234,24 +316,20 @@ impl Engine {
             }
             flags
         };
-        match scope {
+        match &scope {
             Scope::Account(id) => {
-                let row = current
-                    .iter()
-                    .find(|r| r.id == id)
-                    .ok_or_else(|| missing(&id))?;
-                let windows =
-                    relevant_samples(p.as_ref(), &store, &row.id, &settings.models, since_s)?;
+                let row = by_id.get(id.as_str()).ok_or_else(|| missing(id))?;
+                let windows = readings.of(&row.id)?;
                 view.lanes = vec![Lane {
                     account: AccountRef::of(row),
                     peaks: peaks_of(&grid, windows.iter().flat_map(|(_, s)| s)),
                     in_use: in_use(row.id.as_str()),
                 }];
                 view.charts = windows
-                    .into_iter()
+                    .iter()
                     .map(|(w, samples)| Series {
-                        label: w.label,
-                        peaks: peaks_of(&grid, &samples),
+                        label: w.label.clone(),
+                        peaks: peaks_of(&grid, samples),
                     })
                     .collect();
             }
@@ -263,27 +341,18 @@ impl Engine {
                         used.push(id);
                     }
                 }
-                let by_id: HashMap<&str, &AccountRow> =
-                    current.iter().map(|r| (r.id.as_str(), r)).collect();
-                let accounts = current
+                let mut accounts: Vec<AccountRef> = current
                     .iter()
                     .filter(|r| used.contains(&r.id.as_str()))
                     .map(AccountRef::of)
-                    .chain(
-                        used.iter()
-                            .filter(|id| !by_id.contains_key(*id))
-                            .map(|id| AccountRef::removed(id)),
-                    );
+                    .collect();
+                for id in used.iter().filter(|id| !by_id.contains_key(*id)) {
+                    accounts.push(name(&AccountId::from_string(*id))?);
+                }
                 let mut chart = vec![None; columns];
                 for account in accounts {
                     let id = account.id.as_str();
-                    let windows = relevant_samples(
-                        p.as_ref(),
-                        &store,
-                        &account.id,
-                        &settings.models,
-                        since_s,
-                    )?;
+                    let windows = readings.of(&account.id)?;
                     let samples: Vec<&Sample> = windows.iter().flat_map(|(_, s)| s).collect();
                     // The account's spans follow one another, so one search finds a sample's.
                     let own: Vec<(i64, i64)> = spans
@@ -311,8 +380,144 @@ impl Engine {
                 }];
             }
         }
+        let pauses = [EventKind::AutoswitchPaused, EventKind::AutoswitchResumed];
+        view.paused_at_start = store
+            .latest_event(provider, &pauses, None, Some(grid.since_ms))?
+            .is_some_and(|e| e.kind == EventKind::AutoswitchPaused);
+        let keeps = |e: &EventRow| match &scope {
+            Scope::All => true,
+            Scope::Account(id) => {
+                pauses.contains(&e.kind)
+                    || e.from_id.as_ref() == Some(id)
+                    || e.to_id.as_ref() == Some(id)
+            }
+        };
+        for e in store.events_since(provider, grid.since_ms)? {
+            // As in-use changes are: a row later in the current second is placed at now, one
+            // from the next second on is left for the next read.
+            let at_ms = grid.placed(e.at);
+            if !keeps(&e) || at_ms > grid.now_ms {
+                continue;
+            }
+            let switch = matches!(e.kind, EventKind::Switch | EventKind::SwitchRecovered);
+            let (from_id, to_id) = (e.from_id.clone(), e.to_id.clone());
+            let mut event = EventView::of(e, at_ms, &mut name)?;
+            if switch {
+                if let Some(id) = &from_id {
+                    event.before_pct = readings.before(id, at_ms)?;
+                }
+                if let Some(id) = &to_id {
+                    event.after_pct = readings.after(id, at_ms)?;
+                }
+            }
+            view.events.push(event);
+        }
         Ok(view)
     }
+
+    /// §12.2: the newest of the provider's `AUTO_LINE_KINDS` at or after `since_ms`, its
+    /// accounts named as they read now; `None` without a store.
+    pub fn last_auto_event(
+        &self,
+        provider: &ProviderId,
+        since_ms: i64,
+    ) -> Result<Option<EventView>, EngineError> {
+        self.provider(provider)?;
+        let Some(store) = self.existing_store()? else {
+            return Ok(None);
+        };
+        let Some(e) = store.latest_event(provider, &AUTO_LINE_KINDS, Some(since_ms), None)? else {
+            return Ok(None);
+        };
+        let at_ms = e.at;
+        let name = |id: &AccountId| {
+            let row = store.account(id)?.filter(|r| &r.provider == provider);
+            name_of(&store, provider, id, row.as_ref())
+        };
+        Ok(Some(EventView::of(e, at_ms, name)?))
+    }
+}
+
+/// The accounts' relevant windows and their samples in the range, each account's read once,
+/// for its lane and for the usage beside a switch.
+struct Readings<'s> {
+    p: &'s dyn Provider,
+    store: &'s Store,
+    models: &'s [String],
+    since_s: i64,
+    now_ms: i64,
+    read: HashMap<AccountId, Vec<(Window, Vec<Sample>)>>,
+    /// Each account's reading from before the range, when a switch needed it.
+    before_range: HashMap<AccountId, Option<f64>>,
+}
+
+impl Readings<'_> {
+    fn of(&mut self, id: &AccountId) -> Result<&[(Window, Vec<Sample>)], EngineError> {
+        if !self.read.contains_key(id) {
+            let windows = relevant_samples(self.p, self.store, id, self.models, self.since_s)?;
+            self.read.insert(id.clone(), windows);
+        }
+        Ok(&self.read[id])
+    }
+
+    /// The highest relevant `pct` of `id`'s latest reading at or before `at_ms`: the samples
+    /// sharing one `fetched_at`. Older than the range, it is read one row per relevant window.
+    fn before(&mut self, id: &AccountId, at_ms: i64) -> Result<Option<f64>, EngineError> {
+        self.of(id)?;
+        let windows = &self.read[id];
+        let in_range = peak_of_reading(
+            windows
+                .iter()
+                .flat_map(|(_, s)| s)
+                .filter(|s| s.fetched_at * 1000 <= at_ms)
+                .map(|s| (s.fetched_at, s.pct)),
+            |at| at,
+        );
+        if in_range.is_some() {
+            return Ok(in_range);
+        }
+        if let Some(known) = self.before_range.get(id) {
+            return Ok(*known);
+        }
+        let mut latest = Vec::with_capacity(windows.len());
+        for (w, _) in windows {
+            latest.extend(
+                self.store
+                    .usage_sample_before(id, &w.key, self.since_s - 1)?,
+            );
+        }
+        let peak = peak_of_reading(latest, |at| at);
+        self.before_range.insert(id.clone(), peak);
+        Ok(peak)
+    }
+
+    /// The highest relevant `pct` of `id`'s earliest reading at or after `at_ms`, up to now.
+    fn after(&mut self, id: &AccountId, at_ms: i64) -> Result<Option<f64>, EngineError> {
+        let now_ms = self.now_ms;
+        let samples = self.of(id)?.iter().flat_map(|(_, s)| s);
+        Ok(peak_of_reading(
+            samples
+                .filter(|s| (at_ms..=now_ms).contains(&(s.fetched_at * 1000)))
+                .map(|s| (s.fetched_at, s.pct)),
+            |at| -at,
+        ))
+    }
+}
+
+/// One reading's peak: the highest `pct` of the `(fetched_at, pct)` pairs sharing the
+/// `fetched_at` that `order` ranks first (`|at| at` the latest, `|at| -at` the earliest).
+fn peak_of_reading(
+    pairs: impl IntoIterator<Item = (i64, f64)>,
+    order: impl Fn(i64) -> i64,
+) -> Option<f64> {
+    pairs
+        .into_iter()
+        .fold(None, |best: Option<(i64, f64)>, (at, pct)| match best {
+            Some((k, peak)) if k > order(at) => Some((k, peak)),
+            Some((k, peak)) if k == order(at) => Some((k, peak.max(pct))),
+            _ => Some((order(at), pct)),
+        })
+        .map(|(_, peak)| peak)
 }
 
 /// `id`'s relevant windows under `models` (T4-5, as `Engine::history` finds them), each with

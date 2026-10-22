@@ -204,6 +204,11 @@ pub struct LiveIdentityCacheRow {
 const SAMPLES_OF_WINDOW: &str = "SELECT window, fetched_at, pct, resets_at FROM usage_samples \
      WHERE account_id = ?1 AND window = ?2 AND fetched_at >= ?3 ORDER BY fetched_at";
 
+/// One window's latest sample at or before a time: one seek down the primary key (account,
+/// window, time), so no scan and no sort.
+const SAMPLE_BEFORE: &str = "SELECT fetched_at, pct FROM usage_samples \
+     WHERE account_id = ?1 AND window = ?2 AND fetched_at <= ?3 ORDER BY fetched_at DESC LIMIT 1";
+
 /// An account's window keys, ascending: a skip-scan of the primary key (account, window,
 /// time), one seek per key, so no scan of the account's samples and no sort. It finds every
 /// key with a sample, including windows the latest reading no longer has.
@@ -715,6 +720,22 @@ impl Store {
         Ok(rows)
     }
 
+    /// The window's latest sample at or before `at_s`: `(fetched_at, pct)`, one seek on the
+    /// `(account_id, window, fetched_at)` key.
+    pub fn usage_sample_before(
+        &self,
+        id: &AccountId,
+        window: &str,
+        at_s: i64,
+    ) -> Result<Option<(i64, f64)>, StoreError> {
+        Ok(self
+            .lock()
+            .query_row(SAMPLE_BEFORE, params![id.as_str(), window, at_s], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?)
+    }
+
     /// Every window key the account has a sample of, however old, ascending in byte order.
     pub fn usage_window_keys(&self, id: &AccountId) -> Result<Vec<String>, StoreError> {
         window_keys(&self.lock(), id)
@@ -898,5 +919,52 @@ mod tests {
             "one seek per key, never a scan: {plan:?}"
         );
         assert!(!plan.iter().any(|l| l.contains("TEMP B-TREE")), "{plan:?}");
+    }
+
+    #[test]
+    fn the_sample_before_an_instant_reads_one_row_along_the_key() {
+        let t = crate::testutil::T::new();
+        let id = t.account("alex@example.com", b"{}").id;
+        let store = t.engine.store().unwrap();
+        for (at, pct) in [(100, 10.0), (200, 20.0), (300, 30.0)] {
+            store
+                .lock()
+                .execute(
+                    "INSERT INTO usage_samples (account_id, window, fetched_at, pct) \
+                     VALUES (?1, '5h', ?2, ?3)",
+                    params![id.as_str(), at, pct],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.usage_sample_before(&id, "5h", 250).unwrap(),
+            Some((200, 20.0))
+        );
+        assert_eq!(
+            store.usage_sample_before(&id, "5h", 300).unwrap(),
+            Some((300, 30.0)),
+            "at or before"
+        );
+        assert_eq!(store.usage_sample_before(&id, "5h", 99).unwrap(), None);
+        assert_eq!(store.usage_sample_before(&id, "7d", 250).unwrap(), None);
+
+        let c = store.lock();
+        let mut stmt = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {SAMPLE_BEFORE}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params!["a", "5h", 250], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains(
+                "SEARCH usage_samples USING PRIMARY KEY (account_id=? AND window=? AND fetched_at<?)"
+            ),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
     }
 }
