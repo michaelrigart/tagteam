@@ -596,8 +596,8 @@ mod tests {
             state.size = size;
             let head = body_of(&state, size.0, size.1, NOW_MS)
                 .iter()
-                .position(|l| l == " UTC · catching up")
-                .expect("the header's last row");
+                .position(|l| l.starts_with(" p Day") && l.ends_with("   catching up"))
+                .expect("the control bar, above the empty lines");
             assert_centred(
                 &state,
                 size,

@@ -578,8 +578,8 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("[ ] claude-sonnet-5-5")));
         let body = body_of(&state, 120, 40, NOW_MS);
         assert!(
-            body[0].contains("filter: all accounts · claude-opus-5-5"),
-            "the header names the one model: {}",
+            body[0].contains("   f all accounts · claude-opus-5-5"),
+            "the control bar names the one model: {}",
             body[0]
         );
     }

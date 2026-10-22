@@ -1,5 +1,6 @@
-//! The Tokens screen drawn (spec §5.3): its header, the report's table at the terminal's width,
-//! the total line, the selected row's detail, and the footnotes. It reads nothing but the state.
+//! The Tokens screen drawn (spec §5.3): the rows above the table (redesign §8), the report's
+//! table at the terminal's width, the total line, the selected row's detail, and the
+//! footnotes. It reads nothing but the state.
 
 use std::cell::{OnceCell, RefCell};
 use std::rc::Rc;
@@ -17,9 +18,12 @@ use tagteam_engine::tokens::{
 };
 use tagteam_engine::words::{self, Severity};
 
-use super::TokensState;
+use super::{TokensState, headline};
+use crate::autoline;
+use crate::chrome::fit_spans;
+use crate::keys::RIGHT_INSET;
 use crate::state::State;
-use crate::theme::Theme;
+use crate::theme::{Role, Theme};
 use crate::view::{centred_block, fit, keep_visible, select, width_of, wrap};
 
 /// From this width the table adds the cache, the response count and a cost bar (spec §5.3).
@@ -33,7 +37,8 @@ const NOT_INDEXED: &str = "No token usage yet";
 const BAR: usize = 8;
 /// The table keeps this many rows at least; the detail and the notes below it scroll (B25).
 const TABLE_MIN: usize = 3;
-/// The filter gives way to the drill-down on their row down to this many columns (B29).
+/// The control bar's filter is cut no narrower than this before the index's words give way
+/// (T5-7).
 const FILTER_LEAST: usize = 20;
 /// The account column is cut no narrower than this while a more compact period can make room
 /// (B24)...
@@ -145,7 +150,7 @@ impl Cell {
     }
 }
 
-/// `n` bytes as the header shows a refresh's progress: decimal units to one decimal place
+/// `n` bytes as the control bar shows a refresh's progress: decimal units to one decimal place
 /// (`1.2 GB`), rounded half up.
 pub fn bytes(n: u64) -> String {
     const UNITS: [(u128, &str); 4] = [
@@ -873,22 +878,23 @@ impl Layout {
     }
 }
 
-/// The grouping's words in the header.
+/// The grouping's words on the control bar (T5-6).
 fn grouping_text(g: TokenGrouping) -> &'static str {
     match g {
-        TokenGrouping::None => "none",
-        TokenGrouping::Account => "account",
-        TokenGrouping::Model => "model",
-        TokenGrouping::AccountModel => "account, model",
+        TokenGrouping::None => "no grouping",
+        TokenGrouping::Account => "by account",
+        TokenGrouping::Model => "by model",
+        TokenGrouping::AccountModel => "by account and model",
     }
 }
 
-/// The filter's words in the header: `all accounts · all models`, else what it keeps.
+/// The filter's words on the control bar (T5-6): `all accounts · all models`, else what it
+/// keeps, an account by its short name.
 fn filter_text(state: &State) -> String {
     let t = &state.tokens;
     let accounts = match t.accounts.as_deref() {
         None => "all accounts".to_owned(),
-        Some([AccountSel::Unattributed]) => "unattributed".to_owned(),
+        Some([AccountSel::Unattributed]) => "unknown account".to_owned(),
         Some([AccountSel::Account(id)]) => state
             .accounts
             .snapshot()
@@ -900,7 +906,10 @@ fn filter_text(state: &State) -> String {
             })
             .map_or_else(
                 || "1 account".to_owned(),
-                |v| format!("{} {}", v.row.position, words::name(&v.row)),
+                |v| {
+                    let email = words::email(&v.row);
+                    words::short_name(v.row.position, v.row.alias.as_deref(), &email)
+                },
             ),
         Some(list) => words::plural(list.len() as u64, "account"),
     };
@@ -909,12 +918,14 @@ fn filter_text(state: &State) -> String {
         Some([one]) => one.clone(),
         Some(list) => words::plural(list.len() as u64, "model"),
     };
-    format!("filter: {accounts} · {models}")
+    format!("{accounts} · {models}")
 }
 
-/// The rows the drill-down came through, from the top: each one's period and its account and
-/// model when it has them.
-fn crumbs(t: &TokensState, now_ms: i64) -> Option<String> {
+/// The rows the drill-down came through, from the top (T5-9): ` › {crumb} › {crumb}`, muted,
+/// each its row's period and its account and model when it has them, cut to the width less
+/// one. `None` at the top.
+fn crumbs(state: &State, width: usize, now_ms: i64) -> Option<Line<'static>> {
+    let t = &state.tokens;
     let parents: Vec<String> = t.levels[..t.levels.len() - 1]
         .iter()
         .filter_map(|level| {
@@ -928,115 +939,168 @@ fn crumbs(t: &TokensState, now_ms: i64) -> Option<String> {
             let mut parts = vec![period];
             parts.extend(row.account.as_ref().map(account_text));
             parts.extend(row.model.clone());
-            Some(parts.join(" "))
+            Some(parts.join(" · "))
         })
         .collect();
-    (!parents.is_empty()).then(|| format!("› {}", parents.join(" › ")))
+    if parents.is_empty() {
+        return None;
+    }
+    let crumb = format!("› {}", parents.join(" › "));
+    Some(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            fit(&crumb, width.saturating_sub(2)),
+            state.theme.role(Role::Muted),
+        ),
+    ]))
 }
 
-/// The screen's own header (spec §5.3), three rows at most (B29):
-/// 1. the periods with the top level's bracketed, its range, and the grouping its report applies
-///    (blocks are per account), whatever level is shown: 60 columns at the widest;
-/// 2. the filter and the rows the drill-down came through, on the first row when they fit
-///    there whole; else on a row of their own, the filter cut first, to `FILTER_LEAST`, then
-///    the drill-down, each with `…`. The filter's dialog shows it whole, and the detail the
-///    rows;
-/// 3. the zone and the index's state, `catching up` while the index is partial and no refresh
-///    shows its progress instead, and `updating…` while the report on screen is read again, cut
-///    with `…` past the row.
-fn header(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
-    let t = &state.tokens;
-    let mut tabs = vec![Span::raw(" ")];
-    for (i, (period, name)) in [
-        (TokenPeriod::Day, "Day"),
-        (TokenPeriod::Month, "Month"),
-        (TokenPeriod::Session, "Session"),
-        (TokenPeriod::Block, "Block"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        if i > 0 {
-            tabs.push(Span::raw(" "));
-        }
-        if period == t.period {
-            tabs.push(Span::styled(format!("[{name}]"), state.theme.strong()));
-        } else {
-            tabs.push(Span::raw(name));
-        }
-    }
-    let applied = t.top_query(now_ms).applied_grouping();
-    tabs.push(Span::raw(format!(
-        "  {}  group: {}",
-        t.range.label(t.period),
-        grouping_text(applied)
-    )));
-    let filter = filter_text(state);
-    let crumb = crumbs(t, now_ms);
-    let whole = match &crumb {
-        Some(crumb) => format!("{filter}  {crumb}"),
-        None => filter.clone(),
-    };
-    let used: usize = tabs.iter().map(|s| width_of(&s.content)).sum();
-    let room = width.saturating_sub(1);
-    let mut lines = if used + 2 + width_of(&whole) <= width {
-        tabs.push(Span::raw(format!("  {whole}")));
-        vec![Line::from(tabs)]
-    } else {
-        let second = match &crumb {
-            None => fit(&filter, room),
-            Some(crumb) => {
-                let rest = room.saturating_sub(2);
-                let least = rest.saturating_sub(width_of(crumb)).max(FILTER_LEAST);
-                let filter = fit(&filter, width_of(&filter).min(least));
-                let crumb = fit(crumb, rest.saturating_sub(width_of(&filter)));
-                format!("{filter}  {crumb}")
-            }
-        };
-        vec![Line::from(tabs), Line::from(format!(" {second}"))]
-    };
-    let zone = t
-        .report()
-        .map(|r| r.time_zone.clone())
-        .unwrap_or_else(|| t.tz.iana_name().unwrap_or("UTC").to_owned());
-    let mut status = vec![zone];
+/// The bar's periods, in `p`'s order.
+const PERIODS: [(TokenPeriod, &str); 4] = [
+    (TokenPeriod::Day, "Day"),
+    (TokenPeriod::Month, "Month"),
+    (TokenPeriod::Session, "Session"),
+    (TokenPeriod::Block, "5h block"),
+];
+/// Between the bar's groups (§8's text), and where that does not fit (§4.3's group gap).
+const BAR_GAP: &str = "     ";
+const BAR_GAP_NARROW: &str = "   ";
+/// The least gap before the bar's right part (T5-7).
+const BAR_RIGHT_GAP: usize = 3;
+
+/// The index's state as the bar says it (T5-8), joined ` · `: the TUI's own refresh's
+/// progress, another process catching up, or when the index was last refreshed; then
+/// `catching up` while the index has never completed a refresh, and with `updating`,
+/// `updating…` while the shown report is read again.
+fn index_words(t: &TokensState, now_ms: i64, updating: bool) -> String {
     let index = t.watch.state();
-    let tz = &t.tz;
+    let mut parts = Vec::new();
     if let Some(p) = t.watch.refreshing() {
-        status.push(if p.bytes_total > 0 {
-            format!(
-                "indexing transcripts {} / {}",
-                bytes(p.bytes_done),
-                bytes(p.bytes_total)
-            )
+        parts.push(if p.bytes_total > 0 {
+            let (done, total) = (bytes(p.bytes_done), bytes(p.bytes_total));
+            let done = match (done.split_once(' '), total.split_once(' ')) {
+                (Some((n, unit)), Some((_, of))) if unit == of => n.to_owned(),
+                _ => done,
+            };
+            format!("indexing {done} / {total}")
         } else {
-            "indexing transcripts…".to_owned()
+            "indexing…".to_owned()
         });
     } else if t.watch.busy() {
-        status.push("catching up elsewhere".to_owned());
+        parts.push("catching up elsewhere".to_owned());
     } else if let Some(at) = index.and_then(|i| i.refreshed_at_ms) {
-        status.push(format!("refreshed {}", clock(at, tz, now_ms)));
+        parts.push(format!("indexed {}", autoline::when(at, now_ms, &t.tz)));
     }
     if t.watch.refreshing().is_none() && index.is_some_and(|i| i.refreshed_at_ms.is_none()) {
-        status.push("catching up".to_owned());
+        parts.push("catching up".to_owned());
     }
-    if t.pending && t.report().is_some() {
-        status.push("updating…".to_owned());
+    if updating && t.pending && t.report().is_some() {
+        parts.push("updating…".to_owned());
     }
-    lines.push(Line::from(format!(" {}", fit(&status.join(" · "), room))));
-    lines
+    parts.join(" · ")
 }
 
-/// A time in `tz` as the header says it: `14:12` today, else with its date.
-fn clock(ms: i64, tz: &TimeZone, now_ms: i64) -> String {
-    let (Some(at), Some(now)) = (zoned(ms, tz), zoned(now_ms, tz)) else {
-        return words::MISSING.to_owned();
+/// The control bar (T5-6): ` p` and the periods, `[ ]` and the range, `g` and the top level's
+/// applied grouping, `f` and the filter, and the index's state on the right, `RIGHT_INSET` in.
+/// It gives way as T5-7 orders, in the first of its forms that fits.
+fn bar(state: &State, width: usize, now_ms: i64) -> Line<'static> {
+    let t = &state.tokens;
+    let theme = state.theme;
+    let (accent, text, muted) = (
+        theme.role(Role::Accent),
+        theme.role(Role::Text),
+        theme.role(Role::Muted),
+    );
+    let grouping = grouping_text(t.top_query(now_ms).applied_grouping());
+    let left = |gap: &'static str, every_period: bool, filter: String| {
+        let mut spans = vec![Span::raw(" "), Span::styled("p", accent)];
+        let mut first = true;
+        for (period, name) in PERIODS {
+            let current = period == t.period;
+            if !current && !every_period {
+                continue;
+            }
+            spans.push(Span::raw(if first { " " } else { "  " }));
+            spans.push(Span::styled(name, if current { text } else { muted }));
+            first = false;
+        }
+        spans.extend([
+            Span::raw(gap),
+            Span::styled("[ ]", accent),
+            Span::raw(" "),
+            Span::styled(t.range.label(t.period), text),
+            Span::raw(gap),
+            Span::styled("g", accent),
+            Span::raw(" "),
+            Span::styled(grouping, text),
+            Span::raw(gap),
+            Span::styled("f", accent),
+            Span::raw(" "),
+            Span::styled(filter, text),
+        ]);
+        spans
     };
-    if at.date() == now.date() {
-        at.strftime("%H:%M").to_string()
+    let used = |spans: &[Span]| spans.iter().map(|s| width_of(&s.content)).sum::<usize>();
+    let fits = |left: &[Span], right: &str| {
+        used(left) + BAR_RIGHT_GAP + width_of(right) + RIGHT_INSET <= width
+    };
+    let filter = filter_text(state);
+    let unfiltered = t.accounts.is_none() && t.models.is_none();
+    let short = if unfiltered {
+        "all".to_owned()
     } else {
-        at.strftime("%Y-%m-%d %H:%M").to_string()
+        filter.clone()
+    };
+    let (whole, quiet) = (index_words(t, now_ms, true), index_words(t, now_ms, false));
+    let forms = [
+        (left(BAR_GAP, true, filter.clone()), &whole),
+        (left(BAR_GAP_NARROW, true, filter.clone()), &whole),
+        (left(BAR_GAP_NARROW, true, filter), &quiet),
+        (left(BAR_GAP_NARROW, false, short.clone()), &whole),
+        (left(BAR_GAP_NARROW, false, short.clone()), &quiet),
+    ];
+    let (mut spans, right) = match forms.into_iter().find(|(l, r)| fits(l, r)) {
+        Some((left, right)) => (left, vec![Span::styled(right.clone(), muted)]),
+        None => {
+            let bare = used(&left(BAR_GAP_NARROW, false, String::new()));
+            let room = width.saturating_sub(bare + BAR_RIGHT_GAP + width_of(&quiet) + RIGHT_INSET);
+            let least = FILTER_LEAST.min(width_of(&short));
+            let left = left(BAR_GAP_NARROW, false, fit(&short, room.max(least)));
+            let room = width.saturating_sub(used(&left) + BAR_RIGHT_GAP + RIGHT_INSET);
+            let right = if room < 2 {
+                vec![]
+            } else {
+                fit_spans(vec![Span::styled(quiet.clone(), muted)], room)
+            };
+            (left, right)
+        }
+    };
+    if used(&right) > 0 {
+        let gap = width.saturating_sub(used(&spans) + used(&right) + RIGHT_INSET);
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right);
     }
+    Line::from(fit_spans(spans, width))
+}
+
+/// The rows above the table (T5-5): the control bar; the rows the drill-down came through,
+/// while drilled; and while the report has rows, its headline, DIM while it is the last one
+/// read (T2-22), and a blank row. The bar and the crumbs are the controls, so they stay plain.
+fn top(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
+    let t = &state.tokens;
+    let mut lines = vec![bar(state, width, now_ms)];
+    lines.extend(crumbs(state, width, now_ms));
+    if let Some(report) = t.report().filter(|r| !r.rows.is_empty()) {
+        for line in headline::headline(state, report, width, now_ms) {
+            lines.push(if t.stale() {
+                line.patch_style(state.theme.dim())
+            } else {
+                line
+            });
+        }
+        lines.push(Line::default());
+    }
+    lines
 }
 
 /// The selected row in full (B11, B25), in rows at `width`: its numbers first, laid out by
@@ -1111,21 +1175,21 @@ fn below(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
     lines
 }
 
-/// What the body holds below the header, at its size: the table's rows, then the total, then
-/// what lies below it (`below`) in as many rows as it needs, half the body at most and leaving
-/// the table `TABLE_MIN` rows. What does not fit there scrolls with `J`/`K` (B25), and its last
-/// row says which lines show. The total follows the last row shown, so it is at the foot of a
+/// What the body holds under the rows above the table (`top`), at its size: the table's rows,
+/// then the total, then what lies below it (`below`) in as many rows as it needs, half the body
+/// at most and leaving the table `TABLE_MIN` rows. What does not fit there scrolls with `J`/`K`
+/// (B25), and its last row says which lines show. The total follows the last row shown, so it is at the foot of a
 /// table that fills the body.
 struct Plan {
-    header: Vec<Line<'static>>,
+    top: Vec<Line<'static>>,
     rows: usize,
     below: Vec<Line<'static>>,
 }
 
 /// How many rows what lies below the total takes: as many as its `lines`, half of `height` at
 /// most, and never the table's last `TABLE_MIN`.
-fn below_rows(lines: usize, header: usize, height: usize) -> usize {
-    let fixed = header + 2;
+fn below_rows(lines: usize, top: usize, height: usize) -> usize {
+    let fixed = top + 2;
     lines.min(height.saturating_sub(fixed + TABLE_MIN).min(height / 2))
 }
 
@@ -1164,13 +1228,13 @@ fn below_from(t: &TokensState) -> usize {
 fn plan(state: &State, area: Rect, now_ms: i64) -> Plan {
     let width = usize::from(area.width);
     let height = usize::from(area.height);
-    let header = header(state, width, now_ms);
+    let top = top(state, width, now_ms);
     let lines = below(state, width, now_ms);
-    let rows = below_rows(lines.len(), header.len(), height);
+    let rows = below_rows(lines.len(), top.len(), height);
     let (below, _) = window(state.theme, lines, below_from(&state.tokens), rows);
-    let table = height.saturating_sub(header.len() + 2 + below.len());
+    let table = height.saturating_sub(top.len() + 2 + below.len());
     Plan {
-        header,
+        top,
         rows: table,
         below,
     }
@@ -1179,9 +1243,9 @@ fn plan(state: &State, area: Rect, now_ms: i64) -> Plan {
 /// `J`/`K` (B25): what lies below the total moves `by` a line, stopping at either end.
 pub(super) fn scroll_below(state: &mut State, area: Rect, now_ms: i64, by: isize) {
     let width = usize::from(area.width);
-    let header = header(state, width, now_ms).len();
+    let top = top(state, width, now_ms).len();
     let lines = below(state, width, now_ms);
-    let rows = below_rows(lines.len(), header, usize::from(area.height));
+    let rows = below_rows(lines.len(), top, usize::from(area.height));
     let from = below_from(&state.tokens);
     let (_, furthest) = window(state.theme, lines, from, rows);
     let from = from.min(furthest) as isize;
@@ -1235,7 +1299,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     let width = usize::from(area.width);
     let t = &state.tokens;
     let plan = plan(state, area, now_ms);
-    let mut lines = plan.header;
+    let mut lines = plan.top;
     let Some(report) = t.report() else {
         if t.pending {
             lines.push(Line::from(format!(" {LOADING}")));
@@ -1404,17 +1468,43 @@ mod tests {
         vec![one, two, three]
     }
 
+    /// The bar's left part at 80 for a Day report, unfiltered (T5-7's form 4).
+    const DAY_BAR: &str = " p Day   [ ] 30 days   g by account   f all";
+
+    /// Body row 0 as the bar draws it `width` wide: `left`, a gap, then `right` ending
+    /// `RIGHT_INSET` in.
+    fn bar_row(left: &str, right: &str, width: usize) -> String {
+        let gap = width - RIGHT_INSET - width_of(left) - width_of(right);
+        format!("{left}{}{right}", " ".repeat(gap))
+    }
+
+    /// `parts` as `roles` letters: each part's characters in its role, its spaces blank.
+    fn letters(parts: &[(&str, char)]) -> String {
+        parts
+            .iter()
+            .flat_map(|(text, role)| {
+                text.chars()
+                    .map(move |c| if c == ' ' { ' ' } else { *role })
+            })
+            .collect()
+    }
+
+    /// The body's row `n` at `w`×`h`, where `draw_buffer` puts it.
+    fn body_y(state: &State, w: u16, h: u16, n: u16) -> u16 {
+        crate::view::areas(state, Rect::new(0, 0, w, h)).body.y + n
+    }
+
     #[test]
     fn a_day_report_at_80_columns() {
         // Spec §5.3: period, account, input, output, total and cost; the period once per day.
         let state = showing(days(), |_| {});
         let lines = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(lines[0], bar_row(DAY_BAR, "indexed 14:12", 80));
         assert_eq!(
-            lines[0..11],
+            lines[1..11],
             [
-                " [Day] Month Session Block  30 days  group: account",
-                " filter: all accounts · all models",
-                " UTC · refreshed 14:12",
+                " $50.95 at API prices    114.2M tokens    414 responses",
+                "",
                 " DAY         ACCOUNT        INPUT   OUTPUT   TOTAL    COST",
                 "▌2026-09-20  1 a1@x.co       1.2M  ≥310.0K   93.6M  $41.20",
                 "             2 spare       300.0K    80.0K   20.5M   $9.75",
@@ -1442,12 +1532,13 @@ mod tests {
     fn from_120_columns_the_cache_the_responses_and_a_cost_bar_join_them() {
         let state = showing(days(), |_| {});
         let lines = body_of(&state, 120, 40, NOW_MS);
-        assert_eq!(
-            lines[0],
-            " [Day] Month Session Block  30 days  group: account  filter: all accounts · all models"
+        assert!(
+            lines[0].starts_with(" p Day  Month  Session  5h block     [ ] 30 days"),
+            "{}",
+            lines[0]
         );
         assert_eq!(
-            lines[2..7],
+            lines[3..8],
             [
                 " DAY         ACCOUNT        INPUT   OUTPUT  CW 5M  CW 1H  CACHE R   TOTAL  RESP    COST",
                 "▌2026-09-20  1 a1@x.co       1.2M  ≥310.0K   3.0M   1.1M    88.0M   93.6M   412  $41.20  ████████",
@@ -1456,6 +1547,149 @@ mod tests {
                 " TOTAL                       1.5M  ≥390.9K   3.0M   1.1M   108.2M  114.2M   414  $50.95",
             ]
         );
+    }
+
+    #[test]
+    fn the_control_bar_names_each_choice_and_the_index() {
+        // T5-6, T5-7: the periods, the range, the grouping and the filter, the index on the
+        // right; five-space groups at 120, the narrow form at 80.
+        let mut state = showing(days(), |_| {});
+        assert_eq!(
+            body_of(&state, 120, 40, NOW_MS)[0],
+            format!(
+                " p Day  Month  Session  5h block     [ ] 30 days     g by account     f all accounts · all models{}indexed 14:12",
+                " ".repeat(9)
+            )
+        );
+        assert_eq!(
+            body_of(&state, 80, 24, NOW_MS)[0],
+            format!(
+                " p Day   [ ] 30 days   g by account   f all{}indexed 14:12",
+                " ".repeat(23)
+            )
+        );
+        let theme = Theme::new(true);
+        state.theme = theme;
+        let left = letters(&[
+            (" ", 't'),
+            ("p", 'a'),
+            (" ", 't'),
+            ("Day", 't'),
+            ("  ", 't'),
+            ("Month", 'm'),
+            ("  ", 't'),
+            ("Session", 'm'),
+            ("  ", 't'),
+            ("5h block", 'm'),
+            ("     ", 't'),
+            ("[ ]", 'a'),
+            (" ", 't'),
+            ("30 days", 't'),
+            ("     ", 't'),
+            ("g", 'a'),
+            (" ", 't'),
+            ("by account", 't'),
+            ("     ", 't'),
+            ("f", 'a'),
+            (" ", 't'),
+            ("all accounts · all models", 't'),
+        ]);
+        let right = letters(&[("indexed 14:12", 'm')]);
+        let want = format!("{left}{}{right} ", " ".repeat(9));
+        let buf = draw_buffer(&state, 120, 40, NOW_MS);
+        let y = body_y(&state, 120, 40, 0);
+        assert_eq!(roles(&buf, theme, y), canon(theme, &want));
+        assert!(
+            (0..120).all(|x| !buf[(x, y)].modifier.contains(Modifier::BOLD)),
+            "nothing bold"
+        );
+        let row = |keys: &str| body_of(&showing_after(keys, days()), 80, 24, NOW_MS)[0].clone();
+        assert!(
+            row("ppp").starts_with(" p 5h block   [ ] 30 days   g by account"),
+            "{}",
+            row("ppp")
+        );
+        for (keys, words) in [
+            ("g", "   g by model   "),
+            ("gg", "   g by account and model   "),
+            ("ggg", "   g no grouping   "),
+            ("]", "   [ ] 90 days   "),
+            ("]]", "   [ ] all time   "),
+        ] {
+            assert!(row(keys).contains(words), "{keys}: {}", row(keys));
+        }
+    }
+
+    #[test]
+    fn the_headline_says_the_report_s_cost_tokens_and_responses() {
+        // T5-10, T5-11: the cost bold, the labels muted, the dollars and the responses grouped.
+        let headline = " $50.95 at API prices    114.2M tokens    414 responses";
+        let mut state = showing(days(), |_| {});
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(lines[1], headline);
+        assert_eq!(lines[2], "");
+        assert!(lines[3].starts_with(" DAY"), "{lines:?}");
+        assert!(body_of(&state, 120, 40, NOW_MS)[1].starts_with(headline));
+        let theme = Theme::new(true);
+        state.theme = theme;
+        let buf = draw_buffer(&state, 80, 24, NOW_MS);
+        let y = body_y(&state, 80, 24, 1);
+        let want = letters(&[
+            (" ", 't'),
+            ("$50.95", 't'),
+            (" ", 't'),
+            ("at API prices", 'm'),
+            ("    ", 't'),
+            ("114.2M", 't'),
+            (" ", 't'),
+            ("tokens", 'm'),
+            ("    ", 't'),
+            ("414", 't'),
+            (" ", 't'),
+            ("responses", 'm'),
+        ]);
+        assert_eq!(roles(&buf, theme, y).trim_end(), canon(theme, &want));
+        let bold: Vec<u16> = (0..80)
+            .filter(|x| buf[(*x, y)].modifier.contains(Modifier::BOLD))
+            .collect();
+        assert_eq!(bold, (1..7).collect::<Vec<u16>>(), "the cost alone is bold");
+
+        let mut partial = showing(days(), |r| {
+            r.total.cost = Some(Cost {
+                usd_nanos: 50_950_000_000,
+                partial: true,
+            })
+        });
+        partial.theme = theme;
+        assert!(
+            body_of(&partial, 80, 24, NOW_MS)[1].starts_with(" ≥$50.95 at API prices    "),
+            "{:?}",
+            body_of(&partial, 80, 24, NOW_MS)
+        );
+        let buf = draw_buffer(&partial, 80, 24, NOW_MS);
+        let y = body_y(&partial, 80, 24, 1);
+        for x in 1..8 {
+            assert_eq!(buf[(x, y)].fg, Color::Yellow, "{x}");
+            assert!(buf[(x, y)].modifier.contains(Modifier::BOLD), "{x}");
+        }
+        let line =
+            |edit: fn(&mut TokenReport)| body_of(&showing(days(), edit), 80, 24, NOW_MS)[1].clone();
+        assert_eq!(
+            line(|r| r.total.cost = None),
+            " — at API prices    114.2M tokens    414 responses"
+        );
+        assert_eq!(
+            line(|r| {
+                r.total.cost = Some(Cost {
+                    usd_nanos: 1_541_640_000_000,
+                    partial: false,
+                });
+                r.total.responses = 9_891;
+            }),
+            " $1,541.64 at API prices    114.2M tokens    9,891 responses"
+        );
+        assert!(line(|r| r.total.responses = 1).ends_with("    1 response"));
+        assert!(line(|r| r.total.counts = counts(1, 0, 0)).contains("    1 token    "));
     }
 
     /// A session of yesterday, 09:12 to 11:40 UTC, in the tagteam checkout.
@@ -1514,11 +1748,18 @@ mod tests {
         );
         let lines = body_of(&sessions, 80, 24, NOW_MS);
         assert_eq!(
-            lines[0..11],
+            lines[0],
+            bar_row(
+                " p Session   [ ] 30 days   g by account   f all",
+                "indexed 14:12",
+                80
+            )
+        );
+        assert_eq!(
+            lines[1..11],
             [
-                " Day Month [Session] Block  30 days  group: account",
-                " filter: all accounts · all models",
-                " UTC · refreshed 14:12",
+                " $2.46 at API prices    1.8M tokens    2 responses",
+                "",
                 " SESSION            PROJECT              ACCOUNT    INPUT  OUTPUT   TOTAL   COST",
                 "▌09-20 09:12–11:40  …/alex/Code/tagteam  1 a1@x.co  20.0K    3.0K  923.0K  $1.23",
                 " 09-20 09:12–11:40  …/alex/Code/tagteam  2 spare    20.0K    3.0K  923.0K  $1.23",
@@ -1546,27 +1787,39 @@ mod tests {
         let lines = body_of(&months, 80, 24, NOW_MS);
         assert_eq!(
             lines[0],
-            " Day [Month] Session Block  12 months  group: account"
+            bar_row(
+                " p Month   [ ] 12 months   g by account   f all",
+                "indexed 14:12",
+                80
+            )
         );
+        assert_eq!(lines[1], " — at API prices    6 tokens    1 response");
         assert_eq!(lines[3], " MONTH    ACCOUNT    INPUT  OUTPUT  TOTAL  COST");
         assert_eq!(lines[4], "▌2026-09  1 a1@x.co      1       2      6     —");
     }
 
     #[test]
     fn a_block_shows_its_span_and_whether_it_was_observed() {
-        // Spec §5.3, token report §9; blocks are per account, so the header shows the
-        // grouping the report applies.
+        // Spec §5.3, token report §9; blocks are per account, so the bar shows the grouping
+        // the report applies.
         let blocks = showing_after(
             "pppggg",
             vec![block(NOON, true), block(NOON - 5 * HOUR_MS, false)],
         );
         let lines = body_of(&blocks, 80, 24, NOW_MS);
         assert_eq!(
-            lines[0..9],
+            lines[0],
+            bar_row(
+                " p 5h block   [ ] 30 days   g by account   f all",
+                "indexed 14:12",
+                80
+            )
+        );
+        assert_eq!(
+            lines[1..9],
             [
-                " Day Month Session [Block]  30 days  group: account",
-                " filter: all accounts · all models",
-                " UTC · refreshed 14:12",
+                " $10.00 at API prices    10.9M tokens    2 responses",
+                "",
                 " BLOCK                        ACCOUNT     INPUT  OUTPUT  TOTAL    COST",
                 "▌09-21 12:00–17:00  observed  1 a1@x.co  400.0K   50.0K   5.5M   $5.00",
                 "   active · 2h13m elapsed · 2h46m left · 41.2K tokens/min · $3.20/h",
@@ -1624,7 +1877,11 @@ mod tests {
         let lines = body_of(&models, 80, 24, NOW_MS);
         assert_eq!(
             lines[0],
-            " [Day] Month Session Block  30 days  group: model"
+            bar_row(
+                " p Day   [ ] 30 days   g by model   f all",
+                "indexed 14:12",
+                80
+            )
         );
         assert_eq!(
             lines[3],
@@ -1637,7 +1894,14 @@ mod tests {
         opus.model = None;
         let none = showing_after("ggg", vec![opus]);
         let lines = body_of(&none, 80, 24, NOW_MS);
-        assert_eq!(lines[0], " [Day] Month Session Block  30 days  group: none");
+        assert_eq!(
+            lines[0],
+            bar_row(
+                " p Day   [ ] 30 days   g no grouping   f all",
+                "indexed 14:12",
+                80
+            )
+        );
         assert_eq!(
             lines[3],
             " DAY         ACCOUNT             INPUT  OUTPUT  TOTAL  COST"
@@ -1706,24 +1970,29 @@ mod tests {
     }
 
     #[test]
-    fn the_header_says_how_current_the_index_is() {
-        // Spec §5.3 "Indexing".
+    fn the_bar_s_right_part_says_how_current_the_index_is() {
+        // T5-8, spec §5.3 "Indexing": the right end of the bar at 80.
+        let bar = |state: &State| body_of(state, 80, 24, NOW_MS)[0].clone();
         let mut state = showing(days(), |_| {});
         assert_eq!(state.tokens.watch().refreshing(), None);
         assert!(crate::update::drawn(&mut state).contains(&Cmd::RefreshIndex { provider: cc() }));
-        assert_eq!(
-            body_of(&state, 80, 24, NOW_MS)[2],
-            " UTC · indexing transcripts…"
-        );
+        assert_eq!(bar(&state), bar_row(DAY_BAR, "indexing…", 80));
         let progress = IndexProgress {
             bytes_done: 1_200_000_000,
             bytes_total: 3_300_000_000,
             ..IndexProgress::default()
         };
         update(&mut state, Msg::IndexProgress(progress), NOW_MS);
+        assert_eq!(bar(&state), bar_row(DAY_BAR, "indexing 1.2 / 3.3 GB", 80));
+        let progress = IndexProgress {
+            bytes_done: 900_000_000,
+            bytes_total: 3_300_000_000,
+            ..IndexProgress::default()
+        };
+        update(&mut state, Msg::IndexProgress(progress), NOW_MS);
         assert_eq!(
-            body_of(&state, 80, 24, NOW_MS)[2],
-            " UTC · indexing transcripts 1.2 GB / 3.3 GB"
+            bar(&state),
+            bar_row(DAY_BAR, "indexing 900.0 MB / 3.3 GB", 80)
         );
         update(
             &mut state,
@@ -1732,34 +2001,26 @@ mod tests {
             },
             NOW_MS,
         );
-        assert_eq!(
-            body_of(&state, 80, 24, NOW_MS)[2],
-            " UTC · catching up elsewhere"
-        );
+        assert_eq!(bar(&state), bar_row(DAY_BAR, "catching up elsewhere", 80));
         // A report of an index that has never completed a refresh (token report §14).
         let partial = IndexState {
             refreshed_at_ms: None,
             ..IndexState::default()
         };
         let mut state = showing(days(), |r| r.index = partial);
-        assert_eq!(body_of(&state, 80, 24, NOW_MS)[2], " UTC · catching up");
+        assert_eq!(bar(&state), bar_row(DAY_BAR, "catching up", 80));
         crate::screens::tokens::requery(&mut state, NOW_MS);
-        assert_eq!(
-            body_of(&state, 80, 24, NOW_MS)[2],
-            " UTC · catching up · updating…"
-        );
-        // Refreshed on another day: its date.
+        assert_eq!(bar(&state), bar_row(DAY_BAR, "catching up · updating…", 80));
+        // Refreshed on another day: §5.3's time form.
         let state = showing(days(), |r| {
             r.index.refreshed_at_ms = Some(YESTERDAY + HOUR_MS)
         });
-        assert_eq!(
-            body_of(&state, 80, 24, NOW_MS)[2],
-            " UTC · refreshed 2026-09-20 01:00"
-        );
+        assert_eq!(bar(&state), bar_row(DAY_BAR, "indexed Sun 01:00", 80));
     }
 
     #[test]
-    fn a_cold_catch_up_shows_its_progress_whole_at_80_columns_without_saying_catching_up() {
+    fn a_cold_catch_up_shows_its_progress_and_never_says_catching_up() {
+        // T5-6, T5-7: the zone is not shown; `updating…` gives way before the periods.
         let mut state = fresh(Screen::Tokens);
         state.tokens = crate::screens::tokens::TokensState::new(
             cc(),
@@ -1782,8 +2043,8 @@ mod tests {
             NOW_MS,
         );
         assert_eq!(
-            body_of(&state, 80, 24, NOW_MS)[2],
-            " Europe/Brussels · catching up"
+            body_of(&state, 80, 24, NOW_MS)[0],
+            bar_row(DAY_BAR, "catching up", 80)
         );
         crate::update::drawn(&mut state);
         let progress = IndexProgress {
@@ -1793,21 +2054,42 @@ mod tests {
         };
         update(&mut state, Msg::IndexProgress(progress), NOW_MS);
         crate::screens::tokens::requery(&mut state, NOW_MS);
+        let at = |w: u16| body_of(&state, w, 40, NOW_MS)[0].clone();
+        assert_eq!(at(80), bar_row(DAY_BAR, "indexing 12.3 / 33.3 GB", 80));
         assert_eq!(
-            body_of(&state, 80, 24, NOW_MS)[2],
-            " Europe/Brussels · indexing transcripts 12.3 GB / 33.3 GB · updating…"
+            at(120),
+            bar_row(
+                " p Day  Month  Session  5h block   [ ] 30 days   g by account   f all accounts · all models",
+                "indexing 12.3 / 33.3 GB",
+                120
+            )
         );
+        assert_eq!(
+            at(160),
+            bar_row(
+                " p Day  Month  Session  5h block     [ ] 30 days     g by account     f all accounts · all models",
+                "indexing 12.3 / 33.3 GB · updating…",
+                160
+            )
+        );
+        for w in [80, 120, 160] {
+            assert!(!at(w).contains("catching up"), "{}", at(w));
+            assert!(!at(w).contains("Brussels"), "{}", at(w));
+        }
     }
 
     #[test]
     fn loading_and_an_empty_report_say_so() {
         let mut state = fresh(Screen::Tokens);
         state.start();
-        assert_eq!(body_of(&state, 80, 24, NOW_MS)[3], " loading…");
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert!(lines[0].starts_with(DAY_BAR), "{lines:?}");
+        assert_eq!(lines[1], " loading…");
         let empty = showing(vec![], |_| {});
         let lines = body_of(&empty, 80, 24, NOW_MS);
-        assert_eq!(lines[3], " No token usage in this range.");
-        assert_eq!(lines[4], "");
+        assert_eq!(lines[0], bar_row(DAY_BAR, "indexed 14:12", 80));
+        assert_eq!(lines[1], " No token usage in this range.");
+        assert_eq!(lines[2], "");
     }
 
     #[test]
@@ -1818,7 +2100,7 @@ mod tests {
         };
         let state = showing(vec![], |r| r.index = unbuilt);
         let lines = body_of(&state, 80, 24, NOW_MS);
-        assert_eq!(lines[2], " UTC · catching up");
+        assert_eq!(lines[0], bar_row(DAY_BAR, "catching up", 80));
         let title = lines.iter().position(|l| l.trim() == "No token usage yet");
         let sentence = "tagteam reads Claude Code's transcripts; they appear here as you use it.";
         assert_eq!(
@@ -1832,7 +2114,7 @@ mod tests {
         );
         let built = showing(vec![], |_| {});
         assert_eq!(
-            body_of(&built, 80, 24, NOW_MS)[3],
+            body_of(&built, 80, 24, NOW_MS)[1],
             " No token usage in this range."
         );
     }
@@ -1844,88 +2126,103 @@ mod tests {
             r.index.unreadable_files = 3;
         });
         let lines = body_of(&state, 80, 24, NOW_MS);
-        assert_eq!(lines[3], " No token usage in this range.");
+        assert_eq!(lines[1], " No token usage in this range.");
         assert_eq!(
-            lines[4..6],
+            lines[2..4],
             [
                 " 12 transcript lines could not be read, so these totals may be low.",
                 " 3 transcript files could not be read; the next refresh tries again.",
             ]
         );
-        assert_eq!(lines[6], "");
+        assert_eq!(lines[4], "");
     }
 
     #[test]
     fn an_empty_report_without_warnings_shows_only_the_empty_message() {
         let state = showing(vec![], |_| {});
         let lines = body_of(&state, 80, 24, NOW_MS);
-        assert_eq!(lines[3], " No token usage in this range.");
-        assert!(lines[4..].iter().all(|l| l.is_empty()), "{lines:?}");
+        assert_eq!(lines[1], " No token usage in this range.");
+        assert!(lines[2..].iter().all(|l| l.is_empty()), "{lines:?}");
     }
 
     #[test]
-    fn the_drill_down_is_named_in_the_header() {
+    fn a_drilled_level_names_its_way_down_on_a_row_under_the_bar() {
+        // T5-9: the crumbs take a row of their own under the bar, muted, and the bar keeps its
+        // place and its words.
         let mut state = showing(days(), |_| {});
-        let cmds = update(&mut state, key(KeyCode::Enter), NOW_MS);
-        let [Cmd::LoadReport { r#gen, query }] = cmds.as_slice() else {
-            panic!("{cmds:?}");
-        };
-        let rows = vec![session("3f2a9c1d", row_account(1))];
-        let result = Ok(token_report(query.clone(), rows));
-        update(
-            &mut state,
-            Msg::TokenReport {
-                r#gen: *r#gen,
-                result,
-            },
-            NOW_MS,
-        );
+        let bar = body_of(&state, 80, 24, NOW_MS)[0].clone();
+        let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
+        answer_with(&mut state, &down, vec![session("3f2a9c1d", row_account(1))]);
         let lines = body_of(&state, 80, 24, NOW_MS);
-        assert_eq!(
-            lines[0],
-            " [Day] Month Session Block  30 days  group: account"
+        assert_eq!(lines[0], bar);
+        assert!(
+            lines[0].starts_with(" p Day   "),
+            "still `p Day`: {lines:?}"
         );
         assert_eq!(
-            lines[1],
-            " filter: all accounts · all models  › 2026-09-20 1 a1@x.co"
+            lines[1..4],
+            [
+                " › 2026-09-20 · 1 a1@x.co",
+                " $1.23 at API prices    923.0K tokens    1 response",
+                "",
+            ]
+        );
+        assert!(lines[4].starts_with(" SESSION"), "{lines:?}");
+        let theme = Theme::new(true);
+        state.theme = theme;
+        let y = body_y(&state, 80, 24, 1);
+        let buf = draw_buffer(&state, 80, 24, NOW_MS);
+        let want = letters(&[(" ", 't'), ("› 2026-09-20 · 1 a1@x.co", 'm')]);
+        assert_eq!(roles(&buf, theme, y).trim_end(), canon(theme, &want));
+        let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
+        answer_with(&mut state, &down, vec![session("3f2a9c1d", row_account(1))]);
+        assert_eq!(
+            body_of(&state, 80, 24, NOW_MS)[1],
+            " › 2026-09-20 · 1 a1@x.co › session 3f2a9c1d · 1 a1@x.co"
+        );
+        // A crumb longer than the row is cut there; the bar is untouched.
+        let mut state = widest();
+        let bar = body_of(&state, 80, 24, NOW_MS)[0].clone();
+        let rows = state.tokens.report().map(|r| r.rows[..1].to_vec());
+        let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
+        answer_with(&mut state, &down, rows.unwrap_or_default());
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(lines[0], bar);
+        assert!(
+            lines[1].starts_with(" › session 3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c · 3 山田"),
+            "{lines:?}"
+        );
+        assert!(lines[1].ends_with('…'), "{lines:?}");
+        assert!(width_of(&lines[1]) <= 79, "{lines:?}");
+        assert!(
+            lines[4].starts_with(" ACCOUNT"),
+            "one session's models share the period and the project, which the rows leave out: {lines:?}"
         );
     }
 
     #[test]
-    fn the_header_names_the_top_levels_grouping_at_every_depth() {
+    fn the_bar_names_the_top_level_s_grouping_at_every_depth() {
         // `g` changes the top level's grouping; a drilled level's own is not what it sets.
-        let mut state = showing_after("g", days());
-        assert_eq!(
-            body_of(&state, 80, 24, NOW_MS)[0],
-            " [Day] Month Session Block  30 days  group: model"
+        let by_model = bar_row(
+            " p Day   [ ] 30 days   g by model   f all",
+            "indexed 14:12",
+            80,
         );
+        let mut state = showing_after("g", days());
+        assert_eq!(body_of(&state, 80, 24, NOW_MS)[0], by_model);
         for rows in [
             vec![session("3f2a9c1d", row_account(1))],
             vec![session("3f2a9c1d", row_account(1))],
         ] {
             let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
-            let [Cmd::LoadReport { r#gen, query }] = down.as_slice() else {
-                panic!("{down:?}");
-            };
-            let result = Ok(token_report(query.clone(), rows));
-            update(
-                &mut state,
-                Msg::TokenReport {
-                    r#gen: *r#gen,
-                    result,
-                },
-                NOW_MS,
-            );
+            answer_with(&mut state, &down, rows);
         }
         assert_eq!(state.tokens.depth(), 2);
         assert_eq!(
             state.tokens.report().map(|r| r.query.grouping),
             Some(TokenGrouping::AccountModel)
         );
-        assert_eq!(
-            body_of(&state, 80, 24, NOW_MS)[0],
-            " [Day] Month Session Block  30 days  group: model"
-        );
+        assert_eq!(body_of(&state, 80, 24, NOW_MS)[0], by_model);
     }
 
     /// Answers the report query among `cmds` with `rows`.
@@ -2001,7 +2298,7 @@ mod tests {
         assert_eq!(state.tokens.depth(), 2);
         let lines = body_of(&state, 80, 24, NOW_MS);
         assert!(
-            lines[3].starts_with(" ACCOUNT"),
+            lines[4].starts_with(" ACCOUNT"),
             "the period and the project are the same on every row: {lines:?}"
         );
         for model in MODELS {
@@ -2010,8 +2307,8 @@ mod tests {
                 "{model} whole: {lines:?}"
             );
         }
-        assert!(lines[7].starts_with(" TOTAL"), "{lines:?}");
-        assert!(lines[7].contains("1.2M"), "{lines:?}");
+        assert!(lines[8].starts_with(" TOTAL"), "{lines:?}");
+        assert!(lines[8].contains("1.2M"), "{lines:?}");
     }
 
     #[test]
@@ -2046,11 +2343,11 @@ mod tests {
         }
         let state = showing(rows, |_| {});
         let lines = body_of(&state, 120, 40, NOW_MS);
-        assert!(lines[2].contains("  CACHE W  CACHE R  "), "{}", lines[2]);
+        assert!(lines[3].contains("  CACHE W  CACHE R  "), "{}", lines[3]);
         assert!(
-            lines[4].contains("2 an-alias-thirty-five-characters-long  "),
+            lines[5].contains("2 an-alias-thirty-five-characters-long  "),
             "{}",
-            lines[4]
+            lines[5]
         );
     }
 
@@ -2085,6 +2382,11 @@ mod tests {
             |buf: &ratatui::buffer::Buffer, needle: &str| cells(buf, needle).iter().all(|d| *d);
         let plain =
             |buf: &ratatui::buffer::Buffer, needle: &str| cells(buf, needle).iter().all(|d| !d);
+        // The needle's own cells, not DIM: the bar's, whose muted words are DIM by their role.
+        let undimmed = |buf: &ratatui::buffer::Buffer, needle: &str| {
+            let (x, y) = locate(buf, needle).unwrap();
+            (x..x + width_of(needle) as u16).all(|x| !buf[(x, y)].modifier.contains(Modifier::DIM))
+        };
         for theme in TIERS {
             let mut state = showing(many_days(3), |_| {});
             state.theme = theme;
@@ -2101,6 +2403,8 @@ mod tests {
                     "{theme:?} {needle}: a good report is plain"
                 );
             }
+            assert!(undimmed(&buf, "[ ] 30 days"), "{theme:?}");
+            assert!(undimmed(&buf, "$0.03"), "{theme:?}");
             let asked = update(&mut state, ch('p'), NOW_MS);
             let [Cmd::LoadReport { r#gen, .. }] = asked.as_slice() else {
                 panic!("{asked:?}");
@@ -2145,11 +2449,18 @@ mod tests {
             ] {
                 assert!(dim(&buf, needle), "{theme:?} {needle}: DIM on every cell");
             }
-            let again = update(&mut state, ch('p'), NOW_MS);
+            assert!(dim(&buf, "at API prices"), "{theme:?}: the headline too");
             assert!(
-                dim(&draw_buffer(&state, 80, 24, NOW_MS), "2026-09-21"),
+                undimmed(&buf, "[ ] 12 months"),
+                "{theme:?}: the bar, the top level's choices, stays plain"
+            );
+            let again = update(&mut state, ch('p'), NOW_MS);
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            assert!(
+                dim(&buf, "2026-09-21"),
                 "{theme:?}: dim until the new report arrives"
             );
+            assert!(undimmed(&buf, "[ ] 30 days"), "{theme:?}");
             let [Cmd::LoadReport { r#gen, query }] = again.as_slice() else {
                 panic!("{again:?}");
             };
@@ -2176,6 +2487,8 @@ mod tests {
             ] {
                 assert!(plain(&buf, needle), "{theme:?} {needle}: cleared");
             }
+            assert!(undimmed(&buf, "$0.03"), "{theme:?}: the headline cleared");
+            assert!(undimmed(&buf, "[ ] 30 days"), "{theme:?}");
         }
     }
 
@@ -2260,7 +2573,7 @@ mod tests {
         }
         update(&mut state, key(KeyCode::Home), NOW_MS);
         assert_eq!(
-            body_of(&state, 100, 30, NOW_MS)[3],
+            body_of(&state, 100, 30, NOW_MS)[4],
             "▌2026-09-21  1 a1@x.co      1       2      6  $0.01"
         );
         update(&mut state, key(KeyCode::PageDown), NOW_MS);
@@ -2505,9 +2818,9 @@ mod tests {
     }
 
     #[test]
-    fn the_header_keeps_three_rows_and_a_long_filter_is_cut() {
-        // B29: the periods, the filter and the status line take a row each at 80 columns. The
-        // filter, which its dialog shows whole, is cut with `…`; the status line shows whole.
+    fn the_bar_cuts_a_long_filter_and_keeps_its_keys() {
+        // T5-7 form 7: the filter, which its dialog shows whole, is cut to `FILTER_LEAST`, then
+        // the index's words from their end; every key keeps its place.
         let alias = "a-rather-long-alias-for-the-work-account";
         let label = "averyveryverylongname.with.a.long.tail@example.com";
         let model = "claude-opus-5-5-with-a-very-long-suffix-and-then-some-more-of-it-yet";
@@ -2527,53 +2840,15 @@ mod tests {
         };
         update(&mut state, Msg::IndexProgress(progress), NOW_MS);
         let lines = body_of(&state, 80, 24, NOW_MS);
-        assert_eq!(
-            lines[0],
-            " [Day] Month Session Block  30 days  group: account"
-        );
         assert!(
-            lines[1].starts_with(&format!(" filter: 2 {alias} (avery")),
+            lines[0].starts_with(" p Day   [ ] 30 days   g by account   f 2 a-rather-long-ali…"),
             "{lines:?}"
         );
-        assert!(lines[1].ends_with('…'), "{lines:?}");
-        assert!(width_of(&lines[1]) <= 80, "{lines:?}");
-        assert_eq!(lines[2], " UTC · indexing transcripts 1.2 GB / 3.3 GB");
+        assert!(width_of(&lines[0]) <= 79, "{lines:?}");
+        assert!(lines[0].ends_with('…'), "{lines:?}");
+        assert!(lines[1].starts_with(" $50.95 at API prices"), "{lines:?}");
+        assert_eq!(lines[2], "");
         assert!(lines[3].starts_with(" DAY"), "{lines:?}");
-    }
-
-    #[test]
-    fn a_long_drill_down_keeps_its_start_on_the_filters_row() {
-        // B29: the rows a drill-down came through share the filter's row. The filter gives way
-        // first, down to `FILTER_LEAST` columns, then they are cut; the header keeps three rows.
-        let mut state = widest();
-        let rows = state.tokens.report().map(|r| r.rows[..1].to_vec());
-        let cmds = update(&mut state, key(KeyCode::Enter), NOW_MS);
-        let [Cmd::LoadReport { r#gen, query }] = cmds.as_slice() else {
-            panic!("{cmds:?}");
-        };
-        let rows = rows.unwrap_or_default();
-        let result = Ok(token_report(query.clone(), rows));
-        update(
-            &mut state,
-            Msg::TokenReport {
-                r#gen: *r#gen,
-                result,
-            },
-            NOW_MS,
-        );
-        let lines = body_of(&state, 80, 24, NOW_MS);
-        assert_eq!(
-            lines[0..3],
-            [
-                " Day Month [Session] Block  all  group: account, model",
-                " filter: all account…  › session 3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c 3 山田太…",
-                " UTC · refreshed 14:12",
-            ]
-        );
-        assert!(
-            lines[3].starts_with(" ACCOUNT"),
-            "one session's models share the period and the project, which the rows leave out: {lines:?}"
-        );
     }
 
     #[test]
@@ -2581,7 +2856,7 @@ mod tests {
         // B29, by construction: under the Now strip, a 2-row banner and a full toast the body is
         // 16 rows, from row 5. The 80×24 worst case, a 15-row body under a full banner too, is
         // the worst live stack's below.
-        // The header takes three at most; the table's heading and total two; what lies below the total
+        // The rows above the table take three; the table's heading and total two; what lies below the total
         // half the body at most and never the table's last three. Below the total nothing is
         // cut: it scrolls, and J reaches every line of it.
         let long = format!("claude-{}", "x".repeat(1993));
@@ -2603,16 +2878,14 @@ mod tests {
         state.toast(crate::state::ToastKind::Info, [words; 3].join("; "), NOW_MS);
         let lines = draw(&state, 80, 24);
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
-        assert_eq!(
-            lines[5],
-            " Day Month [Session] Block  30 days  group: account"
-        );
         assert!(
-            lines[6].starts_with(" filter: all accounts · claude-xxxx"),
+            lines[5]
+                .starts_with(" p Session   [ ] 30 days   g by account   f all accounts · clau…"),
             "{lines:?}"
         );
-        assert!(lines[6].ends_with('…'), "{lines:?}");
-        assert!(lines[7].starts_with(" UTC · "), "{lines:?}");
+        assert!(lines[5].ends_with('…'), "{lines:?}");
+        assert!(lines[6].starts_with(" $"), "{lines:?}");
+        assert_eq!(lines[7], "", "{lines:?}");
         assert!(lines[8].starts_with(" SESSION"), "{lines:?}");
         let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
         assert!(total >= 9 + 3, "the table keeps three rows: {lines:?}");
@@ -2692,7 +2965,7 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines[6].starts_with(" Day Month"),
+            lines[6].starts_with(" p Session"),
             "the body starts at row 6: {lines:?}"
         );
         assert!(

@@ -3,7 +3,9 @@
 //! session to its models. Every query runs on the report lane (§4.3), never on the UI thread,
 //! and the index's catch-up on the index lane (`index`).
 
+mod amounts;
 pub mod filter;
+mod headline;
 pub mod index;
 mod table;
 
@@ -24,7 +26,7 @@ use crate::state::{Screen, State};
 const DAY_MS: i64 = 86_400_000;
 
 /// The ranges `[` and `]` cycle through (spec §5.3, B9): 7 days, the default (30 days, or for
-/// `Month` the twelve calendar months to this one, token report §11.1), 90 days, or all.
+/// `Month` the twelve calendar months to this one, token report §11.1), 90 days, or all time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Range {
     Week,
@@ -52,14 +54,14 @@ impl Range {
         }
     }
 
-    /// The header's words for the range of a `period` report.
+    /// The control bar's words for the range of a `period` report (T5-6).
     pub fn label(self, period: TokenPeriod) -> &'static str {
         match (self, period) {
             (Range::Week, _) => "7 days",
             (Range::Default, TokenPeriod::Month) => "12 months",
             (Range::Default, _) => "30 days",
             (Range::Quarter, _) => "90 days",
-            (Range::All, _) => "all",
+            (Range::All, _) => "all time",
         }
     }
 }
