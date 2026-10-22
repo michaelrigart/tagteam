@@ -2,6 +2,8 @@
 //! to, over its table; on a Day report today's cost and a sparkline of cost per day, and on a
 //! 5h-block report the active block's progress line.
 
+use std::collections::HashMap;
+
 use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
@@ -9,8 +11,8 @@ use ratatui::text::{Line, Span};
 use tagteam_engine::tokens::{Cost, PeriodKey, RowAccount, TokenPeriod, TokenReport, TokenRow};
 use tagteam_engine::words;
 
+use super::amounts;
 use super::table::figures_clock;
-use super::{Range, amounts};
 use crate::chrome::{WIDE, fit_spans};
 use crate::gauge;
 use crate::keys::RIGHT_INSET;
@@ -24,8 +26,8 @@ const GAP: &str = "    ";
 const RIGHT_GAP: usize = 3;
 /// The per-day sparkline's label (T5-12).
 const PER_DAY: &str = "per day ";
-/// The most dates the per-day sparkline shows (`min(30, range days)`), and the fewest it
-/// keeps (T5-12).
+/// The most dates the per-day sparkline shows (`min(30, the days its query spans)`), and the
+/// fewest it keeps (T5-12).
 const DAYS_MOST: usize = 30;
 const DAYS_LEAST: usize = 7;
 /// The block's gauge, and the fewest cells it keeps on its own row (T5-13).
@@ -49,10 +51,7 @@ pub(super) fn headline(
                 return vec![Line::from(fit_spans(left, width))];
             };
             left.extend(today_spans(theme, report, today));
-            let days = match state.tokens.range {
-                Range::Week => 7,
-                _ => DAYS_MOST,
-            };
+            let days = days_spanned(report, today);
             let room = width.saturating_sub(used(&left) + RIGHT_GAP + PER_DAY.len() + RIGHT_INSET);
             let cells = days.min(room);
             let right = if cells >= DAYS_LEAST {
@@ -201,22 +200,34 @@ fn today_spans(theme: Theme, report: &TokenReport, today: Date) -> Vec<Span<'sta
     ]
 }
 
+/// How many dates the per-day sparkline shows for `report` (T5-12): the days its own query
+/// spans to `today`, so a report shown while another range is asked for keeps its own, and
+/// `DAYS_MOST` at most or for a query with no start.
+fn days_spanned(report: &TokenReport, today: Date) -> usize {
+    report
+        .query
+        .since_ms
+        .and_then(|since| date_of(since, &report.query.tz))
+        .and_then(|since| since.until(today).ok())
+        .map_or(DAYS_MOST, |span| {
+            usize::try_from(span.get_days()).map_or(0, |days| days.min(DAYS_MOST))
+        })
+}
+
 /// The last `cells` dates to `today`, oldest first, each its rows' costs added up: none for a
 /// date with no row, 0 for one whose rows have no price (T5-12).
 fn per_day(report: &TokenReport, today: Date, cells: usize) -> Vec<Option<u64>> {
+    let mut by_date: HashMap<Date, u64> = HashMap::new();
+    for row in &report.rows {
+        if let Some(date) = day_of(row) {
+            let sum = by_date.entry(date).or_default();
+            *sum = sum.saturating_add(row.cost.map_or(0, |c| c.usd_nanos));
+        }
+    }
     let mut values = Vec::with_capacity(cells);
     let mut date = Some(today);
     for _ in 0..cells {
-        let value = date.and_then(|d| {
-            let mut rows = report
-                .rows
-                .iter()
-                .filter(|r| day_of(r) == Some(d))
-                .peekable();
-            rows.peek()?;
-            Some(rows.filter_map(|r| r.cost).map(|c| c.usd_nanos).sum())
-        });
-        values.push(value);
+        values.push(date.and_then(|d| by_date.get(&d).copied()));
         date = date.and_then(|d| d.yesterday().ok());
     }
     values.reverse();
@@ -481,6 +492,16 @@ mod tests {
         let week = body_of(&showing_after("[", rows()), 120, 40, NOW_MS)[1].clone();
         assert!(week.ends_with("per day    ▃ ▅█"), "seven cells: {week}");
         assert_eq!(width_of(&week) + 1, 120, "{week}");
+        // The cells are the shown report's: asked for 30 days, a 7-day report still draws 7.
+        let mut asked = showing_after("[", rows());
+        let cmds = update(&mut asked, ch(']'), NOW_MS);
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::LoadReport { .. }]),
+            "{cmds:?}"
+        );
+        assert!(asked.tokens.pending());
+        let line = body_of(&asked, 120, 40, NOW_MS)[1].clone();
+        assert_eq!(line, week, "seven cells until the new report answers");
 
         let mut unpriced = rows();
         unpriced.push(day_row(0, 2, None));
