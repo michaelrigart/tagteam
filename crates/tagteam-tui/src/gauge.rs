@@ -1,5 +1,6 @@
-//! The bars the Accounts screen draws (spec §4.4, T3-17): the lead card's lead bar, the table's
-//! line gauge and the card's sparkline.
+//! The bars the Accounts and Tokens screens draw (spec §4.4, T3-17): the lead card's lead bar,
+//! the table's line gauge and the card's sparkline; the Tokens headline's block progress line
+//! and its sparkline of cost per day.
 
 use ratatui::text::Span;
 use tagteam_core::Sample;
@@ -58,7 +59,23 @@ pub(crate) fn line_gauge(
     cells: usize,
     theme: Theme,
 ) -> Vec<Span<'static>> {
-    let fill = fill_role(pct);
+    gauge(pct, expected, fill_role(pct), cells, theme)
+}
+
+/// The block's progress (T5-13): `━` whole cells and a `╸` half in accent on a faint `─` track
+/// (tier 0 `·`), `cells` wide.
+pub(crate) fn progress_line(pct: f64, cells: usize, theme: Theme) -> Vec<Span<'static>> {
+    gauge(pct, None, Role::Accent, cells, theme)
+}
+
+/// `line_gauge`'s drawing with its fill in `fill`.
+fn gauge(
+    pct: f64,
+    expected: Option<f64>,
+    fill: Role,
+    cells: usize,
+    theme: Theme,
+) -> Vec<Span<'static>> {
     let x = filled(pct, cells);
     let whole = x.floor() as usize;
     let half = x - x.floor() >= 0.5;
@@ -123,6 +140,21 @@ pub(crate) fn sparkline(
         .into_iter()
         .map(|peak| match peak {
             Some(pct) => SPARK[filled(pct, 7).round() as usize],
+            None => ' ',
+        })
+        .collect();
+    Span::styled(text, theme.role(Role::Accent))
+}
+
+/// T5-12's sparkline: each value on `▁…█` against the largest (`▁` when it is 0), a space for
+/// none, in accent.
+pub(crate) fn sparkline_of(values: &[Option<u64>], theme: Theme) -> Span<'static> {
+    let largest = values.iter().flatten().copied().max().unwrap_or(0);
+    let text: String = values
+        .iter()
+        .map(|value| match value {
+            Some(_) if largest == 0 => SPARK[0],
+            Some(v) => SPARK[filled(*v as f64 / largest as f64 * 100.0, 7).round() as usize],
             None => ' ',
         })
         .collect();
@@ -310,6 +342,49 @@ mod tests {
                 assert_eq!(text, want.replace('─', track), "case {n} in {theme:?}");
                 assert_eq!(text.chars().count(), cells, "case {n} in {theme:?}");
             }
+        }
+    }
+
+    #[test]
+    fn the_progress_line_fills_its_share_in_accent_on_a_track() {
+        for theme in TIERS {
+            let track = if theme.colourless() { "·" } else { "─" };
+            let (text, letters) = drawn(progress_line(44.44, 22, theme), theme);
+            assert_eq!(
+                text,
+                format!("{}╸{}", "━".repeat(9), track.repeat(12)),
+                "{theme:?}"
+            );
+            let want = format!("{}{}", "a".repeat(10), "f".repeat(12));
+            assert_eq!(letters, canon(theme, &want), "{theme:?}");
+
+            let (text, letters) = drawn(progress_line(44.44, 14, theme), theme);
+            assert_eq!(
+                text,
+                format!("{}{}", "━".repeat(6), track.repeat(8)),
+                "{theme:?}"
+            );
+            let want = format!("{}{}", "a".repeat(6), "f".repeat(8));
+            assert_eq!(letters, canon(theme, &want), "{theme:?}");
+
+            // Accent whatever the share: a block's progress is no severity.
+            let (_, letters) = drawn(progress_line(95.0, 10, theme), theme);
+            assert_eq!(letters, canon(theme, "aaaaaaaaaa"), "{theme:?}");
+        }
+    }
+
+    #[test]
+    fn a_sparkline_of_values_scales_to_the_largest() {
+        for theme in TIERS {
+            let values = [None, Some(0), Some(2), Some(4), Some(8)];
+            let (text, letters) = drawn(vec![sparkline_of(&values, theme)], theme);
+            assert_eq!(text, " ▁▃▅█", "{theme:?}");
+            assert_eq!(letters, canon(theme, " aaaa"), "{theme:?}");
+
+            let (text, _) = drawn(vec![sparkline_of(&[Some(0); 3], theme)], theme);
+            assert_eq!(text, "▁▁▁", "{theme:?}");
+            let (text, _) = drawn(vec![sparkline_of(&[None, None], theme)], theme);
+            assert_eq!(text, "  ", "{theme:?}");
         }
     }
 }

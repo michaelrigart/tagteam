@@ -731,7 +731,7 @@ fn laid_out(
 /// What of `row`'s figures depends on the time: the elapsed and remaining seconds, which count
 /// on between queries from the block's start and end, while it is active. `None` when `row` is
 /// not a block, has no `active`, or has ended.
-fn figures_clock(row: &TokenRow, now_ms: i64) -> Option<(i64, i64)> {
+pub(super) fn figures_clock(row: &TokenRow, now_ms: i64) -> Option<(i64, i64)> {
     let PeriodKey::Block {
         start_ms,
         end_ms,
@@ -1364,6 +1364,10 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// The fixtures the headline's tests share with the table's.
+#[cfg(test)]
+pub(super) use tests::{HOUR_MS, NOON, block, body_y, days, letters, showing, showing_after};
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyCode;
@@ -1381,11 +1385,11 @@ mod tests {
 
     /// 2026-09-20T00:00:00Z, the day before `NOW_MS`'s.
     const YESTERDAY: i64 = 1_789_862_400_000;
-    const HOUR_MS: i64 = 3_600_000;
+    pub(crate) const HOUR_MS: i64 = 3_600_000;
     const DAY_MS: i64 = 24 * HOUR_MS;
 
     /// Tokens at 80×24, its report for the query it asked for, `rows`, then `edit`ed.
-    fn showing(rows: Vec<TokenRow>, edit: impl FnOnce(&mut TokenReport)) -> State {
+    pub(crate) fn showing(rows: Vec<TokenRow>, edit: impl FnOnce(&mut TokenReport)) -> State {
         let mut state = fresh(Screen::Tokens);
         let cmds = state.start();
         let [_, Cmd::LoadReport { r#gen, query }] = cmds.as_slice() else {
@@ -1406,7 +1410,7 @@ mod tests {
     }
 
     /// The same, after `keys` set the query up: each key's query is answered with `rows`.
-    fn showing_after(keys: &str, rows: Vec<TokenRow>) -> State {
+    pub(crate) fn showing_after(keys: &str, rows: Vec<TokenRow>) -> State {
         let mut state = fresh(Screen::Tokens);
         state.start();
         let mut last = vec![];
@@ -1439,7 +1443,7 @@ mod tests {
 
     /// Yesterday for accounts 1 (with lower-bound output and its cache split) and 2 (`spare`),
     /// and the day before, unattributed and unpriced.
-    fn days() -> Vec<TokenRow> {
+    pub(crate) fn days() -> Vec<TokenRow> {
         let mut one = token_row(
             day(1),
             Some(row_account(1)),
@@ -1479,7 +1483,7 @@ mod tests {
     }
 
     /// `parts` as `roles` letters: each part's characters in its role, its spaces blank.
-    fn letters(parts: &[(&str, char)]) -> String {
+    pub(crate) fn letters(parts: &[(&str, char)]) -> String {
         parts
             .iter()
             .flat_map(|(text, role)| {
@@ -1490,7 +1494,7 @@ mod tests {
     }
 
     /// The body's row `n` at `w`×`h`, where `draw_buffer` puts it.
-    fn body_y(state: &State, w: u16, h: u16, n: u16) -> u16 {
+    pub(crate) fn body_y(state: &State, w: u16, h: u16, n: u16) -> u16 {
         crate::view::areas(state, Rect::new(0, 0, w, h)).body.y + n
     }
 
@@ -1705,11 +1709,11 @@ mod tests {
     }
 
     /// 12:00 to 17:00 UTC today.
-    const NOON: i64 = 1_789_992_000_000;
+    pub(crate) const NOON: i64 = 1_789_992_000_000;
 
     /// Account 1's block of five hours from `start_ms`: active at `NOW_MS` (14:13:20) and
     /// observed when `active`, else inferred.
-    fn block(start_ms: i64, active: bool) -> TokenRow {
+    pub(crate) fn block(start_ms: i64, active: bool) -> TokenRow {
         let end_ms = start_ms + 5 * HOUR_MS;
         let period = PeriodKey::Block {
             start_ms,
@@ -1816,9 +1820,10 @@ mod tests {
             )
         );
         assert_eq!(
-            lines[1..9],
+            lines[1..10],
             [
                 " $10.00 at API prices    10.9M tokens    2 responses",
+                " ▶ block ━━━━━━━━━╸············ 2h46m left · 41.2K tok/min · $3.20/h",
                 "",
                 " BLOCK                        ACCOUNT     INPUT  OUTPUT  TOTAL    COST",
                 "▌09-21 12:00–17:00  observed  1 a1@x.co  400.0K   50.0K   5.5M   $5.00",
@@ -1834,7 +1839,7 @@ mod tests {
     #[test]
     fn the_active_block_counts_down_between_queries_and_is_no_longer_active_at_its_end() {
         let blocks = showing_after("ppp", vec![block(NOON, true)]);
-        let figures = |at: i64| body_of(&blocks, 80, 24, at)[5].clone();
+        let figures = |at: i64| under_the_block(&body_of(&blocks, 80, 24, at));
         assert!(figures(NOW_MS).starts_with("   active · 2h13m elapsed · 2h46m left"));
         assert!(
             figures(NOW_MS + 61_000).starts_with("   active · 2h14m elapsed · 2h45m left"),
@@ -1847,6 +1852,13 @@ mod tests {
             " TOTAL                                   400.0K   50.0K   5.5M  $5.00",
             "no longer active, until the query its end asks for returns"
         );
+    }
+
+    /// The body row under `block()`'s row: its figures while it is active, else the total.
+    fn under_the_block(lines: &[String]) -> String {
+        let at = lines.iter().position(|l| l.contains("400.0K"));
+        let at = at.unwrap_or_else(|| panic!("no block row: {lines:?}"));
+        lines[at + 1].clone()
     }
 
     #[test]
@@ -3159,7 +3171,7 @@ mod tests {
         let base = NOW_MS - NOW_MS.rem_euclid(1000);
         let fresh = || showing_after("ppp", vec![block(base - 17_940_000, true)]);
         let state = fresh();
-        let figures = |at: i64| body_of(&state, 80, 24, at)[5].clone();
+        let figures = |at: i64| under_the_block(&body_of(&state, 80, 24, at));
         for (at, builds_so_far) in [
             (base, 1),
             (base + 100, 2),
