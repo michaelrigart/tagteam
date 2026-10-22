@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/36 (R4e: Tasks 1–2; Tasks 3–4 ship as R4e2)
 **Branch:** `refactor-r4e-event-source`, based on `refactor-r4d-live-guard-error-kinds`
 **Goal:** Each engine records events under its command's source, so quarantines, releases and recovered switches raised by `tagteam auto` or the daemon stop recording `cli`; event sources and kinds become types, with every stored string unchanged.
 **Architecture:** `str_enum!` (core) spells `EventSource` and `EventKind` (`engine/event.rs`, Task 1). The CLI sets `EngineConfig.source` per command (Task 2). Per-call sources go; every writer reads `Engine::source()` (Task 3). `EventRow` and the store's event functions take the enums (Task 4).
