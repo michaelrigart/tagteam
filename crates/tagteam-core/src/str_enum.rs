@@ -1,9 +1,9 @@
 //! A closed vocabulary of stored spellings: the enum, its variants in declaration order, and the
 //! one place each spelling is written (review refactor §8.9).
 
-/// Declares a fieldless enum whose variants each have one stored spelling, with
-/// `ALL` (declaration order), `as_str` and `parse`. `parse` is `Some` only for a spelling
-/// `as_str` writes. The enum derives `Debug, Clone, Copy, PartialEq, Eq` and no `Display`.
+/// Declares a fieldless enum whose variants each have one stored spelling, with `ALL` (declaration
+/// order), `as_str` and `parse`. `parse` is `Some` only for a spelling `as_str` writes. The enum
+/// derives `Debug, Clone, Copy, PartialEq, Eq` and no `Display`.
 #[macro_export]
 macro_rules! str_enum {
     (

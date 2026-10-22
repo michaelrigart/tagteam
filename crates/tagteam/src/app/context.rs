@@ -358,8 +358,8 @@ pub(crate) fn command_settings(
 /// settings are those of the provider the command acts on (`flag`, else the default, as
 /// `command_settings` chooses it): its own tables come first. `env` is the effective
 /// environment `locate` returned with `run_shell`. The HTTP adapter is built on its first
-/// request, never before (§13.5), and the oracle sends through the same one. The engine records
-/// its events under `source` (review refactor §8.7).
+/// request, never before (§13.5), and the oracle sends through the same one. The engine records its
+/// events under `source` (review refactor §8.7).
 pub(crate) fn build_engine(
     ctx: Context,
     registry: ProviderRegistry,
