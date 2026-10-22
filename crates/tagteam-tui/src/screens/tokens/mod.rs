@@ -7,7 +7,10 @@ mod amounts;
 pub mod filter;
 mod headline;
 pub mod index;
+mod models;
 mod table;
+
+use std::cell::OnceCell;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use jiff::tz::TimeZone;
@@ -18,6 +21,7 @@ use tagteam_engine::tokens::{
 };
 
 use self::index::IndexWatch;
+use self::models::ShortModels;
 pub use self::table::render;
 use crate::msg::Cmd;
 use crate::source::SourceError;
@@ -85,6 +89,8 @@ struct Level {
     /// The report's table lines, kept while the width, the row count and the active blocks'
     /// clocks stay the same.
     layout: table::Layout,
+    /// The short forms of the report's models (T5-22), found when it is first drawn.
+    models: OnceCell<ShortModels>,
 }
 
 impl Level {
@@ -101,7 +107,15 @@ impl Level {
             offset: 0,
             widths: table::Widths::default(),
             layout: table::Layout::default(),
+            models: OnceCell::new(),
         }
+    }
+
+    /// The short forms of the report's models (T5-22): found the first time they are asked for,
+    /// then kept until the next report.
+    fn short_models(&self) -> Option<&ShortModels> {
+        let report = self.report.as_ref()?;
+        Some(self.models.get_or_init(|| ShortModels::of_report(report)))
     }
 }
 
@@ -299,6 +313,7 @@ impl TokensState {
         level.failed = None;
         level.widths = table::Widths::default();
         level.layout = table::Layout::default();
+        level.models = OnceCell::new();
     }
 
     /// Moves the selection `by` rows, stopping at either end.

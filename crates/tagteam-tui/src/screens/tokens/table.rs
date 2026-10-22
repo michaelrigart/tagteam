@@ -18,6 +18,7 @@ use tagteam_engine::tokens::{
 };
 use tagteam_engine::words;
 
+use super::models::ShortModels;
 use super::{TokensState, amounts, headline};
 use crate::autoline;
 use crate::chrome::fit_spans;
@@ -314,6 +315,8 @@ pub(super) struct Widths(OnceCell<Found>);
 struct Table<'a> {
     report: &'a TokenReport,
     widths: &'a Widths,
+    /// The report's models as the Model column names them (T5-22).
+    models: &'a ShortModels,
     cols: Vec<(Col, usize)>,
     /// The column whose total line cell says `TOTAL`: the first.
     lead: Col,
@@ -333,10 +336,12 @@ impl<'a> Table<'a> {
     /// the period and the project for one session's models, whose rows all share them, and
     /// which the header's drill-down and the detail say. From `WIDE` columns, the cache write
     /// (split into 5-minute and 1-hour from `CACHE_SPLIT_FROM` columns, when that still fits),
-    /// the cache read, the responses and the share line. Text columns share the rest.
+    /// the cache read, the responses and the share line. Text columns share the rest. A model is
+    /// named by its short form (T5-22).
     fn new(
         report: &'a TokenReport,
         widths: &'a Widths,
+        models: &'a ShortModels,
         width: usize,
         theme: Theme,
         now_ms: i64,
@@ -389,6 +394,7 @@ impl<'a> Table<'a> {
         let mut table = Table {
             report,
             widths,
+            models,
             cols: cols.into_iter().map(|c| (c, 0)).collect(),
             lead,
             level: 0,
@@ -623,7 +629,15 @@ impl<'a> Table<'a> {
                     .collect::<Vec<_>>()
                     .join(", "),
             },
-            Col::Model => row.model.clone().unwrap_or_else(|| row.models.join(", ")),
+            Col::Model => match &row.model {
+                Some(m) => self.models.get(m).to_owned(),
+                None => row
+                    .models
+                    .iter()
+                    .map(|m| self.models.get(m))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            },
             Col::Cost => cost_text(row.cost.as_ref()),
             Col::Share => match row.cost {
                 Some(c) if self.most > 0 => {
@@ -967,8 +981,8 @@ fn filter_text(state: &State) -> String {
 
 /// The rows the drill-down came through, from the top (T5-9): ` › {crumb} › {crumb}`, muted,
 /// each its row's period (a session by its ID's first 8 characters, an estimated block led by
-/// `ESTIMATED`) and its account and model when it has them, cut to the width less one. `None`
-/// at the top.
+/// `ESTIMATED`) and its account and short model (T5-22) when it has them, cut to the width less
+/// one. `None` at the top.
 fn crumbs(state: &State, width: usize, now_ms: i64) -> Option<Line<'static>> {
     let t = &state.tokens;
     let parents: Vec<String> = t.levels[..t.levels.len() - 1]
@@ -977,6 +991,7 @@ fn crumbs(state: &State, width: usize, now_ms: i64) -> Option<Line<'static>> {
             let report = level.report.as_ref()?;
             let key = level.selected.as_ref()?;
             let row = report.rows.iter().find(|r| &r.key == key)?;
+            let models = level.short_models()?;
             let period = match &row.period {
                 PeriodKey::Session { session_id, .. } => {
                     format!("session {}", short_id(session_id))
@@ -988,7 +1003,7 @@ fn crumbs(state: &State, width: usize, now_ms: i64) -> Option<Line<'static>> {
             };
             let mut parts = vec![period];
             parts.extend(row.account.as_ref().map(account_text));
-            parts.extend(row.model.clone());
+            parts.extend(row.model.as_deref().map(|m| models.get(m).to_owned()));
             Some(parts.join(" · "))
         })
         .collect();
@@ -1354,7 +1369,8 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     let t = &state.tokens;
     let plan = plan(state, area, now_ms);
     let mut lines = plan.top;
-    let Some(report) = t.report() else {
+    let level = t.level();
+    let Some((report, models)) = level.report.as_ref().zip(level.short_models()) else {
         if t.pending {
             lines.push(Line::from(format!(" {LOADING}")));
         }
@@ -1380,7 +1396,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
         }
         return;
     }
-    let table = Table::new(report, &t.level().widths, width, state.theme, now_ms);
+    let table = Table::new(report, &level.widths, models, width, state.theme, now_ms);
     // A failed query keeps the last report, DIM (T2-22).
     let dim = |line: Line<'static>| {
         if t.stale() {
@@ -2328,11 +2344,11 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            " DAY         ACCOUNT             MODEL            INPUT  OUTPUT  TOTAL  API $"
+            " DAY         ACCOUNT             MODEL     INPUT  OUTPUT  TOTAL  API $"
         );
         assert_eq!(
             lines[4],
-            "▌2026-09-20  1 a1@x.co, 2 spare  claude-opus-5-5      1       2      6      —"
+            "▌2026-09-20  1 a1@x.co, 2 spare  opus-5-5      1       2      6      —"
         );
         opus.model = None;
         let none = showing_after("ggg", vec![opus]);
@@ -2623,24 +2639,38 @@ mod tests {
             body_of(&state, 80, 24, NOW_MS)[1],
             " › 2026-09-20 · 1 a1@x.co › session 3f2a9c1d · 1 a1@x.co"
         );
-        // A crumb longer than the row is cut there; the bar is untouched.
-        let mut state = widest();
-        let bar = body_of(&state, 80, 24, NOW_MS)[0].clone();
-        let rows = state.tokens.report().map(|r| r.rows[..1].to_vec());
-        let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
-        answer_with(&mut state, &down, rows.unwrap_or_default());
-        let lines = body_of(&state, 80, 24, NOW_MS);
-        assert_eq!(lines[0], bar);
+        // A crumb as wide as the row less one is whole, its model short (T5-22); a longer one is
+        // cut there; the bar is untouched.
+        let drilled = |mut state: State| {
+            let bar = body_of(&state, 80, 24, NOW_MS)[0].clone();
+            let rows = state.tokens.report().map(|r| r.rows[..1].to_vec());
+            let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
+            answer_with(&mut state, &down, rows.unwrap_or_default());
+            let lines = body_of(&state, 80, 24, NOW_MS);
+            assert_eq!(lines[0], bar);
+            assert!(
+                lines[4].starts_with(" ACCOUNT"),
+                "one session's models share the period and the project, which the rows leave out: {lines:?}"
+            );
+            lines
+        };
+        let lines = drilled(widest());
+        assert_eq!(
+            lines[1],
+            " › session 3f2a9c1d · 3 山田太郎のアカウント · opus-5-5-with-a-very-long-suffix"
+        );
+        assert_eq!(width_of(&lines[1]), 79);
+        let mut rows = widest().tokens.report().unwrap().rows.clone();
+        let longer = "claude-opus-5-5-with-a-very-long-suffix-and-more";
+        rows[0].model = Some(longer.into());
+        rows[0].models = vec![longer.into()];
+        let lines = drilled(showing_after("ppgg]]", rows));
         assert!(
-            lines[1].starts_with(" › session 3f2a9c1d · 3 山田太郎のアカウント · claude-opus"),
+            lines[1].starts_with(" › session 3f2a9c1d · 3 山田太郎のアカウント · opus-5-5"),
             "{lines:?}"
         );
         assert!(lines[1].ends_with('…'), "{lines:?}");
         assert!(width_of(&lines[1]) <= 79, "{lines:?}");
-        assert!(
-            lines[4].starts_with(" ACCOUNT"),
-            "one session's models share the period and the project, which the rows leave out: {lines:?}"
-        );
     }
 
     #[test]
@@ -2690,6 +2720,9 @@ mod tests {
         "claude-sonnet-4-5-20250929",
         "claude-haiku-4-5-20251001",
     ];
+
+    /// `MODELS` as the table names them (T5-22).
+    const SHORT_MODELS: [&str; 3] = ["opus-4-5", "sonnet-4-5", "haiku-4-5"];
 
     fn me() -> RowAccount {
         RowAccount::Account {
@@ -2744,7 +2777,7 @@ mod tests {
             lines[4].starts_with(" ACCOUNT"),
             "the period and the project are the same on every row: {lines:?}"
         );
-        for model in MODELS {
+        for model in SHORT_MODELS {
             assert!(
                 lines.iter().any(|l| l.contains(&format!("  {model}  "))),
                 "{model} whole: {lines:?}"
@@ -2757,7 +2790,8 @@ mod tests {
 
     #[test]
     fn the_sessions_by_account_and_model_keep_their_models_apart_at_80_columns() {
-        // The project gives way before the account, and the account before the model is cut.
+        // The short model IDs (T5-22) leave the project its room; the account gives way before
+        // the model is cut.
         let mut state = fresh(Screen::Tokens);
         state.start();
         let mut last = vec![];
@@ -2766,17 +2800,65 @@ mod tests {
         }
         answer_with(&mut state, &last, work_models());
         let lines = body_of(&state, 80, 24, NOW_MS);
-        assert!(
-            !lines[3].contains("PROJECT"),
-            "the project gave way first: {lines:?}"
+        assert_eq!(
+            lines[3..7],
+            [
+                " SESSION            PROJECT  ACCOUNT   MODEL        INPUT  OUTPUT  TOTAL   API $",
+                "▌09-20 09:12–11:40  tagteam  1 alex@…  opus-4-5    400.0K  100.0K  30.5M  $13.00",
+                "                             1 alex@…  sonnet-4-5  400.0K  100.0K  30.5M  $13.00",
+                "                             1 alex@…  haiku-4-5   400.0K  100.0K  30.5M  $13.00",
+            ]
         );
-        for model in MODELS {
+    }
+
+    #[test]
+    fn model_ids_are_short_in_the_table_and_full_in_the_detail() {
+        // T5-22: short in the Model column and the breadcrumbs; full in the detail and the bar.
+        let counts = counts(1_200_000, 310_000, 88_000_000);
+        let day_row = token_row(day(1), Some(me()), None, counts, Some(41_200_000_000));
+        let mut state = showing(vec![day_row], |_| {});
+        for rows in [
+            vec![token_row(work_session(), Some(me()), None, counts, None)],
+            work_models(),
+        ] {
+            let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
+            answer_with(&mut state, &down, rows);
+        }
+        assert_eq!(state.tokens.depth(), 2);
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
+        for model in SHORT_MODELS {
             assert!(
-                lines[4..7].iter().any(|l| l.contains(model)),
-                "{model} whole: {lines:?}"
+                lines[..total]
+                    .iter()
+                    .any(|l| l.contains(&format!("  {model}  "))),
+                "{model} short: {lines:?}"
             );
         }
-        assert!(lines[4].contains(" 1 alex…  "), "{lines:?}");
+        assert!(
+            !lines[..total].iter().any(|l| l.contains("claude-")),
+            "{lines:?}"
+        );
+        assert!(
+            reads(&lines[total + 1..], "claude-opus-4-5-20251101"),
+            "the selected row's detail: {lines:?}"
+        );
+        // At 80 the bar cuts a long filter (T5-7's form 6); at 120 it has room for it whole.
+        state.tokens.models = Some(vec![MODELS[0].into()]);
+        let bar = &body_of(&state, 120, 40, NOW_MS)[0];
+        assert!(
+            bar.contains("f all accounts · claude-opus-4-5-20251101"),
+            "{bar:?}"
+        );
+        // A by-model day row drilled into names its model short.
+        let opus = token_row(day(1), None, Some("claude-opus-5-5"), counts, None);
+        let mut state = showing_after("g", vec![opus]);
+        let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
+        answer_with(&mut state, &down, vec![session("3f2a9c1d", row_account(1))]);
+        assert_eq!(
+            body_of(&state, 80, 24, NOW_MS)[1],
+            " › 2026-09-20 · opus-5-5"
+        );
     }
 
     #[test]
@@ -3127,8 +3209,8 @@ mod tests {
             "the account by position, cut: {big:?}"
         );
         assert!(
-            big.contains("claude-opus-5-5-with-a-v…"),
-            "the model, cut last: {big:?}"
+            big.contains("  opus-5-5-with-a-very-lon…  "),
+            "the model, short and cut last: {big:?}"
         );
         assert!(!lines[head].contains("PROJ"), "the project gave way first");
         let small = &lines[head + 2];
@@ -3146,7 +3228,7 @@ mod tests {
         assert!(
             at_120
                 .iter()
-                .any(|l| l.contains("▌09-20 09:12  3 …  claude-opus-5-5-with-a-ve…  ")),
+                .any(|l| l.contains("▌09-20 09:12  3 …  opus-5-5-with-a-very-long…  ")),
             "{at_120:?}"
         );
         let at_160 = draw(&state, 160, 40);
@@ -3176,7 +3258,7 @@ mod tests {
         );
         let lines = body_of(&day, 80, 24, NOW_MS);
         assert!(
-            lines[4].starts_with("▌2026-09-20  3 山…   claude-opus"),
+            lines[4].starts_with("▌2026-09-20  3 山…   opus-5-5-with-a-very-long-suf…  "),
             "{}",
             lines[4]
         );
@@ -3591,6 +3673,45 @@ mod tests {
         assert_eq!(found(&state), None, "a new report is measured anew");
         draw(&state, 80, 24);
         assert!(found(&state).is_some_and(|w| w != first));
+    }
+
+    #[test]
+    fn the_short_forms_are_found_once_per_report() {
+        // T5-22: a report's short model IDs are found when it is first drawn, and kept.
+        let mut state = showing_after("g", work_models());
+        let found = |state: &State| state.tokens.level().models.get().cloned();
+        let at = |state: &State| {
+            state
+                .tokens
+                .level()
+                .models
+                .get()
+                .map(|m| m as *const ShortModels)
+        };
+        assert_eq!(found(&state), None, "not drawn yet");
+        draw(&state, 80, 24);
+        let first = found(&state).expect("found by the first frame");
+        assert_eq!(first.get(MODELS[0]), "opus-4-5");
+        let first_at = at(&state);
+        draw(&state, 120, 40);
+        assert_eq!(found(&state).as_ref(), Some(&first), "unchanged");
+        assert_eq!(at(&state), first_at, "the same, not found again");
+        let again = crate::screens::tokens::requery(&mut state, NOW_MS);
+        let [Cmd::LoadReport { r#gen, query }] = again.as_slice() else {
+            panic!("{again:?}");
+        };
+        let result = Ok(token_report(query.clone(), days()));
+        update(
+            &mut state,
+            Msg::TokenReport {
+                r#gen: *r#gen,
+                result,
+            },
+            NOW_MS,
+        );
+        assert_eq!(found(&state), None, "a new report has none until drawn");
+        draw(&state, 80, 24);
+        assert!(found(&state).is_some_and(|m| m != first));
     }
 
     /// The shown level's layout builds so far.
