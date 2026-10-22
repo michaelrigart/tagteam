@@ -340,23 +340,40 @@ mod tests {
     }
 
     #[test]
-    fn a_short_body_takes_what_rows_it_has_without_panicking() {
-        for height in 0..20 {
-            let body = Rect::new(0, 3, 80, height);
-            for scope in [Scope::All, Scope::Account(id(1))] {
-                let view = match scope {
-                    Scope::All => all_of(&[70; 12]),
-                    Scope::Account(_) => one_of(&["5h", "7d"]),
-                };
-                let l = layout(&view, &scope, body, 24, 0);
-                let mut all = vec![l.scope, l.events, l.axis, l.list];
-                all.extend(l.charts.iter().map(|(_, r)| *r));
-                all.extend(l.lanes.iter().map(|(_, r)| *r));
-                for r in all {
-                    assert!(
-                        r.y >= body.y && r.bottom() <= body.bottom(),
-                        "{height}: {r:?}"
-                    );
+    fn every_body_gets_its_parts_in_order_without_overlap() {
+        for (width, terminal_rows) in [(80, 24), (120, 40)] {
+            for height in 0..=60 {
+                let body = Rect::new(0, 3, width, height);
+                for scope in [Scope::All, Scope::Account(id(1))] {
+                    let view = match scope {
+                        Scope::All => all_of(&[70; 12]),
+                        Scope::Account(_) => one_of(&["5h", "7d", "Fable"]),
+                    };
+                    let l = layout(&view, &scope, body, terminal_rows, 0);
+                    // Top to bottom, as T4-8 orders them.
+                    let mut parts = vec![l.scope];
+                    parts.extend(l.charts.iter().map(|(_, r)| *r));
+                    parts.push(l.events);
+                    parts.extend(l.lanes.iter().map(|(_, r)| *r));
+                    parts.extend(l.more.map(|(r, _)| r));
+                    parts.push(l.axis);
+                    parts.extend(l.head);
+                    parts.push(l.list);
+                    let at = format!("{width}×{height} on {terminal_rows} rows, {scope:?}");
+                    for r in &parts {
+                        assert!(
+                            r.y >= body.y && r.bottom() <= body.bottom(),
+                            "{at}: {r:?} outside {body:?}"
+                        );
+                    }
+                    for pair in parts.windows(2) {
+                        assert!(
+                            pair[0].bottom() <= pair[1].y,
+                            "{at}: {:?} overlaps or follows {:?}",
+                            pair[0],
+                            pair[1]
+                        );
+                    }
                 }
             }
         }

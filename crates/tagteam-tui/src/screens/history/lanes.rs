@@ -167,6 +167,68 @@ mod tests {
     }
 
     #[test]
+    fn a_lane_value_past_100_is_full_and_nan_reads_as_0() {
+        let theme = Theme::new(true);
+        let lane = lane_of(1, vec![Some(150.0), Some(f64::NAN)], vec![true, true]);
+        let buf = buffer_of(vec![lane_row(&lane, theme)], 11);
+        assert_eq!(text_of(&buf)[0], " 1 a1    █▁");
+        assert_eq!(&roles(&buf, theme, 0)[9..], canon(theme, "ca"));
+    }
+
+    #[test]
+    fn the_axis_keeps_one_label_per_boundary_across_daylight_saving() {
+        let brussels = TimeZone::get("Europe/Brussels").unwrap();
+        let ms = |at: &str| at.parse::<jiff::Timestamp>().unwrap().as_millisecond();
+        let hours = ["╵15", "╵18", "╵21", "╵00", "╵03", "╵06", "╵09", "╵12"];
+        // Now; the range; each boundary's label; the hours between one boundary and the next.
+        let cases: [(&str, i64, &[&str], &[i64]); 4] = [
+            // 2026-10-25: 03:00 CEST falls back to 02:00 CET.
+            ("2026-10-25T12:00:00Z", 1, &hours, &[3, 3, 3, 4, 3, 3, 3]),
+            (
+                "2026-10-28T12:00:00Z",
+                7,
+                &["╵Thu", "╵Fri", "╵Sat", "╵Sun", "╵Mon", "╵Tue", "╵Wed"],
+                &[24, 24, 24, 25, 24, 24],
+            ),
+            // 2026-03-29: 02:00 CET springs forward to 03:00 CEST.
+            ("2026-03-29T12:00:00Z", 1, &hours, &[3, 3, 3, 2, 3, 3, 3]),
+            (
+                "2026-04-01T12:00:00Z",
+                7,
+                &["╵Thu", "╵Fri", "╵Sat", "╵Sun", "╵Mon", "╵Tue", "╵Wed"],
+                &[24, 24, 24, 23, 24, 24],
+            ),
+        ];
+        for (now, days, labels, steps) in cases {
+            let grid = Grid {
+                since_ms: ms(now) - days * 86_400_000,
+                now_ms: ms(now),
+                columns: 70,
+            };
+            let found = boundaries(grid, days, &brussels);
+            let got: Vec<&str> = found.iter().map(|(_, l)| l.as_str()).collect();
+            assert_eq!(got, labels, "{now}, {days}d");
+            let between: Vec<i64> = found
+                .windows(2)
+                .map(|w| (w[1].0 - w[0].0) / 3_600_000)
+                .collect();
+            assert_eq!(between, steps, "{now}, {days}d");
+            let row = axis_row(grid, days, &brussels, Theme::new(true)).to_string();
+            let drawn: usize = labels.iter().map(|l| row.matches(l).count()).sum();
+            assert!(
+                labels.iter().all(|l| row.matches(l).count() <= 1),
+                "no label twice: {row:?}"
+            );
+            assert_eq!(
+                row.matches('╵').count(),
+                drawn,
+                "each tick a boundary's: {row:?}"
+            );
+            assert!(drawn >= labels.len() - 1, "{row:?}");
+        }
+    }
+
+    #[test]
     fn hidden_lanes_are_counted_on_a_muted_more_row() {
         let theme = Theme::new(true);
         let buf = buffer_of(vec![more_row(6, theme)], 30);
