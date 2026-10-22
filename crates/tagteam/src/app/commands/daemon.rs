@@ -326,12 +326,15 @@ impl App<'_, '_> {
 #[cfg(test)]
 mod tests {
     use tagteam_cc::CLAUDE_CODE;
-    use tagteam_engine::settings::Settings;
+    use tagteam_engine::settings::{
+        COOLDOWN_SECONDS_RANGE, INTERVAL_SECONDS_RANGE, Settings, THRESHOLD_RANGE,
+    };
 
     use crate::cli::{Cli, Command};
 
     use super::{
-        AutoError, Failure, KIND_ENGINE_RUNNING, ProviderId, auto, auto_failure, auto_flags,
+        AutoError, BAD_THRESHOLD, Failure, KIND_ENGINE_RUNNING, ProviderId, auto, auto_failure,
+        auto_flags,
     };
 
     /// `auto`'s flags as parsed from `args` and resolved against the default settings.
@@ -362,6 +365,38 @@ mod tests {
         assert_eq!(parsed_auto_config(&["auto", "--cooldown", "-1"]).2, 0);
         assert_eq!(parsed_auto_config(&["auto", "--interval", "-5"]).1, 15);
         assert_eq!(parsed_auto_config(&["auto", "--threshold", "-3"]).0, 50.0);
+    }
+
+    #[test]
+    fn the_auto_flags_words_name_the_settings_ranges() {
+        // review refactor §8.9: the flags' wording quotes the settings' ranges, so the two
+        // cannot drift.
+        use clap::CommandFactory;
+        let range = |r: &dyn std::fmt::Display, s: &dyn std::fmt::Display| format!("({r}–{s})");
+        let (t, i, c) = (
+            range(THRESHOLD_RANGE.start(), THRESHOLD_RANGE.end()),
+            range(INTERVAL_SECONDS_RANGE.start(), INTERVAL_SECONDS_RANGE.end()),
+            range(COOLDOWN_SECONDS_RANGE.start(), COOLDOWN_SECONDS_RANGE.end()),
+        );
+        assert_eq!(
+            BAD_THRESHOLD,
+            format!(
+                "--threshold takes a number from {} to {}",
+                THRESHOLD_RANGE.start(),
+                THRESHOLD_RANGE.end()
+            )
+        );
+        let cli = Cli::command();
+        let auto = cli.find_subcommand("auto").expect("auto is a subcommand");
+        for (flag, words) in [("threshold", t), ("interval", i), ("cooldown", c)] {
+            let help = auto
+                .get_arguments()
+                .find(|a| a.get_id() == flag)
+                .and_then(|a| a.get_help())
+                .unwrap_or_else(|| panic!("--{flag} has no help"))
+                .to_string();
+            assert!(help.ends_with(&words), "--{flag}: {help:?} vs {words}");
+        }
     }
 
     #[test]

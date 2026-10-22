@@ -504,8 +504,8 @@ fn every_numeric_key_in_the_registry_refuses_a_step_past_either_end() {
     let fx = Fx::new();
     for key in KEYS {
         let outside = match key.kind {
-            KeyKind::Float { min, max } => [min - 0.01, max + 0.01].map(|v| v.to_string()),
-            KeyKind::Int { min, max } => [min - 1, max + 1].map(|v| v.to_string()),
+            KeyKind::Float(r) => [r.start() - 0.01, r.end() + 0.01].map(|v| v.to_string()),
+            KeyKind::Int(r) => [r.start() - 1, r.end() + 1].map(|v| v.to_string()),
             _ => continue,
         };
         for raw in outside {
@@ -526,10 +526,10 @@ fn every_numeric_key_in_the_registry_refuses_a_step_past_either_end() {
 /// A value `set` takes for a key of `kind`: the bottom of a range, or the last choice.
 fn sample(kind: &KeyKind) -> String {
     match kind {
-        KeyKind::Float { min, .. } => min.to_string(),
-        KeyKind::Int { min, .. } => min.to_string(),
+        KeyKind::Float(r) => r.start().to_string(),
+        KeyKind::Int(r) => r.start().to_string(),
         KeyKind::Bool => "yes".into(),
-        KeyKind::Choice(choices) => choices.last().unwrap().to_string(),
+        KeyKind::Choice(c) => c.values().last().unwrap().to_string(),
         KeyKind::Models => "Fable, opus".into(),
         KeyKind::Format => "{account} · {7d}%".into(),
         KeyKind::ShareNames => "hook-data".into(),
