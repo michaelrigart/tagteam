@@ -48,6 +48,8 @@ const FILTER_LEAST: usize = 20;
 const TEXT_MIN: usize = 6;
 /// ... and the project column no narrower than this, else it is left out.
 const PROJECT_MIN: usize = 4;
+/// The project keeps up to this many columns before the period's spans compact (T5-20).
+const PROJECT_KEEP: usize = 20;
 /// The model column keeps its whole value up to this many columns before it is cut: a realistic
 /// Claude model ID (`claude-sonnet-4-5-20250929` is 26) with a suffix such as `[1m]`.
 const MODEL_KEEP: usize = 30;
@@ -58,14 +60,14 @@ const ACCOUNT_LEAST: usize = 3;
 const SPAN_LEVELS: usize = 4;
 /// The active block's figures start this far in.
 const FIGURES_INDENT: usize = 3;
+/// What leads an estimated (inferred) block's span (T5-21).
+const ESTIMATED: &str = "~";
 
 /// The table's columns, in the order they are drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Col {
     /// The day, month, session's times or block's span.
     Period,
-    /// A block's `observed` or `inferred`.
-    Kind,
     Project,
     Account,
     Model,
@@ -83,9 +85,8 @@ enum Col {
 }
 
 impl Col {
-    const ALL: [Col; 15] = [
+    const ALL: [Col; 14] = [
         Col::Period,
-        Col::Kind,
         Col::Project,
         Col::Account,
         Col::Model,
@@ -109,7 +110,7 @@ impl Col {
                 TokenPeriod::Session => "SESSION",
                 TokenPeriod::Block => "BLOCK",
             },
-            Col::Kind | Col::Share => "",
+            Col::Share => "",
             Col::Project => "PROJECT",
             Col::Account => "ACCOUNT",
             Col::Model => "MODEL",
@@ -134,7 +135,7 @@ impl Col {
     fn number(self) -> bool {
         !matches!(
             self,
-            Col::Period | Col::Kind | Col::Project | Col::Account | Col::Model | Col::Share
+            Col::Period | Col::Project | Col::Account | Col::Model | Col::Share
         )
     }
 
@@ -240,8 +241,8 @@ fn period_text(period: &PeriodKey, tz: &TimeZone, now_ms: i64, level: usize) -> 
     }
 }
 
-/// An account as the table names it (spec §5.3): its position and alias, else its label;
-/// `removed`; `unattributed`.
+/// An account as the table names it (spec §5.3, T5-19): its position and alias, else its label;
+/// `removed account`; `unknown account`.
 fn account_text(account: &RowAccount) -> String {
     match account {
         RowAccount::Account {
@@ -250,12 +251,13 @@ fn account_text(account: &RowAccount) -> String {
             alias,
             ..
         } => format!("{position} {}", alias.as_deref().unwrap_or(label)),
-        RowAccount::Removed { .. } => "removed".to_owned(),
-        RowAccount::Unattributed => "unattributed".to_owned(),
+        RowAccount::Removed { .. } => "removed account".to_owned(),
+        RowAccount::Unattributed => "unknown account".to_owned(),
     }
 }
 
-/// An account in full, as the detail and the filter name it: `1 work (a@x.co)`, `removed <id>`.
+/// An account in full, as the detail and the filter name it (T5-19): `1 work (a@x.co)`,
+/// `removed account 3f2a9c1d`, `unknown account`.
 pub fn account_name(account: &RowAccount) -> String {
     match account {
         RowAccount::Account {
@@ -267,9 +269,22 @@ pub fn account_name(account: &RowAccount) -> String {
         RowAccount::Account {
             position, label, ..
         } => format!("{position} {label}"),
-        RowAccount::Removed { id } => format!("removed {id}"),
-        RowAccount::Unattributed => "unattributed".to_owned(),
+        RowAccount::Removed { id } => format!("removed account {}", short_id(id.as_str())),
+        RowAccount::Unattributed => "unknown account".to_owned(),
     }
+}
+
+/// An ID as the breadcrumbs and the detail show it (T5-19): its first 8 characters.
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// A session's project as its cell names it (T5-20): the last non-empty component of `path`,
+/// split on `/` or `\`, else `path` as stored.
+fn project_name(path: &str) -> &str {
+    path.rsplit(['/', '\\'])
+        .find(|c| !c.is_empty())
+        .unwrap_or(path)
 }
 
 /// A cost as a cell says it: dollars and cents, grouped (T5-11), `≥` before a partial one, `—`
@@ -304,6 +319,8 @@ struct Table<'a> {
     lead: Col,
     /// How compact the period's spans are (`span`).
     level: usize,
+    /// Whether the report holds an estimated block, whose span `ESTIMATED` leads (T5-21).
+    estimated: bool,
     /// The largest row cost, for the share line.
     most: u64,
     theme: Theme,
@@ -312,12 +329,11 @@ struct Table<'a> {
 
 impl<'a> Table<'a> {
     /// The columns `report` takes at `width` (spec §5.3): period, account, input, output, total
-    /// and cost always, with the project for sessions, the kind for blocks and the model when
-    /// grouped by it; but not the period and the project for one session's models, whose rows all
-    /// share them, and which the header's drill-down and the detail say. From `WIDE` columns,
-    /// the cache write (split into 5-minute and 1-hour from `CACHE_SPLIT_FROM` columns, when
-    /// that still fits), the cache read, the responses and the share line. Text columns share
-    /// the rest.
+    /// and cost always, with the project for sessions and the model when grouped by it; but not
+    /// the period and the project for one session's models, whose rows all share them, and
+    /// which the header's drill-down and the detail say. From `WIDE` columns, the cache write
+    /// (split into 5-minute and 1-hour from `CACHE_SPLIT_FROM` columns, when that still fits),
+    /// the cache read, the responses and the share line. Text columns share the rest.
     fn new(
         report: &'a TokenReport,
         widths: &'a Widths,
@@ -330,10 +346,8 @@ impl<'a> Table<'a> {
         let mut cols = Vec::new();
         if !one_session {
             cols.push(Col::Period);
-            match q.period {
-                TokenPeriod::Block => cols.push(Col::Kind),
-                TokenPeriod::Session => cols.push(Col::Project),
-                TokenPeriod::Day | TokenPeriod::Month => {}
+            if q.period == TokenPeriod::Session {
+                cols.push(Col::Project);
             }
         }
         let lead = cols.first().copied().unwrap_or(Col::Account);
@@ -363,12 +377,22 @@ impl<'a> Table<'a> {
             .filter_map(|r| r.cost.map(|c| c.usd_nanos))
             .max()
             .unwrap_or(0);
+        let estimated = report.rows.iter().any(|r| {
+            matches!(
+                r.period,
+                PeriodKey::Block {
+                    observed: false,
+                    ..
+                }
+            )
+        });
         let mut table = Table {
             report,
             widths,
             cols: cols.into_iter().map(|c| (c, 0)).collect(),
             lead,
             level: 0,
+            estimated,
             most,
             theme,
             now_ms,
@@ -421,10 +445,9 @@ impl<'a> Table<'a> {
         if col == Col::Share {
             return SHARE;
         }
-        let tz = &self.report.query.tz;
         let cell = |r: &TokenRow| match col {
-            Col::Period => period_text(&r.period, tz, self.now_ms, level),
-            _ => self.cell(col, r, tz).text,
+            Col::Period => self.period_cell(&r.period, level),
+            _ => self.cell(col, r).text,
         };
         self.report
             .rows
@@ -434,24 +457,25 @@ impl<'a> Table<'a> {
             .fold(width_of(col.head(self.report.query.period)), usize::max)
     }
 
-    /// Lays the columns out in `width` (B17, B24). The numbers take their widest and are never
-    /// cut. The period takes the fullest form of its spans that leaves each text column its
-    /// least: the model its whole value up to `MODEL_KEEP`, the account `TEXT_MIN` and the
-    /// project `PROJECT_MIN` (or its own width when that is less). Where no form does, the
-    /// project gives way first and is left out. Where still none does, the most compact period
-    /// is used, and the account gives way to `ACCOUNT_LEAST` and the model to one column, and
-    /// the period itself is cut when that leaves the text columns no more. What is left over then
-    /// goes, in turn, to the model up to `MODEL_KEEP`, the account, the project, and the model
-    /// beyond `MODEL_KEEP`, and the text columns are cut by display width to what they got. A
-    /// number is never cut.
+    /// Lays the columns out in `width` (B17, B24, T5-20). The numbers take their widest and are
+    /// never cut. The period takes the fullest form of its spans that leaves each text column
+    /// its least: the model its whole value up to `MODEL_KEEP`, the account `TEXT_MIN` and the
+    /// project `PROJECT_KEEP` (or its own width when that is less). Where no form does, the
+    /// project gives way first: to `PROJECT_MIN`, then it is left out. Where still none does,
+    /// the most compact period is used, and the account gives way to `ACCOUNT_LEAST` and the
+    /// model to one column, and the period itself is cut when that leaves the text columns no
+    /// more. What is left over then goes, in turn, to the model up to `MODEL_KEEP`, the
+    /// account, the project, and the model beyond `MODEL_KEEP`, and the text columns are cut by
+    /// display width to what they got. A number is never cut.
     fn fit(&mut self, width: usize) {
         let periods = self.found().periods;
         let period_on = self.cols.iter().any(|(c, _)| *c == Col::Period);
-        let least = |t: &Table, col: Col| match col {
+        let least = |t: &Table, col: Col, project: usize| match col {
             Col::Model => t.widest(col).min(MODEL_KEEP),
-            Col::Project => t.widest(col).min(PROJECT_MIN),
+            Col::Project => t.widest(col).min(project),
             _ => t.widest(col).min(TEXT_MIN),
         };
+        let mut project = PROJECT_KEEP;
         let squeezed = |t: &Table, col: Col| match col {
             Col::Model => t.widest(col).min(1),
             _ => t.widest(col).min(ACCOUNT_LEAST),
@@ -467,7 +491,10 @@ impl<'a> Table<'a> {
             let texts: Vec<usize> = (0..self.cols.len())
                 .filter(|&i| self.cols[i].0.text())
                 .collect();
-            let wanted: usize = texts.iter().map(|&i| least(self, self.cols[i].0)).sum();
+            let wanted: usize = texts
+                .iter()
+                .map(|&i| least(self, self.cols[i].0, project))
+                .sum();
             let level = (0..SPAN_LEVELS).find(|&l| {
                 let period = if period_on { periods[l] } else { 0 };
                 fixed + gaps + period + wanted <= width
@@ -476,6 +503,7 @@ impl<'a> Table<'a> {
                 level,
                 self.cols.iter().position(|(c, _)| *c == Col::Project),
             ) {
+                (None, Some(_)) if project > PROJECT_MIN => project = PROJECT_MIN,
                 (None, Some(at)) => {
                     self.cols.remove(at);
                 }
@@ -500,7 +528,7 @@ impl<'a> Table<'a> {
                 if tight {
                     squeezed(self, col)
                 } else {
-                    least(self, col)
+                    least(self, col, project)
                 }
             })
             .collect();
@@ -529,6 +557,18 @@ impl<'a> Table<'a> {
             } else if !col.text() {
                 self.cols[i].1 = self.widest(col);
             }
+        }
+    }
+
+    /// `period` as its column says it at `level`: led, while the report holds an estimated
+    /// block, by `ESTIMATED` for an inferred block and a space for an observed one (T5-21).
+    fn period_cell(&self, period: &PeriodKey, level: usize) -> String {
+        let text = period_text(period, &self.report.query.tz, self.now_ms, level);
+        match period {
+            PeriodKey::Block { observed, .. } if self.estimated => {
+                format!("{}{text}", if *observed { " " } else { ESTIMATED })
+            }
+            _ => text,
         }
     }
 
@@ -565,19 +605,13 @@ impl<'a> Table<'a> {
     }
 
     /// `row`'s cell in `col`.
-    fn cell(&self, col: Col, row: &TokenRow, tz: &TimeZone) -> Cell {
+    fn cell(&self, col: Col, row: &TokenRow) -> Cell {
         let text = match col {
-            Col::Period => period_text(&row.period, tz, self.now_ms, self.level),
-            Col::Kind => match row.period {
-                PeriodKey::Block { observed: true, .. } => "observed",
-                PeriodKey::Block { .. } => "inferred",
-                _ => "",
-            }
-            .to_owned(),
+            Col::Period => self.period_cell(&row.period, self.level),
             Col::Project => match &row.period {
                 PeriodKey::Session {
                     project: Some(p), ..
-                } => p.clone(),
+                } => project_name(p).to_owned(),
                 _ => words::MISSING.to_owned(),
             },
             Col::Account => match &row.account {
@@ -613,26 +647,24 @@ impl<'a> Table<'a> {
                     style: self.theme.strong(),
                 };
             }
-            Col::Kind | Col::Project | Col::Account | Col::Model | Col::Share => String::new(),
+            Col::Project | Col::Account | Col::Model | Col::Share => String::new(),
             Col::Cost => cost_text(t.cost.as_ref()),
             _ => Self::counts_text(col, &t.counts, t.unfinalized, t.responses),
         };
         self.styled(col, text)
     }
 
-    /// One line of cells: each padded or cut to its column, numbers on the right, two columns
-    /// apart, after a one-column margin. `blank` leaves the period's own columns empty. A row's
-    /// project keeps its end when it is cut; every other cell, its start.
-    fn line(&self, cells: Vec<Cell>, blank: bool, row: bool) -> Line<'static> {
+    /// One line of cells: each padded or cut from its end to its column, numbers on the right,
+    /// two columns apart, after a one-column margin. `blank` leaves the period's own columns
+    /// empty.
+    fn line(&self, cells: Vec<Cell>, blank: bool) -> Line<'static> {
         let mut spans = vec![Span::raw(" ")];
         for (i, ((col, w), cell)) in self.cols.iter().zip(cells).enumerate() {
             if i > 0 {
                 spans.push(Span::raw("  "));
             }
-            let text = if blank && matches!(col, Col::Period | Col::Kind | Col::Project) {
+            let text = if blank && matches!(col, Col::Period | Col::Project) {
                 String::new()
-            } else if *col == Col::Project && row {
-                fit_left(&cell.text, *w)
             } else {
                 fit(&cell.text, *w)
             };
@@ -660,17 +692,12 @@ impl<'a> Table<'a> {
                 style: muted,
             })
             .collect();
-        self.line(cells, false, false)
+        self.line(cells, false)
     }
 
     fn row(&self, row: &TokenRow, blank: bool) -> Line<'static> {
-        let tz = &self.report.query.tz;
-        let cells = self
-            .cols
-            .iter()
-            .map(|(c, _)| self.cell(*c, row, tz))
-            .collect();
-        self.line(cells, blank, true)
+        let cells = self.cols.iter().map(|(c, _)| self.cell(*c, row)).collect();
+        self.line(cells, blank)
     }
 
     /// The faint rule above the total (T5-18), from column 1 across the table's columns.
@@ -685,29 +712,8 @@ impl<'a> Table<'a> {
 
     fn total(&self) -> Line<'static> {
         let cells = self.cols.iter().map(|(c, _)| self.total_cell(*c)).collect();
-        self.line(cells, false, false)
+        self.line(cells, false)
     }
-}
-
-/// `s` cut to `w` columns from the left, so a path keeps its end: `…/Code/tagteam`.
-fn fit_left(s: &str, w: usize) -> String {
-    if width_of(s) <= w {
-        return s.to_owned();
-    }
-    if w == 0 {
-        return String::new();
-    }
-    let mut kept: Vec<char> = Vec::new();
-    for c in s.chars().rev() {
-        kept.push(c);
-        let tail: String = kept.iter().rev().collect();
-        if width_of(&tail) > w - 1 {
-            kept.pop();
-            break;
-        }
-    }
-    let tail: String = kept.iter().rev().collect();
-    format!("…{tail}")
 }
 
 /// `line` without the spaces its last cell was padded with.
@@ -960,8 +966,9 @@ fn filter_text(state: &State) -> String {
 }
 
 /// The rows the drill-down came through, from the top (T5-9): ` › {crumb} › {crumb}`, muted,
-/// each its row's period and its account and model when it has them, cut to the width less
-/// one. `None` at the top.
+/// each its row's period (a session by its ID's first 8 characters, an estimated block led by
+/// `ESTIMATED`) and its account and model when it has them, cut to the width less one. `None`
+/// at the top.
 fn crumbs(state: &State, width: usize, now_ms: i64) -> Option<Line<'static>> {
     let t = &state.tokens;
     let parents: Vec<String> = t.levels[..t.levels.len() - 1]
@@ -971,7 +978,12 @@ fn crumbs(state: &State, width: usize, now_ms: i64) -> Option<Line<'static>> {
             let key = level.selected.as_ref()?;
             let row = report.rows.iter().find(|r| &r.key == key)?;
             let period = match &row.period {
-                PeriodKey::Session { session_id, .. } => format!("session {session_id}"),
+                PeriodKey::Session { session_id, .. } => {
+                    format!("session {}", short_id(session_id))
+                }
+                p @ PeriodKey::Block {
+                    observed: false, ..
+                } => format!("{ESTIMATED}{}", period_text(p, &report.query.tz, now_ms, 0)),
                 p => period_text(p, &report.query.tz, now_ms, 0),
             };
             let mut parts = vec![period];
@@ -1143,7 +1155,8 @@ fn top(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
 
 /// The selected row in full (B11, B25), in rows at `width`: its numbers first, laid out by
 /// their parts and never cut; then what tells it apart and what it holds, wrapped: a session's
-/// ID, project and times, a block's span and kind, every account and model.
+/// ID's first 8 characters, its project's path and its times, a block's span and whether it was
+/// observed or estimated, every account and model.
 fn detail_rows(row: &TokenRow, tz: &TimeZone, now_ms: i64, width: usize) -> Vec<Line<'static>> {
     let c = &row.counts;
     let numbers = [
@@ -1163,7 +1176,7 @@ fn detail_rows(row: &TokenRow, tz: &TimeZone, now_ms: i64, width: usize) -> Vec<
             first_ms,
             last_ms,
         } => vec![
-            format!("session {session_id}"),
+            format!("session {}", short_id(session_id)),
             project.clone().unwrap_or_else(|| "no project".to_owned()),
             format!("{} – {}", when(*first_ms, tz), when(*last_ms, tz)),
         ],
@@ -1174,7 +1187,7 @@ fn detail_rows(row: &TokenRow, tz: &TimeZone, now_ms: i64, width: usize) -> Vec<
             ..
         } => vec![
             format!("{} – {}", when(*start_ms, tz), when(*end_ms, tz)),
-            if *observed { "observed" } else { "inferred" }.to_owned(),
+            if *observed { "observed" } else { "estimated" }.to_owned(),
         ],
         p => vec![period_text(p, tz, now_ms, 0)],
     };
@@ -1414,6 +1427,7 @@ pub(super) use tests::{HOUR_MS, NOON, block, body_y, days, letters, showing, sho
 mod tests {
     use crossterm::event::KeyCode;
     use ratatui::style::{Color, Modifier};
+    use tagteam_core::AccountId;
     use tagteam_engine::tokens::{ActiveBlock, IndexProgress, IndexState, RefreshOutcome};
 
     use super::*;
@@ -1552,12 +1566,12 @@ mod tests {
             [
                 " $50.95 at API prices    114.2M tokens    414 responses".to_owned(),
                 String::new(),
-                " DAY         ACCOUNT        INPUT   OUTPUT   TOTAL   API $".to_owned(),
-                "▌2026-09-20  1 a1@x.co       1.2M  ≥310.0K   93.6M  $41.20".to_owned(),
-                "             2 spare       300.0K    80.0K   20.5M   $9.75".to_owned(),
-                " 2026-09-19  unattributed    5.0K      900  105.9K       —".to_owned(),
-                format!(" {}", "─".repeat(57)),
-                " TOTAL                       1.5M  ≥390.9K  114.2M  $50.95".to_owned(),
+                " DAY         ACCOUNT           INPUT   OUTPUT   TOTAL   API $".to_owned(),
+                "▌2026-09-20  1 a1@x.co          1.2M  ≥310.0K   93.6M  $41.20".to_owned(),
+                "             2 spare          300.0K    80.0K   20.5M   $9.75".to_owned(),
+                " 2026-09-19  unknown account    5.0K      900  105.9K       —".to_owned(),
+                format!(" {}", "─".repeat(60)),
+                " TOTAL                          1.5M  ≥390.9K  114.2M  $50.95".to_owned(),
                 " 412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M) · cache read 88.0M"
                     .to_owned(),
                 " 2026-09-20 · 1 a1@x.co".to_owned(),
@@ -1590,12 +1604,12 @@ mod tests {
         assert_eq!(
             lines[3..9],
             [
-                " DAY         ACCOUNT        INPUT   OUTPUT  CACHE W  CACHE R   TOTAL  RESPONSES   API $".to_owned(),
-                "▌2026-09-20  1 a1@x.co       1.2M  ≥310.0K     4.1M    88.0M   93.6M        412  $41.20  ━━━━━━━━".to_owned(),
-                "             2 spare       300.0K    80.0K        0    20.1M   20.5M          1   $9.75  ━╸".to_owned(),
-                " 2026-09-19  unattributed    5.0K      900        0   100.0K  105.9K          1       —".to_owned(),
-                format!(" {}", "─".repeat(96)),
-                " TOTAL                       1.5M  ≥390.9K     4.1M   108.2M  114.2M        414  $50.95".to_owned(),
+                " DAY         ACCOUNT           INPUT   OUTPUT  CACHE W  CACHE R   TOTAL  RESPONSES   API $".to_owned(),
+                "▌2026-09-20  1 a1@x.co          1.2M  ≥310.0K     4.1M    88.0M   93.6M        412  $41.20  ━━━━━━━━".to_owned(),
+                "             2 spare          300.0K    80.0K        0    20.1M   20.5M          1   $9.75  ━╸".to_owned(),
+                " 2026-09-19  unknown account    5.0K      900        0   100.0K  105.9K          1       —".to_owned(),
+                format!(" {}", "─".repeat(99)),
+                " TOTAL                          1.5M  ≥390.9K     4.1M   108.2M  114.2M        414  $50.95".to_owned(),
             ]
         );
     }
@@ -1658,7 +1672,7 @@ mod tests {
         // `—` and rule, the share line in accent, `TOTAL` alone bold, `sel-bg` on the selection.
         let at_80 = [
             letters(&[(
-                " DAY         ACCOUNT        INPUT   OUTPUT   TOTAL   API $",
+                " DAY         ACCOUNT           INPUT   OUTPUT   TOTAL   API $",
                 'm',
             )]),
             letters(&[
@@ -1666,7 +1680,7 @@ mod tests {
                 ("2026-09-20", 'B'),
                 ("  ", 't'),
                 ("1 a1@x.co", 't'),
-                ("       ", 't'),
+                ("          ", 't'),
                 ("1.2M", 'm'),
                 ("  ", 't'),
                 ("≥310.0K", 'w'),
@@ -1678,7 +1692,7 @@ mod tests {
             letters(&[
                 ("             ", 't'),
                 ("2 spare", 't'),
-                ("       ", 't'),
+                ("          ", 't'),
                 ("300.0K", 'm'),
                 ("    ", 't'),
                 ("80.0K", 'm'),
@@ -1691,7 +1705,7 @@ mod tests {
                 (" ", 't'),
                 ("2026-09-19", 't'),
                 ("  ", 't'),
-                ("unattributed", 't'),
+                ("unknown account", 't'),
                 ("    ", 't'),
                 ("5.0K", 'm'),
                 ("      ", 't'),
@@ -1701,11 +1715,11 @@ mod tests {
                 ("       ", 't'),
                 ("—", 'f'),
             ]),
-            letters(&[(" ", 't'), ("─".repeat(57).as_str(), 'f')]),
+            letters(&[(" ", 't'), ("─".repeat(60).as_str(), 'f')]),
             letters(&[
                 (" ", 't'),
                 ("TOTAL", 'B'),
-                ("                       ", 't'),
+                ("                          ", 't'),
                 ("1.5M", 'm'),
                 ("  ", 't'),
                 ("≥390.9K", 'w'),
@@ -1717,7 +1731,7 @@ mod tests {
         ];
         let at_120 = [
             letters(&[(
-                " DAY         ACCOUNT        INPUT   OUTPUT  CACHE W  CACHE R   TOTAL  RESPONSES   API $",
+                " DAY         ACCOUNT           INPUT   OUTPUT  CACHE W  CACHE R   TOTAL  RESPONSES   API $",
                 'm',
             )]),
             letters(&[
@@ -1725,7 +1739,7 @@ mod tests {
                 ("2026-09-20", 'B'),
                 ("  ", 't'),
                 ("1 a1@x.co", 't'),
-                ("       ", 't'),
+                ("          ", 't'),
                 ("1.2M", 'm'),
                 ("  ", 't'),
                 ("≥310.0K", 'w'),
@@ -1745,7 +1759,7 @@ mod tests {
             letters(&[
                 ("             ", 't'),
                 ("2 spare", 't'),
-                ("       ", 't'),
+                ("          ", 't'),
                 ("300.0K", 'm'),
                 ("    ", 't'),
                 ("80.0K", 'm'),
@@ -1766,7 +1780,7 @@ mod tests {
                 (" ", 't'),
                 ("2026-09-19", 't'),
                 ("  ", 't'),
-                ("unattributed", 't'),
+                ("unknown account", 't'),
                 ("    ", 't'),
                 ("5.0K", 'm'),
                 ("      ", 't'),
@@ -1782,11 +1796,11 @@ mod tests {
                 ("       ", 't'),
                 ("—", 'f'),
             ]),
-            letters(&[(" ", 't'), ("─".repeat(96).as_str(), 'f')]),
+            letters(&[(" ", 't'), ("─".repeat(99).as_str(), 'f')]),
             letters(&[
                 (" ", 't'),
                 ("TOTAL", 'B'),
-                ("                       ", 't'),
+                ("                          ", 't'),
                 ("1.5M", 'm'),
                 ("  ", 't'),
                 ("≥390.9K", 'w'),
@@ -2044,18 +2058,13 @@ mod tests {
             [
                 " $2.46 at API prices    1.8M tokens    2 responses".to_owned(),
                 String::new(),
-                " SESSION            PROJECT              ACCOUNT    INPUT  OUTPUT   TOTAL  API $"
-                    .to_owned(),
-                "▌09-20 09:12–11:40  …/alex/Code/tagteam  1 a1@x.co  20.0K    3.0K  923.0K  $1.23"
-                    .to_owned(),
-                " 09-20 09:12–11:40  …/alex/Code/tagteam  2 spare    20.0K    3.0K  923.0K  $1.23"
-                    .to_owned(),
-                format!(" {}", "─".repeat(79)),
-                " TOTAL                                              40.0K    6.0K    1.8M  $2.46"
-                    .to_owned(),
+                " SESSION            PROJECT  ACCOUNT    INPUT  OUTPUT   TOTAL  API $".to_owned(),
+                "▌09-20 09:12–11:40  tagteam  1 a1@x.co  20.0K    3.0K  923.0K  $1.23".to_owned(),
+                " 09-20 09:12–11:40  tagteam  2 spare    20.0K    3.0K  923.0K  $1.23".to_owned(),
+                format!(" {}", "─".repeat(67)),
+                format!(" TOTAL{}40.0K    6.0K    1.8M  $2.46", " ".repeat(34)),
                 " 1 response · cache write 0 (5m 0, 1h 0) · cache read 900.0K".to_owned(),
-                " session 3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c · /Users/alex/Code/tagteam"
-                    .to_owned(),
+                " session 3f2a9c1d · /Users/alex/Code/tagteam".to_owned(),
                 " 2026-09-20 09:12 – 2026-09-20 11:40 · 1 a1@x.co".to_owned(),
                 " $ what this would cost on the API at list prices of 2026-10-01; not your bill"
                     .to_owned(),
@@ -2090,14 +2099,37 @@ mod tests {
     }
 
     #[test]
-    fn a_block_shows_its_span_and_whether_it_was_observed() {
-        // Spec §5.3, token report §9; blocks are per account, so the bar shows the grouping
-        // the report applies.
-        let blocks = showing_after(
-            "pppggg",
-            vec![block(NOON, true), block(NOON - 5 * HOUR_MS, false)],
-        );
+    fn estimated_blocks_lead_with_a_tilde() {
+        // T5-21: an inferred block's span is led by `~`, an observed one's by a space, in one
+        // column that only a report holding an inferred block has; the detail says `estimated`.
+        let rows = || vec![block(NOON, true), block(NOON - 5 * HOUR_MS, false)];
+        let mut blocks = showing_after("ppp", rows());
         let lines = body_of(&blocks, 80, 24, NOW_MS);
+        assert_eq!(
+            lines[1..11],
+            [
+                " $10.00 at API prices    10.9M tokens    2 responses".to_owned(),
+                " ▶ block ━━━━━━━━━╸············ 2h46m left · 41.2K tok/min · $3.20/h".to_owned(),
+                String::new(),
+                " BLOCK               ACCOUNT     INPUT  OUTPUT  TOTAL   API $".to_owned(),
+                "▌ 09-21 12:00–17:00  1 a1@x.co  400.0K   50.0K   5.5M   $5.00".to_owned(),
+                "   active · 2h13m elapsed · 2h46m left · 41.2K tokens/min · $3.20/h".to_owned(),
+                "   projected 9.8M tokens, —".to_owned(),
+                " ~09-21 07:00–12:00  1 a1@x.co  400.0K   50.0K   5.5M   $5.00".to_owned(),
+                format!(" {}", "─".repeat(60)),
+                format!(" TOTAL{}800.0K  100.0K  10.9M  $10.00", " ".repeat(26)),
+            ]
+        );
+        let table = &lines[4..11];
+        assert!(
+            table
+                .iter()
+                .all(|l| !l.contains("observed") && !l.contains("inferred")),
+            "{lines:?}"
+        );
+        // Blocks are per account, so the bar shows the grouping the report applies.
+        let grouped = showing_after("pppggg", rows());
+        let lines = body_of(&grouped, 80, 24, NOW_MS);
         assert_eq!(
             lines[0],
             bar_row(
@@ -2106,22 +2138,127 @@ mod tests {
                 80
             )
         );
+        assert_eq!(lines[4..11], *table);
+        assert_eq!(grouped.tokens.grouping(), TokenGrouping::None);
+        // With only observed blocks there is no leading column.
+        let observed = showing_after("ppp", vec![block(NOON, true)]);
+        let lines = body_of(&observed, 80, 24, NOW_MS);
         assert_eq!(
-            lines[1..11],
+            lines[4..6],
             [
-                " $10.00 at API prices    10.9M tokens    2 responses".to_owned(),
-                " ▶ block ━━━━━━━━━╸············ 2h46m left · 41.2K tok/min · $3.20/h".to_owned(),
-                String::new(),
-                " BLOCK                        ACCOUNT     INPUT  OUTPUT  TOTAL   API $".to_owned(),
-                "▌09-21 12:00–17:00  observed  1 a1@x.co  400.0K   50.0K   5.5M   $5.00".to_owned(),
-                "   active · 2h13m elapsed · 2h46m left · 41.2K tokens/min · $3.20/h".to_owned(),
-                "   projected 9.8M tokens, —".to_owned(),
-                " 09-21 07:00–12:00  inferred  1 a1@x.co  400.0K   50.0K   5.5M   $5.00".to_owned(),
-                format!(" {}", "─".repeat(69)),
-                " TOTAL                                   800.0K  100.0K  10.9M  $10.00".to_owned(),
+                " BLOCK              ACCOUNT     INPUT  OUTPUT  TOTAL  API $",
+                "▌09-21 12:00–17:00  1 a1@x.co  400.0K   50.0K   5.5M  $5.00",
             ]
         );
-        assert_eq!(blocks.tokens.grouping(), TokenGrouping::None);
+        // Selected, the inferred block's detail says it is estimated.
+        update(&mut blocks, ch('j'), NOW_MS);
+        let lines = body_of(&blocks, 80, 24, NOW_MS);
+        let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
+        let below = &lines[total + 1..];
+        assert!(reads(below, "estimated"), "{below:?}");
+        assert!(!below.iter().any(|l| l.contains("inferred")), "{below:?}");
+        // And the breadcrumbs lead it with `~`.
+        let down = update(&mut blocks, key(KeyCode::Enter), NOW_MS);
+        answer_with(
+            &mut blocks,
+            &down,
+            vec![session("3f2a9c1d", row_account(1))],
+        );
+        assert_eq!(
+            body_of(&blocks, 80, 24, NOW_MS)[1],
+            " › ~09-21 07:00–12:00 · 1 a1@x.co"
+        );
+    }
+
+    #[test]
+    fn removed_and_unattributed_rows_read_removed_account_and_unknown_account() {
+        // T5-19: a cell says `removed account` and `unknown account`; the detail and the filter
+        // dialog name a removed account by its ID's first 8 characters.
+        let lines = body_of(&showing(days(), |_| {}), 80, 24, NOW_MS);
+        assert_eq!(
+            lines[3],
+            " DAY         ACCOUNT           INPUT   OUTPUT   TOTAL   API $"
+        );
+        assert_eq!(
+            lines[6],
+            " 2026-09-19  unknown account    5.0K      900  105.9K       —"
+        );
+        let gone = RowAccount::Removed {
+            id: AccountId::from_string("3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c"),
+        };
+        let row = token_row(day(1), Some(gone.clone()), None, counts(1, 2, 3), None);
+        let state = showing(vec![row], |_| {});
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert!(
+            lines[4].starts_with("▌2026-09-20  removed account  "),
+            "{lines:?}"
+        );
+        let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
+        let below = &lines[total + 1..];
+        assert!(reads(below, "removed account 3f2a9c1d"), "{below:?}");
+        assert!(!lines.iter().any(|l| l.contains("7e44")), "{lines:?}");
+        assert_eq!(account_name(&gone), "removed account 3f2a9c1d");
+        assert_eq!(account_name(&RowAccount::Unattributed), "unknown account");
+    }
+
+    #[test]
+    fn ids_show_their_first_8_characters_in_the_crumbs_and_the_detail() {
+        // T5-19: a session is `session {first 8}` in the breadcrumbs and the detail.
+        let mut state = showing_after("pp", vec![realistic()]);
+        let lines = draw(&state, 80, 24);
+        assert!(reads(&lines, "session 3f2a9c1d"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("7e44")), "{lines:?}");
+        let models = ["claude-opus-5-5", "claude-sonnet-5-5"].map(|m| {
+            token_row(
+                realistic().period,
+                Some(row_account(1)),
+                Some(m),
+                counts(1, 2, 3),
+                None,
+            )
+        });
+        let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
+        answer_with(&mut state, &down, models.to_vec());
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(lines[1], " › session 3f2a9c1d · 1 a1@x.co");
+        assert!(!lines.iter().any(|l| l.contains("7e44")), "{lines:?}");
+        // Characters, not bytes.
+        assert_eq!(short_id("山田太郎のアカウント"), "山田太郎のアカウ");
+        assert_eq!(short_id("88aa"), "88aa");
+    }
+
+    #[test]
+    fn a_session_s_project_is_its_basename_and_keeps_it_before_the_period_shortens() {
+        // T5-20: the project is its basename, cut from its end; it keeps `PROJECT_KEEP` columns
+        // before the span compacts, and the account takes what is left.
+        let state = showing_after("pp", vec![realistic()]);
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert!(
+            lines[4].starts_with("▌09-20 09:12–11:40  portal-feature-user…  1 a1@x.…  "),
+            "{lines:?}"
+        );
+        let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
+        let below = &lines[total + 1..];
+        assert!(
+            reads(
+                below,
+                "/Users/alex/Code/ExampleCorp/portal-feature-user-manuals"
+            ),
+            "the detail keeps the full path: {below:?}"
+        );
+        // Where no span fits with it, the project still gives way, as before.
+        let lines = draw(&widest(), 80, 24);
+        let head = lines
+            .iter()
+            .position(|l| l.starts_with(" SESSION"))
+            .unwrap();
+        assert!(!lines[head].contains("PROJ"), "{:?}", lines[head]);
+        assert!(lines[head + 1].starts_with("▌09-20 09:12  "), "{lines:?}");
+        assert_eq!(project_name("/Users/alex/Code/tagteam"), "tagteam");
+        assert_eq!(project_name("/w/"), "w");
+        assert_eq!(project_name(r"C:\Users\alex\Code\tagteam"), "tagteam");
+        assert_eq!(project_name("tagteam"), "tagteam");
+        assert_eq!(project_name("/"), "/");
     }
 
     #[test]
@@ -2140,8 +2277,8 @@ mod tests {
         assert_eq!(
             lines[at + 1..at + 3],
             [
-                format!(" {}", "─".repeat(68)),
-                " TOTAL                                   400.0K   50.0K   5.5M  $5.00".to_owned(),
+                format!(" {}", "─".repeat(58)),
+                format!(" TOTAL{}400.0K   50.0K   5.5M  $5.00", " ".repeat(25)),
             ],
             "no longer active, until the query its end asks for returns"
         );
@@ -2230,7 +2367,7 @@ mod tests {
             let lines = body_of(&state, 80, 24, NOW_MS);
             assert_eq!(
                 lines[5],
-                "             2 spare       300.0K    80.0K   20.5M   ≥$9.75"
+                "             2 spare          300.0K    80.0K   20.5M   ≥$9.75"
             );
             assert!(lines[6].ends_with("       —"), "{}", lines[6]);
             for needle in ["≥310.0K", "≥$9.75"] {
@@ -2495,7 +2632,7 @@ mod tests {
         let lines = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(lines[0], bar);
         assert!(
-            lines[1].starts_with(" › session 3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c · 3 山田"),
+            lines[1].starts_with(" › session 3f2a9c1d · 3 山田太郎のアカウント · claude-opus"),
             "{lines:?}"
         );
         assert!(lines[1].ends_with('…'), "{lines:?}");
@@ -3002,8 +3139,9 @@ mod tests {
             assert!(total.contains(value), "{value} in {total:?}");
         }
         // At 120 the cache, the responses and the share line take room, and the span is cut to its
-        // start, the account to its position and the model to what is left; wider still, it
-        // shows the span and the years.
+        // start, the account to its position and the model to what is left. At 160 the project
+        // keeps `PROJECT_KEEP` columns and the span drops its years first (T5-20); wider still,
+        // it shows the span and the years.
         let at_120 = draw(&state, 120, 40);
         assert!(
             at_120
@@ -3015,8 +3153,15 @@ mod tests {
         assert!(
             at_160
                 .iter()
-                .any(|l| l.contains("2025-09-20 09:12–2025-09-21 11:40")),
+                .any(|l| l.contains("▌09-20 09:12–11:40+1d  portal-feature-user…  ")),
             "{at_160:?}"
+        );
+        let at_180 = draw(&state, 180, 40);
+        assert!(
+            at_180
+                .iter()
+                .any(|l| l.contains("2025-09-20 09:12–2025-09-21 11:40")),
+            "{at_180:?}"
         );
         // Day by account and model: the CJK alias is cut on a character, never in one.
         let day = showing_after(
@@ -3062,7 +3207,7 @@ mod tests {
     /// What the selected row's detail must let a person read (B25).
     const DETAIL: [&str; 7] = [
         "412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M) · cache read 88.0M",
-        "session 3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c",
+        "session 3f2a9c1d",
         "/Users/alex/Code/ExampleCorp/portal-feature-user-manuals",
         "2026-09-20 09:12 – 2026-09-20 11:40",
         "1 a1@x.co",

@@ -458,8 +458,8 @@ mod tests {
         [
             "1 a1@x.co",
             "2 a2@x.co",
-            "removed id-9",
-            "unattributed",
+            "removed account id-9",
+            "unknown account",
             OPUS,
             SONNET,
         ]
@@ -508,7 +508,7 @@ mod tests {
         for text in [
             "Accounts",
             "[x] 1 a1@x.co",
-            "[x] removed id-9",
+            "[x] removed account id-9",
             "Models",
             "[x] claude-sonnet-5-5",
         ] {
