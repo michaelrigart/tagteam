@@ -342,7 +342,12 @@ fn timeline_event(e: EventRow) -> Option<TimelineEvent> {
             at_ms: e.at,
             account: e.from_id?,
         }),
-        EventKind::Quarantine | EventKind::Unquarantine => None,
+        EventKind::Quarantine
+        | EventKind::Unquarantine
+        | EventKind::SwitchFailed
+        | EventKind::AllExhausted
+        | EventKind::AutoswitchPaused
+        | EventKind::AutoswitchResumed => None,
     }
 }
 

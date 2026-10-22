@@ -22,8 +22,24 @@ str_enum! {
         Add => "add",
         Import => "import",
         Remove => "remove",
+        SwitchFailed => "switch-failed",
+        AllExhausted => "all-exhausted",
+        AutoswitchPaused => "autoswitch-paused",
+        AutoswitchResumed => "autoswitch-resumed",
     }
 }
+
+/// §5.3's auto-line kinds, in its order; `add`, `import` and `remove` are not.
+pub const AUTO_LINE_KINDS: [EventKind; 8] = [
+    EventKind::Switch,
+    EventKind::SwitchRecovered,
+    EventKind::SwitchFailed,
+    EventKind::AllExhausted,
+    EventKind::AutoswitchPaused,
+    EventKind::AutoswitchResumed,
+    EventKind::Quarantine,
+    EventKind::Unquarantine,
+];
 
 #[cfg(test)]
 mod tests {
@@ -47,6 +63,10 @@ mod tests {
             ("add", EventKind::Add),
             ("import", EventKind::Import),
             ("remove", EventKind::Remove),
+            ("switch-failed", EventKind::SwitchFailed),
+            ("all-exhausted", EventKind::AllExhausted),
+            ("autoswitch-paused", EventKind::AutoswitchPaused),
+            ("autoswitch-resumed", EventKind::AutoswitchResumed),
         ] {
             assert_eq!(v.as_str(), s);
             assert_eq!(EventKind::parse(s), Some(v));
