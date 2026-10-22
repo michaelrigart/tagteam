@@ -13,10 +13,10 @@ use serde_json::Value;
 
 use crate::read::{Read, ReadError};
 
-/// One `<config_home>/sessions/<pid>.json` (Appendix A.7), reduced to what liveness and the
-/// token report's sightings need.
+/// One `<config_home>/sessions/<pid>.json` (Appendix A.7), as Claude Code writes it, before
+/// `to_session_record` reduces it to what liveness and the token report's sightings need.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionRecord {
+pub struct CcRecord {
     pub pid: u32,
     /// `ps -o lstart=` text, or the all-digit legacy form; `None` when absent or not text.
     pub proc_start: Option<String>,
@@ -68,7 +68,7 @@ fn pid_of(v: Option<&Value>) -> Result<u32, String> {
 
 /// §12.6: non-object JSON, a missing or non-integer or out-of-range `pid`, depth > 32, or
 /// invalid UTF-8 is `Err(detail)`; unknown fields are ignored. `detail` never quotes the bytes.
-pub fn parse_session_record(bytes: &[u8]) -> Result<SessionRecord, String> {
+pub fn parse_cc_record(bytes: &[u8]) -> Result<CcRecord, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "it is not UTF-8".to_owned())?;
     let v: Value = serde_json::from_str(text).map_err(|_| "it is not JSON".to_owned())?;
     let Value::Object(o) = &v else {
@@ -83,7 +83,7 @@ pub fn parse_session_record(bytes: &[u8]) -> Result<SessionRecord, String> {
         Some(Value::Number(n)) => Some(n.to_string()),
         _ => None,
     };
-    Ok(SessionRecord {
+    Ok(CcRecord {
         pid,
         proc_start,
         started_at_ms: o.get("startedAt").and_then(Value::as_i64),
@@ -93,6 +93,33 @@ pub fn parse_session_record(bytes: &[u8]) -> Result<SessionRecord, String> {
             .and_then(Value::as_str)
             .map(str::to_owned),
     })
+}
+
+/// The `kind`s of a session record written by a Claude Code background daemon or its workers
+/// (Appendix A.7).
+const DAEMON_KINDS: [&str; 3] = ["bg", "daemon", "daemon-worker"];
+
+impl CcRecord {
+    /// `start` is `proc_start_of(proc_start)`; `background` is whether `kind` is exactly one of
+    /// `DAEMON_KINDS`; `pid`, `started_at_ms` and `session_id` are carried over.
+    pub fn to_session_record(&self) -> SessionRecord {
+        SessionRecord {
+            pid: self.pid,
+            start: proc_start_of(self.proc_start.as_deref()),
+            started_at_ms: self.started_at_ms,
+            session_id: self.session_id.clone(),
+            background: self
+                .kind
+                .as_deref()
+                .is_some_and(|k| DAEMON_KINDS.contains(&k)),
+        }
+    }
+}
+
+/// Claude Code's record, read as a neutral `SessionRecord`: `parse_cc_record`, then
+/// `to_session_record`.
+pub fn parse_session_record(bytes: &[u8]) -> Result<SessionRecord, String> {
+    parse_cc_record(bytes).map(|r| r.to_session_record())
 }
 
 /// When a recorded process started, in the form its record gives it (§12.6).
@@ -106,6 +133,19 @@ pub enum ProcStart {
     BootTicksIndeterminate,
     /// None given, or none this build can read.
     Unknown,
+}
+
+/// A session record, reduced to what liveness and the token report's sightings need (§12.6,
+/// token report spec §2.4). A provider's `parse_session_record` gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub pid: u32,
+    pub start: ProcStart,
+    /// When the session's execution started, epoch ms.
+    pub started_at_ms: Option<i64>,
+    pub session_id: Option<String>,
+    /// Written by a background session rather than an interactive one.
+    pub background: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -558,7 +598,7 @@ pub fn record_is_live(probe: &dyn ProcessProbe, r: &SessionRecord, launch_comman
         None => return true,
         Some(true) => {}
     }
-    match proc_start_of(r.proc_start.as_deref()) {
+    match r.start {
         ProcStart::EpochS(recorded) => {
             // The OS start time equal to the record's within ±1 s, or unknown, is live. A
             // mismatch alone is no proof (Decision 16): a Linux start time moves with the wall
@@ -596,8 +636,8 @@ mod tests {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
 
-    fn record(v: Value) -> Result<SessionRecord, String> {
-        parse_session_record(v.to_string().as_bytes())
+    fn record(v: Value) -> Result<CcRecord, String> {
+        parse_cc_record(v.to_string().as_bytes())
     }
 
     #[test]
@@ -610,7 +650,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             r,
-            SessionRecord {
+            CcRecord {
                 pid: 4242,
                 proc_start: Some("Thu Oct  1 12:34:56 2026".into()),
                 started_at_ms: Some(1_790_858_096_000),
@@ -620,7 +660,7 @@ mod tests {
         );
         assert_eq!(
             record(json!({"pid": 7})).unwrap(),
-            SessionRecord {
+            CcRecord {
                 pid: 7,
                 proc_start: None,
                 started_at_ms: None,
@@ -649,7 +689,7 @@ mod tests {
         }
         assert_eq!(
             record(json!({"pid": 7, "startedAt": "soon", "kind": 3})).unwrap(),
-            SessionRecord {
+            CcRecord {
                 pid: 7,
                 proc_start: None,
                 started_at_ms: None,
@@ -660,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_record_reads_session_id() {
+    fn a_record_names_its_session_only_in_text() {
         // Token report spec §2.4: a record names its session; anything but text is no id.
         let id = |v: Value| record(v).unwrap().session_id;
         assert_eq!(
@@ -711,11 +751,11 @@ mod tests {
             ),
         ];
         for (case, bytes) in cases {
-            let detail = parse_session_record(&bytes).expect_err(case);
+            let detail = parse_cc_record(&bytes).expect_err(case);
             assert!(!detail.contains("SENTINEL"), "{case}: {detail}");
         }
         assert_eq!(
-            parse_session_record(&nested(31)).unwrap().pid,
+            parse_cc_record(&nested(31)).unwrap().pid,
             7,
             "32 levels is the limit, not past it"
         );
@@ -938,17 +978,16 @@ mod tests {
         }
     }
 
-    fn rec(proc_start: Option<&str>, started_at_ms: Option<i64>) -> SessionRecord {
+    fn rec(start: ProcStart, started_at_ms: Option<i64>) -> SessionRecord {
         SessionRecord {
             pid: 100,
-            proc_start: proc_start.map(str::to_owned),
+            start,
             started_at_ms,
-            kind: Some("interactive".into()),
             session_id: None,
+            background: false,
         }
     }
 
-    const LSTART: &str = "Thu Oct  1 12:34:56 2026";
     const STARTED: i64 = 1_790_858_096;
 
     /// A running process that does not mention the launch command, started at `start_time_s`.
@@ -960,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn an_lstart_record_of_another_program_is_live_only_within_a_second_of_the_os_start_time() {
+    fn an_epoch_start_of_another_program_is_live_only_within_a_second_of_the_os_start_time() {
         for (actual, live) in [
             (STARTED, true),
             (STARTED - 1, true),
@@ -972,7 +1011,7 @@ mod tests {
             let probe = FakeProcessProbe::new();
             probe.set(100, stranger(actual));
             assert_eq!(
-                record_is_live(&probe, &rec(Some(LSTART), None), "claude"),
+                record_is_live(&probe, &rec(ProcStart::EpochS(STARTED), None), "claude"),
                 live,
                 "OS start {actual}"
             );
@@ -981,20 +1020,21 @@ mod tests {
 
     #[test]
     fn a_recycled_pid_left_by_sigkill_is_dead_when_it_is_not_a_claude_process() {
-        // Review Focus 2: the record outlived its writer, and the OS gave the pid to a new
-        // process an hour later. The lstart mismatches and the process is not a claude
-        // process, so the record is dead (Decision 16).
+        // The record outlived its writer, and the OS gave the pid to a new process an hour
+        // later. The start mismatches and the process is not a claude process, so the record is
+        // dead (Decision 16).
         let probe = FakeProcessProbe::new();
         probe.set(100, stranger(STARTED + 3_600));
         assert!(!record_is_live(
             &probe,
-            &rec(Some(LSTART), Some(STARTED * 1000)),
+            &rec(ProcStart::EpochS(STARTED), Some(STARTED * 1000)),
             "claude"
         ));
     }
 
     #[test]
-    fn an_lstart_mismatch_is_recycled_only_when_the_process_does_not_mention_the_launch_command() {
+    fn an_epoch_start_mismatch_is_recycled_only_when_the_process_does_not_mention_the_launch_command()
+     {
         // Decision 16: a Linux start time moves with the wall clock (suspend, a clock step), so
         // a mismatch alone is no proof. A process that mentions `claude` is live, and so is one
         // whose arguments cannot be read (§12.6: undetermined counts as live).
@@ -1008,7 +1048,11 @@ mod tests {
                 },
             );
             assert_eq!(
-                record_is_live(&probe, &rec(Some(LSTART), Some(STARTED * 1000)), "claude"),
+                record_is_live(
+                    &probe,
+                    &rec(ProcStart::EpochS(STARTED), Some(STARTED * 1000)),
+                    "claude"
+                ),
                 live,
                 "mentions {mentions:?}"
             );
@@ -1019,7 +1063,7 @@ mod tests {
     fn a_pid_that_is_gone_is_dead_and_one_that_cannot_be_probed_is_live() {
         let probe = FakeProcessProbe::new();
         assert!(
-            !record_is_live(&probe, &rec(Some(LSTART), None), "claude"),
+            !record_is_live(&probe, &rec(ProcStart::EpochS(STARTED), None), "claude"),
             "unknown pid"
         );
         probe.set(
@@ -1029,7 +1073,11 @@ mod tests {
                 ..running(STARTED)
             },
         );
-        assert!(!record_is_live(&probe, &rec(Some(LSTART), None), "claude"));
+        assert!(!record_is_live(
+            &probe,
+            &rec(ProcStart::EpochS(STARTED), None),
+            "claude"
+        ));
         probe.set(
             100,
             FakeProcess {
@@ -1037,7 +1085,11 @@ mod tests {
                 ..running(STARTED + 3_600)
             },
         );
-        assert!(record_is_live(&probe, &rec(Some(LSTART), None), "claude"));
+        assert!(record_is_live(
+            &probe,
+            &rec(ProcStart::EpochS(STARTED), None),
+            "claude"
+        ));
         probe.set(
             100,
             FakeProcess {
@@ -1046,13 +1098,13 @@ mod tests {
             },
         );
         assert!(
-            record_is_live(&probe, &rec(Some(LSTART), None), "claude"),
+            record_is_live(&probe, &rec(ProcStart::EpochS(STARTED), None), "claude"),
             "an unknown start time counts as live"
         );
     }
 
     #[test]
-    fn an_all_digit_proc_start_must_equal_the_start_ticks() {
+    fn a_boot_tick_start_must_equal_the_start_ticks() {
         for (ticks, live) in [(Some(5_000), true), (Some(5_001), false), (None, true)] {
             let probe = FakeProcessProbe::new();
             probe.set(
@@ -1064,7 +1116,7 @@ mod tests {
                 },
             );
             assert_eq!(
-                record_is_live(&probe, &rec(Some("5000"), None), "claude"),
+                record_is_live(&probe, &rec(ProcStart::BootTicks(5_000), None), "claude"),
                 live,
                 "{ticks:?}"
             );
@@ -1072,9 +1124,9 @@ mod tests {
     }
 
     #[test]
-    fn without_a_usable_proc_start_cswaps_heuristic_decides() {
-        // Review Focus 2: recycled only if the process started more than 120 s after
-        // `startedAt` and nothing about it mentions the launch command.
+    fn without_a_known_start_cswaps_heuristic_decides() {
+        // With no known start, a pid is recycled only if its process started more than 120 s
+        // after `startedAt` and nothing about it mentions the launch command.
         let at_ms = STARTED * 1000;
         let cases = [
             (STARTED + 121, Some(false), Some(at_ms), true, false),
@@ -1086,26 +1138,59 @@ mod tests {
             (STARTED + 121, Some(false), Some(at_ms), false, true),
         ];
         for (start, mentions, started_at, known_start, live) in cases {
-            for proc_start in [None, Some(""), Some("not a date")] {
-                let probe = FakeProcessProbe::new();
-                probe.set(
-                    100,
-                    FakeProcess {
-                        exists: Some(true),
-                        start_time_s: known_start.then_some(start),
-                        start_ticks: None,
-                        mentions_launch: mentions,
-                        ppid: None,
-                    },
-                );
-                assert_eq!(
-                    record_is_live(&probe, &rec(proc_start, started_at), "claude"),
-                    live,
-                    "start {start}, mentions {mentions:?}, startedAt {started_at:?}, \
-                     known {known_start}, procStart {proc_start:?}"
-                );
-            }
+            let probe = FakeProcessProbe::new();
+            probe.set(
+                100,
+                FakeProcess {
+                    exists: Some(true),
+                    start_time_s: known_start.then_some(start),
+                    start_ticks: None,
+                    mentions_launch: mentions,
+                    ppid: None,
+                },
+            );
+            assert_eq!(
+                record_is_live(&probe, &rec(ProcStart::Unknown, started_at), "claude"),
+                live,
+                "start {start}, mentions {mentions:?}, startedAt {started_at:?}, \
+                 known {known_start}"
+            );
         }
+    }
+
+    #[test]
+    fn an_indeterminate_boot_tick_start_is_live_whatever_the_ticks() {
+        for ticks in [Some(5_000), Some(0), None] {
+            let probe = FakeProcessProbe::new();
+            probe.set(
+                100,
+                FakeProcess {
+                    start_ticks: ticks,
+                    ..stranger(STARTED + 3_600)
+                },
+            );
+            assert!(
+                record_is_live(
+                    &probe,
+                    &rec(ProcStart::BootTicksIndeterminate, Some(STARTED * 1000)),
+                    "claude"
+                ),
+                "{ticks:?}"
+            );
+        }
+        let probe = FakeProcessProbe::new();
+        probe.set(
+            100,
+            FakeProcess {
+                exists: Some(false),
+                ..FakeProcess::default()
+            },
+        );
+        assert!(!record_is_live(
+            &probe,
+            &rec(ProcStart::BootTicksIndeterminate, None),
+            "claude"
+        ));
     }
 
     #[test]
@@ -1177,6 +1262,14 @@ mod tests {
     }
 
     #[test]
+    fn this_process_s_start_reads_back_from_its_lstart_text() {
+        let start = SystemProcessProbe
+            .start_time_s(std::process::id())
+            .expect("this process's start time");
+        assert_eq!(parse_lstart(&lstart_of(start)), Some(start));
+    }
+
+    #[test]
     fn this_process_is_live_under_its_own_start_time_and_recycled_under_another() {
         let me = std::process::id();
         let p = SystemProcessProbe;
@@ -1190,20 +1283,19 @@ mod tests {
             start <= now + 1 && now - start < 86_400,
             "{start} vs now {now}"
         );
-        assert_eq!(parse_lstart(&lstart_of(start)), Some(start));
         // The launch command is a word this process never mentions, so a mismatch is decided by
         // the start time alone (Decision 16), wherever the test binary was built.
         let stranger = "no-such-word-7f3a";
         let mine = SessionRecord {
             pid: me,
-            proc_start: Some(lstart_of(start)),
+            start: ProcStart::EpochS(start),
             started_at_ms: Some(start * 1000),
-            kind: None,
             session_id: None,
+            background: false,
         };
         assert!(record_is_live(&p, &mine, stranger));
         let recycled = SessionRecord {
-            proc_start: Some(lstart_of(start - 3_600)),
+            start: ProcStart::EpochS(start - 3_600),
             ..mine.clone()
         };
         assert!(!record_is_live(&p, &recycled, stranger));
@@ -1238,10 +1330,10 @@ mod tests {
         assert_eq!(p.exists(u32::MAX), None);
         let gone = SessionRecord {
             pid: dead,
-            proc_start: None,
+            start: ProcStart::Unknown,
             started_at_ms: None,
-            kind: None,
             session_id: None,
+            background: false,
         };
         assert!(!record_is_live(&p, &gone, "claude"));
     }

@@ -674,7 +674,9 @@ pub fn session_records(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
             );
             let live: Vec<_> = records(&sessions)
                 .into_iter()
-                .filter(|(_, r)| record_is_live(&SystemProcessProbe, r, "claude"))
+                .filter(|(_, r)| {
+                    record_is_live(&SystemProcessProbe, &r.to_session_record(), "claude")
+                })
                 .collect();
             kinds = live.iter().filter_map(|(_, r)| r.kind.clone()).collect();
             workers = live

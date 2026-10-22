@@ -1,9 +1,9 @@
 //! Claude Code's session records (Appendix A.7) as the neutral liveness judgement reads them
 //! (refactor spec §9).
 
-use tagteam_provider::liveness::proc_start_of;
+use tagteam_provider::liveness::{parse_cc_record, proc_start_of};
 use tagteam_provider::{
-    FakeProcess, FakeProcessProbe, ProcStart, parse_session_record, record_is_live,
+    FakeProcess, FakeProcessProbe, ProcStart, SessionRecord, parse_session_record, record_is_live,
 };
 
 /// `"Thu Oct  1 12:34:56 2026"` as epoch seconds.
@@ -166,5 +166,63 @@ fn each_proc_start_text_maps_to_its_form() {
         for text in texts {
             assert_eq!(proc_start_of(*text), form, "{text:?}");
         }
+    }
+}
+
+#[test]
+fn a_cc_record_maps_its_kind_to_background_and_its_start_to_a_form() {
+    let background = |kind: &str| {
+        let bytes = format!(r#"{{"pid": 7, "kind": {kind}}}"#);
+        parse_session_record(bytes.as_bytes())
+            .expect("a readable record")
+            .background
+    };
+    // The kind is matched exactly: no case folding, no trimming, no prefix.
+    for kind in [r#""bg""#, r#""daemon""#, r#""daemon-worker""#] {
+        assert!(background(kind), "{kind}");
+    }
+    for kind in [
+        r#""interactive""#,
+        r#""BG""#,
+        r#"" bg""#,
+        r#""daemon-workers""#,
+        "3",
+        "null",
+    ] {
+        assert!(!background(kind), "{kind}");
+    }
+    let no_kind = parse_session_record(br#"{"pid": 7}"#).expect("a readable record");
+    assert!(!no_kind.background, "an absent kind");
+
+    let record = parse_session_record(
+        br#"{"pid":7,"procStart":"Thu Oct  1 12:34:56 2026","startedAt":1790858096000,"sessionId":"s","kind":"bg"}"#,
+    )
+    .expect("a readable record");
+    assert_eq!(
+        record,
+        SessionRecord {
+            pid: 7,
+            start: ProcStart::EpochS(1_790_858_096),
+            started_at_ms: Some(1_790_858_096_000),
+            session_id: Some("s".into()),
+            background: true,
+        }
+    );
+
+    let start = |member: &str| {
+        let bytes = format!(r#"{{"pid": 7, "procStart": {member}}}"#);
+        parse_session_record(bytes.as_bytes())
+            .expect("a readable record")
+            .start
+    };
+    assert_eq!(start("123456"), ProcStart::BootTicks(123_456));
+    assert_eq!(
+        start("99999999999999999999"),
+        ProcStart::BootTicksIndeterminate
+    );
+
+    for bytes in [&b"{"[..], b"[1]", br#"{"pid": 0}"#] {
+        let error = parse_session_record(bytes).expect_err("an unreadable record");
+        assert_eq!(Err(error), parse_cc_record(bytes).map(|_| ()));
     }
 }

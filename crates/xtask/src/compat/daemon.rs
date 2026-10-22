@@ -13,8 +13,9 @@ use std::io;
 use std::path::Path;
 
 use serde_json::{Value, json};
+use tagteam_provider::liveness::{CcRecord, parse_cc_record};
 use tagteam_provider::{
-    LockProbe, ProcessProbe, Read, RecordEntry, SessionRecord, launch_reservations, parse_lstart,
+    LockProbe, ProcessProbe, Read, RecordEntry, launch_reservations, parse_lstart,
     parse_session_record, read_session_records, read_supervisor_lock, record_is_live,
 };
 
@@ -52,8 +53,8 @@ impl Survey {
 /// A pid the roster names, whose process is the recorded one: judged by the `procStart` or
 /// `startedAt` beside it when the roster has one, and otherwise by the process still being a
 /// `claude` one (a roster pid with no start time of its own could be anyone's by now).
-fn roster_pid_lives(probe: &dyn ProcessProbe, record: &SessionRecord) -> bool {
-    record_is_live(probe, record, LAUNCH)
+fn roster_pid_lives(probe: &dyn ProcessProbe, record: &CcRecord) -> bool {
+    record_is_live(probe, &record.to_session_record(), LAUNCH)
         && (record.proc_start.is_some()
             || record.started_at_ms.is_some()
             || probe.mentions(record.pid, LAUNCH) != Some(false))
@@ -66,7 +67,7 @@ fn roster_pid_lives(probe: &dyn ProcessProbe, record: &SessionRecord) -> bool {
 /// with a pid, a `replPid` or a `supervisorPid` that is no integer (`null` is no pid). The
 /// roster's `supervisorPid` is checked for its type only: a bare pid in a file that keeps stale
 /// ones proves nothing, and the live supervisor is `daemon.lock`'s (`read_lock`).
-fn roster_records(roster: &Value) -> (Vec<(String, SessionRecord)>, Vec<String>) {
+fn roster_records(roster: &Value) -> (Vec<(String, CcRecord)>, Vec<String>) {
     let (mut out, mut unreadable) = (Vec::new(), Vec::new());
     if !roster.is_object() {
         unreadable.push("daemon/roster.json (it is not a JSON object)".to_owned());
@@ -88,7 +89,7 @@ fn roster_records(roster: &Value) -> (Vec<(String, SessionRecord)>, Vec<String>)
         }
     };
     for entry in entries {
-        match parse_session_record(entry.to_string().as_bytes()) {
+        match parse_cc_record(entry.to_string().as_bytes()) {
             Ok(r) => out.push(("a worker in the roster".to_owned(), r)),
             Err(detail) => {
                 unreadable.push(format!("a worker in daemon/roster.json ({detail})"));
@@ -100,7 +101,7 @@ fn roster_records(roster: &Value) -> (Vec<(String, SessionRecord)>, Vec<String>)
             Value::Null => {}
             pid => {
                 let repl = json!({"pid": pid, "procStart": entry["replProcStart"]});
-                match parse_session_record(repl.to_string().as_bytes()) {
+                match parse_cc_record(repl.to_string().as_bytes()) {
                     Ok(r) => out.push(("a worker's repl in the roster".to_owned(), r)),
                     Err(detail) => unreadable.push(format!(
                         "a worker in daemon/roster.json (replPid: {detail})"
@@ -128,18 +129,15 @@ fn read_lock(home: &Path, probe: &dyn ProcessProbe, s: &mut Survey) {
 /// The home's session records into `s`: a live one is alive (`only_daemons` keeps to the
 /// daemon kinds, `DAEMON_KINDS`), one that cannot be read is unreadable.
 fn read_records(home: &Path, probe: &dyn ProcessProbe, only_daemons: bool, s: &mut Survey) {
-    match read_session_records(
-        &home.join("sessions"),
-        "json",
-        &parse_session_record,
-        &mut || 0,
-    ) {
+    match read_session_records(&home.join("sessions"), "json", &parse_cc_record, &mut || 0) {
         Read::Present(entries) => {
             for (entry, _) in entries {
                 match entry {
                     RecordEntry::Record(r) => {
                         let daemon = r.kind.as_deref().is_some_and(|k| DAEMON_KINDS.contains(&k));
-                        if (daemon || !only_daemons) && record_is_live(probe, &r, LAUNCH) {
+                        if (daemon || !only_daemons)
+                            && record_is_live(probe, &r.to_session_record(), LAUNCH)
+                        {
                             s.alive.push(format!(
                                 "a record of kind {} (pid {})",
                                 r.kind.as_deref().unwrap_or("session"),

@@ -81,9 +81,9 @@ pub enum SessionState {
         profile: PathBuf,
     },
     /// At least one live owner (§12.6): `session`, a held reservation or a record that is not a
-    /// daemon's; `daemon`, a Claude Code background daemon (a `bg`, `daemon` or `daemon-worker`
-    /// record, or the supervisor's lock file). Both can hold at once. `damaged` is every input
-    /// that could not be read beside them.
+    /// background session's; `daemon`, a background session (a record its provider marks
+    /// `background`) or the supervisor's lock file. Both can hold at once. `damaged` is every
+    /// input that could not be read beside them.
     Owned {
         profile: PathBuf,
         session: bool,
@@ -121,10 +121,6 @@ pub enum DamagedKind {
     /// The supervisor's lock file.
     SupervisorLock,
 }
-
-/// The `kind`s of a session record written by a Claude Code background daemon or its workers
-/// (Appendix A.7).
-const DAEMON_KINDS: [&str; 3] = ["bg", "daemon", "daemon-worker"];
 
 impl SessionState {
     /// Session-owned (§12.5): a live reservation, record or supervisor, or one that could not be
@@ -305,7 +301,7 @@ impl Engine {
                     match entry {
                         RecordEntry::Record(r) => {
                             if record_is_live(self.process.as_ref(), &r, p.launch_command()) {
-                                if r.kind.as_deref().is_some_and(|k| DAEMON_KINDS.contains(&k)) {
+                                if r.background {
                                     daemon = true;
                                 } else {
                                     session = true;
