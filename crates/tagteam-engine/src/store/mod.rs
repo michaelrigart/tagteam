@@ -1639,6 +1639,83 @@ impl Store {
         Ok(rows.into_iter().flatten().collect())
     }
 
+    /// §12.3: the provider's events at or after `since_ms`, by `(at, rowid)`, leaving out a row
+    /// this build cannot type.
+    pub fn events_since(
+        &self,
+        provider: &ProviderId,
+        since_ms: i64,
+    ) -> Result<Vec<EventRow>, StoreError> {
+        let c = self.lock();
+        let mut stmt =
+            c.prepare("SELECT * FROM events WHERE provider = ?1 AND at >= ?2 ORDER BY at, rowid")?;
+        let rows = stmt
+            .query_map(params![provider.as_str(), since_ms], event_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().flatten().collect())
+    }
+
+    /// The first row `sql` returns that this build can type, in its order.
+    fn first_event(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Result<Option<EventRow>, StoreError> {
+        let c = self.lock();
+        let mut stmt = c.prepare(sql)?;
+        let mut rows = stmt.query(params)?;
+        while let Some(r) = rows.next()? {
+            if let Some(e) = event_from_row(r)? {
+                return Ok(Some(e));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The provider's newest event of one of `kinds` with `since_ms <= at < before_ms` (either
+    /// bound optional), by `(at, rowid)`, skipping rows this build cannot type.
+    pub fn latest_event(
+        &self,
+        provider: &ProviderId,
+        kinds: &[EventKind],
+        since_ms: Option<i64>,
+        before_ms: Option<i64>,
+    ) -> Result<Option<EventRow>, StoreError> {
+        let marks = (4..4 + kinds.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT * FROM events WHERE provider = ?1 AND (?2 IS NULL OR at >= ?2) \
+             AND (?3 IS NULL OR at < ?3) AND kind IN ({marks}) ORDER BY at DESC, rowid DESC"
+        );
+        let provider = provider.as_str();
+        let names: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+        let mut p: Vec<&dyn rusqlite::ToSql> = vec![&provider, &since_ms, &before_ms];
+        p.extend(names.iter().map(|n| n as &dyn rusqlite::ToSql));
+        self.first_event(&sql, &p)
+    }
+
+    /// C-12: the `label` of the latest `remove` event whose `from_id` is `id`.
+    pub fn removed_label(
+        &self,
+        provider: &ProviderId,
+        id: &AccountId,
+    ) -> Result<Option<String>, StoreError> {
+        let latest = self.first_event(
+            "SELECT * FROM events WHERE provider = ?1 AND kind = ?2 AND from_id = ?3 \
+             ORDER BY at DESC, rowid DESC",
+            &[
+                &provider.as_str(),
+                &EventKind::Remove.as_str(),
+                &id.as_str(),
+            ],
+        )?;
+        Ok(latest
+            .and_then(|e| e.detail)
+            .and_then(|d| d.get("label")?.as_str().map(str::to_owned)))
+    }
+
     pub fn journal(&self, provider: &ProviderId) -> Result<Option<JournalRow>, StoreError> {
         let c = self.lock();
         Ok(c.query_row(

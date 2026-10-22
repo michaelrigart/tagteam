@@ -2337,3 +2337,283 @@ fn events_leave_out_a_row_this_build_cannot_type_and_keep_it_stored() {
         .unwrap();
     assert_eq!(stored, 3);
 }
+
+/// An `events` row as `(at, provider, kind, from_id, to_id, source, detail)`, written raw.
+type RawEvent<'a> = (
+    i64,
+    &'a str,
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+    &'a str,
+    Option<&'a str>,
+);
+
+/// Writes `rows` past the store's typing, in order, so a test sets rowids and spellings itself.
+fn raw_events(path: &std::path::Path, rows: &[RawEvent<'_>]) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    for &(at, provider, kind, from_id, to_id, source, detail) in rows {
+        conn.execute(
+            "INSERT INTO events (at, provider, kind, from_id, to_id, source, detail) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![at, provider, kind, from_id, to_id, source, detail],
+        )
+        .unwrap();
+    }
+}
+
+fn stored_events(path: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn events_since_is_the_provider_s_rows_from_its_bound_in_order() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let p = cc();
+    let p = p.as_str();
+    raw_events(
+        &path,
+        &[
+            (150, p, "switch", Some("b"), Some("c"), "cli", None),
+            (100, p, "switch", Some("z"), Some("a"), "cli", None),
+            (99, p, "switch", None, Some("z"), "cli", None),
+            (120, "fake-agent", "switch", None, Some("o"), "cli", None),
+            (100, p, "quarantine", Some("a"), None, "auto", None),
+        ],
+    );
+    let got: Vec<_> = s
+        .events_since(&cc(), 100)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.at, e.provider, e.kind))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (100, cc(), EventKind::Switch),
+            (100, cc(), EventKind::Quarantine),
+            (150, cc(), EventKind::Switch),
+        ]
+    );
+}
+
+#[test]
+fn the_latest_event_of_some_kinds_is_found_within_its_bounds() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let p = cc();
+    let p = p.as_str();
+    raw_events(
+        &path,
+        &[
+            (100, p, "switch", Some("a"), Some("b"), "cli", None),
+            (200, p, "quarantine", Some("b"), None, "auto", None),
+            (300, p, "autoswitch-paused", None, None, "daemon", None),
+            (400, p, "add", None, Some("c"), "cli", None),
+            (
+                500,
+                "fake-agent",
+                "switch",
+                Some("a"),
+                Some("b"),
+                "cli",
+                None,
+            ),
+        ],
+    );
+    let latest = |kinds: &[EventKind], since: Option<i64>, before: Option<i64>| {
+        s.latest_event(&cc(), kinds, since, before)
+            .unwrap()
+            .map(|e| (e.at, e.kind))
+    };
+    let switch_or_quarantine = [EventKind::Switch, EventKind::Quarantine];
+    assert_eq!(
+        latest(&switch_or_quarantine, None, None),
+        Some((200, EventKind::Quarantine))
+    );
+    assert_eq!(
+        latest(&switch_or_quarantine, None, Some(200)),
+        Some((100, EventKind::Switch))
+    );
+    assert_eq!(
+        latest(&switch_or_quarantine, Some(200), None),
+        Some((200, EventKind::Quarantine))
+    );
+    assert_eq!(latest(&switch_or_quarantine, Some(250), None), None);
+    assert_eq!(
+        latest(
+            &[EventKind::AutoswitchPaused, EventKind::AutoswitchResumed],
+            None,
+            None
+        ),
+        Some((300, EventKind::AutoswitchPaused))
+    );
+}
+
+#[test]
+fn the_latest_event_skips_a_row_this_build_cannot_type() {
+    // Review Focus 1: a newer build's source is skipped, not failed on, and the row stays stored.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let p = cc();
+    let p = p.as_str();
+    raw_events(
+        &path,
+        &[
+            (100, p, "switch", Some("a"), Some("b"), "cli", None),
+            (500, p, "switch", Some("b"), Some("a"), "menubar", None),
+        ],
+    );
+    let latest = s
+        .latest_event(&cc(), &[EventKind::Switch], None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (latest.at, latest.kind, latest.source),
+        (100, EventKind::Switch, EventSource::Cli)
+    );
+    assert_eq!(s.events_since(&cc(), 0).unwrap().len(), 1);
+    assert_eq!(stored_events(&path), 2);
+}
+
+#[test]
+fn a_removed_account_s_label_is_read_from_its_latest_remove_event() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let p = cc();
+    let p = p.as_str();
+    raw_events(
+        &path,
+        &[
+            (
+                200,
+                p,
+                "remove",
+                Some("x"),
+                None,
+                "cli",
+                Some(r#"{"label":"ci@example.com"}"#),
+            ),
+            (
+                100,
+                p,
+                "remove",
+                Some("x"),
+                None,
+                "cli",
+                Some(r#"{"label":"old@x.co"}"#),
+            ),
+            (
+                300,
+                p,
+                "remove",
+                Some("w"),
+                None,
+                "cli",
+                Some(r#"{"reason":"gone"}"#),
+            ),
+            (400, p, "remove", Some("v"), None, "cli", None),
+        ],
+    );
+    let label = |id: &str| s.removed_label(&cc(), &AccountId::from_string(id)).unwrap();
+    assert_eq!(label("x").as_deref(), Some("ci@example.com"));
+    assert_eq!(label("w"), None);
+    assert_eq!(label("v"), None);
+    assert_eq!(label("never-removed"), None);
+}
+
+#[test]
+fn four_new_kinds_need_no_migration() {
+    // §12.4: the kinds use the free-text `kind` column, so the schema and its version stay put.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let schema = |path: &std::path::Path| -> Vec<Option<String>> {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT sql FROM sqlite_master ORDER BY type, name")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let event = |at: i64, kind: EventKind, source: EventSource, detail| EventRow {
+        at,
+        provider: cc(),
+        kind,
+        from_id: Some(AccountId::from_string("a")),
+        to_id: None,
+        trigger: None,
+        source,
+        detail,
+    };
+    s.insert_event(&event(1, EventKind::Switch, EventSource::Cli, None), true)
+        .unwrap();
+    s.insert_event(
+        &event(2, EventKind::Quarantine, EventSource::Auto, None),
+        true,
+    )
+    .unwrap();
+    let before = (
+        s.schema_version().unwrap(),
+        raw_version(&path),
+        schema(&path),
+    );
+    let old = s.events().unwrap();
+    assert_eq!(old.len(), 2, "{old:?}");
+
+    let new = [
+        event(
+            3,
+            EventKind::SwitchFailed,
+            EventSource::Auto,
+            Some(json!({"message": "refresh failed", "transient": true})),
+        ),
+        event(
+            4,
+            EventKind::AllExhausted,
+            EventSource::Daemon,
+            Some(json!({"earliest_reset_at": null})),
+        ),
+        event(
+            5,
+            EventKind::AutoswitchPaused,
+            EventSource::Daemon,
+            Some(json!({"at_start": true})),
+        ),
+        event(6, EventKind::AutoswitchResumed, EventSource::Daemon, None),
+    ];
+    for e in &new {
+        s.insert_event(e, true).unwrap();
+    }
+    let events = s.events().unwrap();
+    assert_eq!(events[..old.len()], old[..]);
+    assert_eq!(events[old.len()..], new[..]);
+    let after = (
+        s.schema_version().unwrap(),
+        raw_version(&path),
+        schema(&path),
+    );
+    assert_eq!(after, before);
+
+    drop(s);
+    let s = Store::open(&path).unwrap();
+    assert_eq!(
+        (
+            s.schema_version().unwrap(),
+            raw_version(&path),
+            schema(&path)
+        ),
+        before
+    );
+    assert_eq!(s.events().unwrap(), events);
+}
