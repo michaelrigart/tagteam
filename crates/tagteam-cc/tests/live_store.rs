@@ -2625,3 +2625,75 @@ fn linux_stores_a_managed_key_in_a_readable_config_without_refusing_or_chmodding
     );
     assert_eq!(mode_of(&f.paths.global_config), 0o644);
 }
+
+#[test]
+fn an_absent_managed_key_item_is_not_deleted_and_primary_api_key_still_goes() {
+    let f = fx();
+    let recording = Arc::new(RecordingKeychain::new(f.kc.clone()));
+    let s = LiveStore::new(recording.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO);
+    fs::write(
+        &f.paths.global_config,
+        r#"{"primaryApiKey":"sk-ant-api03-plain","customApiKeyResponses":{"approved":["x"]}}"#,
+    )
+    .unwrap();
+    s.snapshot(&f.env, &f.paths).unwrap();
+    s.clear_managed_key(&f.env, &f.paths, &open).unwrap();
+    let svc = keychain_service(&f.env, ItemKind::ManagedKey);
+    assert!(
+        !recording
+            .calls()
+            .iter()
+            .any(|(s, op)| *s == svc && *op == "delete"),
+        "{:?}",
+        recording.calls()
+    );
+    assert_eq!(
+        config::get_key(&f.paths.global_config, "primaryApiKey")
+            .present()
+            .unwrap(),
+        None
+    );
+    assert!(
+        config::get_key(&f.paths.global_config, "customApiKeyResponses")
+            .present()
+            .unwrap()
+            .is_some()
+    );
+    assert!(f.kc.get(&svc, &keychain_account(&f.env)).is_none());
+}
+
+#[test]
+fn a_managed_key_item_cc_writes_while_tagteam_waits_stops_the_clear() {
+    // Review refactor §8.11: skipping the delete of an absent item is safe because the strict
+    // read under the lock still refuses an item CC wrote meanwhile (core §9.1).
+    let f = fx();
+    let recording = Arc::new(RecordingKeychain::new(f.kc.clone()));
+    let s = LiveStore::new(recording.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO);
+    fs::write(&f.paths.global_config, "{}").unwrap();
+    s.snapshot(&f.env, &f.paths).unwrap();
+    let svc = keychain_service(&f.env, ItemKind::ManagedKey);
+    let acct = keychain_account(&f.env);
+    fs::create_dir(&f.paths.storage_write_lock).unwrap(); // CC takes it
+    let (kc, cc_svc, cc_acct, lock) = (
+        f.kc.clone(),
+        svc.clone(),
+        acct.clone(),
+        f.paths.storage_write_lock.clone(),
+    );
+    let cc = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        kc.put(&cc_svc, &cc_acct, b"sk-ant-api03-cc-wrote-this");
+        fs::remove_dir(&lock).unwrap();
+    });
+    let err = s.clear_managed_key(&f.env, &f.paths, &open).unwrap_err();
+    cc.join().unwrap();
+    assert!(
+        matches!(&err, ProviderError::EntryMoved(place) if *place == svc),
+        "{err:?}"
+    );
+    assert_eq!(
+        f.kc.get(&svc, &acct).as_deref(),
+        Some(&b"sk-ant-api03-cc-wrote-this"[..])
+    );
+    assert!(recording.calls().is_empty(), "{:?}", recording.calls());
+}

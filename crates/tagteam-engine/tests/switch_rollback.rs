@@ -392,6 +392,7 @@ fn a_panic_inside_a_live_write_keeps_the_journal_for_recovery() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
+    fx.put_managed_key(common::STRAY_API_KEY.as_bytes());
     let cfg_before = std::fs::read(fx.paths().global_config).unwrap();
     let cred_before = fx.live_credential();
     // Writing OAuth clears the managed-key axis after the credential entry is written.
