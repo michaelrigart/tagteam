@@ -37,7 +37,7 @@ const PARTIAL: &str = "the token index has not completed its first refresh, so t
 const FOOTNOTES: &str = concat!(
     "\n",
     "No price for claude-test-9: counted without cost (* marks a partial cost).\n",
-    "Output is a lower bound for 1 subagent response.\n",
+    "≥ at least: 1 subagent response is still being counted\n",
 );
 
 /// Midnight UTC, `days` days before today's.
@@ -192,7 +192,7 @@ fn fixture() -> Fixture {
 /// The last footnote, naming the shipped table's date and the overridden models.
 fn price_note(as_of: &str) -> String {
     format!(
-        "API cost at list prices as of {as_of}, with config.toml's for claude-opus-5-5, claude-sonnet-5-5.\n"
+        "$ what this would cost on the API at list prices of {as_of}, with config.toml's for claude-opus-5-5, claude-sonnet-5-5; not your bill\n"
     )
 }
 

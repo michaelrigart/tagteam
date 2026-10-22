@@ -50,8 +50,6 @@ const ACCOUNT_LEAST: usize = 3;
 const SPAN_LEVELS: usize = 4;
 /// The active block's figures start this far in.
 const FIGURES_INDENT: usize = 3;
-/// A lower bound (spec §5.3): output with unfinalized responses, a partial cost.
-const AT_LEAST: &str = "≥";
 
 /// The table's columns, in the order they are drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,7 +259,7 @@ pub fn account_name(account: &RowAccount) -> String {
 /// A cost as a cell says it: dollars and cents, `≥` before a partial one, `—` for none.
 fn cost_text(cost: Option<&Cost>) -> String {
     match cost {
-        Some(c) if c.partial => format!("{AT_LEAST}{}", words::dollars(c.usd_nanos)),
+        Some(c) if c.partial => format!("{}{}", words::AT_LEAST, words::dollars(c.usd_nanos)),
         Some(c) => words::dollars(c.usd_nanos),
         None => words::MISSING.to_owned(),
     }
@@ -520,7 +518,7 @@ impl<'a> Table<'a> {
         match col {
             Col::Input => Cell::plain(words::scaled(c.input)),
             Col::Output if unfinalized > 0 => Cell {
-                text: format!("{AT_LEAST}{}", words::scaled(c.output)),
+                text: format!("{}{}", words::AT_LEAST, words::scaled(c.output)),
                 style: warning,
             },
             Col::Output => Cell::plain(words::scaled(c.output)),
@@ -1101,8 +1099,14 @@ fn below(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
     if let Some(row) = t.selected_row() {
         lines.extend(detail_rows(row, &report.query.tz, now_ms, width));
     }
-    for note in words::token_footnotes(report, AT_LEAST, true) {
-        lines.extend(laid_out(vec![Span::raw(" ")], &[note], " ", 1, width));
+    for note in words::token_footnotes(report, words::AT_LEAST, true) {
+        lines.extend(laid_out(
+            vec![Span::raw(" ")],
+            &[note.line()],
+            " ",
+            1,
+            width,
+        ));
     }
     lines
 }
@@ -1418,10 +1422,13 @@ mod tests {
                 " TOTAL                       1.5M  ≥390.9K  114.2M  $50.95",
                 " 412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M) · cache read 88.0M",
                 " 2026-09-20 · 1 a1@x.co",
-                " Output is a lower bound for 2 subagent responses.",
+                " ≥ at least: 2 subagent responses are still being counted",
             ]
         );
-        assert_eq!(lines[11], " API cost at list prices as of 2026-10-01.");
+        assert_eq!(
+            lines[11],
+            " $ what this would cost on the API at list prices of 2026-10-01; not your bill"
+        );
         assert_eq!(
             draw(&state, 80, 24)[23],
             footer_row(
@@ -1519,7 +1526,7 @@ mod tests {
                 " 1 response · cache write 0 (5m 0, 1h 0) · cache read 900.0K",
                 " session 3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c · /Users/alex/Code/tagteam",
                 " 2026-09-20 09:12 – 2026-09-20 11:40 · 1 a1@x.co",
-                " API cost at list prices as of 2026-10-01.",
+                " $ what this would cost on the API at list prices of 2026-10-01; not your bill",
             ]
         );
         let month = PeriodKey::Month {
@@ -1689,11 +1696,11 @@ mod tests {
             lines[10..16],
             [
                 " No price for claude-test-9: counted without cost (≥ marks a partial cost).",
-                " Output is a lower bound for 2 subagent responses.",
+                " ≥ at least: 2 subagent responses are still being counted",
                 " 12 transcript lines could not be read, so these totals may be low.",
                 " 3 transcript files could not be read; the next refresh tries again.",
-                " API cost at list prices as of 2026-10-01, with config.toml's for",
-                " claude-opus-5-5.",
+                " $ what this would cost on the API at list prices of 2026-10-01, with",
+                " config.toml's for claude-opus-5-5; not your bill",
             ]
         );
     }
@@ -2082,7 +2089,13 @@ mod tests {
             let mut state = showing(many_days(3), |_| {});
             state.theme = theme;
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
-            for needle in ["ACCOUNT", "2026-09-21", "2026-09-20", "TOTAL", "API cost"] {
+            for needle in [
+                "ACCOUNT",
+                "2026-09-21",
+                "2026-09-20",
+                "TOTAL",
+                "what this would cost",
+            ] {
                 assert!(
                     plain(&buf, needle),
                     "{theme:?} {needle}: a good report is plain"
@@ -2127,7 +2140,7 @@ mod tests {
                 "2026-09-20",
                 "2026-09-19",
                 "TOTAL",
-                "API cost",
+                "what this would cost",
                 "cache write",
             ] {
                 assert!(dim(&buf, needle), "{theme:?} {needle}: DIM on every cell");
@@ -2154,7 +2167,13 @@ mod tests {
                 !text_of(&buf).iter().any(|l| l.contains("couldn't read")),
                 "{theme:?}"
             );
-            for needle in ["ACCOUNT", "2026-09-21", "TOTAL", "API cost", "cache write"] {
+            for needle in [
+                "ACCOUNT",
+                "2026-09-21",
+                "TOTAL",
+                "what this would cost",
+                "cache write",
+            ] {
                 assert!(plain(&buf, needle), "{theme:?} {needle}: cleared");
             }
         }
@@ -2402,7 +2421,7 @@ mod tests {
         "2026-09-20 09:12 – 2026-09-20 11:40",
         "1 a1@x.co",
         "claude-opus-5-5, claude-sonnet-5-5",
-        "API cost at list prices as of 2026-10-01.",
+        "$ what this would cost on the API at list prices of 2026-10-01; not your bill",
     ];
 
     #[test]
@@ -2445,10 +2464,10 @@ mod tests {
         state.toast(crate::state::ToastKind::Info, [words; 3].join("; "), NOW_MS);
         let notes = [
             "No price for claude-test-1, claude-test-2, claude-test-3, claude-test-4, claude-test-5, claude-test-6, claude-test-7, claude-test-8, claude-test-9, claude-test-10, claude-test-11, claude-test-12: counted without cost (≥ marks a partial cost).",
-            "Output is a lower bound for 1 subagent response.",
+            "≥ at least: 1 subagent response is still being counted",
             "12 transcript lines could not be read, so these totals may be low.",
             "3 transcript files could not be read; the next refresh tries again.",
-            "API cost at list prices as of 2026-10-01, with config.toml's for claude-opus-5-5, claude-sonnet-5-5.",
+            "$ what this would cost on the API at list prices of 2026-10-01, with config.toml's for claude-opus-5-5, claude-sonnet-5-5; not your bill",
         ];
         let lines = draw(&state, 80, 24);
         let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
@@ -2606,7 +2625,8 @@ mod tests {
             project.clone(),
             format!("{long}, claude-sonnet-5-5"),
             format!("No price for {long}: counted without cost (≥ marks a partial cost)."),
-            "API cost at list prices as of 2026-10-01.".to_owned(),
+            "$ what this would cost on the API at list prices of 2026-10-01; not your bill"
+                .to_owned(),
         ] {
             assert!(reads(&seen, &value), "{seen:?}");
         }
