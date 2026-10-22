@@ -1,0 +1,258 @@
+//! History's swimlanes, its in-use lane and its day axis (T4-7, T4-10, T4-12, §7.4).
+
+use jiff::Timestamp;
+use jiff::civil::{Date, Weekday};
+use jiff::tz::TimeZone;
+use ratatui::text::{Line, Span};
+use tagteam_engine::timeline::{Grid, Lane};
+use tagteam_engine::words;
+
+use super::layout::CHART_X;
+use crate::gauge::fill_role;
+use crate::theme::{Role, Theme};
+use crate::view::pad;
+
+/// A swimlane's levels, low to high (§4.4).
+const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+/// Where an account was not in use, and the in-use lane where it was (§7.4).
+const TRACK: &str = "─";
+const IN_USE: &str = "━";
+/// A lane's name in the gutter, after the marker column and before a space (T4-10).
+const NAME: usize = 7;
+/// Each axis label's tick, and the axis's last word (§7.4).
+const TICK: &str = "╵";
+const NOW: &str = "now";
+/// T4-12: the 1-day axis marks the local hours divisible by this.
+const HOURS: usize = 3;
+
+/// One account's swimlane: its name in the gutter, then each column's binding usage in
+/// `fill_role` where it was in use (blank without a reading), a faint `─` where it was not.
+pub(crate) fn lane_row(lane: &Lane, theme: Theme) -> Line<'static> {
+    let name = pad(&words::account_name(&lane.account), NAME);
+    let mut spans = vec![Span::raw(format!(" {name} "))];
+    let faint = theme.role(Role::Faint);
+    spans.extend(
+        lane.peaks
+            .iter()
+            .zip(&lane.in_use)
+            .map(|(v, used)| match (used, v) {
+                (true, Some(v)) => Span::styled(LEVELS[level(*v)], theme.role(fill_role(*v))),
+                (true, None) => Span::raw(" "),
+                (false, _) => Span::styled(TRACK, faint),
+            }),
+    );
+    Line::from(spans)
+}
+
+/// `round(min(v, 100) / 100 × 7)`: a lane cell's level.
+fn level(v: f64) -> usize {
+    let v = if v.is_nan() { 0.0 } else { v.clamp(0.0, 100.0) };
+    (v / 100.0 * 7.0).round() as usize
+}
+
+/// One account's in-use lane under its charts: `━` in accent where it was in use, a faint `─`
+/// elsewhere, after an empty gutter.
+pub(crate) fn in_use_row(lane: &Lane, theme: Theme) -> Line<'static> {
+    let (accent, faint) = (theme.role(Role::Accent), theme.role(Role::Faint));
+    let mut spans = vec![Span::raw(" ".repeat(usize::from(CHART_X)))];
+    spans.extend(lane.in_use.iter().map(|used| {
+        if *used {
+            Span::styled(IN_USE, accent)
+        } else {
+            Span::styled(TRACK, faint)
+        }
+    }));
+    Line::from(spans)
+}
+
+/// ` +{n} more · f picks one`, muted: the lanes past the cap (§7.4).
+pub(crate) fn more_row(n: usize, theme: Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(" +{n} more · f picks one"),
+        theme.role(Role::Muted),
+    ))
+}
+
+/// T4-12: the day axis in `tz`, muted. Over 1 day `╵HH` at the local hours divisible by 3, over
+/// 7 and 14 days `╵Tue` at local midnights, over 30 `╵Sep 7` at local Monday midnights, each
+/// from its boundary's column; `now` ends at the last column. A label is left out unless a
+/// blank column parts it from the one drawn before it and from `now`.
+pub(crate) fn axis_row(grid: Grid, days: i64, tz: &TimeZone, theme: Theme) -> Line<'static> {
+    let width = usize::from(CHART_X) + grid.columns;
+    let mut row = vec![' '; width];
+    let now_at = width.saturating_sub(NOW.len());
+    let mut end = None;
+    for (at_ms, label) in boundaries(grid, days, tz) {
+        let Some(column) = grid.column_of(at_ms) else {
+            continue;
+        };
+        let x = usize::from(CHART_X) + column;
+        let w = label.chars().count();
+        if end.is_some_and(|e| x <= e) || x + w >= now_at {
+            continue;
+        }
+        row.splice(x..x + w, label.chars());
+        end = Some(x + w);
+    }
+    row.splice(now_at..width, NOW.chars().take(width - now_at));
+    Line::from(Span::styled(
+        row.into_iter().collect::<String>(),
+        theme.role(Role::Muted),
+    ))
+}
+
+/// Each boundary T4-12 labels in `grid`'s range, oldest first, with its label.
+fn boundaries(grid: Grid, days: i64, tz: &TimeZone) -> Vec<(i64, String)> {
+    let date_of = |ms| Timestamp::from_millisecond(ms).map(|t| t.to_zoned(tz.clone()).date());
+    let (Ok(first), Ok(last)) = (date_of(grid.since_ms), date_of(grid.now_ms)) else {
+        return vec![];
+    };
+    let mut out: Vec<(i64, String)> = Vec::new();
+    let mut date: Date = first;
+    while date <= last {
+        let hours: Vec<i8> = match days {
+            1 => (0..24).step_by(HOURS).collect(),
+            d if d >= 30 && date.weekday() != Weekday::Monday => vec![],
+            _ => vec![0],
+        };
+        for hour in hours {
+            let at = date.at(hour, 0, 0, 0);
+            let Ok(zoned) = at.to_zoned(tz.clone()) else {
+                continue;
+            };
+            let ms = zoned.timestamp().as_millisecond();
+            let fresh = out.last().is_none_or(|(before, _)| *before < ms);
+            if ms < grid.since_ms || ms > grid.now_ms || !fresh {
+                continue;
+            }
+            let form = match days {
+                1 => "%H",
+                d if d >= 30 => "%b %-d",
+                _ => "%a",
+            };
+            out.push((ms, format!("{TICK}{}", at.strftime(form))));
+        }
+        let Ok(next) = date.tomorrow() else {
+            break;
+        };
+        date = next;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use jiff::tz::{TimeZone, offset};
+
+    use super::*;
+    use crate::screens::history::buffer_of;
+    use crate::testutil::*;
+
+    #[test]
+    fn a_lane_draws_its_usage_where_in_use_and_a_track_elsewhere() {
+        let theme = Theme::new(true);
+        let lane = lane_of(
+            1,
+            vec![Some(40.0), Some(95.0), None, Some(10.0)],
+            vec![true, true, true, false],
+        );
+        let buf = buffer_of(vec![lane_row(&lane, theme)], 13);
+        assert_eq!(text_of(&buf)[0], " 1 a1    ▄█ ─");
+        assert_eq!(&roles(&buf, theme, 0)[9..], canon(theme, "ac f"));
+
+        let lane = lane_of(1, vec![Some(40.0); 3], vec![true, false, true]);
+        let buf = buffer_of(vec![in_use_row(&lane, theme)], 12);
+        assert_eq!(text_of(&buf)[0], "         ━─━");
+        assert_eq!(&roles(&buf, theme, 0)[9..], canon(theme, "afa"));
+    }
+
+    #[test]
+    fn hidden_lanes_are_counted_on_a_muted_more_row() {
+        let theme = Theme::new(true);
+        let buf = buffer_of(vec![more_row(6, theme)], 30);
+        let text = &text_of(&buf)[0];
+        assert_eq!(text, " +6 more · f picks one");
+        assert_eq!(
+            roles(&buf, theme, 0).trim_end(),
+            canon(theme, " mm mmmm m m mmmmm mmm")
+        );
+    }
+
+    /// The axis over the `days` days to `NOW_MS` in 70 columns, in `tz`.
+    fn axis(days: i64, tz: &TimeZone) -> String {
+        let grid = Grid {
+            since_ms: NOW_MS - days * 86_400_000,
+            now_ms: NOW_MS,
+            columns: 70,
+        };
+        axis_row(grid, days, tz, Theme::new(true)).to_string()
+    }
+
+    /// The column `needle` starts at in `row`.
+    fn at(row: &str, needle: &str) -> Option<usize> {
+        row.find(needle).map(|b| row[..b].chars().count())
+    }
+
+    #[test]
+    fn the_axis_marks_each_day_and_now() {
+        let utc = TimeZone::UTC;
+        let week = axis(7, &utc);
+        for (label, column) in [
+            ("╵Tue", 13),
+            ("╵Wed", 23),
+            ("╵Thu", 33),
+            ("╵Fri", 43),
+            ("╵Sat", 53),
+            ("╵Sun", 63),
+        ] {
+            assert_eq!(at(&week, label), Some(column), "{label} in {week:?}");
+        }
+        assert_eq!(at(&week, "╵Mon"), None, "too near now: {week:?}");
+        assert_eq!(week.matches('╵').count(), 6, "{week:?}");
+        assert_eq!(at(&week, "now"), Some(76));
+        assert_eq!(week.trim_end().chars().count(), 79, "now ends at column 78");
+
+        let day = axis(1, &utc);
+        for (label, column) in [
+            ("╵15", 11),
+            ("╵18", 20),
+            ("╵21", 28),
+            ("╵00", 37),
+            ("╵03", 46),
+            ("╵06", 55),
+            ("╵09", 63),
+            ("╵12", 72),
+        ] {
+            assert_eq!(at(&day, label), Some(column), "{label} in {day:?}");
+        }
+        assert_eq!(day.matches('╵').count(), 8, "{day:?}");
+
+        let month = axis(30, &utc);
+        for (label, column) in [
+            ("╵Aug 24", 12),
+            ("╵Aug 31", 28),
+            ("╵Sep 7", 44),
+            ("╵Sep 14", 61),
+        ] {
+            assert_eq!(at(&month, label), Some(column), "{label} in {month:?}");
+        }
+        assert_eq!(at(&month, "╵Sep 21"), None, "too near now: {month:?}");
+        assert_eq!(month.matches('╵').count(), 4, "{month:?}");
+
+        // In the TUI's time zone: Tuesday starts at 22:00 UTC two hours east.
+        let east = axis(7, &TimeZone::fixed(offset(2)));
+        assert_eq!(at(&east, "╵Tue"), Some(12), "{east:?}");
+
+        let theme = Theme::new(true);
+        let grid = Grid {
+            since_ms: NOW_MS - 7 * 86_400_000,
+            now_ms: NOW_MS,
+            columns: 70,
+        };
+        let buf = buffer_of(vec![axis_row(grid, 7, &utc, theme)], 80);
+        assert!(
+            roles(&buf, theme, 0).chars().all(|c| c == ' ' || c == 'm'),
+            "all muted"
+        );
+    }
+}
