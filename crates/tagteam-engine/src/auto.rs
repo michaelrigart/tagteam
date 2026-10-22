@@ -390,6 +390,40 @@ impl Engine {
     pub fn engine_holder(&self, provider: &ProviderId) -> Read<ProcessStamp> {
         read_holder(&engine_lock_path(&self.env, provider))
     }
+
+    /// Redesign §12.4, T4-25: `autoswitch-resumed` (`on`) or `autoswitch-paused` under this
+    /// engine's source. `at_start` writes only when `on` differs from the provider's latest
+    /// stored `autoswitch-*` (none reads as resumed), with `{"at_start": true}`. Nothing
+    /// without an existing store. Whether it wrote.
+    pub fn record_autoswitch(
+        &self,
+        provider: &ProviderId,
+        on: bool,
+        at_start: bool,
+    ) -> Result<bool, EngineError> {
+        let Some(store) = self.existing_store()? else {
+            return Ok(false);
+        };
+        if at_start {
+            let latest = store.latest_event(
+                provider,
+                &[EventKind::AutoswitchPaused, EventKind::AutoswitchResumed],
+                None,
+                None,
+            )?;
+            if latest.is_none_or(|e| e.kind == EventKind::AutoswitchResumed) == on {
+                return Ok(false);
+            }
+        }
+        let kind = if on {
+            EventKind::AutoswitchResumed
+        } else {
+            EventKind::AutoswitchPaused
+        };
+        let detail = at_start.then(|| json!({"at_start": true}));
+        self.event(provider, kind, None, None, detail)?;
+        Ok(true)
+    }
 }
 
 /// An interruption, or a store that failed: a tick returns these as `Err`.
