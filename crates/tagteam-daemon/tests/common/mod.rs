@@ -101,12 +101,15 @@ pub struct Peer {
 }
 
 impl Peer {
-    /// Connected, with nothing read yet. A read waits 10 s at most.
+    /// Connected, with nothing read yet. A read waits 10 s at most. macOS refuses the timeout
+    /// on a socket the server already closed; a read of that returns EOF at once, so the
+    /// refusal is ignored.
     pub fn connect(path: &Path) -> Peer {
         let stream = UnixStream::connect(path).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
+        match stream.set_read_timeout(Some(Duration::from_secs(10))) {
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
+            result => result.unwrap(),
+        }
         Peer {
             writer: stream.try_clone().unwrap(),
             reader: BufReader::new(stream),
