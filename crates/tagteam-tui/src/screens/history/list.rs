@@ -366,19 +366,20 @@ mod tests {
         );
     }
 
-    /// Every row `state` draws at `w`×`h` is within `w` columns.
-    fn within(state: &State, w: u16, h: u16) {
-        for (y, row) in draw(state, w, h).iter().enumerate() {
-            assert!(
-                crate::view::width_of(row) <= usize::from(w),
-                "{w}×{h} row {y} is {} wide: {row:?}",
-                crate::view::width_of(row)
-            );
-        }
+    /// The list's three rows at `w`×`h`: from body row 16 at 80×24, else under the head.
+    fn list_of(state: &State, w: u16, h: u16) -> Vec<String> {
+        let body = body_of(state, w, h, NOW_MS);
+        let first = match body.iter().position(|r| r.starts_with("   WHEN")) {
+            Some(head) => head + 1,
+            None => 16,
+        };
+        body[first..first + 3].to_vec()
     }
 
     #[test]
-    fn no_row_is_wider_than_the_screen() {
+    fn no_list_row_reaches_past_the_inset() {
+        use crate::keys::RIGHT_INSET;
+        use crate::view::width_of;
         // A stored message with control characters reads as one row.
         let mut failed = event_at(
             NOW_MS - 3 * HOUR * 1000,
@@ -388,6 +389,7 @@ mod tests {
         failed.to = Some(account_ref(2));
         failed.detail = Some(serde_json::json!({"message": "a\nb\tc", "transient": false}));
         // A CJK alias, and a removed account's 200-character label.
+        let alias = "工作用のアカウント".repeat(8);
         let mut wide = event_at(
             NOW_MS - 2 * HOUR * 1000,
             EventKind::Switch,
@@ -395,31 +397,52 @@ mod tests {
         );
         wide.from = Some(account_ref(1));
         wide.to = Some(tagteam_engine::timeline::AccountRef {
-            alias: Some("工作用のアカウント".repeat(8)),
+            alias: Some(alias.clone()),
             ..account_ref(2)
         });
+        let label = format!("{}@example.com", "x".repeat(188));
+        assert_eq!(label.chars().count(), 200);
         let mut long = event_at(NOW_MS - HOUR * 1000, EventKind::Switch, EventSource::Auto);
         long.from = Some(account_ref(1));
         long.to = Some(tagteam_engine::timeline::AccountRef {
             id: tagteam_core::AccountId::from_string("gone"),
             position: None,
             alias: None,
-            email: Some(format!("{}@example.com", "x".repeat(188))),
+            email: Some(label.clone()),
             removed: true,
         });
-        let state = shown(with_events(vec![failed, wide, long]));
-        let body = body_of(&state, 80, 24, NOW_MS);
-        assert!(
-            body[18].starts_with("   11:13   ✕ auto couldn't switch to 2 a2 · a b c"),
-            "{body:?}"
-        );
-        for (w, h) in [(80, 24), (120, 40), (300, 60)] {
-            within(&state, w, h);
-        }
-        let mut state = state;
-        update(&mut state, ch('j'), NOW_MS);
-        for (w, h) in [(80, 24), (120, 40), (300, 60)] {
-            within(&state, w, h);
+        let mut state = shown(with_events(vec![failed, wide, long]));
+        let full_cjk = format!("⇄ you switched 1 a1 → 2 {alias}");
+        let full_label = format!("⇄ auto switched 1 a1 → {label}");
+        for selected in [false, true] {
+            for (w, h) in [(80, 24), (120, 40), (300, 60)] {
+                let rows = list_of(&state, w, h);
+                let at = format!("{w}×{h}, {rows:?}");
+                for row in &rows {
+                    assert!(
+                        width_of(row) <= usize::from(w) - RIGHT_INSET,
+                        "{} wide at {at}",
+                        width_of(row)
+                    );
+                }
+                assert!(
+                    rows[2].ends_with("✕ auto couldn't switch to 2 a2 · a b c"),
+                    "{at}"
+                );
+                if w < 300 {
+                    // Cut, each ending in `…` where `fit` cut it.
+                    assert!(rows[0].contains("⇄ auto switched 1 a1 → xxx"), "{at}");
+                    assert!(rows[0].ends_with('…'), "{at}");
+                    assert!(rows[1].contains("⇄ you switched 1 a1 → 2 工作"), "{at}");
+                    assert!(rows[1].ends_with('…'), "{at}");
+                } else {
+                    assert!(rows[0].ends_with(&full_label), "{at}");
+                    assert!(rows[1].ends_with(&full_cjk), "{at}");
+                }
+            }
+            if !selected {
+                update(&mut state, ch('j'), NOW_MS);
+            }
         }
     }
 
