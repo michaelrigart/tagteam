@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Row, TransactionBehavior, params,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::{AccountId, ProviderId};
@@ -292,52 +293,112 @@ pub struct Activation {
     pub epoch: Option<i64>,
 }
 
-fn journal_to_json(j: &JournalRow) -> Value {
-    json!({
-        "provider": j.provider.as_str(),
-        "holder_pid": j.holder.pid,
-        "holder_start": j.holder.start,
-        "from_id": j.from_id.as_ref().map(AccountId::as_str),
-        "to_id": j.to_id.as_str(),
-        "from_fp": j.from_fp,
-        "from_identity": j.from_identity,
-        "to_fp": j.to_fp,
-        "to_epoch": j.to_epoch,
-        "started_at": j.started_at,
-        "prior": j.prior.as_deref().map(journal_to_json),
-    })
+/// What a replacement records with its marker (§12.5): its keys' one declaration, stored order.
+/// Only `identity_key`, `label` and `kind` are required; the rest read as an absent value, which
+/// is how a build that predates a key stored it.
+#[derive(Serialize, Deserialize)]
+struct ReplacementMeta {
+    identity_key: String,
+    label: String,
+    email: Option<String>,
+    #[serde(default)]
+    org_uuid: String,
+    org_name: Option<String>,
+    account_uuid: Option<String>,
+    kind: String,
+    #[serde(default)]
+    identity_json: Value,
+    login_expires_at: Option<i64>,
+    #[serde(default)]
+    from_live: bool,
 }
 
-/// The inverse of `journal_to_json`. Returns an error rather than silently dropping a
-/// malformed `prior` snapshot: a caller (rollback or recovery) that got `None` back would
-/// delete the undecidable row instead of restoring it (§9.6). A snapshot written before
-/// `to_epoch` existed has no such key, and reads as `None`.
-fn journal_from_json(v: &Value) -> rusqlite::Result<JournalRow> {
-    fn malformed() -> rusqlite::Error {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            "malformed journal snapshot".into(),
-        )
+impl ReplacementMeta {
+    fn of(meta: &LoginMeta<'_>) -> ReplacementMeta {
+        ReplacementMeta {
+            identity_key: meta.identity_key.to_owned(),
+            label: meta.identity.label.clone(),
+            email: meta.identity.email.clone(),
+            org_uuid: meta.identity.org_uuid.clone(),
+            org_name: meta.identity.org_name.clone(),
+            account_uuid: meta.identity.account_uuid.clone(),
+            kind: meta.kind.to_owned(),
+            identity_json: meta.identity.raw.clone(),
+            login_expires_at: meta.login_expires_at,
+            from_live: meta.from_live,
+        }
     }
-    Ok(JournalRow {
-        provider: ProviderId::new(v["provider"].as_str().ok_or_else(malformed)?),
-        holder: ProcessStamp {
-            pid: v["holder_pid"].as_u64().ok_or_else(malformed)? as u32,
-            start: v["holder_start"].as_u64().ok_or_else(malformed)?,
-        },
-        from_id: v["from_id"].as_str().map(AccountId::from_string),
-        to_id: AccountId::from_string(v["to_id"].as_str().ok_or_else(malformed)?),
-        from_fp: v["from_fp"].as_str().map(str::to_owned),
-        from_identity: Some(v["from_identity"].clone()).filter(|x| !x.is_null()),
-        to_fp: v["to_fp"].as_str().ok_or_else(malformed)?.to_owned(),
-        to_epoch: v["to_epoch"].as_i64(),
-        started_at: v["started_at"].as_i64().ok_or_else(malformed)?,
-        prior: match v.get("prior") {
-            Some(p) if !p.is_null() => Some(Box::new(journal_from_json(p)?)),
-            _ => None,
-        },
-    })
+
+    /// `Err` is `ReplacementUnreadable`'s detail, which never quotes the metadata.
+    fn read(stored: &str) -> Result<ReplacementMeta, String> {
+        let v: Value = serde_json::from_str(stored).map_err(|_| "it is not JSON".to_owned())?;
+        for field in ["identity_key", "label", "kind"] {
+            if !v.get(field).is_some_and(Value::is_string) {
+                return Err(format!("it has no {field} field"));
+            }
+        }
+        serde_json::from_value(v).map_err(|_| "one of its fields has the wrong type".to_owned())
+    }
+}
+
+/// A journal row as `prior` stores it (§9.6), keys in stored order. A snapshot written before
+/// `to_epoch` existed has no such key, and reads as `None`.
+#[derive(Serialize, Deserialize)]
+struct JournalSnapshot {
+    provider: String,
+    holder_pid: u32,
+    holder_start: u64,
+    from_id: Option<String>,
+    to_id: String,
+    from_fp: Option<String>,
+    from_identity: Option<Value>,
+    to_fp: String,
+    to_epoch: Option<i64>,
+    started_at: i64,
+    prior: Option<Box<JournalSnapshot>>,
+}
+
+impl From<&JournalRow> for JournalSnapshot {
+    fn from(j: &JournalRow) -> JournalSnapshot {
+        JournalSnapshot {
+            provider: j.provider.as_str().to_owned(),
+            holder_pid: j.holder.pid,
+            holder_start: j.holder.start,
+            from_id: j.from_id.as_ref().map(|id| id.as_str().to_owned()),
+            to_id: j.to_id.as_str().to_owned(),
+            from_fp: j.from_fp.clone(),
+            from_identity: j.from_identity.clone(),
+            to_fp: j.to_fp.clone(),
+            to_epoch: j.to_epoch,
+            started_at: j.started_at,
+            prior: j.prior.as_deref().map(|p| Box::new(p.into())),
+        }
+    }
+}
+
+impl From<JournalSnapshot> for JournalRow {
+    fn from(s: JournalSnapshot) -> JournalRow {
+        JournalRow {
+            provider: ProviderId::new(s.provider),
+            holder: ProcessStamp {
+                pid: s.holder_pid,
+                start: s.holder_start,
+            },
+            from_id: s.from_id.map(AccountId::from_string),
+            to_id: AccountId::from_string(s.to_id),
+            from_fp: s.from_fp,
+            from_identity: s.from_identity,
+            to_fp: s.to_fp,
+            to_epoch: s.to_epoch,
+            started_at: s.started_at,
+            prior: s.prior.map(|p| Box::new((*p).into())),
+        }
+    }
+}
+
+/// `v` as compact JSON; infallible for these structs (string keys, derived `Serialize`).
+fn to_json(v: &impl Serialize) -> String {
+    serde_json::to_string(v).expect("a derived Serialize over string keys cannot fail")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -379,14 +440,10 @@ const ACCOUNT_COLUMNS: &str = "id, provider, position, identity_key, label, emai
     account_uuid, kind, alias, disabled, identity_json, login_expires_at, login_epoch, replacing_fp, \
     quarantine_reason, quarantine_fp, quarantine_at, added_at";
 
-/// Whether recorded replacement metadata is what `finish_replacement` can install (§12.5): a
-/// JSON object whose `identity_key`, `label` and `kind` are strings.
+/// Whether recorded replacement metadata is what `finish_replacement` can install (§12.5): the
+/// `ReplacementMeta` it reads.
 pub fn replacing_meta_parses(meta: &str) -> bool {
-    serde_json::from_str::<Value>(meta).is_ok_and(|v| {
-        ["identity_key", "label", "kind"]
-            .iter()
-            .all(|k| v[*k].is_string())
-    })
+    ReplacementMeta::read(meta).is_ok()
 }
 
 /// Installs a login's identity fields: shared by `update_login` and the replacement
@@ -483,10 +540,24 @@ fn journal_from_row(r: &Row<'_>) -> rusqlite::Result<JournalRow> {
         to_epoch: r.get("to_epoch")?,
         started_at: r.get("started_at")?,
         prior: match json_col(r, "prior")? {
-            Some(v) => Some(Box::new(journal_from_json(&v)?)),
+            Some(v) => Some(Box::new(
+                serde_json::from_value::<JournalSnapshot>(v)
+                    .map_err(|_| malformed_snapshot())?
+                    .into(),
+            )),
             None => None,
         },
     })
+}
+
+/// Rejected rather than dropped: a caller (rollback or recovery) that got `None` back would
+/// delete the undecidable row instead of restoring it (§9.6).
+fn malformed_snapshot() -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        "malformed journal snapshot".into(),
+    )
 }
 
 /// `None` for a row whose kind or source this build cannot type: a newer build's, left stored and
@@ -664,9 +735,9 @@ fn open_flags(create: bool) -> OpenFlags {
 /// never been in WAL mode, and — unlike ordinary reads and writes — reports `SQLITE_BUSY`
 /// immediately rather than waiting on the connection's busy handler (sqlite.org/pragma.html
 /// #pragma_journal_mode). Concurrent first opens of the same fresh file must therefore retry
-/// it themselves; this polls for the same 5-second budget as `busy_timeout` below.
+/// it themselves; this polls for the same `BUSY_TIMEOUT` budget as the connection's busy handler.
 fn set_wal_mode(conn: &Connection) -> Result<(), StoreError> {
-    let deadline = Instant::now() + Duration::from_millis(5000);
+    let deadline = Instant::now() + BUSY_TIMEOUT;
     loop {
         match conn.pragma_update(None, "journal_mode", "WAL") {
             Ok(()) => return Ok(()),
@@ -1107,25 +1178,14 @@ impl Store {
         meta: &LoginMeta<'_>,
         live_names_account: bool,
     ) -> Result<(), StoreError> {
-        let meta = json!({
-            "identity_key": meta.identity_key,
-            "label": meta.identity.label,
-            "email": meta.identity.email,
-            "org_uuid": meta.identity.org_uuid,
-            "org_name": meta.identity.org_name,
-            "account_uuid": meta.identity.account_uuid,
-            "kind": meta.kind,
-            "identity_json": meta.identity.raw,
-            "login_expires_at": meta.login_expires_at,
-            "from_live": meta.from_live,
-        });
+        let meta = to_json(&ReplacementMeta::of(meta));
         let id = lock.id();
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let n = tx.execute(
             "UPDATE accounts SET login_epoch = login_epoch + 1, replacing_fp = ?2, replacing_meta = ?3 \
              WHERE id = ?1 AND replacing_fp IS NULL",
-            params![id.as_str(), fp, meta.to_string()],
+            params![id.as_str(), fp, meta],
         )?;
         if n == 0 {
             let exists: bool = tx.query_row(
@@ -1167,10 +1227,10 @@ impl Store {
     /// marker, all in one transaction. A quarantine it clears records its `unquarantine` event in
     /// that transaction, at `at`, as `account-replaced` from `source`: the epoch moved, and the
     /// holder that finishes the replacement is who records its release (§7.4, §11.4; review
-    /// refactor §8.7, §11). A missing `identity_key`, `label` or `kind` in the recorded metadata
-    /// means the account and its marker are left exactly as they were (§12.5) rather than
-    /// installing an empty identity: that is `ReplacementUnreadable`, as is metadata that is not
-    /// JSON.
+    /// refactor §8.7, §11). Metadata `ReplacementMeta::read` refuses (not JSON, a missing
+    /// `identity_key`, `label` or `kind`, or a mistyped field) means the account and its marker
+    /// are left exactly as they were (§12.5) rather than installing an empty identity: that is
+    /// `ReplacementUnreadable`.
     ///
     /// A login taken from the live store (`from_live`, `add`'s) also records the account's new
     /// `login_epoch` as the activation epoch here (§10.1, §12.5): the live store holds exactly
@@ -1202,27 +1262,25 @@ impl Store {
         };
         let mut cleared = None;
         if let Some(m) = meta {
-            let v: Value = serde_json::from_str(&m)
-                .map_err(|_| StoreError::ReplacementUnreadable("it is not JSON".into()))?;
-            let missing =
-                |field: &str| StoreError::ReplacementUnreadable(format!("it has no {field} field"));
-            let identity_key = v["identity_key"]
-                .as_str()
-                .ok_or_else(|| missing("identity_key"))?;
-            let label = v["label"].as_str().ok_or_else(|| missing("label"))?;
-            let kind = v["kind"].as_str().ok_or_else(|| missing("kind"))?;
+            let m = ReplacementMeta::read(&m).map_err(StoreError::ReplacementUnreadable)?;
             let identity = Identity {
-                label: label.to_owned(),
-                email: v["email"].as_str().map(str::to_owned),
-                org_uuid: v["org_uuid"].as_str().unwrap_or_default().to_owned(),
-                org_name: v["org_name"].as_str().map(str::to_owned),
-                account_uuid: v["account_uuid"].as_str().map(str::to_owned),
-                raw: v["identity_json"].clone(),
+                label: m.label,
+                email: m.email,
+                org_uuid: m.org_uuid,
+                org_name: m.org_name,
+                account_uuid: m.account_uuid,
+                raw: m.identity_json,
             };
-            let login_expires_at = v["login_expires_at"].as_i64();
-            apply_login(&tx, id, identity_key, &identity, kind, login_expires_at)?;
+            apply_login(
+                &tx,
+                id,
+                &m.identity_key,
+                &identity,
+                &m.kind,
+                m.login_expires_at,
+            )?;
             cleared = clear_quarantine_on(&tx, id, ACCOUNT_REPLACED, source, at)?;
-            if v["from_live"].as_bool().unwrap_or(false) {
+            if m.from_live {
                 tx.execute(
                     "UPDATE active_accounts SET login_epoch = \
                      (SELECT login_epoch FROM accounts WHERE id = ?1) WHERE account_id = ?1",
@@ -1610,7 +1668,9 @@ impl Store {
                 j.to_fp,
                 j.to_epoch,
                 j.started_at,
-                j.prior.as_deref().map(|p| journal_to_json(p).to_string()),
+                j.prior
+                    .as_deref()
+                    .map(|p| to_json(&JournalSnapshot::from(p))),
             ],
         )?;
         Ok(())

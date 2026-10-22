@@ -1529,6 +1529,170 @@ fn recorded_replacement_metadata_parses_only_as_finish_replacement_installs_it()
 }
 
 #[test]
+fn a_replacement_records_its_metadata_as_it_did() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    s.begin_replacement(
+        &held_lock(&env, &a),
+        "sha256:x",
+        &login_meta(&identity("a@x.co"), true),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        s.replacing_meta(&a).unwrap().unwrap(),
+        json!({
+            "identity_key": "a@x.co\n",
+            "label": "a@x.co",
+            "email": "a@x.co",
+            "org_uuid": "",
+            "org_name": null,
+            "account_uuid": null,
+            "kind": "oauth",
+            "identity_json": {"emailAddress": "a@x.co"},
+            "login_expires_at": null,
+            "from_live": true,
+        })
+        .to_string()
+    );
+    s.finish_replacement(&held_lock(&env, &a), EventSource::Cli, 0)
+        .unwrap();
+    assert_eq!(s.account(&a).unwrap().unwrap().replacing_fp, None);
+}
+
+#[test]
+fn a_prior_snapshot_is_stored_as_it_was() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    let j = JournalRow {
+        provider: cc(),
+        holder: ProcessStamp { pid: 1, start: 2 },
+        from_id: Some(a),
+        to_id: b,
+        from_fp: Some("sha256:a".into()),
+        from_identity: Some(json!({"emailAddress": "a@x.co"})),
+        to_fp: "sha256:b".into(),
+        to_epoch: Some(4),
+        started_at: 5,
+        prior: None,
+    };
+    let replaced = JournalRow {
+        started_at: 9,
+        prior: Some(Box::new(j.clone())),
+        ..j.clone()
+    };
+    s.insert_journal(&held_guard(&env), &replaced).unwrap();
+    let raw: String = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT prior FROM switch_journal", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        raw,
+        json!({
+            "provider": "claude-code",
+            "holder_pid": 1,
+            "holder_start": 2,
+            "from_id": "a",
+            "to_id": "b",
+            "from_fp": "sha256:a",
+            "from_identity": {"emailAddress": "a@x.co"},
+            "to_fp": "sha256:b",
+            "to_epoch": 4,
+            "started_at": 5,
+            "prior": null,
+        })
+        .to_string()
+    );
+    assert_eq!(s.journal(&cc()).unwrap().unwrap(), replaced);
+}
+
+#[test]
+fn a_prior_snapshot_whose_pid_exceeds_u32_is_malformed() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    let j = JournalRow {
+        provider: cc(),
+        holder: ProcessStamp { pid: 1, start: 2 },
+        from_id: Some(a),
+        to_id: b,
+        from_fp: None,
+        from_identity: None,
+        to_fp: "sha256:b".into(),
+        to_epoch: None,
+        started_at: 5,
+        prior: None,
+    };
+    s.insert_journal(&held_guard(&env), &j).unwrap();
+    drop(s);
+    let prior = r#"{"provider":"claude-code","holder_pid":4294967296,"holder_start":2,"from_id":"a","to_id":"b","from_fp":null,"from_identity":null,"to_fp":"sha256:b","to_epoch":null,"started_at":5,"prior":null}"#;
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE switch_journal SET prior = ?1 WHERE provider = ?2",
+            rusqlite::params![prior, "claude-code"],
+        )
+        .unwrap();
+    let s = Store::open(&path).unwrap();
+    assert!(s.journal(&cc()).is_err());
+}
+
+#[test]
+fn replacement_metadata_details_say_what_is_wrong_without_quoting_it() {
+    let cases = [
+        (r#"{"identity_key": "secret@x.co"#, "it is not JSON"),
+        (r#"{"identity_key":"secret@x.co"}"#, "it has no label field"),
+        (
+            r#"{"identity_key":"secret@x.co","label":"secret@x.co","kind":"oauth","login_expires_at":"secret@x.co"}"#,
+            "one of its fields has the wrong type",
+        ),
+    ];
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    s.begin_replacement(
+        &held_lock(&env, &a),
+        "sha256:x",
+        &login_meta(&identity("a@x.co"), false),
+        false,
+    )
+    .unwrap();
+    for (planted, detail) in cases {
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE accounts SET replacing_meta = ?1 WHERE id = 'a'",
+                [planted],
+            )
+            .unwrap();
+        match s.finish_replacement(&held_lock(&env, &a), EventSource::Cli, 0) {
+            Err(StoreError::ReplacementUnreadable(d)) => {
+                assert_eq!(d, detail);
+                assert!(!d.contains("secret"), "{d}");
+            }
+            other => panic!("{planted}: {other:?}"),
+        }
+        assert_eq!(
+            s.account(&a).unwrap().unwrap().replacing_fp.as_deref(),
+            Some("sha256:x"),
+            "the marker stays"
+        );
+    }
+    assert!(!tagteam_engine::store::replacing_meta_parses(cases[2].0));
+}
+
+#[test]
 fn usage_requests_are_counted_per_identity_after_a_time_without_pruning() {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("t.db");
