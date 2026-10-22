@@ -573,7 +573,10 @@ fn an_event_later_in_the_current_second_is_in_the_last_column() {
     );
     let v = timeline(&fx, Scope::All);
     assert_eq!(kinds(&v.events), [EventKind::AutoswitchPaused]);
-    assert_eq!(v.grid().column_of(v.events[0].at_ms), Some(COLUMNS - 1));
+    let at_ms = v.events[0].at_ms;
+    assert_eq!(at_ms, T0 * 1000 + 300, "the stored time");
+    let grid = v.grid();
+    assert_eq!(grid.column_of(grid.placed(at_ms)), Some(COLUMNS - 1));
 }
 
 #[test]
