@@ -1758,11 +1758,8 @@ mod tests {
                 " $ what this would cost on the API at list prices of 2026-10-01; not your bill",
             ]
         );
-        let theme = TIERS[1];
-        state.theme = theme;
-        let buf = draw_buffer(&state, 80, 24, NOW_MS);
         let numbers = "412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M)";
-        for (n, want) in [
+        let rows = [
             (
                 10,
                 letters(&[
@@ -1782,13 +1779,18 @@ mod tests {
                 12,
                 letters(&[("           ", 't'), ("cache read 88.0M", 'm')]),
             ),
-        ] {
-            let y = body_y(&state, 80, 24, n);
-            assert_eq!(
-                roles(&buf, theme, y).trim_end(),
-                canon(theme, &want),
-                "body row {n}"
-            );
+        ];
+        for theme in TIERS {
+            state.theme = theme;
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            for (n, want) in &rows {
+                let y = body_y(&state, 80, 24, *n);
+                assert_eq!(
+                    roles(&buf, theme, y).trim_end(),
+                    canon(theme, want),
+                    "{theme:?}: body row {n}"
+                );
+            }
         }
         // An unattributed row names its bucket.
         for _ in 0..2 {
@@ -1830,14 +1832,12 @@ mod tests {
     fn each_note_is_led_by_its_mark() {
         // T5-24: ` {mark} {text}`, `≥` in warn and `$` muted, the words muted; a note without a
         // mark starts where the words do, and so does a note's second row.
-        let theme = TIERS[1];
         let mut state = showing(days(), |r| {
             r.unpriced_models = vec!["claude-test-9".into()];
             r.index.skipped_lines = 12;
             r.index.unreadable_files = 3;
             r.price_overrides = vec!["claude-opus-5-5".into()];
         });
-        state.theme = theme;
         let lines = body_of(&state, 80, 40, NOW_MS);
         let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
         let notes = [
@@ -1853,27 +1853,31 @@ mod tests {
         assert_eq!(lines[at], "", "{lines:?}");
         assert_eq!(lines[at + 1..at + 7], notes, "{lines:?}");
         assert!(!lines.iter().any(|l| l.contains("J K:")), "{lines:?}");
-        let buf = draw_buffer(&state, 80, 40, NOW_MS);
         let mark = |n: usize, role: char| {
             let mark: String = notes[n].chars().skip(1).take(1).collect();
             let text: String = notes[n].chars().skip(3).collect();
             letters(&[(" ", 't'), (&mark, role), (" ", 't'), (&text, 'm')])
         };
         let plain = |n: usize| letters(&[(notes[n], 'm')]);
-        for (n, want) in [
+        let rows = [
             (0, plain(0)),
             (1, mark(1, 'w')),
             (2, plain(2)),
             (3, plain(3)),
             (4, mark(4, 'm')),
             (5, plain(5)),
-        ] {
-            let y = body_y(&state, 80, 40, (at + 1 + n) as u16);
-            assert_eq!(
-                roles(&buf, theme, y).trim_end(),
-                canon(theme, &want),
-                "note row {n}"
-            );
+        ];
+        for theme in TIERS {
+            state.theme = theme;
+            let buf = draw_buffer(&state, 80, 40, NOW_MS);
+            for (n, want) in &rows {
+                let y = body_y(&state, 80, 40, (at + 1 + n) as u16);
+                assert_eq!(
+                    roles(&buf, theme, y).trim_end(),
+                    canon(theme, want),
+                    "{theme:?}: note row {n}"
+                );
+            }
         }
     }
 
@@ -2156,8 +2160,6 @@ mod tests {
                 " ".repeat(23)
             )
         );
-        let theme = Theme::new(true);
-        state.theme = theme;
         let left = letters(&[
             (" ", 't'),
             ("p", 'a'),
@@ -2184,13 +2186,30 @@ mod tests {
         ]);
         let right = letters(&[("indexed 14:12", 'm')]);
         let want = format!("{left}{}{right} ", " ".repeat(9));
-        let buf = draw_buffer(&state, 120, 40, NOW_MS);
-        let y = body_y(&state, 120, 40, 0);
-        assert_eq!(roles(&buf, theme, y), canon(theme, &want));
-        assert!(
-            (0..120).all(|x| !buf[(x, y)].modifier.contains(Modifier::BOLD)),
-            "nothing bold"
-        );
+        let text = body_of(&state, 120, 40, NOW_MS)[0].clone();
+        let at = |key: &str| text.find(&format!("     {key} ")).unwrap() as u16 + 5;
+        let keys = [
+            vec![1],
+            (at("[ ]")..at("[ ]") + 3).collect(),
+            vec![at("g"), at("f")],
+        ]
+        .concat();
+        for theme in TIERS {
+            state.theme = theme;
+            let buf = draw_buffer(&state, 120, 40, NOW_MS);
+            let y = body_y(&state, 120, 40, 0);
+            assert_eq!(roles(&buf, theme, y), canon(theme, &want), "{theme:?}");
+            // Nothing bold (T5-6), but in tier 0, which draws accent bold (§4.1): the keys.
+            let bold: Vec<u16> = (0..120)
+                .filter(|&x| buf[(x, y)].modifier.contains(Modifier::BOLD))
+                .collect();
+            let want_bold = if theme.colourless() {
+                keys.clone()
+            } else {
+                vec![]
+            };
+            assert_eq!(bold, want_bold, "{theme:?}: only tier 0's keys are bold");
+        }
         let row = |keys: &str| body_of(&showing_after(keys, days()), 80, 24, NOW_MS)[0].clone();
         assert!(
             row("ppp").starts_with(" p 5h block   [ ] 30 days   g by account"),
@@ -2218,13 +2237,9 @@ mod tests {
         assert_eq!(lines[2], "");
         assert!(lines[3].starts_with(" DAY"), "{lines:?}");
         assert!(body_of(&state, 120, 40, NOW_MS)[1].starts_with(headline));
-        let theme = Theme::new(true);
-        state.theme = theme;
-        let buf = draw_buffer(&state, 80, 24, NOW_MS);
-        let y = body_y(&state, 80, 24, 1);
         let want = letters(&[
             (" ", 't'),
-            ("$50.95", 't'),
+            ("$50.95", 'B'),
             (" ", 't'),
             ("at API prices", 'm'),
             ("    ", 't'),
@@ -2236,11 +2251,25 @@ mod tests {
             (" ", 't'),
             ("responses", 'm'),
         ]);
-        assert_eq!(roles(&buf, theme, y).trim_end(), canon(theme, &want));
-        let bold: Vec<u16> = (0..80)
-            .filter(|x| buf[(*x, y)].modifier.contains(Modifier::BOLD))
-            .collect();
-        assert_eq!(bold, (1..7).collect::<Vec<u16>>(), "the cost alone is bold");
+        for theme in TIERS {
+            state.theme = theme;
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            let y = body_y(&state, 80, 24, 1);
+            assert_eq!(
+                roles(&buf, theme, y).trim_end(),
+                canon(theme, &want),
+                "{theme:?}"
+            );
+            let bold: Vec<u16> = (0..80)
+                .filter(|x| buf[(*x, y)].modifier.contains(Modifier::BOLD))
+                .collect();
+            assert_eq!(
+                bold,
+                (1..7).collect::<Vec<u16>>(),
+                "{theme:?}: the cost alone is bold"
+            );
+        }
+        let theme = TIERS[1];
 
         let mut partial = showing(days(), |r| {
             r.total.cost = Some(Cost {
@@ -3208,6 +3237,23 @@ mod tests {
     }
 
     #[test]
+    fn help_says_from_which_width_the_cache_write_splits() {
+        // T5-25: help's words for `CACHE W 5M` and `1H` name `CACHE_SPLIT_FROM`, so the two
+        // cannot drift apart.
+        let mut state = showing(days(), |_| {});
+        update(&mut state, ch('?'), NOW_MS);
+        let lines = draw(&state, 80, 60);
+        let entry = lines
+            .iter()
+            .find(|l| l.contains("5M 1H  CACHE W 5M and 1H"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(
+            entry.contains(&format!(", from {CACHE_SPLIT_FROM} columns: ")),
+            "{entry}"
+        );
+    }
+
+    #[test]
     fn the_cache_write_is_one_column_where_its_halves_do_not_fit() {
         // At 160 a 70-column alias leaves no room for the halves; it stays whole.
         let alias = format!("alias-{}", "x".repeat(64));
@@ -3258,8 +3304,20 @@ mod tests {
             let (x, y) = locate(buf, needle).unwrap();
             (x..x + width_of(needle) as u16).all(|x| !buf[(x, y)].modifier.contains(Modifier::DIM))
         };
+        // `needle`'s cells on the row `lead` is on, not DIM.
+        let undimmed_on = |buf: &ratatui::buffer::Buffer, lead: &str, needle: &str| {
+            let (_, y) = locate(buf, lead).unwrap();
+            let row = &text_of(buf)[usize::from(y)];
+            let at = row
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {row:?}"));
+            let x = width_of(&row[..at]) as u16;
+            (x..x + width_of(needle) as u16).all(|x| !buf[(x, y)].modifier.contains(Modifier::DIM))
+        };
         // A good report: plain on every cell where muted and faint are hues (tier 2); where they
-        // are DIM by their role (tiers 0 and 1, T5-15's muted heads and counts), on its text.
+        // are DIM by their role (tiers 0 and 1, T5-15's muted heads and counts, T5-23's muted
+        // detail and T5-24's muted notes), on its text: the table's, and below the total the
+        // selected row's identity on its own row.
         let good = |buf: &ratatui::buffer::Buffer, theme: Theme, needles: &[&str]| {
             if theme.role(Role::Muted).add_modifier.contains(Modifier::DIM) {
                 let rows = text_of(buf);
@@ -3268,11 +3326,23 @@ mod tests {
                     (1..6).all(|x| !buf[(x, total)].modifier.contains(Modifier::DIM)),
                     "{theme:?} TOTAL: a good report is plain"
                 );
-                let by_role = ["ACCOUNT", "TOTAL", "what this would cost", "cache write"];
+                let by_role = [
+                    "ACCOUNT",
+                    "TOTAL",
+                    SELECTED,
+                    "what this would cost",
+                    "cache write",
+                ];
                 for needle in needles.iter().filter(|n| !by_role.contains(n)) {
                     assert!(
                         undimmed(buf, needle),
                         "{theme:?} {needle}: a good report is plain"
+                    );
+                }
+                for needle in ["2026-09-21", "1 a1@x.co"] {
+                    assert!(
+                        undimmed_on(buf, SELECTED, needle),
+                        "{theme:?} {SELECTED} {needle}: a good report is plain below the total"
                     );
                 }
             } else {
@@ -3293,6 +3363,7 @@ mod tests {
                 "2026-09-21",
                 "2026-09-20",
                 "TOTAL",
+                SELECTED,
                 "what this would cost",
             ];
             good(&buf, theme, &needles);
@@ -3335,6 +3406,7 @@ mod tests {
                 "2026-09-20",
                 "2026-09-19",
                 "TOTAL",
+                SELECTED,
                 "what this would cost",
                 "cache write",
             ] {
@@ -3376,6 +3448,7 @@ mod tests {
                     "ACCOUNT",
                     "2026-09-21",
                     "TOTAL",
+                    SELECTED,
                     "what this would cost",
                     "cache write",
                 ],

@@ -1410,6 +1410,13 @@ mod tests {
         let mut read_at = Vec::new();
         let mut changed = NOW_MS;
         let mut serve = |state: &mut State, cmds: Vec<Cmd>, at: i64, changed: i64| {
+            // Beside the reads, a tick asks only for the daemon's status, which `live_tick`
+            // answers and leaves out: no check of the index's state and no refresh.
+            assert!(
+                cmds.iter()
+                    .all(|c| matches!(c, Cmd::LoadReport { .. } | Cmd::FetchStatus { .. })),
+                "at {at}: {cmds:?}"
+            );
             let read = reads(cmds);
             if !read.is_empty() {
                 answer(state, &read, vec![], changed, at);
