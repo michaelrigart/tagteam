@@ -18,6 +18,16 @@ pub(super) fn dollars(nanos: u64) -> String {
     }
 }
 
+/// A projection (T5-13): whole dollars from $10 (`$38`), else dollars and cents.
+pub(super) fn about(nanos: u64) -> String {
+    let cents = (u128::from(nanos) + 5_000_000) / 10_000_000;
+    if cents < 1_000 {
+        return dollars(nanos);
+    }
+    let whole = (u128::from(nanos) + 500_000_000) / 1_000_000_000;
+    format!("${}", separated(&whole.to_string()))
+}
+
 /// `digits` with a `,` before every third digit from the right.
 fn separated(digits: &str) -> String {
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -53,6 +63,20 @@ mod tests {
             (u64::MAX, "$18,446,744,073.71"),
         ] {
             assert_eq!(dollars(nanos), want, "{nanos}");
+        }
+    }
+
+    #[test]
+    fn a_projection_is_whole_dollars_from_ten() {
+        for (nanos, want) in [
+            (38_120_000_000, "$38"),
+            (9_990_000_000, "$9.99"),
+            (1_234_500_000_000, "$1,235"),
+            (9_996_000_000, "$10"),
+            (10_000_000_000, "$10"),
+            (0, "$0.00"),
+        ] {
+            assert_eq!(about(nanos), want, "{nanos}");
         }
     }
 }
