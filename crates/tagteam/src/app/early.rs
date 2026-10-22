@@ -16,7 +16,7 @@ const STATUSLINE_UNDER_JSON: &str = "statusline prints a line of text; run it wi
 const SHELL_INIT_UNDER_JSON: &str = "shell-init prints shell code; run it without --json";
 const COMPLETIONS_UNDER_JSON: &str = "completions prints a script; run it without --json";
 
-/// §13.5's fast path, taken before `build_engine_as`: no lock check, no settings warnings (a status
+/// §13.5's fast path, taken before `build_engine`: no lock check, no settings warnings (a status
 /// bar has nowhere to show them), and an engine walled off from the Keychain and the network
 /// (`statusline::engine`), which detects the run shell itself and resolves the provider in
 /// the statusline's order (`--provider`, the run shell's marker, the provider that says it

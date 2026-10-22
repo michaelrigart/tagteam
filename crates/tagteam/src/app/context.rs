@@ -293,7 +293,7 @@ pub(crate) fn engine_for(
     source: EventSource,
 ) -> Result<(Engine, Vec<String>), EngineError> {
     let located = locate_run_shell(&ctx)?;
-    Ok(build_engine_as(
+    Ok(build_engine(
         ctx,
         located.registry,
         located.run_shell,
@@ -360,7 +360,7 @@ pub(crate) fn command_settings(
 /// environment `locate` returned with `run_shell`. The HTTP adapter is built on its first
 /// request, never before (§13.5), and the oracle sends through the same one. The engine records
 /// its events under `source` (review refactor §8.7).
-pub(crate) fn build_engine_as(
+pub(crate) fn build_engine(
     ctx: Context,
     registry: ProviderRegistry,
     run_shell: RunShell,
