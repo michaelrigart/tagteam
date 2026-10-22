@@ -84,7 +84,7 @@ pub(crate) fn said(state: &State, width: u16, now_ms: i64) -> Option<Said> {
             ..said(
                 Some((mark.glyph, mark.role)),
                 Some(when(e.at_ms, now_ms, tz)),
-                list::sentence(e, tz),
+                list::sentence(e, now_ms, tz),
             )
         }
     };
@@ -92,7 +92,7 @@ pub(crate) fn said(state: &State, width: u16, now_ms: i64) -> Option<Said> {
         return Some(of(e));
     }
     if let Some(noted) = decision(state, &provider, job) {
-        let (mark, text) = decided(state, &provider, &noted);
+        let (mark, text) = decided(state, &provider, &noted, now_ms);
         return Some(said(mark, Some(when(noted.at_ms, now_ms, tz)), text));
     }
     if let Some(e) = stored(MONTH_MS) {
@@ -112,7 +112,7 @@ pub(crate) fn said(state: &State, width: u16, now_ms: i64) -> Option<Said> {
 }
 
 /// §5.3's time form in `tz` (T2-24): `HH:MM` on today's date, `Fri 15:38` within the six days
-/// before, else `Oct 12 15:38`.
+/// before or after (a reset to come), else `Oct 12 15:38`.
 pub(crate) fn when(at_ms: i64, now_ms: i64, tz: &TimeZone) -> String {
     let zoned = |ms| Timestamp::from_millisecond(ms).map(|t| t.to_zoned(tz.clone()));
     let (Ok(at), Ok(now)) = (zoned(at_ms), zoned(now_ms)) else {
@@ -121,10 +121,10 @@ pub(crate) fn when(at_ms: i64, now_ms: i64, tz: &TimeZone) -> String {
     let days = now
         .date()
         .since(at.date())
-        .map_or(-1, |span| span.get_days());
+        .map_or(i32::MAX, |span| span.get_days());
     let format = match days {
         0 => "%H:%M",
-        1..=6 => "%a %H:%M",
+        -6..=6 => "%a %H:%M",
         _ => "%b %-d %H:%M",
     };
     at.strftime(format).to_string()
@@ -170,11 +170,13 @@ fn outcome(o: &StatusOutcome) -> Option<Noted> {
 }
 
 /// A decision's mark and words (§11.3, T2-13): a `no-switch` in plain words, marked only when
-/// every account is exhausted; an `error` or `config-warning` as the daemon sent it.
+/// every account is exhausted, its reset in `when`'s form; an `error` or `config-warning` as the
+/// daemon sent it.
 fn decided(
     state: &State,
     provider: &ProviderId,
     noted: &Noted,
+    now_ms: i64,
 ) -> (Option<(&'static str, Role)>, String) {
     match &noted.what {
         NotedWhat::NoSwitch {
@@ -183,7 +185,7 @@ fn decided(
             used_pct,
             frees_at_ms,
         } => {
-            let frees_at = frees_at_ms.map(|ms| clock(ms, state.tokens.tz()));
+            let frees_at = frees_at_ms.map(|ms| when(ms, now_ms, state.tokens.tz()));
             let facts = NoSwitchFacts {
                 detail,
                 used_pct: *used_pct,
@@ -421,6 +423,21 @@ mod tests {
             )
         );
         assert_eq!(&letters(&mut state)[..3], " c ");
+    }
+
+    #[test]
+    fn all_exhausted_names_the_weekday_of_a_reset_tomorrow() {
+        let mut state = live_with(auto_on());
+        update(&mut state, no_switch("all-exhausted", ""), NOW_MS);
+        let reset = json!({"earliestResetAt": "2026-09-22T16:40:00Z"});
+        update(&mut state, auto("all-exhausted", reset), NOW_MS);
+        assert_eq!(
+            line(&state, 100),
+            hinted(
+                " ✕ 14:13  every account is near its limit; the first frees up at Tue 16:40",
+                100
+            )
+        );
     }
 
     #[test]
@@ -768,6 +785,20 @@ mod tests {
         // Today is the TUI's zone's: 23:30 UTC the day before is 01:30 today at UTC+2.
         let plus_two = TimeZone::fixed(jiff::tz::offset(2));
         assert_eq!(when(at("2026-09-20T23:30:00Z"), NOW_MS, &plus_two), "01:30");
+    }
+
+    #[test]
+    fn times_ahead_read_the_weekday_this_week_and_the_date_after() {
+        // A reset to come, from Monday 2026-09-21 14:13:20 UTC.
+        let utc = TimeZone::UTC;
+        for (iso, want) in [
+            ("2026-09-21T23:59:00Z", "23:59"),
+            ("2026-09-22T00:00:00Z", "Tue 00:00"),
+            ("2026-09-27T16:40:00Z", "Sun 16:40"),
+            ("2026-09-28T16:40:00Z", "Sep 28 16:40"),
+        ] {
+            assert_eq!(when(at(iso), NOW_MS, &utc), want, "{iso}");
+        }
     }
 
     #[test]
