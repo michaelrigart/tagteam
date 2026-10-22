@@ -11,7 +11,6 @@ use super::GAP;
 use super::marks::mark;
 use crate::autoline;
 use crate::chrome::fit_spans;
-use crate::daemon::words::clock;
 use crate::keys::RIGHT_INSET;
 use crate::state::State;
 use crate::theme::{Role, Theme};
@@ -48,14 +47,15 @@ pub(super) fn window(
     (first, shown, Some(len - shown))
 }
 
-/// `e` in plain words (§11.4), `all-exhausted`'s earliest reset in the TUI's clock form (T4-29).
-pub(crate) fn sentence(e: &EventView, tz: &TimeZone) -> String {
+/// `e` in plain words (§11.4), `all-exhausted`'s earliest reset in `autoline::when`'s form
+/// (T4-29).
+pub(crate) fn sentence(e: &EventView, now_ms: i64, tz: &TimeZone) -> String {
     let frees_at = e
         .detail
         .as_ref()
         .and_then(|d| d.get("earliest_reset_at"))
         .and_then(Value::as_i64)
-        .map(|s| clock(s.saturating_mul(1000), tz));
+        .map(|s| autoline::when(s.saturating_mul(1000), now_ms, tz));
     words::event(e, frees_at.as_deref())
 }
 
@@ -86,6 +86,7 @@ pub(crate) fn list_rows(
     times: &Times,
     rows: u16,
     width: u16,
+    now_ms: i64,
 ) -> Vec<Line<'static>> {
     let (theme, h, tz) = (state.theme, &state.history, state.tokens.tz());
     let muted = theme.role(Role::Muted);
@@ -110,7 +111,7 @@ pub(crate) fn list_rows(
                 Span::raw(GAP),
                 Span::styled(m.glyph, theme.role(m.role)),
                 Span::raw(" "),
-                Span::raw(sentence(e, tz)),
+                Span::raw(sentence(e, now_ms, tz)),
             ];
             let line = Line::from(fit_spans(spans, room));
             if h.selected == Some(i) {
@@ -497,6 +498,28 @@ mod tests {
             .unwrap_or_else(|| panic!("{body:?}"));
         assert!(
             row.ends_with("✕ auto couldn't switch · every account is near its limit; the first frees up at 16:23"),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn an_all_exhausted_reset_days_ahead_reads_its_weekday() {
+        // Two days after Monday 14:13:20 is Wednesday 14:13, not today's 14:13.
+        let mut exhausted = event_at(
+            NOW_MS - HOUR * 1000,
+            EventKind::AllExhausted,
+            EventSource::Auto,
+        );
+        exhausted.from = Some(account_ref(1));
+        exhausted.detail = Some(serde_json::json!({"earliest_reset_at": NOW_S + 48 * HOUR}));
+        let state = shown(with_events(vec![exhausted]));
+        let body = body_of(&state, 120, 40, NOW_MS);
+        let row = body
+            .iter()
+            .find(|r| r.contains("near its limit"))
+            .unwrap_or_else(|| panic!("{body:?}"));
+        assert!(
+            row.ends_with("every account is near its limit; the first frees up at Wed 14:13"),
             "{row:?}"
         );
     }

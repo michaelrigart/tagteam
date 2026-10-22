@@ -752,7 +752,7 @@ fn draw_view(
     if let Some(head) = at.head.filter(|_| !view.events.is_empty()) {
         frame.render_widget(Paragraph::new(list::head_row(&times, theme)), head);
     }
-    let rows = list::list_rows(state, view, &times, at.list.height, body.width);
+    let rows = list::list_rows(state, view, &times, at.list.height, body.width, now_ms);
     frame.render_widget(Paragraph::new(rows), at.list);
 }
 
