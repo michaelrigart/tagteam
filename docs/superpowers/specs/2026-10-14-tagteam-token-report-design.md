@@ -990,7 +990,10 @@ tagteam tokens [day|month|session|block] [ACCOUNT...] [--unattributed] [--model 
   - Token counts are scaled (`12.4M`) and costs are dollars with cents.
   - A total line closes the table.
   - Footnotes cover unpriced models, unfinalized responses ("output is a lower bound for N
-    subagent responses"), skipped lines, and the price table's date.
+    subagent responses"), skipped lines, and the price table's date. The unfinalized
+    responses' note reads `≥ at least: N subagent responses are still being counted`, and the
+    price table's `$ what this would cost on the API at list prices of <date>; not your bill`.
+    *(Amended by the TUI redesign spec §8.)*
   - Session rows add the project and first and last times. Block rows add the start and end,
     `observed`, and for the active block the remaining time, burn rate and projection.
   - While a refresh runs longer than one second, progress goes to stderr.

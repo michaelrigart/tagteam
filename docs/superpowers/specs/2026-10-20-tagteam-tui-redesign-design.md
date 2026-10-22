@@ -1262,6 +1262,7 @@ Applied in this branch, as small hunks, without rewriting point-in-time facts:
 - **Core spec:** §13.1 (`list`'s words and the `UPDATED` head), §13.4 (`history`'s projection
   words), the `events` kind list, and §11's `auto` human output.
 - **Daemon spec:** D4.2 records pauses and resumes as events.
+- **Token report spec:** §11.2 (the two notes' words).
 
 ## 19. Left to the builder
 
