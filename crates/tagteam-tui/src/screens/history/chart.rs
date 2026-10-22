@@ -241,6 +241,28 @@ mod tests {
     }
 
     #[test]
+    fn a_value_past_100_is_a_full_column_and_nan_reads_as_0() {
+        let theme = Theme::new(true);
+        let peaks = [Some(150.0), Some(f64::NAN)];
+        let buf = buffer_of(chart_rows(&peaks, 9, 90.0, 5, theme), 11);
+        let text = text_of(&buf);
+        assert_eq!(text[0], "    100  █┈");
+        for (y, row) in text.iter().enumerate().take(8).skip(1) {
+            let want = if y == 4 {
+                "     50  █"
+            } else {
+                "         █"
+            };
+            assert_eq!(row, want, "row {y}");
+        }
+        assert_eq!(text[8], "      0  █▁");
+        for y in 0..8 {
+            assert_eq!(&roles(&buf, theme, y)[9..10], canon(theme, "c"), "row {y}");
+        }
+        assert_eq!(&roles(&buf, theme, 8)[9..], canon(theme, "ca"));
+    }
+
+    #[test]
     fn the_y_axis_labels_100_50_from_6_rows_and_0() {
         let gutters = |rows| -> Vec<String> {
             chart_rows(&[None], rows, 90.0, 1, Theme::new(false))
