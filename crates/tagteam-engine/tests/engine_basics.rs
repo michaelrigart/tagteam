@@ -279,6 +279,18 @@ fn forget_store_makes_the_next_use_open_the_file_again() {
 }
 
 #[test]
+fn a_store_that_existing_store_opened_is_the_one_store_returns_later() {
+    // Decision 11: one connection per engine, whichever call opened it first. A read-only
+    // step then a write opens the file once.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    fx.engine.forget_store();
+    let read = fx.engine.existing_store().unwrap().unwrap();
+    let write = fx.engine.store().unwrap();
+    assert!(Arc::ptr_eq(&read, &write), "one cached connection");
+}
+
+#[test]
 fn the_spawner_is_the_port_the_engine_was_built_with() {
     // D6.2: the notifier delivers through the engine's own port, so tests script it.
     let fx = Fx::new();

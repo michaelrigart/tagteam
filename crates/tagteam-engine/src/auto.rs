@@ -1253,4 +1253,20 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_holder_record_that_cannot_be_read_keeps_its_i_o_error() {
+        // A directory where the record belongs: the read fails, which is no shape to name.
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("autoswitch-p.lock");
+        std::fs::create_dir(&path).unwrap();
+        match read_holder(&path) {
+            Read::Unreadable(e) => {
+                assert_eq!(e.what, path.display().to_string());
+                assert!(!e.detail.is_empty());
+                assert_ne!(e.detail, "it is not a pid and a start time");
+            }
+            _ => panic!("a directory is an unreadable record"),
+        }
+    }
 }

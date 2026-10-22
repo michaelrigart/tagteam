@@ -178,6 +178,22 @@ mod tests {
     }
 
     #[test]
+    fn a_daemon_record_that_cannot_be_read_keeps_its_i_o_error() {
+        // A directory where the record belongs: the read fails, which is no shape to name.
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("daemon.lock");
+        fs::create_dir(&path).unwrap();
+        match read_daemon_record(&path) {
+            Read::Unreadable(e) => {
+                assert_eq!(e.what, path.display().to_string());
+                assert!(!e.detail.is_empty());
+                assert_ne!(e.detail, "it is not a pid, a start time and a version");
+            }
+            _ => panic!("a directory is an unreadable record"),
+        }
+    }
+
+    #[test]
     fn find_on_path_finds_the_first_executable_of_a_name() {
         // D6.2's `notify-send`, D9.1's `tagteam`: a file that is not executable is passed over.
         let d = tempfile::tempdir().unwrap();
