@@ -12,13 +12,14 @@ use serde_json::json;
 
 use common::{API_KEY, Fx, LSTART, capture_logs, credential, due, journal, token_requests};
 use tagteam_cc::live::Platform;
+use tagteam_cc::records::parse_lstart;
 use tagteam_core::AccountId;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::refresh::{GateOutcome, OwnedBy};
 use tagteam_engine::session::{DamagedKind, SessionState};
 use tagteam_engine::switch::SwitchReason;
 use tagteam_provider::FlockGuard;
-use tagteam_provider::liveness::{FakeProcess, parse_lstart};
+use tagteam_provider::liveness::FakeProcess;
 use tagteam_provider::profile::{LAUNCH_DIR, MARKER_FILE, ProfileMarker, canonical_profile_path};
 use tagteam_provider::{Provider, Read};
 

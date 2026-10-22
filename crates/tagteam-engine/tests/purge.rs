@@ -514,7 +514,7 @@ fn an_orphaned_profile_with_a_live_daemon_supervisor_refuses_naming_the_daemon()
         779,
         FakeProcess {
             exists: Some(true),
-            start_time_s: tagteam_provider::parse_lstart(common::LSTART),
+            start_time_s: tagteam_cc::records::parse_lstart(common::LSTART),
             ..FakeProcess::default()
         },
     );
@@ -561,7 +561,7 @@ fn an_orphaned_profile_with_an_unreadable_daemon_lock_or_a_session_and_a_daemon_
         779,
         FakeProcess {
             exists: Some(true),
-            start_time_s: tagteam_provider::parse_lstart(common::LSTART),
+            start_time_s: tagteam_cc::records::parse_lstart(common::LSTART),
             ..FakeProcess::default()
         },
     );

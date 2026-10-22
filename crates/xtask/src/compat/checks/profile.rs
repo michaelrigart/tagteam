@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tagteam_cc::ItemKind;
 use tagteam_cc::locks::{STORAGE_WRITE_STALE, acquire_storage_write};
+use tagteam_cc::records::parse_session_record;
 use tagteam_provider::atomic::write_atomic_private;
 use tagteam_provider::{
-    Cancel, MkdirLock, MkdirLockSpec, Read, SystemProcessProbe, parse_session_record,
-    read_supervisor_lock, record_is_live,
+    Cancel, MkdirLock, MkdirLockSpec, Read, SystemProcessProbe, read_supervisor_lock,
+    record_is_live,
 };
 
 use super::{changes, new_record, read_json, records, snapshot};
@@ -639,7 +640,7 @@ pub fn session_records(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
             let parsed = record
                 .proc_start
                 .as_deref()
-                .and_then(tagteam_provider::parse_lstart);
+                .and_then(tagteam_cc::records::parse_lstart);
             p.expect(
                 &format!("SIG{sig}: procStart is ps's lstart"),
                 parsed.is_some() && record.proc_start.as_deref().map(str::trim) == ps.as_deref(),

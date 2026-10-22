@@ -1,10 +1,8 @@
 //! Claude Code's session records (Appendix A.7) as the neutral liveness judgement reads them
 //! (refactor spec §9).
 
-use tagteam_provider::liveness::{parse_cc_record, proc_start_of};
-use tagteam_provider::{
-    FakeProcess, FakeProcessProbe, ProcStart, SessionRecord, parse_session_record, record_is_live,
-};
+use tagteam_cc::records::{parse_cc_record, parse_session_record, proc_start_of};
+use tagteam_provider::{FakeProcess, FakeProcessProbe, ProcStart, SessionRecord, record_is_live};
 
 /// `"Thu Oct  1 12:34:56 2026"` as epoch seconds.
 const LSTART_S: i64 = 1_790_858_096;

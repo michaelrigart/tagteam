@@ -14,6 +14,7 @@ pub mod oauth;
 pub mod paths;
 pub mod prices;
 pub mod provider;
+pub mod records;
 mod session;
 pub mod shape;
 pub mod transcripts;

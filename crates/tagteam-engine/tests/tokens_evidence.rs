@@ -9,12 +9,13 @@ use std::time::{Duration, SystemTime};
 
 use common::{Chmod, Fx, LSTART};
 use serde_json::json;
+use tagteam_cc::records::parse_lstart;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::store::{LaunchRow, SightingRow, SightingSource};
 use tagteam_engine::tokens::{LaunchId, LaunchPoll, Tenure};
 use tagteam_provider::{
     FakeProcess, FlockGuard, LAUNCH_DIR, MARKER_FILE, PENDING_LAUNCH_DIR, PendingEntry,
-    PendingLaunch, parse_lstart,
+    PendingLaunch,
 };
 
 const NOW: i64 = 1_790_000_000_000;

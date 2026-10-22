@@ -13,10 +13,10 @@ use std::io;
 use std::path::Path;
 
 use serde_json::{Value, json};
-use tagteam_provider::liveness::{CcRecord, parse_cc_record};
+use tagteam_cc::records::{CcRecord, parse_cc_record, parse_lstart, parse_session_record};
 use tagteam_provider::{
-    LockProbe, ProcessProbe, Read, RecordEntry, launch_reservations, parse_lstart,
-    parse_session_record, read_session_records, read_supervisor_lock, record_is_live,
+    LockProbe, ProcessProbe, Read, RecordEntry, launch_reservations, read_session_records,
+    read_supervisor_lock, record_is_live,
 };
 
 use super::ctx::DAEMON_KINDS;

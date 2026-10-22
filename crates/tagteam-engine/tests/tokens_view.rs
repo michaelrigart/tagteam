@@ -15,6 +15,7 @@ use jiff::civil::date;
 use jiff::tz::TimeZone;
 use serde_json::json;
 use tagteam_cc::CLAUDE_CODE;
+use tagteam_cc::records::parse_lstart;
 use tagteam_core::tokens::{BlockSpan, CardOverride, PriceOverride, project};
 use tagteam_core::{AccountId, ProviderId, WindowKind};
 use tagteam_engine::registry::ProviderRegistry;
@@ -28,7 +29,7 @@ use tagteam_engine::vault::{KeychainVault, Vault};
 use tagteam_engine::{Engine, EngineConfig, EventKind, EventSource};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::{
-    FakeProcess, MARKER_FILE, PENDING_LAUNCH_DIR, PendingLaunch, Provider, RunShell, parse_lstart,
+    FakeProcess, MARKER_FILE, PENDING_LAUNCH_DIR, PendingLaunch, Provider, RunShell,
 };
 
 const MIN: i64 = 60_000;
