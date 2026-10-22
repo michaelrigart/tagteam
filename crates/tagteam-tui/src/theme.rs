@@ -112,6 +112,12 @@ impl Theme {
         Style::new().add_modifier(Modifier::BOLD)
     }
 
+    /// The cursor's event glyph (§7.5): `role`, bold and REVERSED.
+    pub(crate) fn marked(self, role: Role) -> Style {
+        self.role(role)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    }
+
     /// §4.1's `sel-bg`: the selected row's background in tier 2, nothing otherwise.
     pub(crate) fn sel_bg(self) -> Style {
         match self.tier {

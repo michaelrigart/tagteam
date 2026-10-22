@@ -1,13 +1,16 @@
-//! History's swimlanes, its in-use lane and its day axis (T4-7, T4-10, T4-12, §7.4).
+//! History's events lane, its swimlanes, its in-use lane and its day axis (T4-7, T4-10,
+//! T4-12, T4-13, §7.4).
 
 use jiff::Timestamp;
 use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
 use ratatui::text::{Line, Span};
-use tagteam_engine::timeline::{Grid, Lane};
+use tagteam_engine::EventKind;
+use tagteam_engine::timeline::{Grid, Lane, TimelineView};
 use tagteam_engine::words;
 
 use super::layout::CHART_X;
+use super::marks::{Mark, mark};
 use crate::gauge::fill_role;
 use crate::theme::{Role, Theme};
 use crate::view::pad;
@@ -19,6 +22,9 @@ const TRACK: &str = "─";
 const IN_USE: &str = "━";
 /// The cursor through a lane's empty cells and where the account was not in use (§7.1).
 const CURSOR: &str = "│";
+/// A pause's span until the next resume (§7.4), and tier 0's in its place.
+const PAUSED: &str = "┄";
+const PAUSED_PLAIN: &str = "·";
 /// A lane's name in the gutter, after the marker column and before a space (T4-10).
 const NAME: usize = 7;
 /// Each axis label's tick, and the axis's last word (§7.4).
@@ -26,6 +32,66 @@ const TICK: &str = "╵";
 const NOW: &str = "now";
 /// T4-12: the 1-day axis marks the local hours divisible by this.
 const HOURS: usize = 3;
+
+/// T4-13: the events lane, after an empty gutter: each column's highest-rank event's glyph in
+/// its role (the newest of equal rank), a pause's span `┄` in warn in each column after it and
+/// before the next resume (from column 0 when the range starts paused), and in column `cursor`
+/// its event's glyph `Theme::marked`, or the cursor's `│` in accent with none there.
+pub(crate) fn events_row(view: &TimelineView, cursor: usize, theme: Theme) -> Line<'static> {
+    let grid = view.grid();
+    let mut marks: Vec<Option<Mark>> = vec![None; view.columns];
+    let mut paused = vec![false; view.columns];
+    // The column a pause's span starts at, while paused.
+    let mut from = view.paused_at_start.then_some(0);
+    for e in &view.events {
+        let Some(c) = grid.column_of(grid.placed(e.at_ms)) else {
+            continue;
+        };
+        let m = mark(e);
+        if marks[c].is_none_or(|old| m.rank >= old.rank) {
+            marks[c] = Some(m);
+        }
+        match e.kind {
+            EventKind::AutoswitchPaused => {
+                from.get_or_insert(c + 1);
+            }
+            EventKind::AutoswitchResumed => {
+                if let Some(start) = from.take() {
+                    paused
+                        .iter_mut()
+                        .take(c)
+                        .skip(start)
+                        .for_each(|p| *p = true);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = from {
+        paused.iter_mut().skip(start).for_each(|p| *p = true);
+    }
+    let span = if theme.colourless() {
+        PAUSED_PLAIN
+    } else {
+        PAUSED
+    };
+    let (warn, accent) = (theme.role(Role::Warn), theme.role(Role::Accent));
+    let mut spans = vec![Span::raw(" ".repeat(usize::from(CHART_X)))];
+    spans.extend(
+        marks
+            .iter()
+            .zip(&paused)
+            .enumerate()
+            .map(|(c, (m, p))| match (m, c == cursor) {
+                (Some(m), true) => Span::styled(m.glyph, theme.marked(m.role)),
+                (Some(m), false) => Span::styled(m.glyph, theme.role(m.role)),
+                (None, true) => Span::styled(CURSOR, accent),
+                (None, false) if *p => Span::styled(span, warn),
+                (None, false) => Span::raw(" "),
+            }),
+    );
+    Line::from(spans)
+}
 
 /// One account's swimlane: its name in the gutter, then each column's binding usage in
 /// `fill_role` where it was in use (blank without a reading), a faint `─` where it was not, and
@@ -147,9 +213,12 @@ fn boundaries(grid: Grid, days: i64, tz: &TimeZone) -> Vec<(i64, String)> {
 #[cfg(test)]
 mod tests {
     use jiff::tz::{TimeZone, offset};
+    use ratatui::style::Modifier;
+    use tagteam_engine::timeline::TimelineView;
+    use tagteam_engine::{EventKind, EventSource};
 
     use super::*;
-    use crate::screens::history::buffer_of;
+    use crate::screens::history::{buffer_of, event_at};
     use crate::testutil::*;
 
     #[test]
@@ -206,6 +275,90 @@ mod tests {
         let buf = buffer_of(vec![lane_row(&lane, 0, theme)], 11);
         assert_eq!(text_of(&buf)[0], " 1 a1    █▁");
         assert_eq!(&roles(&buf, theme, 0)[9..], canon(theme, "ca"));
+    }
+
+    /// Ten columns of the 7 days to now, `events` in them, each `(column, kind, source)`.
+    fn ten_columns(events: &[(usize, EventKind, EventSource)], paused: bool) -> TimelineView {
+        let mut view = timeline_view(10, vec![], vec![]);
+        let grid = view.grid();
+        let width = (grid.now_ms - grid.since_ms) / 10;
+        view.events = events
+            .iter()
+            .map(|(c, kind, source)| {
+                event_at(grid.since_ms + *c as i64 * width + 1, *kind, *source)
+            })
+            .collect();
+        view.paused_at_start = paused;
+        view
+    }
+
+    #[test]
+    fn the_events_lane_shows_each_column_s_most_severe_event_and_a_pause_s_span() {
+        use EventKind::{Add, AutoswitchPaused, AutoswitchResumed, Quarantine, Switch};
+        use EventSource::{Auto, Daemon};
+        let theme = Theme::new(true);
+        let view = ten_columns(
+            &[
+                (2, Switch, Auto),
+                (2, Quarantine, Auto),
+                (5, AutoswitchPaused, Daemon),
+                (8, AutoswitchResumed, Daemon),
+                (9, Add, EventSource::Cli),
+            ],
+            false,
+        );
+        let after_gutter = |buf: &ratatui::buffer::Buffer| -> String {
+            text_of(buf)[0].chars().skip(usize::from(CHART_X)).collect()
+        };
+        let buf = buffer_of(vec![events_row(&view, 0, theme)], 19);
+        assert!(
+            text_of(&buf)[0].starts_with(&" ".repeat(9)),
+            "an empty gutter"
+        );
+        assert_eq!(after_gutter(&buf), "│ ✕  ‖┄┄‖+");
+        assert_eq!(&roles(&buf, theme, 0)[9..], canon(theme, "a c  wwwmm"));
+        let reversed = |buf: &ratatui::buffer::Buffer, x: u16| {
+            buf[(x, 0)]
+                .modifier
+                .contains(Modifier::BOLD | Modifier::REVERSED)
+        };
+        assert!(
+            !(9..19).any(|x| reversed(&buf, x)),
+            "no event at the cursor"
+        );
+
+        // Paused from the range's start: the span runs to the resume, which the cursor is on.
+        let view = ten_columns(&[(3, AutoswitchResumed, Daemon)], true);
+        let buf = buffer_of(vec![events_row(&view, 3, theme)], 19);
+        assert_eq!(after_gutter(&buf), "┄┄┄‖");
+        assert_eq!(&roles(&buf, theme, 0)[9..13], canon(theme, "wwwm"));
+        assert!(
+            reversed(&buf, 12),
+            "the cursor's event is bold and REVERSED"
+        );
+        assert!(!(9..12).any(|x| reversed(&buf, x)));
+
+        // A pause with no resume runs to the last column.
+        let view = ten_columns(&[(6, AutoswitchPaused, Daemon)], false);
+        let buf = buffer_of(vec![events_row(&view, 0, theme)], 19);
+        assert_eq!(after_gutter(&buf), "│     ‖┄┄┄");
+
+        // Tier 0 draws `·` for the span; the cursor on column 2 marks its `✕`.
+        let plain = Theme::new(false);
+        let view = ten_columns(
+            &[
+                (2, Switch, Auto),
+                (2, Quarantine, Auto),
+                (5, AutoswitchPaused, Daemon),
+                (8, AutoswitchResumed, Daemon),
+                (9, Add, EventSource::Cli),
+            ],
+            false,
+        );
+        let buf = buffer_of(vec![events_row(&view, 2, plain)], 19);
+        assert_eq!(after_gutter(&buf), "  ✕  ‖··‖+");
+        assert!(reversed(&buf, 11), "{:?}", buf[(11, 0)]);
+        assert!(!(9..19).filter(|x| *x != 11).any(|x| reversed(&buf, x)));
     }
 
     #[test]

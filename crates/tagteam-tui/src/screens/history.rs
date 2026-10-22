@@ -1,8 +1,8 @@
 //! The History screen (redesign §7): focus's provider's timeline, of every account or one
 //! (§7.2), over 1, 7, 14 or 30 days, read on the views lane (§7.7). Its scope row, then
 //! `loading…` before a view or the empty state when nothing is in range (§5.7). A time cursor
-//! moves by column (§7.5), and the scope stays in step with the Accounts selection (T4-17). It
-//! never fetches (core §13.4).
+//! moves by column or by event, the event list's selection one with it (§7.5), and the scope
+//! stays in step with the Accounts selection (T4-17). It never fetches (core §13.4).
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -10,7 +10,9 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_engine::timeline::{AccountRef, Scope, TimelineView};
+use tagteam_engine::EventKind;
+use tagteam_engine::event::AUTO_LINE_KINDS;
+use tagteam_engine::timeline::{AccountRef, EventView, Scope, TimelineView};
 use tagteam_engine::words;
 
 use crate::autoline;
@@ -28,6 +30,8 @@ use crate::view::{body_at, centered, centred_block, fit, width_of};
 mod chart;
 mod lanes;
 mod layout;
+mod list;
+mod marks;
 
 /// T4-21: drawn under the scope row until the first view of a scope and range arrives.
 const LOADING: &str = "loading…";
@@ -85,6 +89,14 @@ impl Range {
         }
     }
 
+    /// The event list with no events (T4-20).
+    fn no_events(self) -> String {
+        match self.days() {
+            1 => "no events in the last day".to_owned(),
+            n => format!("no events in the last {n} days"),
+        }
+    }
+
     fn step(self, by: isize) -> Range {
         let at = Self::ALL.iter().position(|r| *r == self).unwrap_or(1) as isize;
         Self::ALL[(at + by).rem_euclid(Self::ALL.len() as isize) as usize]
@@ -97,6 +109,13 @@ pub(crate) enum Cursor {
     #[default]
     Now,
     At(i64),
+}
+
+/// T4-15: where the cursor goes once the next view arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// On open, a scope change or a range change: the newest auto-line event, else now.
+    Open,
 }
 
 pub struct HistoryState {
@@ -118,6 +137,15 @@ pub struct HistoryState {
     read_ms: Option<i64>,
     /// When the paced re-read that came inside `PACED_MS` of the last read is due (T4-19).
     paced_due_ms: Option<i64>,
+    /// The event list's selected row, newest first: the newest event at or before the cursor
+    /// (T4-14).
+    selected: Option<usize>,
+    /// The list's first row shown (T4-20).
+    list_from: usize,
+    /// `z`: the list has the whole body (§7.6).
+    full_list: bool,
+    /// Where the next view places the cursor; `None` keeps it (T4-15).
+    place: Option<Place>,
 }
 
 impl Default for HistoryState {
@@ -133,6 +161,10 @@ impl Default for HistoryState {
             from_accounts: false,
             read_ms: None,
             paced_due_ms: None,
+            selected: None,
+            list_from: 0,
+            full_list: false,
+            place: Some(Place::Open),
         }
     }
 }
@@ -152,8 +184,93 @@ impl HistoryState {
         self.scope = scope;
         self.view = None;
         self.chart_from = 0;
+        self.place = Some(Place::Open);
         true
     }
+
+    /// The new view's cursor and selection (T4-15): placed on the newest auto-line event, else
+    /// now, after an open, a scope or a range change; else kept, the selection read from it.
+    fn place(&mut self) {
+        let Some(view) = &self.view else {
+            return;
+        };
+        let len = view.events.len();
+        match self.place.take() {
+            Some(Place::Open) => {
+                self.list_from = 0;
+                let auto = view
+                    .events
+                    .iter()
+                    .rposition(|e| AUTO_LINE_KINDS.contains(&e.kind));
+                match auto {
+                    Some(j) => {
+                        self.cursor = Cursor::At(view.events[j].at_ms);
+                        self.selected = Some(len - 1 - j);
+                    }
+                    None => {
+                        self.cursor = Cursor::Now;
+                        self.selected = at_or_before(view, Cursor::Now);
+                    }
+                }
+            }
+            None => self.selected = at_or_before(view, self.cursor),
+        }
+    }
+}
+
+/// The event at list row `row`, newest first.
+fn listed(view: &TimelineView, row: usize) -> Option<&EventView> {
+    let j = view.events.len().checked_sub(row + 1)?;
+    view.events.get(j)
+}
+
+/// The list row of the newest event at or before `cursor` (T4-14).
+fn at_or_before(view: &TimelineView, cursor: Cursor) -> Option<usize> {
+    let until = match cursor {
+        Cursor::Now => i64::MAX,
+        Cursor::At(ms) => ms,
+    };
+    let j = view.events.iter().rposition(|e| e.at_ms <= until)?;
+    Some(view.events.len() - 1 - j)
+}
+
+/// The selected event when it is a switch in the cursor's column: its binding usage just
+/// before and just after it, for the in-use chart's readout (T4-11).
+fn switch_at_cursor(h: &HistoryState) -> Option<(Option<f64>, Option<f64>)> {
+    let view = h.view.as_ref()?;
+    let e = listed(view, h.selected?)?;
+    let grid = view.grid();
+    let switched = matches!(e.kind, EventKind::Switch | EventKind::SwitchRecovered);
+    let here = grid.column_of(grid.placed(e.at_ms)) == Some(cursor_column(h.cursor, view));
+    (switched && here).then_some((e.before_pct, e.after_pct))
+}
+
+/// Whether the view has events for `j`/`k` to move through (the footer's `j/k event`).
+pub(crate) fn has_events(state: &State) -> bool {
+    state
+        .history
+        .view
+        .as_ref()
+        .is_some_and(|v| !v.events.is_empty())
+}
+
+/// Whether `z` has a list to give the body, or the body to give back (the footer's `z list`).
+pub(crate) fn lists(state: &State) -> bool {
+    has_events(state) || state.history.full_list
+}
+
+/// The list's first row moved as little as keeps the selection shown in the rows the layout
+/// gives the list (T4-20).
+fn follow_list(state: &mut State) {
+    let body = body_at(state);
+    let rows = state.size.1;
+    let h = &mut state.history;
+    let Some(view) = &h.view else {
+        return;
+    };
+    let at = layout::layout(view, &h.scope, body, rows, h.chart_from, h.full_list);
+    let len = view.events.len();
+    h.list_from = list::window(len, h.selected, usize::from(at.list.height), h.list_from).0;
 }
 
 /// The cursor's column in `view` (T4-14): the last for now, column 0 for a time before the
@@ -222,6 +339,7 @@ pub(crate) fn reload_paced(state: &mut State, now_ms: i64) -> Option<Cmd> {
 pub(crate) fn on_enter(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     state.history.view = None;
     state.history.from_accounts = false;
+    state.history.place = Some(Place::Open);
     reload(state, now_ms).into_iter().collect()
 }
 
@@ -249,8 +367,8 @@ pub(crate) fn on_accounts(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     reload(state, now_ms).into_iter().collect()
 }
 
-/// The timeline read, under History's latest generation; any other is dropped. A failed one
-/// raises the History banner and keeps the last view (T4-21).
+/// The timeline read, under History's latest generation; any other is dropped. It places the
+/// cursor (T4-15). A failed one raises the History banner and keeps the last view (T4-21).
 pub(crate) fn on_timeline(
     state: &mut State,
     r#gen: u64,
@@ -263,6 +381,8 @@ pub(crate) fn on_timeline(
     match result {
         Ok(view) => {
             state.history.view = Some(view);
+            state.history.place();
+            follow_list(state);
             state.clear_banner(BannerKind::History);
         }
         Err(e) => state.raise_banner(BannerKind::History, e.message),
@@ -346,15 +466,35 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
         KeyCode::Char(']') => step_range(state, 1, now_ms),
         KeyCode::Left => move_cursor(state, -1),
         KeyCode::Right => move_cursor(state, 1),
+        KeyCode::Char('j') | KeyCode::Down => step_event(state, 1),
+        KeyCode::Char('k') | KeyCode::Up => step_event(state, -1),
         KeyCode::Home => {
             // T4-14: the oldest event, or column 0 with none.
-            if let Some(view) = &state.history.view {
-                state.history.cursor = at_column(view, 0);
+            let h = &mut state.history;
+            if let Some(view) = &h.view {
+                match view.events.first() {
+                    Some(oldest) => {
+                        h.cursor = Cursor::At(oldest.at_ms);
+                        h.selected = Some(view.events.len() - 1);
+                    }
+                    None => h.cursor = at_column(view, 0),
+                }
+                follow_list(state);
             }
             vec![]
         }
         KeyCode::End => {
-            state.history.cursor = Cursor::Now;
+            let h = &mut state.history;
+            h.cursor = Cursor::Now;
+            if let Some(view) = &h.view {
+                h.selected = at_or_before(view, Cursor::Now);
+                follow_list(state);
+            }
+            vec![]
+        }
+        KeyCode::Char('z') => {
+            state.history.full_list = !state.history.full_list;
+            follow_list(state);
             vec![]
         }
         KeyCode::Char('f') => {
@@ -372,17 +512,42 @@ fn step_range(state: &mut State, by: isize, now_ms: i64) -> Vec<Cmd> {
     let h = &mut state.history;
     h.range = h.range.step(by);
     h.view = None;
+    h.place = Some(Place::Open);
     reload(state, now_ms).into_iter().collect()
 }
 
-/// `←`/`→`: the cursor one column, stopping at either end (T4-14).
+/// `←`/`→`: the cursor one column, stopping at either end, and the selection the newest event
+/// at or before it (T4-14).
 fn move_cursor(state: &mut State, by: isize) -> Vec<Cmd> {
     let h = &mut state.history;
     if let Some(view) = &h.view {
         let last = view.columns.saturating_sub(1) as isize;
         let at = cursor_column(h.cursor, view) as isize;
         h.cursor = at_column(view, (at + by).clamp(0, last) as usize);
+        h.selected = at_or_before(view, h.cursor);
+        follow_list(state);
     }
+    vec![]
+}
+
+/// `j`/`↓` and `k`/`↑`: the next or previous list row, newest first, stopping at either end, and
+/// the cursor at its time (T4-14). With none selected, the cursor is before the oldest: either
+/// selects it.
+fn step_event(state: &mut State, by: isize) -> Vec<Cmd> {
+    let h = &mut state.history;
+    let Some(view) = &h.view else {
+        return vec![];
+    };
+    let Some(last) = view.events.len().checked_sub(1) else {
+        return vec![];
+    };
+    let at = h.selected.map_or(last as isize, |s| s as isize + by);
+    let row = at.clamp(0, last as isize) as usize;
+    h.selected = Some(row);
+    if let Some(e) = listed(view, row) {
+        h.cursor = Cursor::At(e.at_ms);
+    }
+    follow_list(state);
     vec![]
 }
 
@@ -418,7 +583,7 @@ fn scroll_charts(state: &mut State, by: isize) -> Vec<Cmd> {
         return vec![];
     };
     // From what shows: a resize or a new read may have left the stored scroll past the end.
-    let furthest = layout::layout(view, &h.scope, body, state.size.1, usize::MAX)
+    let furthest = layout::layout(view, &h.scope, body, state.size.1, usize::MAX, false)
         .charts
         .first()
         .map_or(0, |(i, _)| *i);
@@ -446,34 +611,50 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     if area.is_empty() {
         return;
     }
-    let scope_row = Rect::new(area.x, area.y, area.width, 1);
-    let line = scope_line(state, area.width, now_ms);
-    frame.render_widget(Paragraph::new(line), scope_row);
-    let under = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+    let scope = Paragraph::new(scope_line(state, area.width, now_ms));
     let h = &state.history;
     match &h.view {
-        None => {
-            let line = Line::from(Span::styled(LOADING, state.theme.role(Role::Muted)));
-            frame.render_widget(
-                Paragraph::new(line.centered()),
-                centered(under, under.width, 1),
-            );
+        Some(view) if !nothing_in_range(view) => {
+            return draw_view(state, frame, view, area, scope, now_ms);
         }
-        Some(view) if nothing_in_range(view) => {
-            let sentence = (h.range != Range::Month).then_some(LONGER);
-            centred_block(frame, under, &h.range.nothing(), sentence, state.theme);
-        }
-        Some(view) => draw_view(state, frame, view, area),
+        _ => frame.render_widget(scope, Rect::new(area.x, area.y, area.width, 1)),
+    }
+    let under = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+    if h.view.is_none() {
+        let line = Line::from(Span::styled(LOADING, state.theme.role(Role::Muted)));
+        frame.render_widget(
+            Paragraph::new(line.centered()),
+            centered(under, under.width, 1),
+        );
+    } else {
+        let sentence = (h.range != Range::Month).then_some(LONGER);
+        centred_block(frame, under, &h.range.nothing(), sentence, state.theme);
     }
 }
 
-/// `view`'s charts under their titles, its lanes, the more row and the axis (T4-8 to T4-12).
-/// A view read at another width is drawn from the left and clipped until its re-read (T4-19).
-fn draw_view(state: &State, frame: &mut Frame, view: &TimelineView, body: Rect) {
+/// The `scope` row, then `view`'s charts under their titles, its events lane, its lanes, the
+/// more row, the axis and the event list (T4-8 to T4-13, T4-20); with `z`, the list alone. A view
+/// read at another width is drawn from the left and clipped until its re-read (T4-19).
+fn draw_view(
+    state: &State,
+    frame: &mut Frame,
+    view: &TimelineView,
+    body: Rect,
+    scope: Paragraph<'static>,
+    now_ms: i64,
+) {
     let theme = state.theme;
     let h = &state.history;
     let all = h.scope == Scope::All;
-    let at = layout::layout(view, &h.scope, body, frame.area().height, h.chart_from);
+    let at = layout::layout(
+        view,
+        &h.scope,
+        body,
+        frame.area().height,
+        h.chart_from,
+        h.full_list,
+    );
+    frame.render_widget(scope, at.scope);
     let line_pct = if all {
         view.threshold
     } else {
@@ -505,13 +686,23 @@ fn draw_view(state: &State, frame: &mut Frame, view: &TimelineView, body: Rect) 
     if let Some((rect, n)) = at.more {
         frame.render_widget(Paragraph::new(lanes::more_row(n, theme)), rect);
     }
-    let axis = lanes::axis_row(view.grid(), h.range.days(), state.tokens.tz(), theme);
-    frame.render_widget(Paragraph::new(axis), at.axis);
+    if !h.full_list {
+        let events = lanes::events_row(view, cursor, theme);
+        frame.render_widget(Paragraph::new(events), at.events);
+        let axis = lanes::axis_row(view.grid(), h.range.days(), state.tokens.tz(), theme);
+        frame.render_widget(Paragraph::new(axis), at.axis);
+    }
+    if let Some(head) = at.head.filter(|_| !view.events.is_empty()) {
+        frame.render_widget(Paragraph::new(list::head_row(state, view, now_ms)), head);
+    }
+    let rows = list::list_rows(state, view, at.list.height, body.width, now_ms);
+    frame.render_widget(Paragraph::new(rows), at.list);
 }
 
-/// No lanes and no chart value (T4-21).
+/// No events, no lanes and no chart value (T4-21).
 fn nothing_in_range(view: &TimelineView) -> bool {
-    view.lanes.is_empty()
+    view.events.is_empty()
+        && view.lanes.is_empty()
         && view
             .charts
             .iter()
@@ -586,9 +777,66 @@ fn buffer_of(lines: Vec<Line<'static>>, width: u16) -> ratatui::buffer::Buffer {
     buf
 }
 
+/// `many()`'s account `position` as the timeline names it.
+#[cfg(test)]
+pub(crate) fn account_ref(position: u32) -> AccountRef {
+    AccountRef {
+        id: crate::testutil::id(position),
+        position: Some(position),
+        alias: None,
+        email: Some(format!("a{position}@x.co")),
+        removed: false,
+    }
+}
+
+/// A `kind` event by `source` stored at `at_ms`, naming no account.
+#[cfg(test)]
+pub(crate) fn event_at(
+    at_ms: i64,
+    kind: EventKind,
+    source: tagteam_engine::EventSource,
+) -> EventView {
+    EventView {
+        at_ms,
+        kind,
+        source,
+        trigger: None,
+        from: None,
+        to: None,
+        detail: None,
+        before_pct: None,
+        after_pct: None,
+    }
+}
+
+/// §7.1's three newest events, oldest first: 3's stored login refused on Saturday at 08:58 and
+/// replaced at 11:33, then auto's switch 1 → 2 today at 11:28, 2h45m before now.
+#[cfg(test)]
+pub(crate) fn three_events() -> Vec<EventView> {
+    use serde_json::json;
+    use tagteam_engine::EventSource;
+    use tagteam_engine::store::CREDENTIALS_REPLACED;
+    let ago = |d: i64, h: i64, m: i64, s: i64| {
+        crate::testutil::NOW_MS - ((d * 24 + h) * 3600 + m * 60 + s) * 1000
+    };
+    let mut refused = event_at(ago(2, 5, 15, 20), EventKind::Quarantine, EventSource::Auto);
+    refused.to = Some(account_ref(3));
+    refused.detail = Some(json!({"reason": "invalid_grant"}));
+    let mut stored = event_at(ago(2, 2, 40, 20), EventKind::Unquarantine, EventSource::Cli);
+    stored.to = Some(account_ref(3));
+    stored.detail = Some(json!({"reason": CREDENTIALS_REPLACED}));
+    let mut switch = event_at(ago(0, 2, 45, 0), EventKind::Switch, EventSource::Auto);
+    switch.trigger = Some("proactive".into());
+    switch.from = Some(account_ref(1));
+    switch.to = Some(account_ref(2));
+    switch.detail = Some(json!({"window": "5h", "label": "5h", "pct": 93.0, "threshold": 90.0}));
+    vec![refused, stored, switch]
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyCode;
+    use tagteam_engine::EventSource;
     use tagteam_engine::timeline::{IN_USE, Series};
 
     use super::*;
@@ -1478,6 +1726,314 @@ mod tests {
         assert_eq!(
             update(&mut state, Msg::Tick, NOW_MS + RESIZE_DEBOUNCE_MS),
             [read_of(2, Scope::All, NOW_S - WEEK, 70)]
+        );
+    }
+
+    /// `view` with `events`, oldest first.
+    fn with(mut view: TimelineView, events: Vec<EventView>) -> TimelineView {
+        view.events = events;
+        view
+    }
+
+    /// An instant in column `c` of the 70 columns over the 7 days to now.
+    fn in_column(c: i64) -> i64 {
+        NOW_MS - WEEK * 1000 + c * (WEEK * 1000 / 70) + 60_000
+    }
+
+    /// The cursor's time as the scope row says it.
+    fn cursor_said(state: &State) -> String {
+        scope_row(state)
+            .rsplit("cursor ")
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// The list row the selection marker is on at 80×24, counted from the list's first.
+    fn marked_row(state: &State) -> Option<usize> {
+        body_of(state, 80, 24, NOW_MS)[16..]
+            .iter()
+            .position(|r| r.starts_with('▌'))
+    }
+
+    /// Auto's switch 1 → 2 at `at_ms`.
+    fn switch_at(at_ms: i64) -> EventView {
+        let mut e = event_at(at_ms, EventKind::Switch, EventSource::Auto);
+        e.from = Some(account_ref(1));
+        e.to = Some(account_ref(2));
+        e
+    }
+
+    /// `kind` naming account 3 at `at_ms`.
+    fn of_three(at_ms: i64, kind: EventKind) -> EventView {
+        let mut e = event_at(at_ms, kind, EventSource::Cli);
+        e.to = Some(account_ref(3));
+        e
+    }
+
+    #[test]
+    fn j_k_home_and_end_move_the_selection_and_the_cursor_together() {
+        let (mut state, _) = opened(3);
+        arrived(&mut state, with(drawn(70), three_events()));
+        let shown = |state: &State| (cursor_said(state), marked_row(state));
+        let at = |said: &str, row: usize| (said.to_owned(), Some(row));
+        assert_eq!(shown(&state), at("11:28", 0), "placed on the newest");
+        let steps = [
+            (ch('j'), "Sat 11:33", 1),
+            (ch('k'), "11:28", 0),
+            (key(KeyCode::Down), "Sat 11:33", 1),
+            (key(KeyCode::Down), "Sat 08:58", 2),
+            (key(KeyCode::Down), "Sat 08:58", 2),
+            (key(KeyCode::Up), "Sat 11:33", 1),
+            (key(KeyCode::Home), "Sat 08:58", 2),
+            (key(KeyCode::End), "now", 0),
+            (ch('k'), "11:28", 0),
+        ];
+        for (i, (msg, said, row)) in steps.into_iter().enumerate() {
+            update(&mut state, msg, NOW_MS);
+            assert_eq!(shown(&state), at(said, row), "step {i}");
+        }
+    }
+
+    #[test]
+    fn moving_the_cursor_by_column_selects_the_nearest_event_at_or_before_it() {
+        let (mut state, _) = opened(3);
+        let older = of_three(in_column(20), EventKind::Quarantine);
+        arrived(
+            &mut state,
+            with(drawn(70), vec![older, switch_at(in_column(40))]),
+        );
+        assert_eq!(state.history.selected, Some(0), "the newest");
+        update(&mut state, key(KeyCode::Left), NOW_MS);
+        assert_eq!(
+            state.history.selected,
+            Some(1),
+            "between the two: the older"
+        );
+        assert_eq!(marked_row(&state), Some(1));
+        for _ in 0..19 {
+            update(&mut state, key(KeyCode::Left), NOW_MS);
+        }
+        assert_eq!(state.history.selected, Some(1), "column 20 holds it");
+        update(&mut state, key(KeyCode::Left), NOW_MS);
+        assert_eq!(state.history.selected, None, "before the oldest");
+        assert_eq!(marked_row(&state), None);
+        update(&mut state, key(KeyCode::Right), NOW_MS);
+        assert_eq!(state.history.selected, Some(1));
+    }
+
+    #[test]
+    fn on_open_the_cursor_is_on_the_newest_auto_line_event() {
+        let (mut state, _) = opened(3);
+        let switch = switch_at(in_column(30));
+        let added = of_three(in_column(50), EventKind::Add);
+        let view = with(drawn(70), vec![switch.clone(), added.clone()]);
+        arrived(&mut state, view.clone());
+        assert_eq!(state.history.cursor, Cursor::At(switch.at_ms));
+        assert_eq!(
+            state.history.selected,
+            Some(1),
+            "the switch, under the newer add"
+        );
+        let utc = jiff::tz::TimeZone::UTC;
+        assert_eq!(
+            cursor_said(&state),
+            autoline::when(switch.at_ms, NOW_MS, &utc)
+        );
+        // A refresh keeps a cursor moved by hand, and selects from it.
+        update(&mut state, key(KeyCode::Right), NOW_MS);
+        let moved = state.history.cursor;
+        assert_ne!(moved, Cursor::At(switch.at_ms));
+        assert!(!state.reload_views(NOW_MS).is_empty());
+        arrived(&mut state, view.clone());
+        assert_eq!(state.history.cursor, moved);
+        assert_eq!(state.history.selected, Some(1));
+        // A range change places it again: with no auto-line kind, at now.
+        update(&mut state, ch(']'), NOW_MS);
+        arrived(&mut state, with(drawn(70), vec![added]));
+        assert_eq!(state.history.cursor, Cursor::Now);
+        assert_eq!(cursor_said(&state), "now");
+        assert_eq!(state.history.selected, Some(0), "the add, at or before now");
+        // So do a scope change and opening History again.
+        update(&mut state, ch('f'), NOW_MS);
+        update(&mut state, ch('1'), NOW_MS);
+        arrived(&mut state, view.clone());
+        assert_eq!(state.history.cursor, Cursor::At(switch.at_ms));
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        update(&mut state, ch('1'), NOW_MS);
+        update(&mut state, ch('3'), NOW_MS);
+        arrived(&mut state, view);
+        assert_eq!(state.history.cursor, Cursor::At(switch.at_ms));
+    }
+
+    #[test]
+    fn a_switch_at_the_cursor_reads_before_and_after_on_the_in_use_chart() {
+        let mut accounts = many(3);
+        accounts[1].usage = read(60, 53.0, 6.0, false);
+        accounts[1].active = true;
+        let mut state = fresh(Screen::History);
+        state.start();
+        let result = Ok(snapshot(accounts));
+        update(&mut state, Msg::Accounts { r#gen: 1, result }, NOW_MS);
+        let mut switch = switch_at(in_column(40));
+        switch.before_pct = Some(93.0);
+        switch.after_pct = Some(3.0);
+        arrived(&mut state, with(drawn(70), vec![switch]));
+        let title = |state: &State| body_of(state, 80, 24, NOW_MS).remove(1);
+        assert!(title(&state).starts_with(" in use"), "{}", title(&state));
+        assert!(
+            title(&state).ends_with("at cursor  93% →   3%   now  53%"),
+            "{}",
+            title(&state)
+        );
+        // A column before it: that column's peak.
+        update(&mut state, key(KeyCode::Left), NOW_MS);
+        assert!(
+            title(&state).ends_with("at cursor  39%   now  53%"),
+            "{}",
+            title(&state)
+        );
+    }
+
+    #[test]
+    fn a_removed_account_s_lane_and_events_draw_with_its_label() {
+        // Review Focus 2.
+        let (mut state, _) = opened(3);
+        let gone = AccountRef {
+            id: AccountId::from_string("gone"),
+            position: None,
+            alias: None,
+            email: Some("alex@personal.example".into()),
+            removed: true,
+        };
+        let lanes = vec![
+            lane_of(1, vec![Some(10.0); 70], (0..70).map(|c| c < 40).collect()),
+            tagteam_engine::timeline::Lane {
+                account: gone.clone(),
+                peaks: vec![Some(50.0); 70],
+                in_use: (0..70).map(|c| c >= 40).collect(),
+            },
+        ];
+        let mut switch = switch_at(in_column(40));
+        switch.trigger = Some("proactive".into());
+        switch.to = Some(gone);
+        arrived(
+            &mut state,
+            with(timeline_view(70, vec![], lanes), vec![switch]),
+        );
+        // T4-10's ` {fit(name, 7):<7} `: the label cut, ending in `…`.
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert!(
+            body.iter().any(|r| r.starts_with(" alex@p… ")),
+            "its lane: {body:?}"
+        );
+        let body = body_of(&state, 120, 40, NOW_MS);
+        let row = body
+            .iter()
+            .find(|r| r.contains("auto switched"))
+            .unwrap_or_else(|| panic!("no switch row: {body:?}"));
+        assert!(
+            row.ends_with("→ alex@personal.example (before it reached the limit)"),
+            "{row:?}"
+        );
+    }
+
+    /// `n` accounts added, one an hour before now, oldest first.
+    fn hourly(n: i64) -> Vec<EventView> {
+        (1..=n)
+            .rev()
+            .map(|k| of_three(NOW_MS - k * HOUR * 1000, EventKind::Add))
+            .collect()
+    }
+
+    #[test]
+    fn the_80_by_24_budget_with_events() {
+        let (mut state, _) = opened(3);
+        arrived(&mut state, with(drawn(70), hourly(12)));
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(body.len(), 20);
+        assert!(
+            body[10].starts_with("      0"),
+            "the chart's last row: {body:?}"
+        );
+        assert!(
+            body[11].starts_with(&" ".repeat(9)) && body[11].ends_with('+'),
+            "the events lane: {body:?}"
+        );
+        assert!(body[12].starts_with(" 1 a1 "), "{body:?}");
+        assert!(body[15].ends_with("now"), "the axis: {body:?}");
+        for row in &body[16..19] {
+            assert!(row.ends_with("+ 3 a3 added"), "{body:?}");
+        }
+        assert_eq!(body[19], "   ⋮ 9 more · z full list");
+    }
+
+    #[test]
+    fn a_range_change_places_the_cursor_where_the_scope_row_says() {
+        // Task 4's stale time: a cursor left before a shorter range drew in column 0 while the
+        // scope row kept its time.
+        use ratatui::style::Modifier;
+        let (mut state, _) = opened(3);
+        update(&mut state, ch(']'), NOW_MS);
+        update(&mut state, ch(']'), NOW_MS);
+        let mut month = drawn(70);
+        month.since_s = NOW_S - 30 * 86_400;
+        let refused = of_three(NOW_MS - 20 * 86_400_000, EventKind::Quarantine);
+        arrived(&mut state, with(month.clone(), vec![refused.clone()]));
+        assert_eq!(state.history.cursor, Cursor::At(refused.at_ms));
+        // `]` to 1 day: once its view arrives, the cursor is on its switch, and the scope row's
+        // time is the column the events lane marks.
+        update(&mut state, ch(']'), NOW_MS);
+        let mut day = drawn(70);
+        day.since_s = NOW_S - 86_400;
+        let switch = three_events().remove(2);
+        arrived(&mut state, with(day.clone(), vec![switch.clone()]));
+        assert_eq!(cursor_said(&state), "11:28");
+        let grid = day.grid();
+        let column = grid.column_of(grid.placed(switch.at_ms)).unwrap();
+        let lane_y = crate::view::areas(&state, Rect::new(0, 0, 80, 24)).body.y + 11;
+        let buf = draw_buffer(&state, 80, 24, NOW_MS);
+        let marked = |x: usize| {
+            let cell = &buf[(layout::CHART_X + x as u16, lane_y)];
+            (
+                cell.symbol().to_owned(),
+                cell.modifier.contains(Modifier::BOLD | Modifier::REVERSED),
+            )
+        };
+        assert_eq!(marked(column), ("⇄".to_owned(), true));
+        // With no auto-line event, at now: the lane's `│` in the last column.
+        update(&mut state, ch('['), NOW_MS);
+        arrived(&mut state, month);
+        assert_eq!(cursor_said(&state), "now");
+        let buf = draw_buffer(&state, 80, 24, NOW_MS);
+        assert_eq!(buf[(layout::CHART_X + 69, lane_y)].symbol(), "│");
+    }
+
+    #[test]
+    fn events_alone_are_something_in_range() {
+        // T4-21: nothing in range is no events, no lanes and no chart value.
+        let (mut state, _) = opened(3);
+        arrived(&mut state, with(nothing(70), three_events()));
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert!(!body.iter().any(|l| l.contains("Nothing")), "{body:?}");
+        assert!(body[16].starts_with("▌  11:28"), "{body:?}");
+    }
+
+    #[test]
+    fn the_footer_names_j_k_and_z_once_there_are_events() {
+        let (mut state, _) = opened(3);
+        arrived(&mut state, drawn(70));
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            footer_row("←/→ cursor  [ ] range  f scope  r refresh", 80)
+        );
+        arrived(&mut state, with(drawn(70), three_events()));
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            footer_row(
+                "←/→ cursor  j/k event  [ ] range  f scope  z list  r refresh",
+                80
+            )
         );
     }
 }

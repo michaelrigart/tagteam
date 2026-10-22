@@ -6,6 +6,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::chrome::WIDE;
 use crate::daemon;
+use crate::screens::history;
 use crate::state::{Screen, State};
 use crate::view::width_of;
 
@@ -319,6 +320,18 @@ pub(crate) const KEYS: &[KeyRow] = &[
     },
     KeyRow {
         screen: Some(Screen::History),
+        keys: "j k ↑ ↓",
+        does: "previous or next event",
+        footer: Footer::Show {
+            key: "j/k",
+            label: |state| history::has_events(state).then_some("event"),
+            from: 0,
+        },
+        #[cfg(test)]
+        probes: STEP,
+    },
+    KeyRow {
+        screen: Some(Screen::History),
         keys: "[ ]",
         does: "range: 1, 7, 14 or 30 days",
         footer: Footer::Show {
@@ -340,6 +353,18 @@ pub(crate) const KEYS: &[KeyRow] = &[
         },
         #[cfg(test)]
         probes: &[plain('f')],
+    },
+    KeyRow {
+        screen: Some(Screen::History),
+        keys: "z",
+        does: "the event list on the whole body",
+        footer: Footer::Show {
+            key: "z",
+            label: |state| history::lists(state).then_some("list"),
+            from: 0,
+        },
+        #[cfg(test)]
+        probes: &[plain('z')],
     },
     KeyRow {
         screen: Some(Screen::History),
@@ -611,6 +636,23 @@ mod tests {
         state
     }
 
+    /// History with three events, the middle one selected: `j` and `k` each move from it, and
+    /// `z` has a list to give the body.
+    fn with_events() -> State {
+        use tagteam_engine::{EventKind, EventSource};
+        let mut view = timeline_view(70, vec![], vec![]);
+        view.events = (1..=3)
+            .rev()
+            .map(|k| {
+                let at = NOW_MS - k * HOUR * 1000;
+                crate::screens::history::event_at(at, EventKind::Add, EventSource::Cli)
+            })
+            .collect();
+        let mut state = history_scoped(Scope::All, view);
+        update(&mut state, ch('j'), NOW_MS);
+        state
+    }
+
     /// Account 1's History with four windows' charts, two of which fit at 80×24.
     fn four_charts() -> State {
         let chart = |label: &str| Series {
@@ -692,6 +734,7 @@ mod tests {
             (Some(Tokens), Char('K'), false) => vec![scrolled(tokens(60))],
             (Some(History), Char('[' | ']' | 'f'), false) => vec![history()],
             (Some(History), Left | Right | Home | End, false) => vec![cursor_moved()],
+            (Some(History), Char('j' | 'k' | 'z') | Down | Up, false) => vec![with_events()],
             (Some(History), Char('J'), false) => vec![four_charts()],
             (Some(History), Char('K'), false) => vec![scrolled(four_charts())],
             other => panic!("no state in which {other:?} acts: the table's row needs one"),
