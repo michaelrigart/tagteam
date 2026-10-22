@@ -28,13 +28,16 @@ pub const DEFAULT_HISTORY_RETENTION_DAYS: u32 = 180;
 pub const DEFAULT_TOKENS_RETENTION_DAYS: u32 = 365;
 pub const DEFAULT_STATUSLINE_FORMAT: &str = "{account} · 5h {5h}% · 7d {7d}%{stale}";
 
-/// §6.4's valid ranges. A value in the file outside its range falls back to the default, with a
-/// warning; a CLI flag is clamped into it. The registry's bounds ([`KEYS`]) are these.
+/// §6.4's valid ranges, each declared once. A value in the file outside its range falls back to
+/// the default, with a warning; a CLI flag is clamped into it. The registry's bounds ([`KEYS`])
+/// are these, and the `u32` fields' ranges lie within `u32` (see `whole`).
 pub const THRESHOLD_RANGE: RangeInclusive<f64> = 50.0..=99.9;
 pub const INTERVAL_SECONDS_RANGE: RangeInclusive<i64> = 15..=3600;
 pub const COOLDOWN_SECONDS_RANGE: RangeInclusive<i64> = 0..=86_400;
 pub const HYSTERESIS_PCT_RANGE: RangeInclusive<f64> = 0.0..=50.0;
-pub const UNHEALTHY_TICKS_RANGE: RangeInclusive<u32> = 1..=100;
+pub const UNHEALTHY_TICKS_RANGE: RangeInclusive<i64> = 1..=100;
+pub const HISTORY_RETENTION_DAYS_RANGE: RangeInclusive<i64> = 1..=3650;
+pub const TOKENS_RETENTION_DAYS_RANGE: RangeInclusive<i64> = 30..=3650;
 
 /// The statusline placeholders §13.5 defines, without their braces. `{model:<name>}` is the one
 /// parameterised placeholder; see [`is_statusline_placeholder`]. The `statusline.format` check
@@ -93,21 +96,12 @@ fn is_provider_id(s: &str) -> bool {
         && !s.ends_with('-')
 }
 
-/// `ui.color`. `NO_COLOR`, `FORCE_COLOR` and `--no-color` are the CLI's to apply on top.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColorMode {
-    Auto,
-    Always,
-    Never,
-}
-
-impl ColorMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ColorMode::Auto => "auto",
-            ColorMode::Always => "always",
-            ColorMode::Never => "never",
-        }
+tagteam_core::str_enum! {
+    /// `ui.color`. `NO_COLOR`, `FORCE_COLOR` and `--no-color` are the CLI's to apply on top.
+    pub enum ColorMode {
+        Auto => "auto",
+        Always => "always",
+        Never => "never",
     }
 }
 
@@ -141,18 +135,37 @@ impl NotifyEvent {
     }
 }
 
+/// What a `Choice` key's value must be: one of an enum's spellings, in its `ALL` order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choices {
+    /// `autoswitch.strategy`: [`AutoStrategy`]'s spellings.
+    Strategy,
+    /// `ui.color`: [`ColorMode`]'s spellings.
+    Color,
+}
+
+impl Choices {
+    /// The spellings, in the enum's `ALL` order.
+    pub fn values(self) -> Vec<&'static str> {
+        match self {
+            Choices::Strategy => AutoStrategy::ALL.map(AutoStrategy::as_str).to_vec(),
+            Choices::Color => ColorMode::ALL.map(ColorMode::as_str).to_vec(),
+        }
+    }
+}
+
 /// What a key holds: how it is read from the file, parsed from the command line and written.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum KeyKind {
-    /// A number in `min..=max`. The file may hold it as an integer.
-    Float { min: f64, max: f64 },
-    /// A whole number in `min..=max`.
-    Int { min: i64, max: i64 },
+    /// A number in the range. The file may hold it as an integer.
+    Float(&'static RangeInclusive<f64>),
+    /// A whole number in the range.
+    Int(&'static RangeInclusive<i64>),
     /// In the file a TOML boolean, the integer 1 or 0, or one of [`parse_bool`]'s words as a
     /// string; on the command line the words alone. A write stores a TOML boolean.
     Bool,
-    /// One of these strings, exactly.
-    Choice(&'static [&'static str]),
+    /// One of the enum's spellings, exactly.
+    Choice(Choices),
     /// `autoswitch.models`: model display names, or `all` alone. A name repeated in another
     /// case collapses into its first spelling.
     Models,
@@ -179,11 +192,8 @@ pub struct Key {
     pub per_provider: bool,
 }
 
-const STRATEGIES: &[&str] = &["best", "consume-first"];
-const COLORS: &[&str] = &["auto", "always", "never"];
-
-/// Every §6.4 key, in the order of the spec's table, then the daemon's three (D7). The
-/// auto-switch bounds are M3b's `*_RANGE` constants, which `auto` clamps its flags to.
+/// Every §6.4 key, in the order of the spec's table, then the daemon's three (D7). The numeric
+/// bounds are the `*_RANGE` constants, which `auto` also clamps its flags to.
 pub const KEYS: &[Key] = &[
     Key {
         name: "default_provider",
@@ -192,39 +202,27 @@ pub const KEYS: &[Key] = &[
     },
     Key {
         name: "autoswitch.threshold",
-        kind: KeyKind::Float {
-            min: *THRESHOLD_RANGE.start(),
-            max: *THRESHOLD_RANGE.end(),
-        },
+        kind: KeyKind::Float(&THRESHOLD_RANGE),
         per_provider: true,
     },
     Key {
         name: "autoswitch.interval_seconds",
-        kind: KeyKind::Int {
-            min: *INTERVAL_SECONDS_RANGE.start(),
-            max: *INTERVAL_SECONDS_RANGE.end(),
-        },
+        kind: KeyKind::Int(&INTERVAL_SECONDS_RANGE),
         per_provider: true,
     },
     Key {
         name: "autoswitch.cooldown_seconds",
-        kind: KeyKind::Int {
-            min: *COOLDOWN_SECONDS_RANGE.start(),
-            max: *COOLDOWN_SECONDS_RANGE.end(),
-        },
+        kind: KeyKind::Int(&COOLDOWN_SECONDS_RANGE),
         per_provider: true,
     },
     Key {
         name: "autoswitch.hysteresis_pct",
-        kind: KeyKind::Float {
-            min: *HYSTERESIS_PCT_RANGE.start(),
-            max: *HYSTERESIS_PCT_RANGE.end(),
-        },
+        kind: KeyKind::Float(&HYSTERESIS_PCT_RANGE),
         per_provider: true,
     },
     Key {
         name: "autoswitch.strategy",
-        kind: KeyKind::Choice(STRATEGIES),
+        kind: KeyKind::Choice(Choices::Strategy),
         per_provider: true,
     },
     Key {
@@ -234,10 +232,7 @@ pub const KEYS: &[Key] = &[
     },
     Key {
         name: "autoswitch.unhealthy_ticks",
-        kind: KeyKind::Int {
-            min: *UNHEALTHY_TICKS_RANGE.start() as i64,
-            max: *UNHEALTHY_TICKS_RANGE.end() as i64,
-        },
+        kind: KeyKind::Int(&UNHEALTHY_TICKS_RANGE),
         per_provider: true,
     },
     Key {
@@ -247,12 +242,12 @@ pub const KEYS: &[Key] = &[
     },
     Key {
         name: "usage.history_retention_days",
-        kind: KeyKind::Int { min: 1, max: 3650 },
+        kind: KeyKind::Int(&HISTORY_RETENTION_DAYS_RANGE),
         per_provider: false,
     },
     Key {
         name: "tokens.retention_days",
-        kind: KeyKind::Int { min: 30, max: 3650 },
+        kind: KeyKind::Int(&TOKENS_RETENTION_DAYS_RANGE),
         per_provider: false,
     },
     Key {
@@ -267,7 +262,7 @@ pub const KEYS: &[Key] = &[
     },
     Key {
         name: "ui.color",
-        kind: KeyKind::Choice(COLORS),
+        kind: KeyKind::Choice(Choices::Color),
         per_provider: false,
     },
     Key {
@@ -307,11 +302,13 @@ impl Key {
     }
 
     /// What a valid value is, as every warning and refusal words it: "must be a number from 50
-    /// to 99.9". The auto-switch keys' phrases are M3b's, which `auto`'s tests pin.
+    /// to 99.9". The auto-switch keys' phrases are the ones `auto`'s tests pin.
     pub fn expect(&self) -> String {
         match self.kind {
-            KeyKind::Float { min, max } => format!("must be a number from {min} to {max}"),
-            KeyKind::Int { min, max } => {
+            KeyKind::Float(range) => {
+                format!("must be a number from {} to {}", range.start(), range.end())
+            }
+            KeyKind::Int(range) => {
                 let unit = if self.name.ends_with("_days") {
                     " of days"
                 } else if self.name.ends_with("_seconds") {
@@ -321,10 +318,14 @@ impl Key {
                 } else {
                     ""
                 };
-                format!("must be a whole number{unit} from {min} to {max}")
+                format!(
+                    "must be a whole number{unit} from {} to {}",
+                    range.start(),
+                    range.end()
+                )
             }
             KeyKind::Bool => "must be true, false, 1, 0, yes or no".to_owned(),
-            KeyKind::Choice(values) => format!("must be {}", one_of(values)),
+            KeyKind::Choice(choices) => format!("must be {}", one_of(&choices.values())),
             KeyKind::Models => {
                 "must be a model name, a list of model names, or [\"all\"] alone".to_owned()
             }
@@ -353,20 +354,23 @@ impl Key {
     /// `warn`, which gets the text that follows the key in the warning, and the rest stand.
     pub fn parse_item(&self, item: &Item, warn: &mut dyn FnMut(String)) -> Option<Value> {
         match self.kind {
-            KeyKind::Float { min, max } => {
+            KeyKind::Float(range) => {
                 let n = item
                     .as_float()
                     .or_else(|| item.as_integer().map(|i| i as f64))?;
-                (min..=max).contains(&n).then_some(Value::Float(n))
+                range.contains(&n).then_some(Value::Float(n))
             }
-            KeyKind::Int { min, max } => {
+            KeyKind::Int(range) => {
                 let n = item.as_integer()?;
-                (min..=max).contains(&n).then_some(Value::Int(n))
+                range.contains(&n).then_some(Value::Int(n))
             }
             KeyKind::Bool => parse_bool_item(item).map(Value::Bool),
-            KeyKind::Choice(values) => {
+            KeyKind::Choice(choices) => {
                 let s = item.as_str()?;
-                values.contains(&s).then(|| Value::Str(s.to_owned()))
+                choices
+                    .values()
+                    .contains(&s)
+                    .then(|| Value::Str(s.to_owned()))
             }
             KeyKind::Models => models_from_item(item).map(Value::List),
             KeyKind::Format => {
@@ -389,23 +393,25 @@ impl Key {
     /// `Err` is the reason, starting with "must be".
     pub fn parse_arg(&self, raw: &str) -> Result<Value, String> {
         match self.kind {
-            KeyKind::Float { min, max } => raw
+            KeyKind::Float(range) => raw
                 .parse::<f64>()
                 .ok()
-                .filter(|n| (min..=max).contains(n))
+                .filter(|n| range.contains(n))
                 // `-0` is in range, and a float keeps its sign: `+ 0.0` makes it a plain zero.
                 .map(|n| Value::Float(n + 0.0))
                 .ok_or_else(|| self.expect()),
-            KeyKind::Int { min, max } => raw
+            KeyKind::Int(range) => raw
                 .parse::<i64>()
                 .ok()
-                .filter(|n| (min..=max).contains(n))
+                .filter(|n| range.contains(n))
                 .map(Value::Int)
                 .ok_or_else(|| self.expect()),
             KeyKind::Bool => parse_bool(raw)
                 .map(Value::Bool)
                 .ok_or_else(|| self.expect()),
-            KeyKind::Choice(values) if values.contains(&raw) => Ok(Value::Str(raw.to_owned())),
+            KeyKind::Choice(choices) if choices.values().contains(&raw) => {
+                Ok(Value::Str(raw.to_owned()))
+            }
             KeyKind::Choice(_) => Err(self.expect()),
             KeyKind::Models => {
                 let names = list_arg(raw, "model names")?;
@@ -780,25 +786,29 @@ pub struct Settings {
     /// names it invalidly; the CLI falls back to the registry's first provider (C-3). Whether
     /// this build has the one it names is the CLI's to check.
     pub default_provider: Option<ProviderId>,
-    /// `autoswitch.threshold`: 50–99.9. The provider's own table first.
+    /// `autoswitch.threshold`, in [`THRESHOLD_RANGE`]. The provider's own table first.
     pub threshold: f64,
-    /// `autoswitch.interval_seconds`: 15–3600. The provider's own table first.
+    /// `autoswitch.interval_seconds`, in [`INTERVAL_SECONDS_RANGE`]. The provider's own table
+    /// first.
     pub interval_seconds: i64,
-    /// `autoswitch.cooldown_seconds`: 0–86400. The provider's own table first.
+    /// `autoswitch.cooldown_seconds`, in [`COOLDOWN_SECONDS_RANGE`]. The provider's own table
+    /// first.
     pub cooldown_seconds: i64,
-    /// `autoswitch.hysteresis_pct`: 0–50. The provider's own table first.
+    /// `autoswitch.hysteresis_pct`, in [`HYSTERESIS_PCT_RANGE`]. The provider's own table first.
     pub hysteresis_pct: f64,
     /// `autoswitch.strategy`: `best` or `consume-first`. The provider's own table first.
     pub strategy: AutoStrategy,
     /// `autoswitch.include_api_key_accounts`. The provider's own table first.
     pub include_api_key_accounts: bool,
-    /// `autoswitch.unhealthy_ticks`: 1–100. The provider's own table first.
+    /// `autoswitch.unhealthy_ticks`, in [`UNHEALTHY_TICKS_RANGE`]. The provider's own table
+    /// first.
     pub unhealthy_ticks: u32,
     /// `autoswitch.models`: model display names, or `all`. The provider's own table first.
     pub models: Vec<String>,
-    /// `usage.history_retention_days`: 1–3650.
+    /// `usage.history_retention_days`, in [`HISTORY_RETENTION_DAYS_RANGE`].
     pub history_retention_days: u32,
-    /// `tokens.retention_days`: 30–3650 (token report spec §4 Retention).
+    /// `tokens.retention_days`, in [`TOKENS_RETENTION_DAYS_RANGE`] (token report spec §4
+    /// Retention).
     pub tokens_retention_days: u32,
     /// `statusline.format`. The provider's own table first.
     pub statusline_format: String,
@@ -914,7 +924,8 @@ impl Settings {
             ("autoswitch.cooldown_seconds", Value::Int(n)) => self.cooldown_seconds = n,
             ("autoswitch.hysteresis_pct", Value::Float(n)) => self.hysteresis_pct = n,
             ("autoswitch.strategy", Value::Str(s)) => {
-                self.strategy = AutoStrategy::parse(&s).unwrap_or(AutoStrategy::Best)
+                self.strategy = AutoStrategy::parse(&s)
+                    .expect("parse_item admits only AutoStrategy::ALL's spellings")
             }
             ("autoswitch.include_api_key_accounts", Value::Bool(b)) => {
                 self.include_api_key_accounts = b
@@ -928,11 +939,8 @@ impl Settings {
             ("statusline.format", Value::Str(s)) => self.statusline_format = s,
             ("run.share_extra", Value::List(names)) => self.share_extra = names,
             ("ui.color", Value::Str(s)) => {
-                self.color = match s.as_str() {
-                    "always" => ColorMode::Always,
-                    "never" => ColorMode::Never,
-                    _ => ColorMode::Auto,
-                }
+                self.color =
+                    ColorMode::parse(&s).expect("parse_item admits only ColorMode::ALL's spellings")
             }
             ("daemon.autoswitch", Value::Bool(b)) => self.daemon_autoswitch = b,
             ("notify.enabled", Value::Bool(b)) => self.notify_enabled = b,
@@ -944,9 +952,9 @@ impl Settings {
     }
 }
 
-/// An `Int` key's value as a `u32` field holds it: the ranges of `autoswitch.unhealthy_ticks`,
-/// `usage.history_retention_days` and `tokens.retention_days` lie within `u32`. The two seconds
-/// keys are `i64`, as M3b's `AutoConfig` takes them.
+/// An `Int` key's value as a `u32` field holds it: [`UNHEALTHY_TICKS_RANGE`],
+/// [`HISTORY_RETENTION_DAYS_RANGE`] and [`TOKENS_RETENTION_DAYS_RANGE`] lie within `u32`. The two
+/// seconds keys are `i64`, as `AutoConfig` takes them.
 fn whole(n: i64) -> u32 {
     u32::try_from(n).expect("a u32 field's Int range lies within u32")
 }

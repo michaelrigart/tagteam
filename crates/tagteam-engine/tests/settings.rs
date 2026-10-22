@@ -7,10 +7,11 @@ use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::AutoStrategy;
 use tagteam_core::tokens::{CardOverride, PriceOverride};
 use tagteam_engine::settings::{
-    self, COOLDOWN_SECONDS_RANGE, ColorMode, HYSTERESIS_PCT_RANGE, INTERVAL_SECONDS_RANGE,
-    Inspection, KEYS, Key, KeyKind, KeyState, NotifyEvent, STATUSLINE_PLACEHOLDERS, Settings,
-    SettingsError, Source, THRESHOLD_RANGE, UNHEALTHY_TICKS_RANGE, Value, inspect,
-    is_statusline_placeholder, parse_bool, resolve,
+    self, COOLDOWN_SECONDS_RANGE, Choices, ColorMode, HISTORY_RETENTION_DAYS_RANGE,
+    HYSTERESIS_PCT_RANGE, INTERVAL_SECONDS_RANGE, Inspection, KEYS, Key, KeyKind, KeyState,
+    NotifyEvent, STATUSLINE_PLACEHOLDERS, Settings, SettingsError, Source, THRESHOLD_RANGE,
+    TOKENS_RETENTION_DAYS_RANGE, UNHEALTHY_TICKS_RANGE, Value, inspect, is_statusline_placeholder,
+    parse_bool, resolve,
 };
 use tagteam_provider::Env;
 
@@ -1019,77 +1020,123 @@ fn list(names: &[&str]) -> Value {
 
 #[test]
 fn the_registry_is_section_six_four_s_table_in_order() {
-    let rows: Vec<(&str, KeyKind, bool)> = KEYS
+    /// A key's kind as the table below states it: a range by its ends, a choice by its values.
+    #[derive(Debug, PartialEq)]
+    enum Shape {
+        Float(f64, f64),
+        Int(i64, i64),
+        Choice(Vec<&'static str>),
+        Other(KeyKind),
+    }
+    let shape = |kind: KeyKind| match kind {
+        KeyKind::Float(r) => Shape::Float(*r.start(), *r.end()),
+        KeyKind::Int(r) => Shape::Int(*r.start(), *r.end()),
+        KeyKind::Choice(c) => Shape::Choice(c.values()),
+        other => Shape::Other(other),
+    };
+    let rows: Vec<(&str, Shape, bool)> = KEYS
         .iter()
-        .map(|k| (k.name, k.kind, k.per_provider))
+        .map(|k| (k.name, shape(k.kind), k.per_provider))
         .collect();
     assert_eq!(
         rows,
         vec![
-            ("default_provider", KeyKind::Provider, false),
-            (
-                "autoswitch.threshold",
-                KeyKind::Float {
-                    min: 50.0,
-                    max: 99.9
-                },
-                true
-            ),
-            (
-                "autoswitch.interval_seconds",
-                KeyKind::Int { min: 15, max: 3600 },
-                true
-            ),
-            (
-                "autoswitch.cooldown_seconds",
-                KeyKind::Int {
-                    min: 0,
-                    max: 86_400
-                },
-                true
-            ),
-            (
-                "autoswitch.hysteresis_pct",
-                KeyKind::Float {
-                    min: 0.0,
-                    max: 50.0
-                },
-                true
-            ),
+            ("default_provider", Shape::Other(KeyKind::Provider), false),
+            ("autoswitch.threshold", Shape::Float(50.0, 99.9), true),
+            ("autoswitch.interval_seconds", Shape::Int(15, 3600), true),
+            ("autoswitch.cooldown_seconds", Shape::Int(0, 86_400), true),
+            ("autoswitch.hysteresis_pct", Shape::Float(0.0, 50.0), true),
             (
                 "autoswitch.strategy",
-                KeyKind::Choice(&["best", "consume-first"]),
+                Shape::Choice(vec!["best", "consume-first"]),
                 true
             ),
-            ("autoswitch.include_api_key_accounts", KeyKind::Bool, true),
             (
-                "autoswitch.unhealthy_ticks",
-                KeyKind::Int { min: 1, max: 100 },
+                "autoswitch.include_api_key_accounts",
+                Shape::Other(KeyKind::Bool),
                 true
             ),
-            ("autoswitch.models", KeyKind::Models, true),
-            (
-                "usage.history_retention_days",
-                KeyKind::Int { min: 1, max: 3650 },
-                false
-            ),
-            (
-                "tokens.retention_days",
-                KeyKind::Int { min: 30, max: 3650 },
-                false
-            ),
-            ("statusline.format", KeyKind::Format, true),
-            ("run.share_extra", KeyKind::ShareNames, true),
+            ("autoswitch.unhealthy_ticks", Shape::Int(1, 100), true),
+            ("autoswitch.models", Shape::Other(KeyKind::Models), true),
+            ("usage.history_retention_days", Shape::Int(1, 3650), false),
+            ("tokens.retention_days", Shape::Int(30, 3650), false),
+            ("statusline.format", Shape::Other(KeyKind::Format), true),
+            ("run.share_extra", Shape::Other(KeyKind::ShareNames), true),
             (
                 "ui.color",
-                KeyKind::Choice(&["auto", "always", "never"]),
+                Shape::Choice(vec!["auto", "always", "never"]),
                 false
             ),
-            ("daemon.autoswitch", KeyKind::Bool, true),
-            ("notify.enabled", KeyKind::Bool, false),
-            ("notify.events", KeyKind::NotifyEvents, true),
+            ("daemon.autoswitch", Shape::Other(KeyKind::Bool), true),
+            ("notify.enabled", Shape::Other(KeyKind::Bool), false),
+            ("notify.events", Shape::Other(KeyKind::NotifyEvents), true),
         ]
     );
+}
+
+#[test]
+fn the_choice_keys_say_their_enums_spellings_in_order() {
+    // review refactor §8.9: a choice key's values are its enum's `ALL`, not a second list.
+    let strategy = reg("autoswitch.strategy");
+    let color = reg("ui.color");
+    assert_eq!(strategy.expect(), "must be \"best\" or \"consume-first\"");
+    assert_eq!(color.expect(), "must be \"auto\", \"always\" or \"never\"");
+    assert_eq!(strategy.kind, KeyKind::Choice(Choices::Strategy));
+    assert_eq!(color.kind, KeyKind::Choice(Choices::Color));
+    assert_eq!(
+        Choices::Strategy.values(),
+        AutoStrategy::ALL.map(AutoStrategy::as_str)
+    );
+    assert_eq!(
+        Choices::Color.values(),
+        ColorMode::ALL.map(ColorMode::as_str)
+    );
+}
+
+#[test]
+fn every_numeric_key_reads_its_declared_range() {
+    // review refactor §8.9: each range is declared once, and the registry holds that constant.
+    let kind = |name: &str| reg(name).kind;
+    assert_eq!(
+        kind("autoswitch.threshold"),
+        KeyKind::Float(&THRESHOLD_RANGE)
+    );
+    assert_eq!(
+        kind("autoswitch.interval_seconds"),
+        KeyKind::Int(&INTERVAL_SECONDS_RANGE)
+    );
+    assert_eq!(
+        kind("autoswitch.cooldown_seconds"),
+        KeyKind::Int(&COOLDOWN_SECONDS_RANGE)
+    );
+    assert_eq!(
+        kind("autoswitch.hysteresis_pct"),
+        KeyKind::Float(&HYSTERESIS_PCT_RANGE)
+    );
+    assert_eq!(
+        kind("autoswitch.unhealthy_ticks"),
+        KeyKind::Int(&UNHEALTHY_TICKS_RANGE)
+    );
+    assert_eq!(
+        kind("usage.history_retention_days"),
+        KeyKind::Int(&HISTORY_RETENTION_DAYS_RANGE)
+    );
+    assert_eq!(
+        kind("tokens.retention_days"),
+        KeyKind::Int(&TOKENS_RETENTION_DAYS_RANGE)
+    );
+    assert_eq!(HISTORY_RETENTION_DAYS_RANGE, 1..=3650);
+    assert_eq!(TOKENS_RETENTION_DAYS_RANGE, 30..=3650);
+    // `whole` narrows these three to the `u32` fields.
+    for range in [
+        &UNHEALTHY_TICKS_RANGE,
+        &HISTORY_RETENTION_DAYS_RANGE,
+        &TOKENS_RETENTION_DAYS_RANGE,
+    ] {
+        for end in [range.start(), range.end()] {
+            assert!(u32::try_from(*end).is_ok(), "{end}");
+        }
+    }
 }
 
 #[test]
@@ -1220,14 +1267,20 @@ fn each_key_says_what_a_valid_value_is() {
 /// The numbers at a numeric kind's bounds, and just outside them, as TOML.
 fn bounds(kind: KeyKind) -> (Vec<String>, Vec<String>) {
     match kind {
-        KeyKind::Float { min, max } => (
-            vec![format!("{min:?}"), format!("{max:?}")],
-            vec![format!("{:?}", min - 0.1), format!("{:?}", max + 0.1)],
-        ),
-        KeyKind::Int { min, max } => (
-            vec![min.to_string(), max.to_string()],
-            vec![(min - 1).to_string(), (max + 1).to_string()],
-        ),
+        KeyKind::Float(r) => {
+            let (min, max) = (*r.start(), *r.end());
+            (
+                vec![format!("{min:?}"), format!("{max:?}")],
+                vec![format!("{:?}", min - 0.1), format!("{:?}", max + 0.1)],
+            )
+        }
+        KeyKind::Int(r) => {
+            let (min, max) = (*r.start(), *r.end());
+            (
+                vec![min.to_string(), max.to_string()],
+                vec![(min - 1).to_string(), (max + 1).to_string()],
+            )
+        }
         _ => (Vec::new(), Vec::new()),
     }
 }
@@ -1851,10 +1904,10 @@ fn every_spelling_a_choice_key_declares_reads_back_as_itself() {
     // `apply` falls back to a default for a spelling it does not know; no declared one may.
     let mut spellings = 0;
     for key in KEYS {
-        let KeyKind::Choice(values) = key.kind else {
+        let KeyKind::Choice(choices) = key.kind else {
             continue;
         };
-        for &spelling in values {
+        for spelling in choices.values() {
             spellings += 1;
             let value = Value::Str(spelling.to_owned());
             let text = written(key, &value);

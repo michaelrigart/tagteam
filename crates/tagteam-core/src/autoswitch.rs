@@ -7,27 +7,11 @@ use crate::ids::AccountId;
 use crate::rank::{binding_window, blocked_until};
 use crate::usage::{Window, headroom};
 
-/// `autoswitch.strategy` (§6.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutoStrategy {
-    Best,
-    ConsumeFirst,
-}
-
-impl AutoStrategy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            AutoStrategy::Best => "best",
-            AutoStrategy::ConsumeFirst => "consume-first",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "best" => Some(AutoStrategy::Best),
-            "consume-first" => Some(AutoStrategy::ConsumeFirst),
-            _ => None,
-        }
+crate::str_enum! {
+    /// `autoswitch.strategy` (§6.4).
+    pub enum AutoStrategy {
+        Best => "best",
+        ConsumeFirst => "consume-first",
     }
 }
 
