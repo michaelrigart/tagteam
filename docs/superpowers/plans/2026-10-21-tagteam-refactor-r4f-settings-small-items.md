@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/38 (R4f: Tasks 1–2; Tasks 3–5 ship as R4f2)
 **Branch:** `refactor-r4f-settings-small-items`, based on `refactor-r4e2-event-writers`
 **Goal:** A settings registry the compiler checks (§8.8), one millisecond-to-second conversion (CC-E-8), one stated quarantine-reason fallback (CC-E-12), and serde structs for the store's hand-written JSON (CC-E-18, -19 part); every output and stored byte unchanged.
 **Architecture:** Settings first (Tasks 1–2): enums through R4e's `str_enum!`, kinds holding their sets and ranges, and a crate-private `KeyId` matched exhaustively. Then one time helper (3), one reason reader (4) and two serde structs (5).
