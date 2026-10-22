@@ -69,8 +69,8 @@ pub use keychain::{Keychain, KeychainError, LockState, ReadCounts, ReadTally};
 pub use liveness::{FakeProcess, FakeProcessProbe};
 pub use liveness::{
     ProcStart, ProcessProbe, RecordEntry, SessionRecord, SystemProcessProbe, parse_lstart,
-    parse_session_record, read_session_records, read_session_records_dated, read_supervisor_lock,
-    record_is_live,
+    parse_session_record, read_session_records, read_supervisor_lock, record_is_live,
+    session_record_path,
 };
 pub use mkdir_lock::TimedOut;
 pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};

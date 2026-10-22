@@ -22,6 +22,7 @@ use crate::flock::MutationGuard;
 use crate::http::{Http, HttpError, HttpResponse};
 use crate::import::ForeignFormat;
 use crate::keychain::{KeychainError, LockState};
+use crate::liveness::SessionRecord;
 use crate::mkdir_lock::LockError;
 use crate::process::ProcessSpawner;
 use crate::read::{Read, ReadError};
@@ -806,10 +807,17 @@ pub trait Provider: Send + Sync {
     /// Where the profile's background supervisor records itself, for an agent whose supervisor
     /// writes no session record of its own (CC 2.1.292: `<profile>/daemon.lock`, §12.6). A live
     /// supervisor there makes the profile session-owned; one that cannot be read counts as
-    /// unreadable. `None`: the agent has no such file.
+    /// unreadable. `None`: the agent has no such file. Its content is read with
+    /// `parse_session_record`.
     fn supervisor_lock(&self, _profile: &Path) -> Option<PathBuf> {
         None
     }
+    /// §12.6: one of this agent's session records, or its supervisor lock's content, reduced to
+    /// what liveness and the token report need. Bytes that are no record are `Err(detail)`, and
+    /// `detail` never quotes them. `pid` is 1 through `i32::MAX`, never a process group.
+    fn parse_session_record(&self, bytes: &[u8]) -> Result<SessionRecord, String>;
+    /// A record's file extension: records are `<session_records_dir>/<pid>.<ext>`.
+    fn session_record_ext(&self) -> &'static str;
     /// §8.1, §12.5: the profile's credential, read as the agent reads it (Decision 19): the
     /// Keychain item named from `spelling`, the marker's recorded spelling, then the credential
     /// file in `dir`, the profile's actual directory.

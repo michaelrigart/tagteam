@@ -11,8 +11,8 @@ use std::sync::Arc;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::{
     MARKER_FILE, PendingEntry, PendingFile, PendingLaunch, ProfileMarker, Provider, Read,
-    RecordEntry, parse_session_record, profile_path, read_own_bytes, read_session_records_dated,
-    record_is_live,
+    RecordEntry, profile_path, read_own_bytes, read_session_records, record_is_live,
+    session_record_path,
 };
 
 use crate::engine::Engine;
@@ -125,7 +125,12 @@ impl Engine {
                 let _ = hooks::point(self, "scan-record-read");
                 at
             };
-            let Read::Present(entries) = read_session_records_dated(&dir, &mut clock) else {
+            let Read::Present(entries) = read_session_records(
+                &dir,
+                p.session_record_ext(),
+                &|b| p.parse_session_record(b),
+                &mut clock,
+            ) else {
                 continue;
             };
             for (entry, read_at) in entries {
@@ -428,7 +433,8 @@ impl Engine {
         state: &mut LaunchPoll,
     ) -> Result<(), EngineError> {
         let p = self.provider(&id.provider)?;
-        let record = p.session_records_dir(profile).join(format!("{pid}.json"));
+        let record =
+            session_record_path(&p.session_records_dir(profile), pid, p.session_record_ext());
         let mtime = match fs::metadata(&record) {
             Ok(meta) => i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
             // Not written yet, or already removed at the child's exit.
@@ -448,7 +454,7 @@ impl Engine {
         let read_at = self.now_ms();
         hooks::point(self, "launch-record-read")?;
         let named = read
-            .and_then(|bytes| parse_session_record(&bytes).ok())
+            .and_then(|bytes| p.parse_session_record(&bytes).ok())
             .filter(|r| {
                 r.pid == pid
                     && r.started_at_ms.is_some_and(|at| at >= id.started_at_ms)
@@ -723,10 +729,11 @@ impl Engine {
         for _ in 0..MAX_ANCESTORS {
             pid = self.process.parent_pid(pid).filter(|&parent| parent > 1)?;
             hooks::point(self, "statusline-ancestor").ok()?;
-            let Ok(bytes) = fs::read(records.join(format!("{pid}.json"))) else {
+            let Ok(bytes) = fs::read(session_record_path(records, pid, p.session_record_ext()))
+            else {
                 continue;
             };
-            let Ok(r) = parse_session_record(&bytes) else {
+            let Ok(r) = p.parse_session_record(&bytes) else {
                 continue;
             };
             if r.pid == pid && record_is_live(self.process.as_ref(), &r, p.launch_command()) {
