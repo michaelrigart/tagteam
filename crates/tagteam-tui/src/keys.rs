@@ -228,7 +228,7 @@ pub(crate) const KEYS: &[KeyRow] = &[
     KeyRow {
         screen: Some(Screen::Tokens),
         keys: "p",
-        does: "period: day, month, session or block",
+        does: "period: day, month, session or 5h block",
         footer: Footer::Show {
             key: "p",
             label: |_| Some("period"),
@@ -264,7 +264,7 @@ pub(crate) const KEYS: &[KeyRow] = &[
     KeyRow {
         screen: Some(Screen::Tokens),
         keys: "[ ]",
-        does: "range: 7, 30 or 90 days, or all",
+        does: "range: 7, 30 or 90 days, or all time",
         footer: Footer::Show {
             key: "[ ]",
             label: |_| Some("range"),

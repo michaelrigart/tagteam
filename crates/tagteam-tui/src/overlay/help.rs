@@ -31,8 +31,16 @@ const MARKS: &[(&str, Role, &str)] = &[
     ("✕", Role::Crit, "needs you"),
     ("!", Role::Warn, "tagteam retries"),
     ("✓", Role::Ok, "done"),
-    ("≥", Role::Text, "at least"),
-    ("~", Role::Text, "estimated"),
+    (
+        "≥",
+        Role::Warn,
+        "at least: still being counted, or a cost missing some prices",
+    ),
+    (
+        "~",
+        Role::Text,
+        "estimated: a 5h block placed by rule, not read from a reset",
+    ),
     ("›", Role::Muted, "breadcrumb"),
     ("·", Role::Muted, "separator"),
     ("⏎", Role::Accent, "Enter"),
@@ -59,6 +67,14 @@ const RATE: (&str, &str) = (
     "%/h",
     "how fast a window fills: a fit through its last two days of readings, or its average so \
      far when there are too few",
+);
+
+/// What Tokens' cache-write halves are (T5-25): `CACHE W 5M` and `1H` are columns, not marks, so
+/// the help names them beside the rate.
+const CACHE: (&str, &str) = (
+    "5M 1H",
+    "CACHE W 5M and 1H, from 160 columns: cache writes kept 5 minutes and 1 hour; CACHE W is \
+     both",
 );
 
 pub(super) fn key(state: &State, scroll: &mut u16, key: KeyEvent) -> KeyOutcome {
@@ -116,21 +132,24 @@ pub(super) fn rows(state: &State, width: u16) -> Vec<Line<'static>> {
         }
         lines
     };
-    // One lead column for every mark, as wide as the widest, so their words line up.
-    let (rate, words) = RATE;
+    // One lead column for the rate, the cache halves and every mark, as wide as the widest, so
+    // their words line up.
     let marks_listed = marks(theme);
     let lead_width = marks_listed
         .iter()
         .map(|(glyph, _, _)| width_of(glyph))
-        .fold(width_of(rate), usize::max);
+        .chain([RATE, CACHE].map(|(lead, _)| width_of(lead)))
+        .fold(1, usize::max);
     let mut marks = vec![title("Marks")];
-    marks.extend(entry(
-        rate,
-        theme.role(Role::Muted),
-        words,
-        lead_width,
-        column,
-    ));
+    for (lead, words) in [RATE, CACHE] {
+        marks.extend(entry(
+            lead,
+            theme.role(Role::Muted),
+            words,
+            lead_width,
+            column,
+        ));
+    }
     for (glyph, role, words) in &marks_listed {
         marks.extend(entry(glyph, theme.role(*role), words, lead_width, column));
     }
@@ -421,7 +440,7 @@ mod tests {
 
     #[test]
     fn every_mark_s_words_start_in_one_column() {
-        // `%/h` is three columns wide: the glyphs' words line up with its words, not short of them.
+        // `5M 1H` is five columns wide: the glyphs' words line up with its words and `%/h`'s.
         let state = open(Screen::Accounts);
         for width in [80, 99] {
             let rows = rows(&state, width);
@@ -440,7 +459,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 starts.len(),
-                marks(state.theme).len() + 1,
+                marks(state.theme).len() + 2,
                 "{width}: {starts:?}"
             );
             assert!(
@@ -484,6 +503,74 @@ mod tests {
                         .unwrap_or_else(|| panic!("{glyph} {words} at {width}"));
                     assert_eq!(lead.content, glyph, "{words} {theme:?}");
                     assert_eq!(lead.style, theme.role(role), "{glyph} {words} {theme:?}");
+                }
+            }
+        }
+    }
+
+    /// The entry led by `lead` in either column: its lead span and its words, its continuation
+    /// rows' (those under it at the same column, with a blank lead) joined on.
+    fn entry_led_by(rows: &[Line<'static>], lead: &str) -> Option<(Span<'static>, String)> {
+        // Each row's entries as (column, lead span, words).
+        let entries = |line: &Line<'static>| -> Vec<(usize, Span<'static>, String)> {
+            let mut x = 0;
+            let mut found = Vec::new();
+            for (i, span) in line.spans.iter().enumerate() {
+                if span.content == "  " && i + 3 < line.spans.len() {
+                    let words = line.spans[i + 3].content.trim().to_owned();
+                    found.push((x, line.spans[i + 1].clone(), words));
+                }
+                x += width_of(&span.content);
+            }
+            found
+        };
+        rows.iter().enumerate().find_map(|(at, line)| {
+            let (x, span, words) = entries(line)
+                .into_iter()
+                .find(|(_, span, _)| span.content.trim() == lead)?;
+            let mut said = vec![words];
+            for next in &rows[at + 1..] {
+                let below = entries(next).into_iter().find(|(nx, _, _)| *nx == x);
+                match below {
+                    Some((_, lead, words)) if lead.content.trim().is_empty() => said.push(words),
+                    _ => break,
+                }
+            }
+            Some((span, said.join(" ")))
+        })
+    }
+
+    #[test]
+    fn the_marks_explain_at_least_estimated_and_the_cache_write_halves() {
+        // T5-25: §9.2's legend decodes Tokens' `≥`, `~` and `CACHE W 5M`/`1H`.
+        for theme in TIERS {
+            let mut state = open(Screen::Tokens);
+            state.theme = theme;
+            for width in [80, 120] {
+                let rows = rows(&state, width);
+                for (lead, role, words) in [
+                    (
+                        "≥",
+                        Role::Warn,
+                        "at least: still being counted, or a cost missing some prices",
+                    ),
+                    (
+                        "~",
+                        Role::Text,
+                        "estimated: a 5h block placed by rule, not read from a reset",
+                    ),
+                    (
+                        "5M 1H",
+                        Role::Muted,
+                        "CACHE W 5M and 1H, from 160 columns: cache writes kept 5 minutes and \
+                         1 hour; CACHE W is both",
+                    ),
+                ] {
+                    let (span, said) = entry_led_by(&rows, lead)
+                        .unwrap_or_else(|| panic!("{lead} at {width}: {rows:?}"));
+                    assert_eq!(span.content.trim(), lead, "{theme:?} {width}");
+                    assert_eq!(span.style, theme.role(role), "{lead} {theme:?} {width}");
+                    assert_eq!(said, words, "{lead} {theme:?} {width}");
                 }
             }
         }
