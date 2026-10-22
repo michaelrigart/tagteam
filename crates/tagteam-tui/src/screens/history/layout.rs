@@ -22,20 +22,19 @@ pub(crate) const LANES_MOST: usize = 10;
 /// Where each part of History goes in the body.
 #[derive(Debug)]
 pub(crate) struct Layout {
-    #[cfg(test)]
     pub(crate) scope: Rect,
     /// Each chart shown: its index in `view.charts`, and its title row and rows.
     pub(crate) charts: Vec<(usize, Rect)>,
-    #[cfg(test)]
+    /// The events lane; no rows while the list has the body.
     pub(crate) events: Rect,
     /// The lanes shown, by index in `view.lanes`, in position order (T4-7, T4-8).
     pub(crate) lanes: Vec<(usize, Rect)>,
     /// The `+N more · f picks one` row, and N.
     pub(crate) more: Option<(Rect, usize)>,
+    /// The day axis; no rows while the list has the body.
     pub(crate) axis: Rect,
-    #[cfg(test)]
+    /// The list's `WHEN`/`WHAT` head, from `WIDE` columns.
     pub(crate) head: Option<Rect>,
-    #[cfg(test)]
     pub(crate) list: Rect,
 }
 
@@ -53,20 +52,21 @@ impl Rows {
         rect
     }
 
-    #[cfg(test)]
     fn rest(&mut self) -> Rect {
         self.take(u16::MAX)
     }
 }
 
 /// T4-8: `view`'s rows in `body` on a terminal `terminal_rows` tall, one account's charts
-/// from `chart_from` on (as far as keeps the last one shown).
+/// from `chart_from` on (as far as keeps the last one shown); with `full_list` (`z`), the list
+/// has every row under the scope row, its blank and its head.
 pub(crate) fn layout(
     view: &TimelineView,
     scope: &Scope,
     body: Rect,
     terminal_rows: u16,
     chart_from: usize,
+    full_list: bool,
 ) -> Layout {
     let spaced = terminal_rows >= RULE_FROM;
     let headed = body.width >= WIDE;
@@ -77,10 +77,22 @@ pub(crate) fn layout(
         area: body,
         y: body.y,
     };
-    // The scope row.
-    rows.take(1);
+    let scope_row = rows.take(1);
     if spaced {
         rows.take(1);
+    }
+    if full_list {
+        let none = rows.take(0);
+        return Layout {
+            scope: scope_row,
+            charts: vec![],
+            events: none,
+            lanes: vec![],
+            more: None,
+            axis: none,
+            head: headed.then(|| rows.take(1)),
+            list: rows.rest(),
+        };
     }
     let (charts, lanes, more, events);
     match scope {
@@ -129,32 +141,19 @@ pub(crate) fn layout(
         }
     }
     let axis = rows.take(1);
-    #[cfg(not(test))]
-    let _ = events;
-    #[cfg(test)]
-    let (head, list) = {
-        if spaced {
-            rows.take(1);
-        }
-        let head = headed.then(|| rows.take(1));
-        (head, rows.rest())
-    };
+    if spaced {
+        rows.take(1);
+    }
+    let head = headed.then(|| rows.take(1));
     Layout {
-        #[cfg(test)]
-        scope: Rect {
-            height: body.height.min(1),
-            ..body
-        },
+        scope: scope_row,
         charts,
-        #[cfg(test)]
         events,
         lanes,
         more,
         axis,
-        #[cfg(test)]
         head,
-        #[cfg(test)]
-        list,
+        list: rows.rest(),
     }
 }
 
@@ -223,7 +222,7 @@ mod tests {
     #[test]
     fn the_80_by_24_budget_fits_3_6_and_12_accounts() {
         let body = Rect::new(0, 3, 80, 20);
-        let l = layout(&all_of(&[70; 3]), &Scope::All, body, 24, 0);
+        let l = layout(&all_of(&[70; 3]), &Scope::All, body, 24, 0, false);
         assert_eq!(row(body, l.scope), 0);
         assert_eq!(charts(body, &l), [(0, (1, 10))], "the title and 9 rows");
         assert_eq!(row(body, l.events), 11);
@@ -233,7 +232,7 @@ mod tests {
         assert_eq!(l.head, None);
         assert_eq!(rows(body, l.list), (16, 19));
 
-        let l = layout(&all_of(&[70; 6]), &Scope::All, body, 24, 0);
+        let l = layout(&all_of(&[70; 6]), &Scope::All, body, 24, 0, false);
         assert_eq!(charts(body, &l), [(0, (1, 7))], "the title and 6 rows");
         assert_eq!(row(body, l.events), 8);
         assert_eq!(
@@ -246,7 +245,7 @@ mod tests {
 
         // Positions 4, 8, 10, 2, 12 and 6 were in use in the most columns.
         let used = [3, 9, 1, 12, 5, 7, 2, 11, 4, 10, 6, 8];
-        let l = layout(&all_of(&used), &Scope::All, body, 24, 0);
+        let l = layout(&all_of(&used), &Scope::All, body, 24, 0, false);
         assert_eq!(charts(body, &l), [(0, (1, 6))], "the title and 5 rows");
         assert_eq!(row(body, l.events), 7);
         assert_eq!(
@@ -263,7 +262,7 @@ mod tests {
     #[test]
     fn at_120_by_40_the_chart_takes_12_rows_and_the_list_the_rest() {
         let body = Rect::new(0, 4, 120, 35);
-        let l = layout(&all_of(&[70; 3]), &Scope::All, body, 40, 0);
+        let l = layout(&all_of(&[70; 3]), &Scope::All, body, 40, 0, false);
         assert_eq!(row(body, l.scope), 0);
         assert_eq!(
             charts(body, &l),
@@ -278,7 +277,7 @@ mod tests {
         assert_eq!(rows(body, l.list), (22, 34));
 
         // Every lane in use as long: the two of the highest positions are hidden.
-        let l = layout(&all_of(&[70; 12]), &Scope::All, body, 40, 0);
+        let l = layout(&all_of(&[70; 12]), &Scope::All, body, 40, 0, false);
         assert_eq!(charts(body, &l), [(0, (2, 14))]);
         assert_eq!(
             lanes(body, &l),
@@ -295,7 +294,7 @@ mod tests {
     fn one_account_s_charts_share_the_rows_and_scroll() {
         let body = Rect::new(0, 3, 80, 20);
         let scope = Scope::Account(id(1));
-        let l = layout(&one_of(&["5h", "7d"]), &scope, body, 24, 0);
+        let l = layout(&one_of(&["5h", "7d"]), &scope, body, 24, 0, false);
         assert_eq!(row(body, l.scope), 0);
         assert_eq!(
             charts(body, &l),
@@ -309,11 +308,11 @@ mod tests {
         assert_eq!(rows(body, l.list), (16, 19));
 
         let four = one_of(&["5h", "7d", "Fable", "Sonnet"]);
-        let l = layout(&four, &scope, body, 24, 0);
+        let l = layout(&four, &scope, body, 24, 0, false);
         assert_eq!(charts(body, &l), [(0, (1, 6)), (1, (7, 12))]);
-        let l = layout(&four, &scope, body, 24, 2);
+        let l = layout(&four, &scope, body, 24, 2, false);
         assert_eq!(charts(body, &l), [(2, (1, 6)), (3, (7, 12))]);
-        let l = layout(&four, &scope, body, 24, 3);
+        let l = layout(&four, &scope, body, 24, 3, false);
         assert_eq!(
             charts(body, &l),
             [(2, (1, 6)), (3, (7, 12))],
@@ -321,7 +320,7 @@ mod tests {
         );
 
         let body = Rect::new(0, 4, 120, 35);
-        let l = layout(&one_of(&["5h", "7d", "Fable"]), &scope, body, 40, 0);
+        let l = layout(&one_of(&["5h", "7d", "Fable"]), &scope, body, 40, 0, false);
         assert_eq!(
             charts(body, &l),
             [(0, (2, 9)), (1, (10, 17)), (2, (18, 25))],
@@ -334,9 +333,27 @@ mod tests {
         assert_eq!(rows(body, l.list), (31, 34));
 
         // No relevant window: no chart, and the list takes its rows.
-        let l = layout(&one_of(&[]), &scope, Rect::new(0, 3, 80, 20), 24, 0);
+        let l = layout(&one_of(&[]), &scope, Rect::new(0, 3, 80, 20), 24, 0, false);
         assert!(l.charts.is_empty());
         assert_eq!(row(Rect::new(0, 3, 80, 20), l.events), 1);
+    }
+
+    #[test]
+    fn the_full_list_takes_every_row_under_the_scope_row() {
+        let body = Rect::new(0, 3, 80, 20);
+        for scope in [Scope::All, Scope::Account(id(1))] {
+            let l = layout(&all_of(&[70; 3]), &scope, body, 24, 0, true);
+            assert_eq!(row(body, l.scope), 0);
+            assert!(l.charts.is_empty() && l.lanes.is_empty() && l.more.is_none());
+            assert_eq!((l.events.height, l.axis.height), (0, 0), "{scope:?}");
+            assert_eq!(l.head, None);
+            assert_eq!(rows(body, l.list), (1, 19), "{scope:?}");
+        }
+        // With its blank and its head from 30 rows and 120 columns.
+        let body = Rect::new(0, 4, 120, 35);
+        let l = layout(&all_of(&[70; 3]), &Scope::All, body, 40, 0, true);
+        assert_eq!(l.head.map(|h| row(body, h)), Some(2), "after a blank");
+        assert_eq!(rows(body, l.list), (3, 34));
     }
 
     #[test]
@@ -349,7 +366,7 @@ mod tests {
                         Scope::All => all_of(&[70; 12]),
                         Scope::Account(_) => one_of(&["5h", "7d", "Fable"]),
                     };
-                    let l = layout(&view, &scope, body, terminal_rows, 0);
+                    let l = layout(&view, &scope, body, terminal_rows, 0, false);
                     // Top to bottom, as T4-8 orders them.
                     let mut parts = vec![l.scope];
                     parts.extend(l.charts.iter().map(|(_, r)| *r));

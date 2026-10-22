@@ -32,6 +32,8 @@ pub(crate) const ONE_ACCOUNT_LINE: f64 = 90.0;
 /// The title row's readout labels (§7.3).
 const AT_CURSOR: &str = "at cursor";
 const NOW: &str = "now";
+/// Between a switch's binding usage before it and after it (§7.3).
+const ARROW: &str = "→";
 
 /// T4-9: `peaks` over `rows` rows, the top first, each under the y axis's gutter: a value's
 /// eighths in `fill_role`, and in an empty cell the cursor's `│` in column `cursor`, else the
@@ -98,7 +100,8 @@ fn cell(e: usize, r: usize) -> Option<&'static str> {
 }
 
 /// T4-11: ` {label}` in bold, from `WIDE` columns the in-use chart's subtitle, and on the right,
-/// one column in and never cut, `at cursor` and `now` with their values.
+/// one column in and never cut, `at cursor` and `now` with their values; for a switch at the
+/// cursor, the in-use chart's `at cursor` is its binding usage before `→` after.
 pub(crate) fn title_row(state: &State, series: &Series, all: bool, width: u16) -> Line<'static> {
     let theme = state.theme;
     let muted = theme.role(Role::Muted);
@@ -115,15 +118,26 @@ pub(crate) fn title_row(state: &State, series: &Series, all: bool, width: u16) -
         ),
         None => Span::styled(format!("{:>4}", words::MISSING), muted),
     };
-    let right = vec![
-        Span::styled(AT_CURSOR, muted),
-        Span::raw(" "),
-        value(at_cursor),
+    let mut right = vec![Span::styled(AT_CURSOR, muted), Span::raw(" ")];
+    match all
+        .then(|| super::switch_at_cursor(&state.history))
+        .flatten()
+    {
+        Some((before, after)) => right.extend([
+            value(before),
+            Span::raw(" "),
+            Span::styled(ARROW, muted),
+            Span::raw(" "),
+            value(after),
+        ]),
+        None => right.push(value(at_cursor)),
+    }
+    right.extend([
         Span::raw(GAP),
         Span::styled(NOW, muted),
         Span::raw(" "),
         value(now),
-    ];
+    ]);
     let mut left = vec![
         Span::raw(" "),
         Span::styled(series.label.clone(), theme.strong()),
