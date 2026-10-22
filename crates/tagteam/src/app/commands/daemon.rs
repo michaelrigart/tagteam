@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn the_auto_flags_words_name_the_settings_ranges() {
-        // review refactor §8.9: the flags' wording quotes the settings' ranges, so the two
+        // review refactor §8.8: the flags' wording quotes the settings' ranges, so the two
         // cannot drift.
         use clap::CommandFactory;
         let range = |r: &dyn std::fmt::Display, s: &dyn std::fmt::Display| format!("({r}–{s})");
