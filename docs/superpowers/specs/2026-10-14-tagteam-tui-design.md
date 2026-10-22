@@ -286,7 +286,7 @@ selected account's card.
 
 ```
  p Day  Month  Session  5h block     [ ] 30 days     g by account     f all accounts · all models         indexed 14:12
- $50.95 at API prices    114.2M tokens    414 responses    today $50.95          per day ▁▂▁▃▂▄▃▂▅▄▃▆▄▅▇▅▄▆▅▇▆█▅▆▇▅▆█▇█
+ $50.95 at API prices    114.2M tokens    414 responses    today $50.95          per day                             ▁█
 
  DAY         ACCOUNT           INPUT   OUTPUT  CACHE W  CACHE R   TOTAL  RESPONSES   API $
 ▌2026-10-14  1 alex             1.2M  ≥310.0K     4.1M    88.0M   93.6M        412  $41.20  ━━━━━━━━
@@ -314,7 +314,8 @@ The layout is the redesign spec's §8, shown at 120 columns. *(Amended by the TU
     day of the eleventh month before the current one (TR §11.1). The last range reads
     `all time`. *(Amended by the TUI redesign spec §8.)*
   - **Group** (`g` cycles): `None`, `Account`, `Model` or `AccountModel`. Blocks are per
-    account (TR §10.1), so with `Block` the header shows the grouping the report applies.
+    account (TR §10.1), so with `Block` the control bar shows the grouping the report applies.
+    *(Amended by the TUI redesign spec §8.)*
   - **Filter** (`f`): a dialog that sets `accounts` and `models`.
     - **The choices** come from an inventory independent of the active filter. When the dialog
       opens, the report lane runs one unfiltered query: `Month`, `AccountModel`, no range, no
@@ -365,12 +366,12 @@ The layout is the redesign spec's §8, shown at 120 columns. *(Amended by the TU
   shows the breadcrumbs, joined by `›`: each level's selected row, short model IDs, and a
   session as `session` with its ID's first 8 characters. *(Amended by the TUI redesign spec
   §8.)*
-- **Blocks.** A block row shows its start and end, and whether it is observed or inferred
-  (TR §9). The active block's row also shows elapsed and remaining time, burn rate (tokens per
-  minute, cost per hour) and the projected tokens and cost at its end (`ActiveBlock`). With
-  period `5h block`, the headline also shows the active block's progress line (`▶ block … left
-  · … tok/min · …/h · ≈ … at its end`), beside the row's figures, which stay. *(Amended by the
-  TUI redesign spec §8.)*
+- **Blocks.** A block row shows its start and end, and the detail says whether it is
+  `observed` or `estimated` (TR §9's inferred). The active block's row also shows elapsed and
+  remaining time, burn rate (tokens per minute, cost per hour) and the projected tokens and cost
+  at its end (`ActiveBlock`). With period `5h block`, the headline also shows the active block's
+  progress line (`▶ block … left · … tok/min · …/h · ≈ … at its end`), beside the row's
+  figures, which stay. *(Amended by the TUI redesign spec §8.)*
 - **Indexing.** The words sit on the control bar's right. *(Amended by the TUI redesign spec
   §8.)*
   - **While the TUI's own refresh runs,** the bar shows its `IndexProgress` as
@@ -482,8 +483,10 @@ timer mode, since nothing else collects for it.
 - **Live mode, with a daemon that keeps the index current.** That is, one whose `status.jobs`
   includes the index refresh job (D13, TR §12). The TUI does not refresh on a timer. It re-runs
   `token_report` on the daemon's `token-index` event when the event's `changedAt` is newer than
-  the report on screen (§8, §9). `r` on Tokens still runs a refresh, as a person's request. A
-  daemon without that job leaves the TUI refreshing as in timer mode.
+  the report on screen (§8, §9), at most every 30 s, every 5 s while the TUI's own refresh runs,
+  and at once after `r`. `r` on Tokens still runs a refresh, as a person's request. A daemon
+  without that job leaves the TUI refreshing as in timer mode. *(Amended by the TUI redesign
+  spec §14, C-13.)*
 - **When to re-query.** While Tokens is open, the report lane re-runs `token_report` when any of
   these holds:
   - **The index changed.** `changed_at_ms` moved past the report on screen. The report lane
