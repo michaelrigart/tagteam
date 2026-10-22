@@ -285,13 +285,25 @@ selected account's card.
 ### 5.3 Tokens
 
 ```
- [Day] Month Session Block    30 days    group: account    filter: all accounts · all models
- DAY         ACCOUNT    INPUT  OUTPUT  CACHE W  CACHE R   TOTAL     COST
- 2026-10-14  alex        1.2M    310k     4.1M    88.0M   93.6M   $41.20 ████████
-             spare       0.3M     80k     0.9M    20.1M   21.4M    $9.75 ██
- 2026-10-13  alex        …
- Enter sessions  p period  g group  f filter  [ ] range  Esc back
+ p Day  Month  Session  5h block     [ ] 30 days     g by account     f all accounts · all models         indexed 14:12
+ $50.95 at API prices    114.2M tokens    414 responses    today $50.95          per day ▁▂▁▃▂▄▃▂▅▄▃▆▄▅▇▅▄▆▅▇▆█▅▆▇▅▆█▇█
+
+ DAY         ACCOUNT           INPUT   OUTPUT  CACHE W  CACHE R   TOTAL  RESPONSES   API $
+▌2026-10-14  1 alex             1.2M  ≥310.0K     4.1M    88.0M   93.6M        412  $41.20  ━━━━━━━━
+             2 spare          300.0K    80.0K        0    20.1M   20.5M          1   $9.75  ━╸
+ 2026-10-13  unknown account    5.0K      900        0   100.0K  105.9K          1       —
+ ───────────────────────────────────────────────────────────────────────────────────────────────────
+ TOTAL                          1.5M  ≥390.9K     4.1M   108.2M  114.2M        414  $50.95
+
+ SELECTED  2026-10-14 · 1 alex   ⏎ its sessions
+           412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M) · cache read 88.0M
+
+ ≥ at least: 2 subagent responses are still being counted
+ $ what this would cost on the API at list prices of 2026-10-01; not your bill
+ ⏎ sessions  p period  g group  f filter  [ ] range  r refresh
 ```
+
+The layout is the redesign spec's §8, shown at 120 columns. *(Amended by the TUI redesign spec §8.)*
 
 - **The query** is TR §10's `TokenQuery`, for the default provider or `--provider`'s.
   - **Period** (`p` cycles): `Day`, `Month`, `Session` or `Block`. Rows come in the report's
@@ -299,7 +311,8 @@ selected account's card.
     and models by name.
   - **Range** (`[`/`]`): 7 days, 30 days, 90 days or all, as `since_ms` with no `until_ms`. The
     default is 30 days, as for `tagteam tokens`. For `Month`, the default starts on the first
-    day of the eleventh month before the current one (TR §11.1).
+    day of the eleventh month before the current one (TR §11.1). The last range reads
+    `all time`. *(Amended by the TUI redesign spec §8.)*
   - **Group** (`g` cycles): `None`, `Account`, `Model` or `AccountModel`. Blocks are per
     account (TR §10.1), so with `Block` the header shows the grouping the report applies.
   - **Filter** (`f`): a dialog that sets `accounts` and `models`.
@@ -311,40 +324,61 @@ selected account's card.
       included as well. Any narrower selection sends `Some` of exactly those, and selecting
       none of a kind is refused in the dialog (TR §10.1: `Some` of an empty list matches
       nothing).
-  - **Time zone:** the system zone. The header shows the report's `time_zone`.
+  - **Time zone:** the system zone, which the screen no longer names. *(Amended by the TUI
+    redesign spec §8.)*
 - **Columns.**
-  - At 80 columns: period, account, input, output, total and cost.
-  - From 120 columns, also cache write (5-minute and 1-hour where they fit), cache read, the
-    response count, and a bar of cost relative to the largest row.
-  - The model column appears when the grouping includes the model.
+  - At 80 columns: period, account, input, output, total and `API $`.
+  - From 120 columns, also cache write (`CACHE W`), cache read (`CACHE R`), the response count
+    (`RESPONSES`), and a share line of cost relative to the largest row. From 160 columns the
+    cache write splits into `CACHE W 5M` and `1H` where they fit.
+  - The model column appears when the grouping includes the model, in short IDs; the detail
+    keeps the full ID.
+  - A session's project shows by its name, the last component of its path; the detail keeps
+    the full path.
   - Token counts are scaled (`12.4M`) and costs are dollars with cents, as in TR §11.2.
+
+  *(Amended by the TUI redesign spec §8.)*
 - **Rows that need a mark.**
   - `RowAccount::Account` shows as its alias, else its label, with its position.
-    `Removed` shows as `removed`, and `Unattributed` as `unattributed`.
+    `Removed` shows as `removed account`, and `Unattributed` as `unknown account`.
   - A row with `unfinalized > 0` marks its output `≥`: a lower bound (TR §2.3).
   - A `Cost` with `partial` marks the cost `≥`. A missing cost shows `—`.
-- **The total line and footnotes,** as TR §11.2 has them. The total line is `TokenTotal`. The
-  footnotes cover:
+  - An estimated (inferred) block shows `~` before its start.
+
+  *(Amended by the TUI redesign spec §8.)*
+- **The total line and footnotes,** as TR §11.2 has them. The total line is `TokenTotal`, under
+  a faint rule. Between them and the notes, the selected row's detail sits under `SELECTED`.
+  The footnotes, each led by its mark where it has one, cover:
   - unpriced models (`unpriced_models`);
-  - unfinalized responses (`output is a lower bound for N subagent responses`);
+  - unfinalized responses (`≥ at least: N subagent responses are still being counted`);
   - skipped lines and unreadable files (`IndexState`);
-  - price overrides (`price_overrides`);
-  - the price table's date (`prices_as_of`).
+  - price overrides (`price_overrides`), named in the price note;
+  - the price table's date (`$ what this would cost on the API at list prices of <date>; not
+    your bill`, or with overrides `…, with config.toml's for <models>; not your bill`).
+
+  *(Amended by the TUI redesign spec §8.)*
 - **Drill-down.** `Enter` on a row runs `TokenQuery::drill(row)` (TR §10). From a day, month or
   block row, that row's sessions (project, first and last time, accounts, models, tokens and
   cost). From a session row, its per-model rows. At the per-model rows `drill` returns `None`,
   and `Enter` does nothing. `Esc` or `Backspace` goes back one level, and keeps the selection by
-  `RowKey`, which is stable across refreshes.
+  `RowKey`, which is stable across refreshes. While drilled, a muted row under the control bar
+  shows the breadcrumbs, joined by `›`: each level's selected row, short model IDs, and a
+  session as `session` with its ID's first 8 characters. *(Amended by the TUI redesign spec
+  §8.)*
 - **Blocks.** A block row shows its start and end, and whether it is observed or inferred
   (TR §9). The active block's row also shows elapsed and remaining time, burn rate (tokens per
-  minute, cost per hour) and the projected tokens and cost at its end (`ActiveBlock`).
-- **Indexing.**
-  - **While the TUI's own refresh runs,** the header shows its `IndexProgress` as
-    `indexing transcripts 1.2 GB / 3.3 GB`.
+  minute, cost per hour) and the projected tokens and cost at its end (`ActiveBlock`). With
+  period `5h block`, the headline also shows the active block's progress line (`▶ block … left
+  · … tok/min · …/h · ≈ … at its end`), beside the row's figures, which stay. *(Amended by the
+  TUI redesign spec §8.)*
+- **Indexing.** The words sit on the control bar's right. *(Amended by the TUI redesign spec
+  §8.)*
+  - **While the TUI's own refresh runs,** the bar shows its `IndexProgress` as
+    `indexing 1.2 / 3.3 GB`.
   - **While `refreshed_at_ms` is `None`** (no complete refresh yet, TR §14), the table shows
-    what the index holds, labelled `catching up`.
-  - **When the TUI's refresh returns `Busy`,** the header shows `catching up elsewhere`.
-  - **Otherwise** the header shows the time of the last complete refresh.
+    what the index holds, and the bar says `catching up`.
+  - **When the TUI's refresh returns `Busy`,** the bar shows `catching up elsewhere`.
+  - **Otherwise** the bar shows the time of the last complete refresh: `indexed 14:12`.
 
 ### 5.4 History
 
@@ -610,7 +644,8 @@ The protocol is the daemon spec's D5 (`2026-10-14-tagteam-daemon-design.md`, App
     the TUI redesign spec §7.7.)*
   - `mode` re-fetches `status` (§7.4).
   - `token-index` re-runs `token_report` when Tokens is open and the event's `changedAt` is
-    newer than the report on screen (§6.4).
+    newer than the report on screen (§6.4), at most every 30 s, every 5 s while the TUI's own
+    refresh runs, and at once after `r`. *(Amended by the TUI redesign spec §14, C-13.)*
   - The auto line comes from the store, read with `accounts`, and the daemon's `no-switch`,
     `error` and `config-warning` events feed its rank 2. *(Amended by the TUI redesign spec
     §5.3.)*

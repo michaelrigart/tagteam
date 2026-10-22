@@ -90,6 +90,17 @@ with the one before, so any release may contain breaking changes. Each section s
   `w` opens History at it.
 - A switch makes up to 5 fewer Keychain calls while it holds Claude Code's locks (15 instead of 20
   for a typical `tagteam switch <N>`), so a Claude Code waiting on those locks waits less.
+- `tagteam tui`'s Tokens screen has one control bar for the period, range, grouping and filter,
+  and a headline with the report's cost, tokens and responses; from 120 columns, today's cost and
+  a sparkline of cost per day; with 5-hour blocks, the active block's progress. Its table says
+  `API $` and `RESPONSES`, short model names, a project's name, `~` for an estimated block, and
+  `removed account` or `unknown account`; the selected row's detail is labelled `SELECTED`.
+- `tagteam tokens` and `tagteam tui` word two notes anew: `≥ at least: N subagent responses are
+  still being counted` and `$ what this would cost on the API at list prices of <date>; not your
+  bill`.
+- `tagteam tui` re-reads the token report on the daemon's index events at most every 30 s, every
+  5 s while its own refresh runs, and at once after `r`. A report it could not read again keeps
+  its banner over a collection's warnings.
 
 ### Security
 
