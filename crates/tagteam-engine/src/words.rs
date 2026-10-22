@@ -542,8 +542,13 @@ pub fn trigger(trigger: Trigger) -> &'static str {
 
 /// `<position> <alias, else the email's local part>`: `2 work`, `1 alex` (spec §5.3, §11.4).
 pub fn short_name(position: u32, alias: Option<&str>, email_or_label: &str) -> String {
-    let name = alias.unwrap_or_else(|| email_or_label.split('@').next().unwrap_or(email_or_label));
-    format!("{position} {name}")
+    format!("{position} {}", bare_name(alias, email_or_label))
+}
+
+/// The alias, else the email's local part: `short_name` without its position, and the
+/// possessive of an automatic switch's sentence (T4-29).
+fn bare_name<'a>(alias: Option<&'a str>, email_or_label: &'a str) -> &'a str {
+    alias.unwrap_or_else(|| email_or_label.split('@').next().unwrap_or(email_or_label))
 }
 
 /// An account as the timeline names it (T4-28): `short_name` while it is current, its stored
@@ -577,9 +582,8 @@ fn binding_reached(e: &EventView, trigger: Option<Trigger>) -> Option<String> {
     }
     let from = e.from.as_ref()?;
     let whose = match (from.alias.as_deref(), from.email.as_deref()) {
-        (Some(alias), _) => alias,
-        (None, Some(email)) => email.split('@').next().unwrap_or(email),
         (None, None) => return None,
+        (alias, email) => bare_name(alias, email.unwrap_or_default()),
     };
     let detail = e.detail.as_ref()?;
     let label = detail.get("label")?.as_str()?;
@@ -2113,6 +2117,64 @@ mod tests {
             assert_eq!(said, *want, "{}", e.kind.as_str());
             assert!(!said.to_lowercase().contains("claude"), "{said}");
         }
+    }
+
+    #[test]
+    fn an_automatic_switch_without_a_usable_detail_or_possessive_says_its_trigger() {
+        let account = |position: Option<u32>, email: Option<&str>| AccountRef {
+            id: AccountId::from_string("id-1"),
+            position,
+            alias: None,
+            email: email.map(str::to_owned),
+            removed: position.is_none(),
+        };
+        let alex = account(Some(1), Some("alex@example.com"));
+        let work = AccountRef {
+            alias: Some("work".into()),
+            ..account(Some(2), Some("sam@corp.example"))
+        };
+        let proactive = |from: Option<&AccountRef>, detail: Value| EventView {
+            at_ms: NOW * 1000,
+            kind: EventKind::Switch,
+            source: EventSource::Auto,
+            trigger: Some("proactive".into()),
+            from: from.cloned(),
+            to: Some(work.clone()),
+            detail: Some(detail),
+            before_pct: None,
+            after_pct: None,
+        };
+        let valid = json!({"window": "5h", "label": "5h", "pct": 93.4, "threshold": 90.0});
+        for detail in [
+            json!({"window": "5h", "label": "5h", "pct": "93", "threshold": 90.0}),
+            json!({"window": "5h", "label": "5h", "pct": null, "threshold": 90.0}),
+            json!({"window": "5h", "label": 5, "pct": 93.4, "threshold": 90.0}),
+            json!("str"),
+        ] {
+            assert_eq!(
+                event(&proactive(Some(&alex), detail.clone()), None),
+                "auto switched 1 alex → 2 work (before it reached the limit)",
+                "{detail}"
+            );
+        }
+        assert_eq!(
+            event(
+                &proactive(
+                    Some(&alex),
+                    json!({"window": "5h", "label": "5h", "pct": 93, "threshold": 90})
+                ),
+                None
+            ),
+            "auto switched 1 alex → 2 work · alex's 5h reached 93%"
+        );
+        assert_eq!(
+            event(&proactive(None, valid.clone()), None),
+            "auto switched to 2 work (before it reached the limit)"
+        );
+        assert_eq!(
+            event(&proactive(Some(&account(None, None)), valid), None),
+            "auto switched an account → 2 work (before it reached the limit)"
+        );
     }
 
     const NAMES: ProviderNames = ProviderNames {
