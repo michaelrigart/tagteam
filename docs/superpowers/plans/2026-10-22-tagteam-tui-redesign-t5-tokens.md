@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/44
 **Goal:** Give the Tokens screen §8's layout (one control bar, a headline with the active 5-hour block's progress, a table drawn in roles with plain words, a labelled detail and notes led by their marks), word the token report's two changed notes once for the TUI and `tagteam tokens`, slow the live re-query to 30 s (PERF-D-2), and close the redesign: its spec moves to `Implemented`.
 **Architecture:** The screen stays `screens/tokens/` over the engine's unchanged `TokenReport`. `table.rs`'s three-row header is rewritten in place as the control bar and its breadcrumb row; the headline is a new `headline.rs`, thousands separators a new `amounts.rs`, the short model IDs a new `models.rs`; `gauge.rs` gains the block's progress line, the per-day sparkline and the share line. `words::token_footnotes` returns marked notes that both renderers print. The re-query throttle and the banner order are small edits to `index.rs` and `chrome.rs`.
 **Tech Stack:** Rust 1.88 (edition 2024), ratatui 0.30.2, crossterm =0.29.0. No new dependency.
