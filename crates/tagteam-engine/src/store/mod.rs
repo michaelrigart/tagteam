@@ -358,6 +358,15 @@ struct JournalSnapshot {
     prior: Option<Box<JournalSnapshot>>,
 }
 
+/// A derived `Deserialize` also takes a positional array, which no build writes; the snapshot is
+/// refused rather than misread (review refactor §8.9).
+fn is_snapshot_object(v: &Value) -> bool {
+    v.as_object().is_some_and(|o| match o.get("prior") {
+        None | Some(Value::Null) => true,
+        Some(p) => is_snapshot_object(p),
+    })
+}
+
 impl From<&JournalRow> for JournalSnapshot {
     fn from(j: &JournalRow) -> JournalSnapshot {
         JournalSnapshot {
@@ -540,6 +549,7 @@ fn journal_from_row(r: &Row<'_>) -> rusqlite::Result<JournalRow> {
         to_epoch: r.get("to_epoch")?,
         started_at: r.get("started_at")?,
         prior: match json_col(r, "prior")? {
+            Some(v) if !is_snapshot_object(&v) => return Err(malformed_snapshot()),
             Some(v) => Some(Box::new(
                 serde_json::from_value::<JournalSnapshot>(v)
                     .map_err(|_| malformed_snapshot())?
