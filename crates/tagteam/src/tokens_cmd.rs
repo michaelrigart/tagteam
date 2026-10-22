@@ -799,7 +799,11 @@ pub(crate) fn block_note(observed: bool, active: Option<&ActiveBlock>) -> String
 fn footnotes(report: &TokenReport) -> String {
     format!(
         "\n{}\n",
-        words::token_footnotes(report, "*", false).join("\n")
+        words::token_footnotes(report, "*", false)
+            .iter()
+            .map(words::Footnote::line)
+            .collect::<Vec<_>>()
+            .join("\n")
     )
 }
 

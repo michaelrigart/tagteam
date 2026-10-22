@@ -421,42 +421,82 @@ pub fn skipped_transcript_lines(n: u64) -> String {
     )
 }
 
-/// The token report's footnotes (token report §11.2), one sentence each: unpriced models,
-/// responses whose output is a lower bound (token report §2.3), skipped lines, the transcript
-/// files the last refresh could not read when `unreadable` asks for them, and the price
-/// table's date. `mark` is what marks a partial cost: `*` in the CLI, `≥` in the TUI (TUI spec
-/// §5.3).
-pub fn token_footnotes(report: &TokenReport, mark: &str, unreadable: bool) -> Vec<String> {
+/// A lower bound (token report §2.3): the TUI's cells, and the lead of its note.
+pub const AT_LEAST: &str = "≥";
+/// The lead of the note that says what an API cost is (redesign §8).
+pub const PRICE_MARK: &str = "$";
+
+/// One of the token report's footnotes (token report §11.2): its mark, for the two notes the
+/// TUI redesign's §8 leads with one, and its words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Footnote {
+    pub mark: Option<&'static str>,
+    pub text: String,
+}
+
+impl Footnote {
+    /// `{mark} {text}`, or the text alone.
+    pub fn line(&self) -> String {
+        match self.mark {
+            Some(mark) => format!("{mark} {}", self.text),
+            None => self.text.clone(),
+        }
+    }
+
+    fn plain(text: String) -> Self {
+        Self { mark: None, text }
+    }
+}
+
+/// The token report's footnotes (token report §11.2): unpriced models, responses whose output
+/// is a lower bound (token report §2.3), skipped lines, the transcript files the last refresh
+/// could not read when `unreadable` asks for them, and the price table's date. `mark` is what
+/// marks a partial cost: `*` in the CLI, `≥` in the TUI (TUI spec §5.3). The lower bound's
+/// note and the price table's are led by their marks (redesign §8).
+pub fn token_footnotes(report: &TokenReport, mark: &str, unreadable: bool) -> Vec<Footnote> {
     let mut notes = Vec::new();
     if !report.unpriced_models.is_empty() {
-        notes.push(format!(
+        notes.push(Footnote::plain(format!(
             "No price for {}: counted without cost ({mark} marks a partial cost).",
             report.unpriced_models.join(", ")
-        ));
+        )));
     }
-    if report.total.unfinalized > 0 {
-        notes.push(format!(
-            "Output is a lower bound for {}.",
-            plural(report.total.unfinalized, "subagent response")
-        ));
+    let unfinalized = report.total.unfinalized;
+    if unfinalized > 0 {
+        notes.push(Footnote {
+            mark: Some(AT_LEAST),
+            text: format!(
+                "at least: {} {} still being counted",
+                plural(unfinalized, "subagent response"),
+                if unfinalized == 1 { "is" } else { "are" }
+            ),
+        });
     }
     if report.index.skipped_lines > 0 {
-        notes.push(skipped_transcript_lines(report.index.skipped_lines));
+        notes.push(Footnote::plain(skipped_transcript_lines(
+            report.index.skipped_lines,
+        )));
     }
     if unreadable && report.index.unreadable_files > 0 {
-        notes.push(format!(
+        notes.push(Footnote::plain(format!(
             "{}.",
             unreadable_transcripts(report.index.unreadable_files)
-        ));
+        )));
     }
-    notes.push(if report.price_overrides.is_empty() {
-        format!("API cost at list prices as of {}.", report.prices_as_of)
-    } else {
-        format!(
-            "API cost at list prices as of {}, with config.toml's for {}.",
-            report.prices_as_of,
-            report.price_overrides.join(", ")
-        )
+    notes.push(Footnote {
+        mark: Some(PRICE_MARK),
+        text: if report.price_overrides.is_empty() {
+            format!(
+                "what this would cost on the API at list prices of {}; not your bill",
+                report.prices_as_of
+            )
+        } else {
+            format!(
+                "what this would cost on the API at list prices of {}, with config.toml's for {}; not your bill",
+                report.prices_as_of,
+                report.price_overrides.join(", ")
+            )
+        },
     });
     notes
 }
@@ -1625,11 +1665,25 @@ mod tests {
     }
 
     #[test]
+    fn the_lower_bound_s_note_agrees_with_its_count() {
+        let mut three = report();
+        three.total.unfinalized = 3;
+        assert_eq!(
+            token_footnotes(&three, "*", false)[0].text,
+            "at least: 3 subagent responses are still being counted"
+        );
+    }
+
+    #[test]
     fn the_token_footnotes_name_what_the_report_leaves_out_and_mark_partial_costs_as_asked() {
         let plain = report();
         assert_eq!(
             token_footnotes(&plain, "*", true),
-            ["API cost at list prices as of 2026-10-01."]
+            [Footnote {
+                mark: Some("$"),
+                text: "what this would cost on the API at list prices of 2026-10-01; not your bill"
+                    .into(),
+            }]
         );
         let mut every = report();
         every.unpriced_models = vec!["claude-test-9".into(), "claude-x".into()];
@@ -1637,18 +1691,23 @@ mod tests {
         every.index.skipped_lines = 12;
         every.index.unreadable_files = 3;
         every.price_overrides = vec!["claude-opus-5-5".into()];
+        let notes = token_footnotes(&every, "≥", true);
         assert_eq!(
-            token_footnotes(&every, "≥", true),
+            notes.iter().map(Footnote::line).collect::<Vec<_>>(),
             [
                 "No price for claude-test-9, claude-x: counted without cost (≥ marks a partial cost).",
-                "Output is a lower bound for 1 subagent response.",
+                "≥ at least: 1 subagent response is still being counted",
                 "12 transcript lines could not be read, so these totals may be low.",
                 "3 transcript files could not be read; the next refresh tries again.",
-                "API cost at list prices as of 2026-10-01, with config.toml's for claude-opus-5-5.",
+                "$ what this would cost on the API at list prices of 2026-10-01, with config.toml's for claude-opus-5-5; not your bill",
             ]
         );
         assert_eq!(
-            token_footnotes(&every, "*", false)[0],
+            notes.iter().map(|n| n.mark).collect::<Vec<_>>(),
+            [None, Some("≥"), None, None, Some("$")]
+        );
+        assert_eq!(
+            token_footnotes(&every, "*", false)[0].line(),
             "No price for claude-test-9, claude-x: counted without cost (* marks a partial cost)."
         );
         assert_eq!(
