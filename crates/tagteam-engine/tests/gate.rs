@@ -124,7 +124,10 @@ fn a_quarantine_bound_to_an_older_generation_is_released_and_the_gate_proceeds()
     assert_eq!(quarantine_of(&fx, &a), (None, None));
     let events = fx.engine.store().unwrap().events().unwrap();
     assert_eq!(
-        events.iter().filter(|e| e.kind == "unquarantine").count(),
+        events
+            .iter()
+            .filter(|e| e.kind.as_str() == "unquarantine")
+            .count(),
         1,
         "{events:?}"
     );
@@ -245,7 +248,10 @@ fn invalid_grant_quarantines_bound_to_the_generation_sent() {
         "the vault is kept"
     );
     let events = fx.engine.store().unwrap().events().unwrap();
-    assert!(events.iter().any(|e| e.kind == "quarantine"), "{events:?}");
+    assert!(
+        events.iter().any(|e| e.kind.as_str() == "quarantine"),
+        "{events:?}"
+    );
 }
 
 #[test]

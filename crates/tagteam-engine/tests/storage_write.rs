@@ -295,7 +295,7 @@ fn ctrl_c_while_a_recovery_write_waits_for_cc_lets_the_recovery_finish() {
     let store = fx.engine.store().unwrap();
     assert_eq!(store.active(&fx.provider()).unwrap(), Some(a));
     assert_eq!(
-        store.events().unwrap().last().unwrap().kind,
+        store.events().unwrap().last().unwrap().kind.as_str(),
         "switch-recovered"
     );
     assert!(ended > released, "recovery waited for CC's lock");

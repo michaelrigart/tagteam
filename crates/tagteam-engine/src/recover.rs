@@ -8,6 +8,7 @@ use tagteam_provider::{
 use crate::account_lock::AccountLock;
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::event::EventKind;
 use crate::hooks;
 use crate::oracle::verdict;
 use crate::store::{AccountRow, EventRow, JournalRow, Store};
@@ -338,11 +339,11 @@ impl Engine {
             &EventRow {
                 at: self.now_ms(),
                 provider: row.provider.clone(),
-                kind: "switch-recovered".into(),
+                kind: EventKind::SwitchRecovered,
                 from_id: row.from_id.clone(),
                 to_id: Some(to.id.clone()),
                 trigger: Some("recovery".into()),
-                source: self.source().as_str().into(),
+                source: self.source(),
                 detail: None,
             },
             // Never an auto-switch record: the row names neither the

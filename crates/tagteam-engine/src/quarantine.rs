@@ -7,6 +7,7 @@ use tagteam_provider::{DeadReason, Provenance, Provider, Read};
 use crate::account_lock::AccountLock;
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::event::EventKind;
 use crate::refresh::fp_str;
 use crate::store::{ACCOUNT_REPLACED, AccountRow, CREDENTIALS_REPLACED, EventRow};
 use crate::switch::Axis;
@@ -57,18 +58,18 @@ impl Engine {
     fn quarantine_event(
         &self,
         row: &AccountRow,
-        kind: &str,
+        kind: EventKind,
         reason: Option<&str>,
     ) -> Result<(), EngineError> {
         self.store()?.insert_event(
             &EventRow {
                 at: self.now_ms(),
                 provider: row.provider.clone(),
-                kind: kind.into(),
+                kind,
                 from_id: None,
                 to_id: Some(row.id.clone()),
                 trigger: None,
-                source: self.source().as_str().into(),
+                source: self.source(),
                 detail: reason.map(|r| json!({"reason": r})),
             },
             self.registered_id(&row.provider).is_some(),
@@ -86,7 +87,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         self.store()?
             .set_quarantine(&row.id, reason.as_str(), fp, self.now_ms())?;
-        self.quarantine_event(row, "quarantine", Some(reason.as_str()))?;
+        self.quarantine_event(row, EventKind::Quarantine, Some(reason.as_str()))?;
         tracing::warn!(
             position = row.position,
             account = %row.id,
@@ -101,12 +102,9 @@ impl Engine {
     /// `CREDENTIALS_REPLACED`) and this engine's source (review refactor §8.7), in one store
     /// transaction. `false`, and no event, when there was none.
     pub(crate) fn unquarantine(&self, row: &AccountRow, reason: &str) -> Result<bool, EngineError> {
-        Ok(self.store()?.clear_quarantine(
-            &row.id,
-            reason,
-            self.source().as_str(),
-            self.now_ms(),
-        )?)
+        Ok(self
+            .store()?
+            .clear_quarantine(&row.id, reason, self.source(), self.now_ms())?)
     }
 
     /// §7.4: whether `row`'s quarantine no longer binds. The vault must hold another

@@ -2028,7 +2028,12 @@ mod hooked {
                         other
                             .store()
                             .unwrap()
-                            .clear_quarantine(&id, "credentials-replaced", "cli", 1)
+                            .clear_quarantine(
+                                &id,
+                                "credentials-replaced",
+                                tagteam_engine::EventSource::Cli,
+                                1,
+                            )
                             .unwrap();
                         if joining {
                             *started.lock().unwrap() = FlockGuard::try_lock(&race).unwrap();

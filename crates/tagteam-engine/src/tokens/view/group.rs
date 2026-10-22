@@ -18,6 +18,7 @@ use super::{
     AccountSel, ActiveBlock, Basis, Cost, PeriodKey, RowAccount, RowKey, TokenCounts,
     TokenGrouping, TokenPeriod, TokenQuery, TokenRow, TokenTotal,
 };
+use crate::event::EventKind;
 use crate::store::{
     AccountRow, EpochRow, EventRow, LaunchRow, ReportResponse, ReportSession, ReportUsage, Store,
     StoreError,
@@ -327,21 +328,21 @@ impl Evidence {
 /// `switch-recovered` move the login to `to_id`, `add` and `import` start an account, and
 /// `remove`, which records the account as `from_id`, ends it.
 fn timeline_event(e: EventRow) -> Option<TimelineEvent> {
-    match e.kind.as_str() {
-        "switch" | "switch-recovered" => Some(TimelineEvent::Switch {
+    match e.kind {
+        EventKind::Switch | EventKind::SwitchRecovered => Some(TimelineEvent::Switch {
             at_ms: e.at,
             from: e.from_id,
             to: e.to_id?,
         }),
-        "add" | "import" => Some(TimelineEvent::Add {
+        EventKind::Add | EventKind::Import => Some(TimelineEvent::Add {
             at_ms: e.at,
             account: e.to_id?,
         }),
-        "remove" => Some(TimelineEvent::Remove {
+        EventKind::Remove => Some(TimelineEvent::Remove {
             at_ms: e.at,
             account: e.from_id?,
         }),
-        _ => None,
+        EventKind::Quarantine | EventKind::Unquarantine => None,
     }
 }
 

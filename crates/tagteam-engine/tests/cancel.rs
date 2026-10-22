@@ -273,7 +273,7 @@ fn a_token_set_during_recovery_s_writes_lets_recovery_finish() {
     let store = fx.engine.store().unwrap();
     assert_eq!(store.active(&fx.provider()).unwrap(), Some(a));
     assert_eq!(
-        store.events().unwrap().last().unwrap().kind,
+        store.events().unwrap().last().unwrap().kind.as_str(),
         "switch-recovered"
     );
     assert_eq!(

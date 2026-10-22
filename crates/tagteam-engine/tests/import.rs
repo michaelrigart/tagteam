@@ -67,7 +67,7 @@ fn events(fx: &Fx, kind: &str, id: &AccountId) -> usize {
         .events()
         .unwrap()
         .iter()
-        .filter(|e| e.kind == kind && e.to_id.as_ref() == Some(id))
+        .filter(|e| e.kind.as_str() == kind && e.to_id.as_ref() == Some(id))
         .count()
 }
 

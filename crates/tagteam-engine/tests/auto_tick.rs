@@ -708,10 +708,10 @@ fn a_manual_switch_during_the_tick_s_perform_is_live_changed() {
         .events()
         .unwrap()
         .into_iter()
-        .filter(|e| e.kind == "switch")
+        .filter(|e| e.kind.as_str() == "switch")
         .collect();
     assert_eq!(switches.len(), 1);
-    assert_eq!(switches[0].source, "cli");
+    assert_eq!(switches[0].source.as_str(), "cli");
     assert_eq!(auto_state(&fx), AutoState::default());
 }
 
@@ -1084,7 +1084,7 @@ fn quarantines_other_processes_set_or_clear_are_reported_against_the_previous_ti
     engine.tick(&sink).unwrap();
     assert!(matches!(sink.take()[0], AutoEvent::Poll { .. }));
     store
-        .clear_quarantine(&a, "credentials-replaced", "cli", 1)
+        .clear_quarantine(&a, "credentials-replaced", EventSource::Cli, 1)
         .unwrap();
     engine.tick(&sink).unwrap();
     assert_eq!(sink.take()[0], unquarantined("credentials-replaced"));

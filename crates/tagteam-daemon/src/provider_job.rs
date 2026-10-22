@@ -708,6 +708,7 @@ mod tests {
     use std::cell::Cell;
 
     use serde_json::{Value, json};
+    use tagteam_engine::EventSource;
     use tagteam_engine::lifecycle::AddTokenOptions;
     use tagteam_engine::settings::config_path;
     use tagteam_provider::{FlockGuard, Method};
@@ -1285,7 +1286,12 @@ mod tests {
         fx.clock.advance_ms(60_000);
         job.run(&mut cx);
         store
-            .clear_quarantine(&a, "credentials-replaced", "cli", (T0 + 60) * 1000)
+            .clear_quarantine(
+                &a,
+                "credentials-replaced",
+                EventSource::Cli,
+                (T0 + 60) * 1000,
+            )
             .unwrap();
         fx.clock.advance_ms(60_000);
         job.run(&mut cx);

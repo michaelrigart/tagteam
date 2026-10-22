@@ -25,7 +25,7 @@ use tagteam_engine::tokens::{
     TokenCounts, TokenGrouping, TokenPeriod, TokenQuery, TokenReport,
 };
 use tagteam_engine::vault::{KeychainVault, Vault};
-use tagteam_engine::{Engine, EngineConfig, EventSource};
+use tagteam_engine::{Engine, EngineConfig, EventKind, EventSource};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::{
     FakeProcess, MARKER_FILE, PENDING_LAUNCH_DIR, PendingLaunch, Provider, RunShell, parse_lstart,
@@ -177,11 +177,11 @@ impl View {
         let row = EventRow {
             at,
             provider: cc(),
-            kind: kind.into(),
+            kind: EventKind::parse(kind).expect("a known event kind"),
             from_id: from.cloned(),
             to_id: to.cloned(),
             trigger: None,
-            source: "cli".into(),
+            source: EventSource::Cli,
             detail: None,
         };
         self.store.insert_event(&row, true).unwrap();
