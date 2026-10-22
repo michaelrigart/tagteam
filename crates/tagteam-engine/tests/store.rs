@@ -2446,6 +2446,7 @@ fn the_latest_event_of_some_kinds_is_found_within_its_bounds() {
         Some((200, EventKind::Quarantine))
     );
     assert_eq!(latest(&switch_or_quarantine, Some(250), None), None);
+    assert_eq!(latest(&[], None, None), None);
     assert_eq!(
         latest(
             &[EventKind::AutoswitchPaused, EventKind::AutoswitchResumed],
@@ -2454,6 +2455,50 @@ fn the_latest_event_of_some_kinds_is_found_within_its_bounds() {
         ),
         Some((300, EventKind::AutoswitchPaused))
     );
+}
+
+#[test]
+fn the_latest_event_breaks_a_tie_in_at_by_insertion() {
+    // Each provider's two rows share an `at`; the later insert wins whichever kind it is.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let p = cc();
+    let p = p.as_str();
+    let other = ProviderId::new("fake-agent");
+    raw_events(
+        &path,
+        &[
+            (200, p, "quarantine", Some("b"), None, "auto", None),
+            (200, p, "switch", Some("a"), Some("b"), "cli", None),
+            (
+                200,
+                other.as_str(),
+                "switch",
+                Some("a"),
+                Some("b"),
+                "cli",
+                None,
+            ),
+            (
+                200,
+                other.as_str(),
+                "quarantine",
+                Some("b"),
+                None,
+                "auto",
+                None,
+            ),
+        ],
+    );
+    let kinds = [EventKind::Switch, EventKind::Quarantine];
+    let latest = |provider: &ProviderId| {
+        s.latest_event(provider, &kinds, None, None)
+            .unwrap()
+            .map(|e| (e.at, e.kind))
+    };
+    assert_eq!(latest(&cc()), Some((200, EventKind::Switch)));
+    assert_eq!(latest(&other), Some((200, EventKind::Quarantine)));
 }
 
 #[test]
@@ -2521,12 +2566,25 @@ fn a_removed_account_s_label_is_read_from_its_latest_remove_event() {
                 Some(r#"{"reason":"gone"}"#),
             ),
             (400, p, "remove", Some("v"), None, "cli", None),
+            (
+                900,
+                "fake-agent",
+                "remove",
+                Some("x"),
+                None,
+                "cli",
+                Some(r#"{"label":"alex@example.com"}"#),
+            ),
+            (500, p, "remove", Some("s"), None, "cli", Some(r#""str""#)),
+            (600, p, "remove", Some("n"), None, "cli", Some("[1]")),
         ],
     );
     let label = |id: &str| s.removed_label(&cc(), &AccountId::from_string(id)).unwrap();
     assert_eq!(label("x").as_deref(), Some("ci@example.com"));
     assert_eq!(label("w"), None);
     assert_eq!(label("v"), None);
+    assert_eq!(label("s"), None);
+    assert_eq!(label("n"), None);
     assert_eq!(label("never-removed"), None);
 }
 
