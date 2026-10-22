@@ -11,7 +11,7 @@ use tagteam_engine::tokens::TokenReport;
 const SEPARATORS: [char; 5] = ['-', '.', '/', ':', '_'];
 
 /// T5-22: the short form of each of a report's models.
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(test, derive(Debug, Clone, PartialEq))]
 pub(super) struct ShortModels(HashMap<String, String>);
 
 impl ShortModels {

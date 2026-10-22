@@ -1365,10 +1365,10 @@ fn below(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
 }
 
 /// What the body holds under the rows above the table (`top`), at its size: the table's head and
-/// rows, then the rule and the total, then what lies below it (`below`) in as many rows as it needs, half the body
-/// at most and leaving the table `TABLE_MIN` rows. What does not fit there scrolls with `J`/`K`
-/// (B25), and its last row says which lines show. The total follows the last row shown, so it is at the foot of a
-/// table that fills the body.
+/// rows, then the rule and the total, then what lies below it (`below`) in as many rows as it
+/// needs, half the body at most and leaving the table `TABLE_MIN` rows. What does not fit there
+/// scrolls with `J`/`K` (B25), and its last row says which lines show. The total follows the last
+/// row shown, so it is at the foot of a table that fills the body.
 struct Plan {
     top: Vec<Line<'static>>,
     rows: usize,
