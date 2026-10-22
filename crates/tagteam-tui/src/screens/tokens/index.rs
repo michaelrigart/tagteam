@@ -288,7 +288,7 @@ pub(crate) fn on_daemon_index(state: &mut State) {
     state.tokens.watch.busy = false;
 }
 
-/// The link is down: a `token-index` event that waited for `LIVE_REQUERY_MS` is forgotten.
+/// The link is down: a `token-index` event that waited for its due time is forgotten.
 pub(crate) fn on_link_down(state: &mut State) {
     state.tokens.watch.live_due = false;
 }
@@ -296,8 +296,8 @@ pub(crate) fn on_link_down(state: &mut State) {
 /// Spec §6.4 in live mode, §8: the daemon's `token-index` event for `provider`. While Tokens shows
 /// that provider's report, a `changedAt` newer than the report's reads it again, at most every
 /// `LIVE_REQUERY_MS` (`LIVE_REFRESHING_MS` while the TUI's own refresh runs; at once after `r`):
-/// an event that comes sooner waits for then, and the report read then has every change since. `changedAt` is to the second, so a change in the second the report's
-/// was in counts as newer.
+/// an event that comes sooner waits for then, and the report read then has every change since.
+/// `changedAt` is to the second, so a change in the second the report's was in counts as newer.
 pub(crate) fn on_token_index(
     state: &mut State,
     provider: &str,
