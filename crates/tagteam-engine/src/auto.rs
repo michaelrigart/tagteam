@@ -697,7 +697,6 @@ impl AutoEngine<'_> {
                 }
                 Err(e) => {
                     self.count(t)?;
-                    self.switch_failed(&t.live.id, id, &e)?;
                     self.error(
                         sink,
                         format!(
@@ -706,6 +705,7 @@ impl AutoEngine<'_> {
                         ),
                         transient(&e),
                     );
+                    self.switch_failed(&t.live.id, id, &e)?;
                     return Ok((TickOutcome::Error, decision.clone()));
                 }
             }
