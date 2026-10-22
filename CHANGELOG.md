@@ -88,6 +88,8 @@ with the one before, so any release may contain breaking changes. Each section s
   one account, and `⏎` on Accounts opens its history.
 - `tagteam tui`'s auto line reads auto's last action from the store, also without the daemon, and
   `w` opens History at it.
+- A switch makes up to 5 fewer Keychain calls while it holds Claude Code's locks (15 instead of 20
+  for a typical `tagteam switch <N>`), so a Claude Code waiting on those locks waits less.
 
 ### Security
 

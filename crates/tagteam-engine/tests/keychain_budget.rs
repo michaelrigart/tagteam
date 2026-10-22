@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use common::Fx;
 use tagteam_cc::live::{LiveStore, Platform};
-use tagteam_cc::{CLAUDE_CODE, CcPaths, ClaudeCode};
+use tagteam_cc::{CLAUDE_CODE, CcPaths, ClaudeCode, ItemKind};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;
@@ -86,12 +86,15 @@ impl Keychain for Counting {
         self.inner.lock_state()
     }
     fn unlock(&self) -> bool {
+        self.record("unlock", "", "");
         self.inner.unlock()
     }
     fn delete_service(&self, service: &str) -> Result<u32, KeychainError> {
+        self.record("delete_service", service, "");
         self.inner.delete_service(service)
     }
     fn service_has_items(&self, service: &str) -> Read<bool> {
+        self.record("service_has_items", service, "");
         self.inner.service_has_items(service)
     }
     fn read_counts(&self) -> Option<Arc<ReadCounts>> {
@@ -105,6 +108,34 @@ fn locked_reads(calls: &[Call], item: &str) -> usize {
         .iter()
         .filter(|c| c.locked && c.op == "find" && c.item == item)
         .count()
+}
+
+/// The spawns `calls` make, in review refactor §8.11's unit: one per call and two per `upsert`
+/// (add, then verify the write). It does not claim to match `SecurityCli` for every operation.
+/// `locked == false` counts every call; `locked == true` counts only those made under CC's
+/// refresh lock.
+fn spawns(calls: &[Call], locked: bool) -> usize {
+    calls
+        .iter()
+        .filter(|c| !locked || c.locked)
+        .map(|c| if c.op == "upsert" { 2 } else { 1 })
+        .sum()
+}
+
+/// Every call as `op item locked`, one per line, for a failure message. Never any bytes.
+fn listing(calls: &[Call]) -> String {
+    calls
+        .iter()
+        .map(|c| {
+            format!(
+                "{} {} {}",
+                c.op,
+                c.item,
+                if c.locked { "locked" } else { "free" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// An engine over `fx`'s Env, clock, oracle and ports whose Claude Code and vault both go
@@ -174,4 +205,54 @@ fn a_capture_under_the_locks_makes_the_next_vault_reads_fresh() {
     assert_eq!(locked_reads(&calls, "vault:a"), 4, "{calls:?}");
     // `settle_outgoing` before the capture, and `hold_vault` after it.
     assert_eq!(locked_reads(&calls, "vault:a.prev"), 2, "{calls:?}");
+}
+
+// The budget of a manual switch, in spawns (review refactor §8.11). They are pins, not limits: a
+// change that saves calls must lower them on purpose, and one that adds calls must raise them
+// on purpose.
+const SWITCH_N_SPAWNS: usize = 20;
+const SWITCH_N_LOCKED_SPAWNS: usize = 15;
+const BARE_SWITCH_SPAWNS: usize = 21;
+const BARE_SWITCH_LOCKED_SPAWNS: usize = 15;
+
+#[test]
+fn a_manual_switch_spends_its_keychain_budget() {
+    let (fx, a, b) = scenario();
+    let (live_svc, live_acct) = fx.live_item(ItemKind::OAuth);
+    let live = fx.kc.get(&live_svc, &live_acct).unwrap();
+    let vault_b = fx.vault_bytes(&b).unwrap();
+    assert_ne!(
+        live, vault_b,
+        "the live entry must differ from b's vault bytes"
+    );
+    assert_eq!(fx.cc.vault_form(&live).as_ref(), vault_b.as_slice());
+    assert_eq!(fx.managed_key(), None);
+    assert_eq!(common::rescue_files(&fx), 0);
+
+    let (engine, counting) = counting_engine(&fx, &[(&a, "a"), (&b, "b")]);
+    let out = engine.switch(fx.switch_request(&a, false)).unwrap();
+    assert_eq!(out.reason, SwitchReason::Switched);
+    assert!(fx.displaced().is_empty());
+    let calls = counting.calls();
+    let (total, held) = (spawns(&calls, false), spawns(&calls, true));
+    assert_eq!(
+        (total, held),
+        (SWITCH_N_SPAWNS, SWITCH_N_LOCKED_SPAWNS),
+        "switch <a>, spawns in total and under the locks:\n{}",
+        listing(&calls)
+    );
+
+    let (fx, a, b) = scenario();
+    let (engine, counting) = counting_engine(&fx, &[(&a, "a"), (&b, "b")]);
+    let out = engine.switch(fx.rotation_request(false)).unwrap();
+    assert_eq!(out.reason, SwitchReason::Switched);
+    assert_eq!(out.to.map(|r| r.id), Some(a.clone()));
+    let calls = counting.calls();
+    let (total, held) = (spawns(&calls, false), spawns(&calls, true));
+    assert_eq!(
+        (total, held),
+        (BARE_SWITCH_SPAWNS, BARE_SWITCH_LOCKED_SPAWNS),
+        "bare switch, spawns in total and under the locks:\n{}",
+        listing(&calls)
+    );
 }
