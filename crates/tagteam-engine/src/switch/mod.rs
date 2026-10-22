@@ -421,7 +421,7 @@ impl Engine {
             return;
         }
         let budget = p.poll_budget();
-        let now_s = self.now_ms().div_euclid(1000);
+        let now_s = self.now_s();
         let outgoing = outcome.from.as_ref().filter(|from| from.id != to.id);
         for (row, active) in [(Some(to), true), (outgoing, false)] {
             let Some(row) = row else {

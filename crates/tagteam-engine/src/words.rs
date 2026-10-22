@@ -4,6 +4,7 @@
 //! around them.
 
 use tagteam_core::autoswitch::{NoSwitchReason, Trigger};
+use tagteam_core::time::ms_to_s;
 use tagteam_core::{Window, WindowKind};
 use tagteam_provider::TransientKind;
 
@@ -342,7 +343,7 @@ pub fn next_update(at: i64, now_s: i64) -> String {
 /// T3-10: `login valid 6 more days`, `… 1 more day`, `… 5h20m more`, `login expired`.
 pub fn login_valid(expires_at_ms: i64, now_s: i64) -> String {
     const DAY: i64 = 86_400;
-    let left = expires_at_ms.div_euclid(1000).saturating_sub(now_s);
+    let left = ms_to_s(expires_at_ms).saturating_sub(now_s);
     if left <= 0 {
         "login expired".to_owned()
     } else if left < DAY {

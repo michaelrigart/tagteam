@@ -311,7 +311,7 @@ impl Engine {
         let results = self.collect_each(store, &first, &roles, policy);
         self.check_cancel()?;
         report.add(results);
-        let now_s = self.now_ms().div_euclid(1000);
+        let now_s = self.now_s();
         let polls = self.poll_rows(p.as_ref(), &rows, live)?;
         let picked =
             self.scheduled_candidates(store, p.as_ref(), &polls.candidates, live, policy, now_s)?;
@@ -365,7 +365,7 @@ impl Engine {
         let live_ids = self.live_accounts(&rows);
         let live = rows.iter().find(|r| live_ids.contains(&r.id));
         let polls = self.poll_rows(p.as_ref(), &rows, live)?;
-        let now_s = self.now_ms().div_euclid(1000);
+        let now_s = self.now_s();
         let mut earliest: Option<i64> = None;
         for row in polls.live.into_iter().chain(polls.candidates) {
             // Review refactor §8.1, §11: a held backoff is the account's real deadline, not a
@@ -762,10 +762,6 @@ fn windows(result: UsageResult) -> Result<Vec<Window>, Stop> {
 impl Collection<'_> {
     fn now_ms(&self) -> i64 {
         self.engine.now_ms()
-    }
-
-    fn now_s(&self) -> i64 {
-        self.now_ms().div_euclid(1000)
     }
 
     /// §14.1's cancellation point before a usage request, or before a refresh started for one.
@@ -1312,7 +1308,7 @@ impl Collection<'_> {
         fetched: Result<Vec<Window>, Stop>,
     ) -> Result<Collected, EngineError> {
         hooks::point(self.engine, "usage-before-record")?;
-        let now_s = self.now_s();
+        let now_s = self.engine.now_s();
         Ok(match fetched {
             Ok(windows) => {
                 let plan = self.plan(&windows, self.active_now()?, now_s);

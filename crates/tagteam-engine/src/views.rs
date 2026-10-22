@@ -3,6 +3,7 @@ use std::os::unix::fs::MetadataExt;
 use std::time::Duration;
 
 use tagteam_core::pace::pace;
+use tagteam_core::time::ms_to_s;
 use tagteam_core::trust::decision_grade;
 use tagteam_core::usage::{earliest_relevant_reset, headroom, is_relevant};
 use tagteam_core::{AccountId, Pace, PollBudget, ProviderId, Sample, TrustInputs, Window};
@@ -392,7 +393,7 @@ impl Engine {
         let (Some(store), Some(state)) = (store, state) else {
             return Ok(UsageView::unread(status, None));
         };
-        let now_s = self.now_ms().div_euclid(1000);
+        let now_s = self.now_s();
         let windows = match state.fetched_at {
             Some(at) => {
                 let read = state.last_good.as_deref().unwrap_or_default();
@@ -458,7 +459,7 @@ impl Engine {
         budget: &PollBudget,
     ) -> Result<bool, EngineError> {
         let now_ms = self.now_ms();
-        let now_s = now_ms.div_euclid(1000);
+        let now_s = ms_to_s(now_ms);
         // §8.4 extends trust only while failures are being retried, and a quarantined account
         // is never retried: it keeps the five-minute rule alone.
         let retried = row.quarantine_reason.is_none();

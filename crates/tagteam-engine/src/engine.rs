@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
+use tagteam_core::time::ms_to_s;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::liveness::ProcessProbe;
 use tagteam_provider::process::ProcessSpawner;
@@ -197,6 +198,11 @@ impl Engine {
 
     pub fn now_ms(&self) -> i64 {
         self.clock.now_ms()
+    }
+
+    /// The clock in whole seconds, rounded down.
+    pub fn now_s(&self) -> i64 {
+        ms_to_s(self.now_ms())
     }
 
     /// The settings as last read (§6.4), as a snapshot. A reload replaces what later calls
@@ -759,6 +765,18 @@ mod tests {
                 ..test_config(Env::for_test(d.path()))
             });
             assert_eq!(engine.source(), source);
+        }
+    }
+
+    #[test]
+    fn now_s_is_the_clock_in_whole_seconds_rounded_down() {
+        let d = tempfile::tempdir().unwrap();
+        for (ms, s) in [(1_999, 1), (-1, -1)] {
+            let engine = Engine::new(EngineConfig {
+                clock: Arc::new(tagteam_provider::FakeClock::new(ms)),
+                ..test_config(Env::for_test(d.path()))
+            });
+            assert_eq!(engine.now_s(), s, "{ms} ms");
         }
     }
 

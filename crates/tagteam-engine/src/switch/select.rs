@@ -571,7 +571,7 @@ impl Engine {
             .iter()
             .filter_map(|r| blocked_until(r.windows.as_deref().unwrap_or_default(), models))
             .min();
-        let now_s = self.now_ms().div_euclid(1000);
+        let now_s = self.now_s();
         let when = reset.map_or_else(String::new, |at| {
             format!("; the earliest reset is in {}", span(at - now_s))
         });
@@ -636,7 +636,7 @@ impl Engine {
         // §11.2 step 6, judged from the state as read now: the engine is its one writer, and
         // the check and the record are both made under `MutationGuard`.
         if matches!(auto.trigger, Trigger::Proactive | Trigger::ConsumeFirst) {
-            let now_s = self.now_ms().div_euclid(1000);
+            let now_s = self.now_s();
             if let Some(at) = store.autoswitch_state(&req.provider)?.last_switch_at {
                 let ends = at.saturating_add(auto.cooldown_s);
                 if now_s < ends {

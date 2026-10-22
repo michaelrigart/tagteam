@@ -1,6 +1,7 @@
 //! ISO 8601 UTC, as tagteam's JSON spells a time (§13.2) and as the endpoints and an export
 //! file write one (§8.1, §13.3). Only `Z` and numeric offsets are read, and only UTC is
-//! written.
+//! written. Also the one conversion from epoch milliseconds to whole seconds (review refactor
+//! §8.9).
 
 /// The value of `n` ASCII digits, or `None` if any byte is not one.
 fn digits(b: &[u8]) -> Option<i64> {
@@ -125,6 +126,16 @@ pub fn format_iso8601(epoch_s: i64) -> String {
     )
 }
 
+/// Epoch milliseconds as whole seconds, rounded down (`div_euclid`): -1 ms is -1 s.
+pub fn ms_to_s(ms: i64) -> i64 {
+    ms.div_euclid(1000)
+}
+
+/// Epoch milliseconds as whole seconds, rounded up; never overflows.
+pub fn ms_to_s_ceil(ms: i64) -> i64 {
+    ms.div_euclid(1000) + i64::from(ms.rem_euclid(1000) != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +170,33 @@ mod tests {
             Some(1_790_000_000),
             "seconds still drop the fraction, never round it"
         );
+    }
+
+    #[test]
+    fn milliseconds_become_seconds_rounded_down_or_up() {
+        for (ms, down) in [
+            (0, 0),
+            (999, 0),
+            (1000, 1),
+            (1999, 1),
+            (-1, -1),
+            (-1000, -1),
+            (-1001, -2),
+        ] {
+            assert_eq!(ms_to_s(ms), down, "{ms} ms rounded down");
+        }
+        for (ms, up) in [
+            (0, 0),
+            (1, 1),
+            (1000, 1),
+            (1001, 2),
+            (-1, 0),
+            (-999, 0),
+            (-1000, -1),
+            (i64::MAX, 9_223_372_036_854_776),
+        ] {
+            assert_eq!(ms_to_s_ceil(ms), up, "{ms} ms rounded up");
+        }
     }
 
     #[test]

@@ -167,7 +167,7 @@ impl App<'_, '_> {
         self.collect(ids)?;
         let lists = self.engine.accounts(self.provider_flag.as_ref())?;
         let this = self.this_account();
-        let (now_s, color) = (self.now_s(), self.color());
+        let (now_s, color) = (self.engine.now_s(), self.color());
         let engine = &self.engine;
         let names = |id: &str| {
             engine
@@ -193,7 +193,7 @@ impl App<'_, '_> {
             ShellAccount::Unmanaged => self.session_login(),
             ShellAccount::NotInShell | ShellAccount::Managed(_) => None,
         };
-        let (now_s, color) = (self.now_s(), self.color());
+        let (now_s, color) = (self.engine.now_s(), self.color());
         let human = render::status_human(&s, &session, login.as_deref(), now_s, color);
         let json =
             render::status_json(&s, &session, provider.as_str(), &render_usage(&self.engine));

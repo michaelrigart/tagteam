@@ -211,7 +211,7 @@ impl Job for AutoJob<'_> {
             return Ran::Stop(StopReason::Signal);
         };
         let jitter = (cx.jitter)();
-        let now = cx.engine.now_ms().div_euclid(1000);
+        let now = cx.engine.now_s();
         let delay = next_delay(
             &decision,
             &self.cfg,

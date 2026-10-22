@@ -14,7 +14,7 @@ use age::armor::{ArmoredReader, ArmoredWriter, Format};
 /// A passphrase, which `Debug` never shows; the CLI builds one from what the person typed.
 pub use age::secrecy::SecretString;
 use serde_json::{Map, Value, json};
-use tagteam_core::time::{format_iso8601, parse_iso8601};
+use tagteam_core::time::{format_iso8601, ms_to_s, parse_iso8601};
 use tagteam_core::{Fingerprint, ProviderId};
 pub use tagteam_provider::import::ImportRecord;
 use tagteam_provider::import::{
@@ -143,7 +143,7 @@ pub fn envelope(
                 "label": a.label,
                 "alias": a.alias,
                 "disabled": a.disabled,
-                "addedAt": format_iso8601(a.added_at.div_euclid(1000)),
+                "addedAt": format_iso8601(ms_to_s(a.added_at)),
                 "identity": a.identity,
                 "credential": a.credential,
             })
@@ -152,7 +152,7 @@ pub fn envelope(
     let v = json!({
         "format": FORMAT,
         "version": VERSION,
-        "exportedAt": format_iso8601(now_ms.div_euclid(1000)),
+        "exportedAt": format_iso8601(ms_to_s(now_ms)),
         "exportedFrom": exported_from(),
         "tagteamVersion": env!("CARGO_PKG_VERSION"),
         "active": active,

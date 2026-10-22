@@ -12,6 +12,7 @@ use tagteam_core::autoswitch::{
     Phase, Snapshot, Trigger, decide, departure,
 };
 use tagteam_core::fmt::span;
+use tagteam_core::time::ms_to_s_ceil;
 use tagteam_core::usage::headroom;
 use tagteam_core::{AccountId, Fingerprint, ProviderId, Window, WindowKind};
 use tagteam_provider::{Env, FlockGuard, LockError, ProcessStamp, Provider, Read, ReadError};
@@ -451,9 +452,9 @@ impl AutoEngine<'_> {
         let state = store.usage_state(id).ok()??;
         let mut at = state.next_poll_at?;
         if let Some(ms) = store.usage_lease_expires_at(id).ok().flatten() {
-            at = at.max((ms + 999).div_euclid(1000));
+            at = at.max(ms_to_s_ceil(ms));
         }
-        let now = self.engine.now_ms().div_euclid(1000);
+        let now = self.engine.now_s();
         if let Some(until) = state.backoff_until.filter(|u| backoff_holds(Some(*u), now)) {
             at = at.max(until);
         }
@@ -753,7 +754,7 @@ impl AutoEngine<'_> {
     /// step 7); the switch checks it again under its locks.
     fn snapshot(&self, p: &dyn Provider, accounts: &[Account], live: &AccountId) -> Snapshot {
         Snapshot {
-            now: self.engine.now_ms().div_euclid(1000),
+            now: self.engine.now_s(),
             live: Live::Managed(live.clone()),
             accounts: accounts
                 .iter()
@@ -798,7 +799,7 @@ impl AutoEngine<'_> {
 
     /// The cooldown left as `no-switch cooldown` states it, from the state as stored now.
     fn cooldown_left(&self, store: &Store) -> Result<String, EngineError> {
-        let now = self.engine.now_ms().div_euclid(1000);
+        let now = self.engine.now_s();
         Ok(store
             .autoswitch_state(&self.provider)?
             .last_switch_at
