@@ -12,6 +12,7 @@ use tagteam_provider::{Provider, Read, StoredLogin};
 
 use crate::engine::{Engine, GuardRequest};
 use crate::error::{EngineError, SessionOwner};
+use crate::event::EventKind;
 use crate::lifecycle::{LoginSource, LoginWrite, Prepared, check_identity_conflict};
 use crate::store::{AccountRow, Store, StoreError};
 use crate::transfer::ImportRecord;
@@ -271,7 +272,7 @@ impl Engine {
                 source: LoginSource {
                     from_live: false,
                     live_names_account,
-                    event: "import",
+                    event: EventKind::Import,
                     added_at: None,
                 },
             },
@@ -346,7 +347,7 @@ impl Engine {
                 source: LoginSource {
                     from_live: false,
                     live_names_account: false,
-                    event: "import",
+                    event: EventKind::Import,
                     added_at: v.record.added_at,
                 },
             },

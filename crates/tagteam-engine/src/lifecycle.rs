@@ -10,6 +10,7 @@ use tagteam_provider::{Credential, Identity, Provenance, Provider, Read};
 use crate::account_lock::AccountLock;
 use crate::engine::{Engine, GuardRequest, Reconcile};
 use crate::error::{DeletionRefusal, EngineError, GuardScope};
+use crate::event::EventKind;
 use crate::fsutil::{FileId, absent};
 use crate::live_guard::{LiveGuardError, live_files, refuse_inside};
 use crate::rescue::RescueUnlisted;
@@ -182,7 +183,7 @@ pub(crate) struct LoginSource {
     /// The live identity names the account (§12.5 "A replacement records its own evidence").
     pub(crate) live_names_account: bool,
     /// The `events` row's kind: `add`, or `import` (§13.3).
-    pub(crate) event: &'static str,
+    pub(crate) event: EventKind,
     /// A new account's `added_at`, epoch ms: an import keeps the file's (§13.3); `None` is now.
     pub(crate) added_at: Option<i64>,
 }
@@ -253,7 +254,7 @@ impl Engine {
     pub(crate) fn event(
         &self,
         provider: &ProviderId,
-        kind: &str,
+        kind: EventKind,
         from: Option<&AccountId>,
         to: Option<&AccountId>,
     ) -> Result<(), EngineError> {
@@ -261,11 +262,11 @@ impl Engine {
             &EventRow {
                 at: self.now_ms(),
                 provider: provider.clone(),
-                kind: kind.to_owned(),
+                kind,
                 from_id: from.cloned(),
                 to_id: to.cloned(),
                 trigger: None,
-                source: self.source().as_str().into(),
+                source: self.source(),
                 detail: None,
             },
             self.registered_id(provider).is_some(),
@@ -319,7 +320,7 @@ impl Engine {
         }
         self.remove_profile(p.as_ref(), row, pending)?;
         self.store()?.delete_account(&row.id)?;
-        self.event(&row.provider, "remove", Some(&row.id), None)?;
+        self.event(&row.provider, EventKind::Remove, Some(&row.id), None)?;
         Ok(rescues.len())
     }
 
@@ -896,7 +897,7 @@ impl Engine {
                 source: LoginSource {
                     from_live: true,
                     live_names_account: true,
-                    event: "add",
+                    event: EventKind::Add,
                     added_at: None,
                 },
             },
@@ -1006,7 +1007,7 @@ impl Engine {
                 source: LoginSource {
                     from_live: false,
                     live_names_account,
-                    event: "add",
+                    event: EventKind::Add,
                     added_at: None,
                 },
             },

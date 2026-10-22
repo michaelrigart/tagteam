@@ -134,7 +134,7 @@ fn a_session_owned_account_with_an_unreadable_replacement_still_refuses_remove()
         assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a9"));
         assert!(profile.exists(), "{meta}");
         let events = fx.engine.store().unwrap().events().unwrap();
-        assert!(events.iter().all(|e| e.kind != "remove"), "{meta}");
+        assert!(events.iter().all(|e| e.kind.as_str() != "remove"), "{meta}");
     }
 }
 
@@ -144,7 +144,10 @@ fn remove_records_its_event_after_leaving_an_unreadable_replacement_as_it_was() 
         let (fx, a) = landed_unreadable(meta);
         fx.engine.remove(&a).unwrap();
         let events = fx.engine.store().unwrap().events().unwrap();
-        let removes: Vec<_> = events.iter().filter(|e| e.kind == "remove").collect();
+        let removes: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind.as_str() == "remove")
+            .collect();
         assert_eq!(removes.len(), 1, "{meta}: {events:?}");
         assert_eq!(removes[0].from_id.as_ref(), Some(&a), "{meta}");
     }

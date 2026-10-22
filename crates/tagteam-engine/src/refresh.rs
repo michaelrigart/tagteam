@@ -943,7 +943,13 @@ mod tests {
             .events()
             .unwrap()
             .into_iter()
-            .map(|e| (e.kind, e.detail, e.source))
+            .map(|e| {
+                (
+                    e.kind.as_str().to_owned(),
+                    e.detail,
+                    e.source.as_str().to_owned(),
+                )
+            })
             .collect();
         assert_eq!(
             events,

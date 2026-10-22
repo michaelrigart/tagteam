@@ -7,11 +7,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_engine::EventSource;
 use tagteam_engine::store::{
     Activation, AutoRecord, DisplacedRow, EventRow, JournalRow, LoginMeta, NewAccount, SeedLaunch,
     Store, StoreError,
 };
+use tagteam_engine::{EventKind, EventSource};
 use tagteam_provider::{Env, Identity, ProcessStamp};
 
 /// Reads the on-disk journal mode through a fresh, independent connection, so the assertion
@@ -184,11 +184,11 @@ fn commit_switch_is_one_transaction_and_delete_clears_active() {
     let ev = EventRow {
         at: 6,
         provider: cc(),
-        kind: "switch".into(),
+        kind: EventKind::Switch,
         from_id: Some(a.clone()),
         to_id: Some(b.clone()),
         trigger: Some("manual".into()),
-        source: "cli".into(),
+        source: EventSource::Cli,
         detail: None,
     };
     s.commit_switch(&cc(), &b, 0, &ev, None).unwrap();
@@ -522,12 +522,12 @@ fn quarantines_are_set_bound_to_a_fingerprint_and_cleared() {
         (Some("invalid_grant"), Some("sha256:sent"), Some(42))
     );
     assert!(
-        s.clear_quarantine(&a, "credentials-replaced", "auto", 77)
+        s.clear_quarantine(&a, "credentials-replaced", EventSource::Auto, 77)
             .unwrap(),
         "one was set"
     );
     assert!(
-        !s.clear_quarantine(&a, "credentials-replaced", "auto", 78)
+        !s.clear_quarantine(&a, "credentials-replaced", EventSource::Auto, 78)
             .unwrap(),
         "nothing left to clear"
     );
@@ -542,11 +542,11 @@ fn quarantines_are_set_bound_to_a_fingerprint_and_cleared() {
         vec![EventRow {
             at: 77,
             provider: cc(),
-            kind: "unquarantine".into(),
+            kind: EventKind::Unquarantine,
             from_id: None,
             to_id: Some(a.clone()),
             trigger: None,
-            source: "auto".into(),
+            source: EventSource::Auto,
             detail: Some(json!({"reason": "credentials-replaced"})),
         }]
     );
@@ -554,7 +554,7 @@ fn quarantines_are_set_bound_to_a_fingerprint_and_cleared() {
         !s.clear_quarantine(
             &AccountId::from_string("nobody"),
             "credentials-replaced",
-            "cli",
+            EventSource::Cli,
             79
         )
         .unwrap()
@@ -604,15 +604,15 @@ fn the_database_and_its_sidecars_are_created_0600() {
 }
 
 /// The `switch` event a commit from `from` to `to` inserts.
-fn switch_event(from: &AccountId, to: &AccountId, trigger: &str, source: &str) -> EventRow {
+fn switch_event(from: &AccountId, to: &AccountId, trigger: &str, source: EventSource) -> EventRow {
     EventRow {
         at: 1_790_000_000_000,
         provider: cc(),
-        kind: "switch".into(),
+        kind: EventKind::Switch,
         from_id: Some(from.clone()),
         to_id: Some(to.clone()),
         trigger: Some(trigger.into()),
-        source: source.into(),
+        source,
         detail: None,
     }
 }
@@ -659,7 +659,7 @@ fn an_automatic_commit_records_its_departure_and_resets_the_count() {
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let b = add(&s, &cc(), "b", "b@x.co", 2);
     s.set_unhealthy_ticks(&cc(), 2).unwrap();
-    let ev = switch_event(&a, &b, "proactive", "auto");
+    let ev = switch_event(&a, &b, "proactive", EventSource::Auto);
     s.commit_switch(&cc(), &b, 0, &ev, Some(&record(&a, &b)))
         .unwrap();
     let recorded = AutoState {
@@ -676,8 +676,14 @@ fn an_automatic_commit_records_its_departure_and_resets_the_count() {
     assert_eq!(s.events().unwrap(), vec![ev]);
     // A manual commit records nothing: the last automatic switch's record stands.
     s.set_unhealthy_ticks(&cc(), 1).unwrap();
-    s.commit_switch(&cc(), &a, 0, &switch_event(&b, &a, "manual", "cli"), None)
-        .unwrap();
+    s.commit_switch(
+        &cc(),
+        &a,
+        0,
+        &switch_event(&b, &a, "manual", EventSource::Cli),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         s.autoswitch_state(&cc()).unwrap(),
         AutoState {
@@ -713,7 +719,7 @@ fn the_record_lands_with_the_commit_or_not_at_all() {
     )
     .unwrap();
     let ghost = AccountId::from_string("ghost");
-    let ev = switch_event(&a, &ghost, "proactive", "auto");
+    let ev = switch_event(&a, &ghost, "proactive", EventSource::Auto);
     assert!(
         s.commit_switch(&cc(), &ghost, 0, &ev, Some(&record(&a, &ghost)))
             .is_err()
@@ -731,7 +737,7 @@ fn a_departure_trigger_this_build_does_not_know_reads_as_none() {
     let s = Store::open(&path).unwrap();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let b = add(&s, &cc(), "b", "b@x.co", 2);
-    let ev = switch_event(&a, &b, "proactive", "auto");
+    let ev = switch_event(&a, &b, "proactive", EventSource::Auto);
     s.commit_switch(&cc(), &b, 0, &ev, Some(&record(&a, &b)))
         .unwrap();
     rusqlite::Connection::open(&path)
@@ -748,11 +754,11 @@ fn switch_event_to(to: &AccountId) -> EventRow {
     EventRow {
         at: 6,
         provider: cc(),
-        kind: "switch".into(),
+        kind: EventKind::Switch,
         from_id: None,
         to_id: Some(to.clone()),
         trigger: Some("manual".into()),
-        source: "cli".into(),
+        source: EventSource::Cli,
         detail: None,
     }
 }
@@ -1364,11 +1370,11 @@ fn a_provider_s_rows_go_and_its_usage_budget_stays() {
             &EventRow {
                 at: 1,
                 provider: p.clone(),
-                kind: "add".into(),
+                kind: EventKind::Add,
                 from_id: None,
                 to_id: Some(id.clone()),
                 trigger: None,
-                source: "cli".into(),
+                source: EventSource::Cli,
                 detail: None,
             },
             true,
@@ -2100,4 +2106,31 @@ fn an_account_row_is_switchable_when_enabled_with_an_identity_and_a_poll_candida
         ..row
     };
     assert_eq!(rules(&quarantined), (true, false));
+}
+
+#[test]
+fn events_leave_out_a_row_this_build_cannot_type_and_keep_it_stored() {
+    // Review refactor §8.7: a newer build's kind or source is left out of the read, not failed
+    // on, and the row stays stored.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "INSERT INTO events (at, provider, kind, source) VALUES
+           (1, 'claude-code', 'switch', 'cli'),
+           (2, 'claude-code', 'x-new-kind', 'cli'),
+           (3, 'claude-code', 'switch', 'menubar');",
+    )
+    .unwrap();
+    let events = s.events().unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        (events[0].at, events[0].kind, events[0].source),
+        (1, EventKind::Switch, EventSource::Cli)
+    );
+    let stored: i64 = conn
+        .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stored, 3);
 }

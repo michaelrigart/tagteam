@@ -264,7 +264,10 @@ fn read(fx: &Fx, id: &AccountId, w: &[Window]) {
 /// The last event the store recorded, as `(kind, source)`.
 fn last_event(fx: &Fx) -> (String, String) {
     let last = fx.engine.store().unwrap().events().unwrap().pop().unwrap();
-    (last.kind, last.source)
+    (
+        last.kind.as_str().to_owned(),
+        last.source.as_str().to_owned(),
+    )
 }
 
 #[test]

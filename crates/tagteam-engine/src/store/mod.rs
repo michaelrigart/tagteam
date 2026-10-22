@@ -15,7 +15,7 @@ use tagteam_provider::atomic::ensure_private_dir;
 use tagteam_provider::{Clock, Identity, MutationGuard, ProcessStamp, SystemClock};
 
 use crate::account_lock::AccountLock;
-use crate::event::EventSource;
+use crate::event::{EventKind, EventSource};
 
 mod tokens;
 mod usage;
@@ -232,11 +232,11 @@ pub struct NewAccount<'a> {
 pub struct EventRow {
     pub at: i64,
     pub provider: ProviderId,
-    pub kind: String,
+    pub kind: EventKind,
     pub from_id: Option<AccountId>,
     pub to_id: Option<AccountId>,
     pub trigger: Option<String>,
-    pub source: String,
+    pub source: EventSource,
     pub detail: Option<Value>,
 }
 
@@ -489,11 +489,18 @@ fn journal_from_row(r: &Row<'_>) -> rusqlite::Result<JournalRow> {
     })
 }
 
-fn event_from_row(r: &Row<'_>) -> rusqlite::Result<EventRow> {
-    Ok(EventRow {
+/// `None` for a row whose kind or source this build cannot type: a newer build's, left stored
+/// and left out of `events` (review refactor §8.7).
+fn event_from_row(r: &Row<'_>) -> rusqlite::Result<Option<EventRow>> {
+    let kind: String = r.get("kind")?;
+    let source: String = r.get("source")?;
+    let (Some(kind), Some(source)) = (EventKind::parse(&kind), EventSource::parse(&source)) else {
+        return Ok(None);
+    };
+    Ok(Some(EventRow {
         at: r.get("at")?,
         provider: ProviderId::new(r.get::<_, String>("provider")?),
-        kind: r.get("kind")?,
+        kind,
         from_id: r
             .get::<_, Option<String>>("from_id")?
             .map(AccountId::from_string),
@@ -501,9 +508,9 @@ fn event_from_row(r: &Row<'_>) -> rusqlite::Result<EventRow> {
             .get::<_, Option<String>>("to_id")?
             .map(AccountId::from_string),
         trigger: r.get("trigger")?,
-        source: r.get("source")?,
+        source,
         detail: json_col(r, "detail")?,
-    })
+    }))
 }
 
 /// §14.2 and Decision 10: every `events` row is logged at INFO once it is written, naming its
@@ -589,7 +596,7 @@ fn clear_quarantine_on(
     c: &Connection,
     id: &AccountId,
     reason: &str,
-    source: &str,
+    source: EventSource,
     at: i64,
 ) -> rusqlite::Result<Option<EventRow>> {
     let provider: Option<String> = c
@@ -607,11 +614,11 @@ fn clear_quarantine_on(
     let event = EventRow {
         at,
         provider: ProviderId::new(provider),
-        kind: "unquarantine".into(),
+        kind: EventKind::Unquarantine,
         from_id: None,
         to_id: Some(id.clone()),
         trigger: None,
-        source: source.to_owned(),
+        source,
         detail: Some(json!({"reason": reason})),
     };
     Store::insert_event_on(c, &event)?;
@@ -1214,7 +1221,7 @@ impl Store {
             };
             let login_expires_at = v["login_expires_at"].as_i64();
             apply_login(&tx, id, identity_key, &identity, kind, login_expires_at)?;
-            cleared = clear_quarantine_on(&tx, id, ACCOUNT_REPLACED, source.as_str(), at)?;
+            cleared = clear_quarantine_on(&tx, id, ACCOUNT_REPLACED, source, at)?;
             if v["from_live"].as_bool().unwrap_or(false) {
                 tx.execute(
                     "UPDATE active_accounts SET login_epoch = \
@@ -1295,7 +1302,7 @@ impl Store {
         &self,
         id: &AccountId,
         reason: &str,
-        source: &str,
+        source: EventSource,
         at: i64,
     ) -> Result<bool, StoreError> {
         let mut c = self.lock();
@@ -1452,11 +1459,11 @@ impl Store {
             params![
                 e.at,
                 e.provider.as_str(),
-                e.kind,
+                e.kind.as_str(),
                 e.from_id.as_ref().map(AccountId::as_str),
                 e.to_id.as_ref().map(AccountId::as_str),
                 e.trigger,
-                e.source,
+                e.source.as_str(),
                 e.detail.as_ref().map(Value::to_string),
             ],
         )
@@ -1553,13 +1560,15 @@ impl Store {
         Ok(())
     }
 
+    /// Every event this build can read, in order; a newer build's row it cannot type is left out
+    /// and stays stored.
     pub fn events(&self) -> Result<Vec<EventRow>, StoreError> {
         let c = self.lock();
         let mut stmt = c.prepare("SELECT * FROM events ORDER BY rowid")?;
         let rows = stmt
             .query_map([], event_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        Ok(rows.into_iter().flatten().collect())
     }
 
     pub fn journal(&self, provider: &ProviderId) -> Result<Option<JournalRow>, StoreError> {

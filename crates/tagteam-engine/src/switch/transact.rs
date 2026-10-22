@@ -8,6 +8,7 @@ use crate::account_lock::AccountLock;
 use crate::displace::displace;
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::event::EventKind;
 use crate::hooks;
 use crate::oracle::verdict;
 use crate::provenance::ProfileCheck;
@@ -692,7 +693,7 @@ impl Engine {
             &EventRow {
                 at: self.now_ms(),
                 provider: req.provider.clone(),
-                kind: "switch".into(),
+                kind: EventKind::Switch,
                 from_id: outgoing.map(|o| o.id.clone()),
                 to_id: Some(target.id.clone()),
                 trigger: Some(
@@ -701,7 +702,7 @@ impl Engine {
                         .map_or("manual", |a| a.trigger.as_str())
                         .into(),
                 ),
-                source: self.source().as_str().into(),
+                source: self.source(),
                 detail: None,
             },
             record.as_ref(),

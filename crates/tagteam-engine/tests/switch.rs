@@ -88,7 +88,10 @@ fn rotation_activates_the_next_account_and_keeps_machine_shared_keys() {
     let store = fx.engine.store().unwrap();
     assert_eq!(store.active(&fx.provider()).unwrap(), Some(a));
     assert!(store.journal(&fx.provider()).unwrap().is_none());
-    assert_eq!(store.events().unwrap().last().unwrap().kind, "switch");
+    assert_eq!(
+        store.events().unwrap().last().unwrap().kind.as_str(),
+        "switch"
+    );
     // CC's lock directories are gone again.
     assert!(!fx.paths().refresh_lock.exists() && !fx.paths().config_lock.exists());
 }
@@ -1368,7 +1371,10 @@ fn auto_state(fx: &Fx) -> AutoState {
 
 fn switch_events(fx: &Fx) -> Vec<EventRow> {
     let events = fx.engine.store().unwrap().events().unwrap();
-    events.into_iter().filter(|e| e.kind == "switch").collect()
+    events
+        .into_iter()
+        .filter(|e| e.kind.as_str() == "switch")
+        .collect()
 }
 
 #[test]

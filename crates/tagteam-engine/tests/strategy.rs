@@ -569,7 +569,10 @@ fn a_quarantine_that_no_longer_binds_is_released_before_candidates_are_counted()
     assert_eq!(quarantine_of(&fx, &a), (None, None));
     // Recorded with the switch's own source.
     let events = fx.engine.store().unwrap().events().unwrap();
-    let released = events.iter().find(|e| e.kind == "unquarantine").unwrap();
+    let released = events
+        .iter()
+        .find(|e| e.kind.as_str() == "unquarantine")
+        .unwrap();
     assert_eq!(
         (released.to_id.as_ref(), released.source.as_str()),
         (Some(&a), "cli")
@@ -722,7 +725,7 @@ fn a_double_fired_strategy_switches_once() {
             .events()
             .unwrap()
             .into_iter()
-            .filter(|e| e.kind == "switch")
+            .filter(|e| e.kind.as_str() == "switch")
             .count();
         assert_eq!(switches, 1, "{strategy:?}");
     }
@@ -855,7 +858,7 @@ fn an_interrupted_collection_ends_the_strategy_with_the_signal_and_no_switch() {
                 .events()
                 .unwrap()
                 .iter()
-                .all(|e| e.kind != "switch")
+                .all(|e| e.kind.as_str() != "switch")
         );
     }
 }
