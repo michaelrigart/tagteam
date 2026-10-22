@@ -506,9 +506,7 @@ impl Engine {
         // write and the store update.
         if let Some(reason) = &row.quarantine_reason {
             if !self.quarantine_released(p, &row) {
-                return Ok(GateOutcome::Dead(
-                    QuarantineReason::parse(reason).unwrap_or(QuarantineReason::InvalidGrant),
-                ));
+                return Ok(GateOutcome::Dead(QuarantineReason::from_stored(reason)));
             }
             self.unquarantine(&row, CREDENTIALS_REPLACED)?;
         }

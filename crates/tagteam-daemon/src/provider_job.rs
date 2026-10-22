@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tagteam_core::autoswitch::{
     AutoConfig, Decision, NoSwitchReason, Trigger, announces_sleep, next_delay,
 };
+use tagteam_core::time::ms_to_s;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::auto::{AutoEngine, AutoEvent, EventSink, QuarantineWatch, TickOutcome};
 use tagteam_engine::collect::{CollectMode, Collected};
@@ -425,7 +426,7 @@ impl<'e> ProviderJob<'e> {
             // D4.3: evaluated again at least every 60 s, while the work waits its deadline.
             return Ran::After((self.work_due_ms - now).clamp(1, RECHECK_MS));
         }
-        self.last_tick_at = Some(now.div_euclid(1000));
+        self.last_tick_at = Some(ms_to_s(now));
         // D4.1: every secret read the run makes, whether it collects, freshens or switches.
         let before = self.reads();
         let worked = if self.mode == Some(Mode::Auto) {
