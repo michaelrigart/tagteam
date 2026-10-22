@@ -623,13 +623,15 @@ fn a_switch_carries_the_usage_just_before_and_just_after_it() {
     assert_eq!(at(day(3, 0)), (EventKind::Quarantine, None, None));
     assert_eq!(at(day(1, 0)), (EventKind::Switch, None, None));
 
-    // At the range's edge, `from`'s last reading is from before it.
+    // At the range's edge, `from`'s last reading before the switch is from before the range,
+    // though it has one in the range after it.
     sample(&fx, &c, "5h", SINCE - 60, 91.0);
+    sample(&fx, &c, "5h", day(0, 5), 40.0);
     put(
         &fx,
         Raw {
             from: Some("c"),
-            to: Some("a"),
+            to: Some("b"),
             ..raw_event(SINCE + 60, "switch")
         },
     );
@@ -639,7 +641,7 @@ fn a_switch_carries_the_usage_just_before_and_just_after_it() {
         .iter()
         .find(|e| e.at_ms == (SINCE + 60) * 1000)
         .unwrap();
-    assert_eq!((edge.before_pct, edge.after_pct), (Some(91.0), Some(91.0)));
+    assert_eq!((edge.before_pct, edge.after_pct), (Some(91.0), Some(3.0)));
 }
 
 #[test]
