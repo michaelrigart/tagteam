@@ -1076,7 +1076,7 @@ fn the_registry_is_section_six_four_s_table_in_order() {
 
 #[test]
 fn the_choice_keys_say_their_enums_spellings_in_order() {
-    // review refactor §8.9: a choice key's values are its enum's `ALL`, not a second list.
+    // review refactor §8.8: a choice key's values are its enum's `ALL`, not a second list.
     let strategy = reg("autoswitch.strategy");
     let color = reg("ui.color");
     assert_eq!(strategy.expect(), "must be \"best\" or \"consume-first\"");
@@ -1095,7 +1095,7 @@ fn the_choice_keys_say_their_enums_spellings_in_order() {
 
 #[test]
 fn every_numeric_key_reads_its_declared_range() {
-    // review refactor §8.9: each range is declared once, and the registry holds that constant.
+    // review refactor §8.8: each range is declared once, and the registry holds that constant.
     let kind = |name: &str| reg(name).kind;
     assert_eq!(
         kind("autoswitch.threshold"),
@@ -1901,7 +1901,8 @@ fn every_key_s_written_value_is_stored_in_the_settings_it_loads_into() {
 
 #[test]
 fn every_spelling_a_choice_key_declares_reads_back_as_itself() {
-    // `apply` falls back to a default for a spelling it does not know; no declared one may.
+    // `parse_item` admits only the enum's spellings, so `apply` never sees another; each one must
+    // read back as itself.
     let mut spellings = 0;
     for key in KEYS {
         let KeyKind::Choice(choices) = key.kind else {

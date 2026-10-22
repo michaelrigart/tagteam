@@ -181,9 +181,36 @@ pub enum KeyKind {
     NotifyEvents,
 }
 
+/// The identity of a registry key, which `Settings::value` and `Settings::apply` match
+/// exhaustively (review refactor §8.8), so the compiler refuses a key either one forgets. It is
+/// `pub(crate)` on purpose: the names stay in [`KEYS`], where each variant is named once, because
+/// `dead_code` refuses a variant no entry names and `every_key_id_is_in_the_registry_once` refuses
+/// a duplicate (R4f plan, Ruling 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyId {
+    DefaultProvider,
+    Threshold,
+    IntervalSeconds,
+    CooldownSeconds,
+    HysteresisPct,
+    Strategy,
+    IncludeApiKeyAccounts,
+    UnhealthyTicks,
+    Models,
+    HistoryRetentionDays,
+    TokensRetentionDays,
+    StatuslineFormat,
+    ShareExtra,
+    Color,
+    DaemonAutoswitch,
+    NotifyEnabled,
+    NotifyEvents,
+}
+
 /// One §6.4 key.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Key {
+    pub(crate) id: KeyId,
     /// The dotted name `config` takes: `autoswitch.threshold`, or `default_provider` at the top
     /// level.
     pub name: &'static str,
@@ -196,86 +223,103 @@ pub struct Key {
 /// bounds are the `*_RANGE` constants, which `auto` also clamps its flags to.
 pub const KEYS: &[Key] = &[
     Key {
+        id: KeyId::DefaultProvider,
         name: "default_provider",
         kind: KeyKind::Provider,
         per_provider: false,
     },
     Key {
+        id: KeyId::Threshold,
         name: "autoswitch.threshold",
         kind: KeyKind::Float(&THRESHOLD_RANGE),
         per_provider: true,
     },
     Key {
+        id: KeyId::IntervalSeconds,
         name: "autoswitch.interval_seconds",
         kind: KeyKind::Int(&INTERVAL_SECONDS_RANGE),
         per_provider: true,
     },
     Key {
+        id: KeyId::CooldownSeconds,
         name: "autoswitch.cooldown_seconds",
         kind: KeyKind::Int(&COOLDOWN_SECONDS_RANGE),
         per_provider: true,
     },
     Key {
+        id: KeyId::HysteresisPct,
         name: "autoswitch.hysteresis_pct",
         kind: KeyKind::Float(&HYSTERESIS_PCT_RANGE),
         per_provider: true,
     },
     Key {
+        id: KeyId::Strategy,
         name: "autoswitch.strategy",
         kind: KeyKind::Choice(Choices::Strategy),
         per_provider: true,
     },
     Key {
+        id: KeyId::IncludeApiKeyAccounts,
         name: "autoswitch.include_api_key_accounts",
         kind: KeyKind::Bool,
         per_provider: true,
     },
     Key {
+        id: KeyId::UnhealthyTicks,
         name: "autoswitch.unhealthy_ticks",
         kind: KeyKind::Int(&UNHEALTHY_TICKS_RANGE),
         per_provider: true,
     },
     Key {
+        id: KeyId::Models,
         name: "autoswitch.models",
         kind: KeyKind::Models,
         per_provider: true,
     },
     Key {
+        id: KeyId::HistoryRetentionDays,
         name: "usage.history_retention_days",
         kind: KeyKind::Int(&HISTORY_RETENTION_DAYS_RANGE),
         per_provider: false,
     },
     Key {
+        id: KeyId::TokensRetentionDays,
         name: "tokens.retention_days",
         kind: KeyKind::Int(&TOKENS_RETENTION_DAYS_RANGE),
         per_provider: false,
     },
     Key {
+        id: KeyId::StatuslineFormat,
         name: "statusline.format",
         kind: KeyKind::Format,
         per_provider: true,
     },
     Key {
+        id: KeyId::ShareExtra,
         name: "run.share_extra",
         kind: KeyKind::ShareNames,
         per_provider: true,
     },
     Key {
+        id: KeyId::Color,
         name: "ui.color",
         kind: KeyKind::Choice(Choices::Color),
         per_provider: false,
     },
     Key {
+        id: KeyId::DaemonAutoswitch,
         name: "daemon.autoswitch",
         kind: KeyKind::Bool,
         per_provider: true,
     },
     Key {
+        id: KeyId::NotifyEnabled,
         name: "notify.enabled",
         kind: KeyKind::Bool,
         per_provider: false,
     },
     Key {
+        id: KeyId::NotifyEvents,
         name: "notify.events",
         kind: KeyKind::NotifyEvents,
         per_provider: true,
@@ -624,6 +668,43 @@ impl Value {
         }
     }
 
+    /// The number a `Float` key holds. Each accessor below panics on another variant: [`KEYS`]
+    /// pairs each kind with one.
+    fn into_float(self) -> f64 {
+        match self {
+            Value::Float(n) => n,
+            _ => panic!("KEYS pairs each kind with one Value variant"),
+        }
+    }
+
+    fn into_int(self) -> i64 {
+        match self {
+            Value::Int(n) => n,
+            _ => panic!("KEYS pairs each kind with one Value variant"),
+        }
+    }
+
+    fn into_bool(self) -> bool {
+        match self {
+            Value::Bool(b) => b,
+            _ => panic!("KEYS pairs each kind with one Value variant"),
+        }
+    }
+
+    fn into_string(self) -> String {
+        match self {
+            Value::Str(s) => s,
+            _ => panic!("KEYS pairs each kind with one Value variant"),
+        }
+    }
+
+    fn into_list(self) -> Vec<String> {
+        match self {
+            Value::List(items) => items,
+            _ => panic!("KEYS pairs each kind with one Value variant"),
+        }
+    }
+
     /// The value under `--json`: a list is an array.
     pub fn to_json(&self) -> serde_json::Value {
         match self {
@@ -881,73 +962,71 @@ impl Settings {
 
     /// `key`'s value, as `config` shows it.
     pub fn value(&self, key: &Key) -> Value {
-        match key.name {
-            "default_provider" => Value::Str(
+        match key.id {
+            KeyId::DefaultProvider => Value::Str(
                 self.default_provider
                     .as_ref()
                     .map_or_else(String::new, ToString::to_string),
             ),
-            "autoswitch.threshold" => Value::Float(self.threshold),
-            "autoswitch.interval_seconds" => Value::Int(self.interval_seconds),
-            "autoswitch.cooldown_seconds" => Value::Int(self.cooldown_seconds),
-            "autoswitch.hysteresis_pct" => Value::Float(self.hysteresis_pct),
-            "autoswitch.strategy" => Value::Str(self.strategy.as_str().to_owned()),
-            "autoswitch.include_api_key_accounts" => Value::Bool(self.include_api_key_accounts),
-            "autoswitch.unhealthy_ticks" => Value::Int(self.unhealthy_ticks.into()),
-            "autoswitch.models" => Value::List(self.models.clone()),
-            "usage.history_retention_days" => Value::Int(self.history_retention_days.into()),
-            "tokens.retention_days" => Value::Int(self.tokens_retention_days.into()),
-            "statusline.format" => Value::Str(self.statusline_format.clone()),
-            "run.share_extra" => Value::List(self.share_extra.clone()),
-            "ui.color" => Value::Str(self.color.as_str().to_owned()),
-            "daemon.autoswitch" => Value::Bool(self.daemon_autoswitch),
-            "notify.enabled" => Value::Bool(self.notify_enabled),
-            "notify.events" => Value::List(
+            KeyId::Threshold => Value::Float(self.threshold),
+            KeyId::IntervalSeconds => Value::Int(self.interval_seconds),
+            KeyId::CooldownSeconds => Value::Int(self.cooldown_seconds),
+            KeyId::HysteresisPct => Value::Float(self.hysteresis_pct),
+            KeyId::Strategy => Value::Str(self.strategy.as_str().to_owned()),
+            KeyId::IncludeApiKeyAccounts => Value::Bool(self.include_api_key_accounts),
+            KeyId::UnhealthyTicks => Value::Int(self.unhealthy_ticks.into()),
+            KeyId::Models => Value::List(self.models.clone()),
+            KeyId::HistoryRetentionDays => Value::Int(self.history_retention_days.into()),
+            KeyId::TokensRetentionDays => Value::Int(self.tokens_retention_days.into()),
+            KeyId::StatuslineFormat => Value::Str(self.statusline_format.clone()),
+            KeyId::ShareExtra => Value::List(self.share_extra.clone()),
+            KeyId::Color => Value::Str(self.color.as_str().to_owned()),
+            KeyId::DaemonAutoswitch => Value::Bool(self.daemon_autoswitch),
+            KeyId::NotifyEnabled => Value::Bool(self.notify_enabled),
+            KeyId::NotifyEvents => Value::List(
                 self.notify_events
                     .iter()
                     .map(|e| e.as_str().to_owned())
                     .collect(),
             ),
-            other => unreachable!("`{other}` is not a registry key"),
         }
     }
 
-    /// Stores what `key.parse_item` gave. The registry's kinds and ranges make each pairing
-    /// below the only one that can occur.
+    /// Stores what `key.parse_item` gave. [`KEYS`] pairs each key's kind with the one `Value`
+    /// variant the matching accessor takes.
     fn apply(&mut self, key: &Key, value: Value) {
-        match (key.name, value) {
-            ("default_provider", Value::Str(id)) => {
-                self.default_provider = Some(ProviderId::new(id))
+        match key.id {
+            KeyId::DefaultProvider => {
+                self.default_provider = Some(ProviderId::new(value.into_string()))
             }
-            ("autoswitch.threshold", Value::Float(n)) => self.threshold = n,
-            ("autoswitch.interval_seconds", Value::Int(n)) => self.interval_seconds = n,
-            ("autoswitch.cooldown_seconds", Value::Int(n)) => self.cooldown_seconds = n,
-            ("autoswitch.hysteresis_pct", Value::Float(n)) => self.hysteresis_pct = n,
-            ("autoswitch.strategy", Value::Str(s)) => {
-                self.strategy = AutoStrategy::parse(&s)
+            KeyId::Threshold => self.threshold = value.into_float(),
+            KeyId::IntervalSeconds => self.interval_seconds = value.into_int(),
+            KeyId::CooldownSeconds => self.cooldown_seconds = value.into_int(),
+            KeyId::HysteresisPct => self.hysteresis_pct = value.into_float(),
+            KeyId::Strategy => {
+                self.strategy = AutoStrategy::parse(&value.into_string())
                     .expect("parse_item admits only AutoStrategy::ALL's spellings")
             }
-            ("autoswitch.include_api_key_accounts", Value::Bool(b)) => {
-                self.include_api_key_accounts = b
+            KeyId::IncludeApiKeyAccounts => self.include_api_key_accounts = value.into_bool(),
+            KeyId::UnhealthyTicks => self.unhealthy_ticks = whole(value.into_int()),
+            KeyId::Models => self.models = value.into_list(),
+            KeyId::HistoryRetentionDays => self.history_retention_days = whole(value.into_int()),
+            KeyId::TokensRetentionDays => self.tokens_retention_days = whole(value.into_int()),
+            KeyId::StatuslineFormat => self.statusline_format = value.into_string(),
+            KeyId::ShareExtra => self.share_extra = value.into_list(),
+            KeyId::Color => {
+                self.color = ColorMode::parse(&value.into_string())
+                    .expect("parse_item admits only ColorMode::ALL's spellings")
             }
-            ("autoswitch.unhealthy_ticks", Value::Int(n)) => self.unhealthy_ticks = whole(n),
-            ("autoswitch.models", Value::List(names)) => self.models = names,
-            ("usage.history_retention_days", Value::Int(n)) => {
-                self.history_retention_days = whole(n)
+            KeyId::DaemonAutoswitch => self.daemon_autoswitch = value.into_bool(),
+            KeyId::NotifyEnabled => self.notify_enabled = value.into_bool(),
+            KeyId::NotifyEvents => {
+                self.notify_events = value
+                    .into_list()
+                    .iter()
+                    .filter_map(|n| NotifyEvent::parse(n))
+                    .collect()
             }
-            ("tokens.retention_days", Value::Int(n)) => self.tokens_retention_days = whole(n),
-            ("statusline.format", Value::Str(s)) => self.statusline_format = s,
-            ("run.share_extra", Value::List(names)) => self.share_extra = names,
-            ("ui.color", Value::Str(s)) => {
-                self.color =
-                    ColorMode::parse(&s).expect("parse_item admits only ColorMode::ALL's spellings")
-            }
-            ("daemon.autoswitch", Value::Bool(b)) => self.daemon_autoswitch = b,
-            ("notify.enabled", Value::Bool(b)) => self.notify_enabled = b,
-            ("notify.events", Value::List(names)) => {
-                self.notify_events = names.iter().filter_map(|n| NotifyEvent::parse(n)).collect()
-            }
-            (name, value) => unreachable!("the registry never gives `{name}` {value:?}"),
         }
     }
 }
@@ -1332,5 +1411,29 @@ fn every_key(item: &Item, path: &mut Vec<String>, unknown: &mut Vec<String>) {
             }
         }
         _ => unknown.push(path.join(".")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_key_id_is_in_the_registry_once() {
+        for (at, a) in KEYS.iter().enumerate() {
+            for b in &KEYS[at + 1..] {
+                assert_ne!(a.id, b.id, "`{}` and `{}` share a KeyId", a.name, b.name);
+            }
+        }
+    }
+
+    #[test]
+    fn each_key_applies_the_value_it_shows() {
+        let default = Settings::default();
+        for key in KEYS {
+            let mut settings = Settings::default();
+            settings.apply(key, default.value(key));
+            assert_eq!(settings.value(key), default.value(key), "`{}`", key.name);
+        }
     }
 }
