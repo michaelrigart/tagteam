@@ -13,6 +13,7 @@ use crate::hooks;
 use crate::oracle::verdict;
 use crate::provenance::ProfileCheck;
 use crate::store::{AccountRow, AutoRecord, CREDENTIALS_REPLACED, EventRow, JournalRow, Store};
+use crate::vault::VaultMemo;
 
 use super::plan::Plan;
 use super::rollback::Rollback;
@@ -47,6 +48,7 @@ pub(super) struct LockedSwitch<'a, 'g> {
     pub(super) store: &'a Store,
     pub(super) account_locks: &'a [AccountLock],
     pub(super) locks: &'a LiveLocks<'g>,
+    pub(super) memo: &'a VaultMemo<'a>,
 }
 
 /// The rows `rederive` locked and what `preflight` read under the locks.
@@ -81,7 +83,9 @@ pub(super) enum Rederived {
 impl Engine {
     /// §9.4 step 1: the live account, the target and the self-switch decision, all re-read
     /// under the locks. `Replan` when any of them moved, or the account locks held are no
-    /// longer the outgoing account's; planning again then reaches the right outcome.
+    /// longer the outgoing account's; planning again then reaches the right outcome. Its read
+    /// of the target's vault enters `memo`, which the rest of the attempt reads through
+    /// (review refactor §8.11).
     pub(super) fn rederive(
         &self,
         p: &dyn Provider,
@@ -89,6 +93,7 @@ impl Engine {
         req: &SwitchRequest,
         plan: &Plan,
         outgoing: Option<&AccountRow>,
+        memo: &VaultMemo<'_>,
     ) -> Result<Rederived, EngineError> {
         let (live_identity, again) = self.live_row(p, store, &req.provider)?;
         // §9.4 step 1: an automatic switch re-checks its preconditions here, before anything is
@@ -137,7 +142,7 @@ impl Engine {
         // which is `outgoing` when anything proceeds.
         // Only the target's vault is read here (§9.3): if it emptied while this command waited,
         // a rotation plans again and rotates on, and a direct switch reports it.
-        if !self.has_login(&target)? {
+        if !self.has_login(&target, Some(memo))? {
             return Ok(Rederived::Replan);
         }
         // §9.4 step 1 (amended): a refresh that finished while this switch waited for the
@@ -156,7 +161,7 @@ impl Engine {
                 return Ok(Rederived::Replan);
             }
             if (!self_switch || req.force) && p.kind_traits(&target.kind).refreshable {
-                let vault = self.read_target(&target)?;
+                let vault = self.read_target(&target, Some(memo))?;
                 if self.due(p, &vault) {
                     return Err(needs_relogin(p, &target));
                 }
@@ -196,8 +201,14 @@ impl Engine {
         })
     }
 
-    pub(super) fn read_target(&self, target: &AccountRow) -> Result<Vec<u8>, EngineError> {
-        match self.vault.read(&target.id) {
+    /// The target's vault credential, or why there is none. Pass a `memo` only under the
+    /// switch's account locks (review refactor §8.11).
+    pub(super) fn read_target(
+        &self,
+        target: &AccountRow,
+        memo: Option<&VaultMemo<'_>>,
+    ) -> Result<Vec<u8>, EngineError> {
+        match self.read_vault(&target.id, memo) {
             Read::Present(b) if !b.is_empty() => Ok(b),
             Read::Unreadable(source) => Err(EngineError::UnreadableAccount {
                 position: target.position,
@@ -267,6 +278,7 @@ impl Engine {
             force: req.force,
             live_identity: pf.live_identity.as_ref(),
             own_secret: own_secret.as_deref(),
+            memo: Some(ls.memo),
             ..Settle::new(p, provider, warnings)
         };
         let target_secret = self.settle_branch(&mut cx, ls, plan, req, &pf)?;
@@ -386,7 +398,7 @@ impl Engine {
             // Step 2, the direct branch: displace whatever is live on either axis unless it is
             // identical to the target in vault form (H5.3).
             None => {
-                let secret = self.read_target(&pf.target)?;
+                let secret = self.read_target(&pf.target, Some(ls.memo))?;
                 let reason = if req.force {
                     "forced-activation"
                 } else {
@@ -413,7 +425,7 @@ impl Engine {
                 }
                 // Read only now: settling a self-switch may have captured a newer live
                 // generation into this very account, and that is the one to activate.
-                self.read_target(&pf.target)?
+                self.read_target(&pf.target, Some(ls.memo))?
             }
         })
     }
@@ -549,7 +561,7 @@ impl Engine {
         let Some(bytes) = Axis::of(p, &out.kind).live_secret(live) else {
             return Ok(());
         };
-        let vault = match self.vault.read(&out.id) {
+        let vault = match ls.memo.read(&out.id) {
             Read::Present(v) => Some(v),
             Read::Absent => None,
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
@@ -564,7 +576,7 @@ impl Engine {
         // credential is not the vault's own, and tri-state: an unreadable `.prev` may be
         // exactly that generation, and capturing over the newer one would lose it (step 3).
         let superseded = !ours
-            && match self.vault.read_prev(&out.id) {
+            && match ls.memo.read_prev(&out.id) {
                 Read::Present(prev) => same_generation(p, &prev, &bytes),
                 Read::Absent => false,
                 Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),

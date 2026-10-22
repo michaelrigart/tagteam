@@ -9,6 +9,7 @@ use crate::engine::{Engine, GuardRequest};
 use crate::error::EngineError;
 use crate::hooks;
 use crate::store::{AccountRow, Store};
+use crate::vault::VaultMemo;
 
 use plan::{Ask, Planned};
 use transact::{LockedSwitch, Rederived};
@@ -346,16 +347,19 @@ impl Engine {
                 ids.push(&o.id);
             }
             let accounts = self.lock_accounts(&ids)?;
+            let memo = VaultMemo::new(&self.vault, &accounts);
             let locks = p.lock_live(&self.env, &guard)?;
-            match self.rederive(p, store, req, &plan, outgoing.as_ref())? {
+            match self.rederive(p, store, req, &plan, outgoing.as_ref(), &memo)? {
                 Rederived::Go(locked) => {
                     let ls = LockedSwitch {
                         guard: &guard,
                         store,
                         account_locks: &accounts,
                         locks: &locks,
+                        memo: &memo,
                     };
                     let mut outcome = self.transact(p, &plan, locked, &ls, req)?;
+                    drop(memo);
                     drop(locks);
                     drop(accounts);
                     // §9.1 (amended): with CC's locks released, `oauthAccount` is read again.

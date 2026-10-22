@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tagteam_core::AccountId;
 use tagteam_provider::atomic::{ensure_private_dir, write_atomic_private};
@@ -138,6 +140,10 @@ impl VaultBackend for FileVault {
 /// stored form come from the caller's provider (`fingerprint`, and `vault_form`, H5.3).
 pub struct Vault {
     backend: Box<dyn VaultBackend>,
+    /// Bumped by every `store` and `delete` before it touches the backend, whether or not it
+    /// succeeds, because a failed store may already have written `.prev` (review refactor
+    /// §8.11). `VaultMemo` keeps a read only while this count is unchanged.
+    writes: AtomicU64,
 }
 
 fn prev_key(id: &AccountId) -> String {
@@ -146,7 +152,10 @@ fn prev_key(id: &AccountId) -> String {
 
 impl Vault {
     pub fn new(backend: Box<dyn VaultBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            writes: AtomicU64::new(0),
+        }
     }
 
     pub fn read(&self, id: &AccountId) -> Read<Vec<u8>> {
@@ -168,6 +177,7 @@ impl Vault {
         bytes: &[u8],
         p: &dyn Provider,
     ) -> Result<(), VaultError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
         let id = lock.id();
         let form = p.vault_form(bytes);
         let fp = p.fingerprint(&form);
@@ -248,6 +258,7 @@ impl Vault {
     /// account actually needs to keep working — in place rather than gone. A locked Keychain
     /// that still holds an item aborts the delete (§6.2).
     pub fn delete(&self, lock: &AccountLock) -> Result<(), VaultError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
         let id = lock.id();
         for key in [prev_key(id), id.to_string()] {
             self.backend.delete(&key)?;
@@ -266,5 +277,258 @@ impl Vault {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Current,
+    Prev,
+}
+
+struct Kept {
+    id: AccountId,
+    slot: Slot,
+    at: u64,
+    read: Read<Vec<u8>>,
+}
+
+/// Vault reads under one switch attempt's account locks (review refactor §8.11). Writes need the
+/// account lock and bump the vault's count; a read kept at an older count is read again. Never
+/// kept: `Unreadable`, or an account outside `locks`. Never shared: the daemon's threads share
+/// `Vault` and `Engine`. It holds credentials, so it has no `Debug`.
+pub(crate) struct VaultMemo<'a> {
+    vault: &'a Vault,
+    locks: &'a [AccountLock],
+    kept: RefCell<Vec<Kept>>,
+}
+
+impl<'a> VaultMemo<'a> {
+    pub(crate) fn new(vault: &'a Vault, locks: &'a [AccountLock]) -> Self {
+        Self {
+            vault,
+            locks,
+            kept: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn read(&self, id: &AccountId) -> Read<Vec<u8>> {
+        self.through(id, Slot::Current)
+    }
+
+    pub(crate) fn read_prev(&self, id: &AccountId) -> Read<Vec<u8>> {
+        self.through(id, Slot::Prev)
+    }
+
+    fn through(&self, id: &AccountId, slot: Slot) -> Read<Vec<u8>> {
+        let fresh = || match slot {
+            Slot::Current => self.vault.read(id),
+            Slot::Prev => self.vault.read_prev(id),
+        };
+        if !self.locks.iter().any(|l| l.id() == id) {
+            return fresh();
+        }
+        // Only this thread can write a locked account, under its account lock, so no write of it
+        // overlaps this read. A write to another account bumps the count too, and only makes the
+        // next read fresh.
+        let at = self.vault.writes.load(Ordering::SeqCst);
+        let mut kept = self.kept.borrow_mut();
+        kept.retain(|k| k.at == at);
+        if let Some(k) = kept.iter().find(|k| &k.id == id && k.slot == slot) {
+            return k.read.clone();
+        }
+        let read = fresh();
+        if !matches!(read, Read::Unreadable(_)) {
+            kept.push(Kept {
+                id: id.clone(),
+                slot,
+                at,
+                read: read.clone(),
+            });
+        }
+        read
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use tagteam_cc::ClaudeCode;
+    use tagteam_cc::live::Platform;
+    use tagteam_provider::{Env, FakeKeychain};
+
+    use super::*;
+
+    /// Backend state the tests reach after the vault has taken the backend.
+    #[derive(Default)]
+    struct Shared {
+        items: Mutex<BTreeMap<String, Vec<u8>>>,
+        reads: Mutex<BTreeMap<String, usize>>,
+        unreadable: Mutex<BTreeSet<String>>,
+        refuse_writes: AtomicBool,
+    }
+
+    struct Counting(Arc<Shared>);
+
+    impl VaultBackend for Counting {
+        fn read(&self, key: &str) -> Read<Vec<u8>> {
+            *self
+                .0
+                .reads
+                .lock()
+                .unwrap()
+                .entry(key.to_owned())
+                .or_default() += 1;
+            if self.0.unreadable.lock().unwrap().contains(key) {
+                return Read::Unreadable(ReadError::new("vault", "refused"));
+            }
+            match self.0.items.lock().unwrap().get(key) {
+                Some(b) => Read::Present(b.clone()),
+                None => Read::Absent,
+            }
+        }
+        fn write(&self, key: &str, bytes: &[u8]) -> Result<(), VaultError> {
+            if self.0.refuse_writes.load(Ordering::SeqCst) {
+                return Err(VaultError::Write(VaultCause::Check("refused".into())));
+            }
+            self.0
+                .items
+                .lock()
+                .unwrap()
+                .insert(key.to_owned(), bytes.to_vec());
+            Ok(())
+        }
+        fn delete(&self, key: &str) -> Result<(), VaultError> {
+            self.0.items.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        env: Env,
+        shared: Arc<Shared>,
+        vault: Vault,
+        provider: ClaudeCode,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let shared = Arc::new(Shared::default());
+            Self {
+                env: Env::for_test(dir.path()),
+                _dir: dir,
+                vault: Vault::new(Box::new(Counting(shared.clone()))),
+                shared,
+                provider: ClaudeCode::new(Arc::new(FakeKeychain::new()), Platform::MacOs),
+            }
+        }
+
+        fn lock(&self, id: &AccountId) -> AccountLock {
+            AccountLock::acquire(&self.env, id, AccountLock::WAIT).unwrap()
+        }
+
+        fn reads(&self, key: &str) -> usize {
+            self.shared
+                .reads
+                .lock()
+                .unwrap()
+                .get(key)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        /// The vault form of a credential whose refresh token is `rt-<n>`.
+        fn form(&self, n: u32) -> Vec<u8> {
+            self.provider.vault_form(&cred(n)).into_owned()
+        }
+    }
+
+    fn cred(n: u32) -> Vec<u8> {
+        format!(r#"{{"claudeAiOauth":{{"refreshToken":"rt-{n}"}},"mcpOAuth":{{}}}}"#).into_bytes()
+    }
+
+    fn id(name: &str) -> AccountId {
+        AccountId::from_string(name)
+    }
+
+    #[test]
+    fn a_memo_reads_a_locked_entry_once_until_the_vault_is_written() {
+        let f = Fixture::new();
+        let a = id("a");
+        let lock = f.lock(&a);
+        f.vault.store(&lock, &cred(1), &f.provider).unwrap();
+        let locks = [lock];
+        let memo = VaultMemo::new(&f.vault, &locks);
+
+        let (cur0, prev0) = (f.reads("a"), f.reads("a.prev"));
+        let cur = memo.read(&a);
+        let prev = memo.read_prev(&a);
+        memo.read(&a);
+        memo.read_prev(&a);
+        assert_eq!(f.reads("a") - cur0, 1);
+        assert_eq!(f.reads("a.prev") - prev0, 1);
+        assert_eq!(cur.present(), f.vault.read(&a).present());
+        assert_eq!(prev.present(), f.vault.read_prev(&a).present());
+
+        f.vault.store(&locks[0], &cred(2), &f.provider).unwrap();
+        let (cur0, prev0) = (f.reads("a"), f.reads("a.prev"));
+        assert_eq!(memo.read(&a).present(), Some(f.form(2)));
+        assert_eq!(memo.read_prev(&a).present(), Some(f.form(1)));
+        memo.read(&a);
+        memo.read_prev(&a);
+        assert_eq!(f.reads("a") - cur0, 1);
+        assert_eq!(f.reads("a.prev") - prev0, 1);
+
+        f.vault.delete(&locks[0]).unwrap();
+        let cur0 = f.reads("a");
+        assert!(matches!(memo.read(&a), Read::Absent));
+        assert!(matches!(memo.read(&a), Read::Absent));
+        assert_eq!(f.reads("a") - cur0, 1);
+    }
+
+    #[test]
+    fn a_failed_write_still_makes_the_next_read_fresh() {
+        let f = Fixture::new();
+        let a = id("a");
+        let locks = [f.lock(&a)];
+        let memo = VaultMemo::new(&f.vault, &locks);
+        assert!(matches!(memo.read(&a), Read::Absent));
+
+        f.shared.refuse_writes.store(true, Ordering::SeqCst);
+        let err = f.vault.store(&locks[0], &cred(1), &f.provider).unwrap_err();
+        assert!(matches!(err, VaultError::Write(_)), "{err}");
+
+        let before = f.reads("a");
+        assert!(matches!(memo.read(&a), Read::Absent));
+        assert_eq!(f.reads("a") - before, 1);
+    }
+
+    #[test]
+    fn a_memo_keeps_no_unreadable_read_and_no_unlocked_account() {
+        let f = Fixture::new();
+        let (a, c) = (id("a"), id("c"));
+        let locks = [f.lock(&a)];
+        f.vault.store(&locks[0], &cred(1), &f.provider).unwrap();
+        let memo = VaultMemo::new(&f.vault, &locks);
+
+        f.shared.unreadable.lock().unwrap().insert("a".to_owned());
+        let before = f.reads("a");
+        assert!(matches!(memo.read(&a), Read::Unreadable(_)));
+        assert!(matches!(memo.read(&a), Read::Unreadable(_)));
+        assert_eq!(f.reads("a") - before, 2);
+
+        f.shared.unreadable.lock().unwrap().clear();
+        assert_eq!(memo.read(&a).present(), Some(f.form(1)));
+        assert_eq!(f.reads("a") - before, 3);
+
+        let before = f.reads("c");
+        memo.read(&c);
+        memo.read(&c);
+        assert_eq!(f.reads("c") - before, 2);
     }
 }

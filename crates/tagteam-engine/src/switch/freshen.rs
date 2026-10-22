@@ -182,7 +182,7 @@ impl Engine {
             reread = current(&store)?;
             &reread
         };
-        let vault = self.read_target(target)?;
+        let vault = self.read_target(target, None)?;
         let due = self.due(p, &vault);
         let chosen = req.target.chosen();
         if target.quarantine_reason.is_some() {
