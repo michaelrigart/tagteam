@@ -137,12 +137,12 @@ impl Engine {
             .collect()
     }
 
-    /// Settles one interrupted switch whose holder died (§9.6), under the same locks as a
-    /// switch: the account locks of both accounts it names, then CC's locks. The live
-    /// credential decides the direction; the row is cleared only once a fresh re-read of every
-    /// surface names one account. Never writes an old credential back. An undecidable row
-    /// stays until `switch --force` settles it. A forward finish's event carries this engine's source
-    /// (review refactor §8.7).
+    /// Settles one interrupted switch whose holder died (§9.6), under the same locks as a switch:
+    /// the account locks of both accounts it names, then CC's locks. The live credential decides
+    /// the direction; the row is cleared only once a fresh re-read of every surface names one
+    /// account. Never writes an old credential back. An undecidable row stays until
+    /// `switch --force` settles it. A forward finish's event carries this engine's source (review
+    /// refactor §8.7).
     pub(crate) fn recover_one(
         &self,
         guard: &MutationGuard,

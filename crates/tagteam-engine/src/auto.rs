@@ -708,9 +708,8 @@ impl AutoEngine<'_> {
     }
 
     /// §11.2 step 2: an unresolved switch journal for the provider is recovered first, under
-    /// `MutationGuard`, its events carrying the engine's source (§9.6; review
-    /// refactor §8.7). `Some`
-    /// with recovery's refusal while a row stays: one recovery could not decide, could not
+    /// `MutationGuard`, its events carrying the engine's source (§9.6; review refactor §8.7).
+    /// `Some` with recovery's refusal while a row stays: one recovery could not decide, could not
     /// take the live locks or found its agent writing, or the mutation lock was held past its
     /// timeout.
     fn recover(&self) -> Result<Option<EngineError>, EngineError> {

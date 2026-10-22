@@ -210,8 +210,8 @@ fn a_recovery_logs_which_way_it_went() {
 
 #[test]
 fn a_daemon_engine_records_and_logs_a_recovered_switch_as_the_daemon_s() {
-    // Review refactor §8.7: the recovery runs under the engine that takes the guard, and the
-    // log quotes its source as a string.
+    // Review refactor §8.7: the recovery runs under the engine that takes the guard, and the log
+    // quotes its source as a string.
     let _serial = one_at_a_time();
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");

@@ -105,8 +105,7 @@ pub struct EngineConfig {
     pub spawner: Arc<dyn ProcessSpawner>,
     /// §12.8, from `detect_run_shell`; `env` is already the effective (outer) environment.
     pub run_shell: RunShell,
-    /// Who raised the events this engine records: the command that built it (review refactor
-    /// §8.7).
+    /// Who raised the events this engine records: the command that built it (review refactor §8.7).
     pub source: EventSource,
 }
 
@@ -463,14 +462,14 @@ impl Engine {
         Ok(MutationGuard::acquire(&self.env, timeout)?)
     }
 
-    /// `MutationGuard`, with the rows whose recovery could not take its provider's live locks
-    /// or whose entry its agent wrote meanwhile (`RecoveryBlocked`, `RecoveryMoved`) collected
-    /// by provider as `Blocked`, not refused. Under `FingerprintsOnly` the rows are recovered
-    /// from fingerprints alone: no network call (§7.6, §9.6). A recovery interrupted at one of
-    /// its lock waits ends the command with that interruption (§14.1). Each recovered switch is
-    /// recorded with this engine's source (review refactor §8.7). The lock is waited for up to `r.timeout`. The rows are read
-    /// before the lock and again under it; `DecodableOnly` (`purge`) reads them with
-    /// `dead_decodable_journals`, so a row that does not decode is left for it to delete
+    /// `MutationGuard`, with the rows whose recovery could not take its provider's live locks or
+    /// whose entry its agent wrote meanwhile (`RecoveryBlocked`, `RecoveryMoved`) collected by
+    /// provider as `Blocked`, not refused. Under `FingerprintsOnly` the rows are recovered from
+    /// fingerprints alone: no network call (§7.6, §9.6). A recovery interrupted at one of its lock
+    /// waits ends the command with that interruption (§14.1). Each recovered switch is recorded
+    /// with this engine's source (review refactor §8.7). The lock is waited for up to `r.timeout`.
+    /// The rows are read before the lock and again under it; `DecodableOnly` (`purge`) reads them
+    /// with `dead_decodable_journals`, so a row that does not decode is left for it to delete
     /// (§10.5 step 5) rather than ending it; every other mode reads them all, strictly.
     ///
     /// With `r.refuse_interrupted`, an interrupted switch still on record for one of

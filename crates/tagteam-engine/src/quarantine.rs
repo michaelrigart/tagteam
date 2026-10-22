@@ -170,11 +170,11 @@ impl Engine {
     }
 
     /// §7.4 / Decision 9: clears every quarantine of `provider` that no longer binds
-    /// (`quarantine_released`), each under its account lock (try-only; a busy account is
-    /// left), and records each release with this engine's source. A pending replacement (§12.5) has moved
-    /// the account's `login_epoch`, so its release is `account-replaced`; its reconciliation
-    /// later finds no quarantine left to clear, so the account still gets one event. Returns
-    /// the released accounts.
+    /// (`quarantine_released`), each under its account lock (try-only; a busy account is left), and
+    /// records each release with this engine's source. A pending replacement (§12.5) has moved the
+    /// account's `login_epoch`, so its release is `account-replaced`; its reconciliation later
+    /// finds no quarantine left to clear, so the account still gets one event. Returns the released
+    /// accounts.
     pub fn release_unbound_quarantines(
         &self,
         provider: &ProviderId,

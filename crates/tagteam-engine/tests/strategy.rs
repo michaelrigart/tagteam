@@ -36,7 +36,7 @@ fn nothing_is_released_or_created_without_a_store() {
 
 #[test]
 fn a_quarantine_the_vault_has_moved_past_is_released_and_recorded_with_its_source() {
-    // M3b's tick passes "auto"; the event says who released it.
+    // The event is recorded under the engine's source (review refactor §8.7), here "auto".
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b"); // live
@@ -567,7 +567,7 @@ fn a_quarantine_that_no_longer_binds_is_released_before_candidates_are_counted()
     let out = best(&fx).unwrap();
     assert_eq!(out.to.map(|r| r.id), Some(a.clone()), "{}", out.message);
     assert_eq!(quarantine_of(&fx, &a), (None, None));
-    // Recorded with the switch's own source.
+    // Recorded under the engine's source (review refactor §8.7): "cli" for these test engines.
     let events = fx.engine.store().unwrap().events().unwrap();
     let released = events
         .iter()

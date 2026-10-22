@@ -1750,6 +1750,7 @@ mod hooked {
     use std::sync::{Arc, Mutex};
 
     use common::{block_rescue, rescue_files, unblock_rescue};
+    use tagteam_engine::EventSource;
     use tagteam_provider::Clock;
 
     use super::*;
@@ -2028,12 +2029,7 @@ mod hooked {
                         other
                             .store()
                             .unwrap()
-                            .clear_quarantine(
-                                &id,
-                                "credentials-replaced",
-                                tagteam_engine::EventSource::Cli,
-                                1,
-                            )
+                            .clear_quarantine(&id, "credentials-replaced", EventSource::Cli, 1)
                             .unwrap();
                         if joining {
                             *started.lock().unwrap() = FlockGuard::try_lock(&race).unwrap();
