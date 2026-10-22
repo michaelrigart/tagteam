@@ -13,7 +13,8 @@ use crate::state::State;
 use crate::view::{scrolled_windows, width_of, wrap_rows};
 
 /// `⏎` or a digit chooses, `Esc` declines: a CLI prompt is answered, and History takes the
-/// scope chosen (T4-17).
+/// scope chosen (T4-17). A prompt's digit is its option's number; a scope's is the account's
+/// position, `0` all accounts.
 pub(super) fn key(
     state: &mut State,
     options: &[String],
@@ -24,13 +25,16 @@ pub(super) fn key(
 ) -> KeyOutcome {
     let last = options.len().saturating_sub(1);
     let digit = match key.code {
-        KeyCode::Char(c @ '1'..='9') => Some(c as usize - '1' as usize),
+        KeyCode::Char(c) => c.to_digit(10).and_then(|d| match then {
+            ChooseThen::Reply(_) => (d >= 1).then(|| d as usize - 1).filter(|i| *i <= last),
+            ChooseThen::Scope(scopes) => history::scope_of_digit(state, scopes, d),
+        }),
         _ => None,
     };
     let answer = match key.code {
         KeyCode::Enter if !options.is_empty() => Some(Some(*selected)),
         KeyCode::Esc => Some(None),
-        _ => digit.filter(|d| *d <= last).map(Some),
+        _ => digit.map(Some),
     };
     if let Some(answer) = answer {
         return KeyOutcome::CloseWith(match then {
@@ -58,6 +62,7 @@ pub(super) fn render(
     question: &str,
     options: &[String],
     at: &usize,
+    then: &ChooseThen,
 ) {
     let w = 64u16.min(area.width.saturating_sub(4));
     let inner = usize::from(w).saturating_sub(BOX_COLS).max(1);
@@ -69,10 +74,12 @@ pub(super) fn render(
         .max(CHOICE_ROWS);
     let mut lines: Vec<Line<'static>> = asked.into_iter().map(Line::from).collect();
     lines.push(Line::default());
+    // A scope's options lead with the account's position, its digit: no number of their own.
+    let numbered = matches!(then, ChooseThen::Reply(_));
     let blocks: Vec<Vec<String>> = options
         .iter()
         .enumerate()
-        .map(|(i, option)| choice_rows(i, option, inner - GUTTER))
+        .map(|(i, option)| choice_rows(numbered.then_some(i), option, inner - GUTTER))
         .collect();
     let heights: Vec<usize> = blocks.iter().map(Vec::len).collect();
     // From the first choice that keeps the selected one in view, whole.
@@ -98,10 +105,11 @@ pub(super) fn render(
     boxed(frame, state.theme, spec, lines);
 }
 
-/// Choice `i`'s rows, `w` columns at most each: `N. ` and its text, which wraps at word boundaries under
-/// itself, onto `CHOICE_ROWS` at most; the rest is cut (`wrap_rows`).
-fn choice_rows(i: usize, option: &str, w: usize) -> Vec<String> {
-    let number = format!("{}. ", i + 1);
+/// Choice `i`'s rows, `w` columns at most each: `N. ` when it is numbered and its text, which
+/// wraps at word boundaries under itself, onto `CHOICE_ROWS` at most; the rest is cut
+/// (`wrap_rows`).
+fn choice_rows(i: Option<usize>, option: &str, w: usize) -> Vec<String> {
+    let number = i.map_or_else(String::new, |i| format!("{}. ", i + 1));
     let hang = width_of(&number);
     wrap_rows(option, w.saturating_sub(hang), CHOICE_ROWS)
         .into_iter()

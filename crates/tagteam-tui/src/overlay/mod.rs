@@ -266,8 +266,8 @@ pub fn render(state: &State, frame: &mut Frame) {
             question,
             options,
             selected: at,
-            ..
-        } => choose::render(state, frame, area, question, options, at),
+            then,
+        } => choose::render(state, frame, area, question, options, at, then),
         Overlay::Text {
             prompt,
             input,
