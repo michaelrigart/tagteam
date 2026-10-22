@@ -18,8 +18,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
+use tagteam_provider::Cancel;
+use tagteam_provider::liveness::{CcRecord, parse_cc_record};
 use tagteam_provider::term::{self, ByteRead, Readiness};
-use tagteam_provider::{Cancel, SessionRecord, parse_session_record};
 
 use super::ctx::Ctx;
 use super::registry::{Meta, OptIn, Phase};
@@ -214,16 +215,16 @@ pub fn metas() -> Vec<Meta> {
 }
 
 /// The session records in `dir` (`<home>/sessions`, Appendix A.7) that parse, with their paths.
-pub fn records(dir: &Path) -> Vec<(PathBuf, SessionRecord)> {
+pub fn records(dir: &Path) -> Vec<(PathBuf, CcRecord)> {
     let Ok(listing) = fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut out: Vec<(PathBuf, SessionRecord)> = listing
+    let mut out: Vec<(PathBuf, CcRecord)> = listing
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .filter_map(|p| {
-            let r = parse_session_record(&fs::read(&p).ok()?).ok()?;
+            let r = parse_cc_record(&fs::read(&p).ok()?).ok()?;
             Some((p, r))
         })
         .collect();
@@ -234,9 +235,9 @@ pub fn records(dir: &Path) -> Vec<(PathBuf, SessionRecord)> {
 /// The first record in `dir` that is not in `before`, waiting up to `timeout` for one.
 pub fn new_record(
     dir: &Path,
-    before: &[(PathBuf, SessionRecord)],
+    before: &[(PathBuf, CcRecord)],
     timeout: Duration,
-) -> Option<(PathBuf, SessionRecord)> {
+) -> Option<(PathBuf, CcRecord)> {
     let mut found = None;
     wait_until(timeout, || {
         found = records(dir)
