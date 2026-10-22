@@ -13,9 +13,9 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::AutoStrategy;
 use tagteam_core::tokens::{CardOverride, PriceOverride};
+use tagteam_core::{ProviderId, str_enum};
 use tagteam_provider::{Env, LockError};
 use toml_edit::{DocumentMut, Item, TableLike};
 
@@ -96,7 +96,7 @@ fn is_provider_id(s: &str) -> bool {
         && !s.ends_with('-')
 }
 
-tagteam_core::str_enum! {
+str_enum! {
     /// `ui.color`. `NO_COLOR`, `FORCE_COLOR` and `--no-color` are the CLI's to apply on top.
     pub enum ColorMode {
         Auto => "auto",
@@ -185,7 +185,7 @@ pub enum KeyKind {
 /// exhaustively (review refactor §8.8), so the compiler refuses a key either one forgets. It is
 /// `pub(crate)` on purpose: the names stay in [`KEYS`], where each variant is named once, because
 /// `dead_code` refuses a variant no entry names and `every_key_id_is_in_the_registry_once` refuses
-/// a duplicate (R4f plan, Ruling 2).
+/// a duplicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyId {
     DefaultProvider,
@@ -220,7 +220,8 @@ pub struct Key {
 }
 
 /// Every §6.4 key, in the order of the spec's table, then the daemon's three (D7). The numeric
-/// bounds are the `*_RANGE` constants, which `auto` also clamps its flags to.
+/// bounds are the `*_RANGE` constants; `auto` clamps its threshold, interval and cooldown flags
+/// to theirs.
 pub const KEYS: &[Key] = &[
     Key {
         id: KeyId::DefaultProvider,
