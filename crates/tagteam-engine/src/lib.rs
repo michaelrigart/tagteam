@@ -40,6 +40,7 @@ pub mod store;
 pub mod switch;
 #[cfg(test)]
 mod testutil;
+pub mod timeline;
 pub mod tokens;
 pub mod transfer;
 pub mod vault;

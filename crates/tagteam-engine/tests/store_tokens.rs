@@ -1733,3 +1733,41 @@ fn a_purge_between_a_prunes_chunks_stops_it_and_frees_its_lease() {
         "h2 took the lease and pruned"
     );
 }
+
+#[test]
+fn active_history_since_is_the_rows_since_and_the_last_one_before() {
+    // §12.3: the rows from `since` on, after the last one before it, by `(at, rowid)`.
+    let (_d, s, path) = store();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    for (p, at, id) in [
+        (cc(), 100, Some("a")),
+        (cc(), 200, Some("b")),
+        (cc(), 300, None),
+        (fake(), 250, Some("x")),
+        (cc(), 300, Some("a")),
+    ] {
+        raw.execute(
+            "INSERT INTO active_history (provider, at, account_id, recorded_at) \
+             VALUES (?1, ?2, ?3, ?2)",
+            rusqlite::params![p.as_str(), at, id],
+        )
+        .unwrap();
+    }
+    let since = |at| s.active_history_since(&cc(), at).unwrap();
+    assert_eq!(
+        since(250),
+        [
+            (200, Some("b".into())),
+            (300, None),
+            (300, Some("a".into()))
+        ]
+    );
+    let all = [
+        (100, Some("a".into())),
+        (200, Some("b".into())),
+        (300, None),
+        (300, Some("a".into())),
+    ];
+    assert_eq!(since(100), all);
+    assert_eq!(since(50), all);
+}
