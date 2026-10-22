@@ -8,9 +8,10 @@ use tagteam_core::time::ms_to_s;
 use tagteam_core::{Window, WindowKind};
 use tagteam_provider::TransientKind;
 
+use crate::event::{EventKind, EventSource};
 use crate::failure::FailureKind;
-use crate::store::AccountRow;
-use crate::timeline::AccountRef;
+use crate::store::{ACCOUNT_REPLACED, AccountRow, CREDENTIALS_REPLACED};
+use crate::timeline::{AccountRef, EventView};
 use crate::tokens::TokenReport;
 use crate::views::{AccountView, HistoryWindow, NO_DATA, ProviderNames, UsageStatus, UsageView};
 
@@ -32,6 +33,9 @@ pub const THIS: &str = "this";
 pub const SPEND_HEAD: &str = "SPEND";
 /// An account with neither a place nor a label left to name it by (T4-28).
 const AN_ACCOUNT: &str = "an account";
+
+/// How an event opens when auto tried and failed to switch (§11.4).
+const COULD_NOT_SWITCH: &str = "auto couldn't switch";
 /// A projection further out than this is not worth a countdown: it will not run out.
 const A_YEAR_S: i64 = 365 * 86_400;
 
@@ -122,6 +126,9 @@ pub fn spend_text(w: &Window) -> Option<String> {
 const LOGIN_EXPIRED: &str = "login expired";
 const KEYCHAIN: &str = "can't read the Keychain";
 pub const NEEDS_LOGIN: &str = "needs a new login";
+
+/// Why an account needs a new login, after its problem's name or a quarantine event's.
+const LOGIN_REFUSED: &str = "its stored login was refused";
 const OTHER_ACCOUNT: &str = "logged in as another account";
 const NO_LOGIN: &str = "no stored login";
 /// A usage check the provider turned away for now (§11.1); also the TUI's STATUS phrase.
@@ -551,6 +558,95 @@ pub fn account_name(r: &AccountRef) -> String {
     }
 }
 
+/// `account_name`, or `an account` when the event names none.
+fn named(r: Option<&AccountRef>) -> String {
+    r.map_or_else(|| AN_ACCOUNT.to_owned(), account_name)
+}
+
+/// A string field of an event's `detail`.
+fn detail_str<'a>(e: &'a EventView, field: &str) -> Option<&'a str> {
+    e.detail.as_ref()?.get(field)?.as_str()
+}
+
+/// The `detail`-worded clause of an automatic switch (§11.4, C-17): `alex's 5h reached 93%`,
+/// only for `proactive` and `at-limit`, the possessive being the `from` account's alias, else its
+/// email's local part (T4-29).
+fn binding_reached(e: &EventView, trigger: Option<Trigger>) -> Option<String> {
+    if !matches!(trigger, Some(Trigger::Proactive | Trigger::AtLimit)) {
+        return None;
+    }
+    let from = e.from.as_ref()?;
+    let whose = match (from.alias.as_deref(), from.email.as_deref()) {
+        (Some(alias), _) => alias,
+        (None, Some(email)) => email.split('@').next().unwrap_or(email),
+        (None, None) => return None,
+    };
+    let detail = e.detail.as_ref()?;
+    let label = detail.get("label")?.as_str()?;
+    let pct = detail.get("pct")?.as_f64()?;
+    Some(format!("{whose}'s {label} reached {}%", pct.round() as i64))
+}
+
+/// A stored event in plain words (spec §11.4, T4-29), for History's event list and the auto
+/// line. `frees_at` is `all-exhausted`'s `detail.earliest_reset_at` in the caller's clock form.
+pub fn event(e: &EventView, frees_at: Option<&str>) -> String {
+    let to = || named(e.to.as_ref());
+    let subject = || named(e.to.as_ref().or(e.from.as_ref()));
+    match e.kind {
+        EventKind::Switch => {
+            let who = match e.source {
+                EventSource::Cli => "you",
+                EventSource::Auto | EventSource::Daemon => "auto",
+            };
+            let moved = match &e.from {
+                Some(from) => format!("{who} switched {} → {}", account_name(from), to()),
+                None => format!("{who} switched to {}", to()),
+            };
+            if e.source == EventSource::Cli {
+                return moved;
+            }
+            let trigger_kind = e.trigger.as_deref().and_then(Trigger::parse);
+            match (binding_reached(e, trigger_kind), trigger_kind) {
+                (Some(reached), _) => format!("{moved} · {reached}"),
+                (None, Some(t)) => format!("{moved} ({})", trigger(t)),
+                (None, None) => moved,
+            }
+        }
+        EventKind::SwitchRecovered => format!("tagteam finished an interrupted switch to {}", to()),
+        EventKind::SwitchFailed => match detail_str(e, "message") {
+            Some(message) => format!("{COULD_NOT_SWITCH} to {} · {message}", to()),
+            None => format!("{COULD_NOT_SWITCH} to {}", to()),
+        },
+        EventKind::AllExhausted => {
+            let facts = NoSwitchFacts {
+                detail: "",
+                used_pct: None,
+                threshold: 0.0,
+                frees_at,
+                display_name: "",
+            };
+            format!(
+                "{COULD_NOT_SWITCH} · {}",
+                no_switch(NoSwitchReason::AllExhausted, &facts)
+            )
+        }
+        EventKind::AutoswitchPaused => "auto paused".into(),
+        EventKind::AutoswitchResumed => "auto resumed".into(),
+        EventKind::Quarantine => match detail_str(e, "reason") {
+            Some(reason) => format!("{} {NEEDS_LOGIN} · {LOGIN_REFUSED} ({reason})", subject()),
+            None => format!("{} {NEEDS_LOGIN}", subject()),
+        },
+        EventKind::Unquarantine => match detail_str(e, "reason") {
+            Some(CREDENTIALS_REPLACED) => format!("{} works again · new login stored", subject()),
+            Some(ACCOUNT_REPLACED) => format!("{} works again · account replaced", subject()),
+            _ => format!("{} works again", subject()),
+        },
+        EventKind::Add => format!("{} added", subject()),
+        EventKind::Import => format!("{} imported", subject()),
+        EventKind::Remove => format!("{} removed", subject()),
+    }
+}
+
 /// What needs attention on an account (redesign §6.3, §11.2, T3-11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Problem {
@@ -622,7 +718,7 @@ pub fn problem_sentence(problem: Problem, v: &AccountView, when: Option<&str>) -
                 .map(|r| format!(" ({r})"))
                 .unwrap_or_default();
             let when = when.map(|w| format!(", {w}")).unwrap_or_default();
-            let cause = format!("its stored login was refused{reason}{when}");
+            let cause = format!("{LOGIN_REFUSED}{reason}{when}");
             return format!("{}: {cause}.", capitalised(NEEDS_LOGIN));
         }
         Problem::LoginExpired => (
@@ -684,7 +780,7 @@ pub fn remedy(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tagteam_cc::CLAUDE_CODE;
     use tagteam_core::{AccountId, Pace, ProjectionMethod, ProviderId};
     use tagteam_provider::KindTraits;
@@ -1736,6 +1832,287 @@ mod tests {
         );
         assert_eq!(named(None, None, Some("ci@example.com")), "ci@example.com");
         assert_eq!(named(None, None, None), "an account");
+    }
+
+    #[test]
+    fn every_event_kind_has_its_sentence() {
+        let current = |position, alias: Option<&str>, email: &str| AccountRef {
+            id: AccountId::from_string(format!("id-{position}")),
+            position: Some(position),
+            alias: alias.map(str::to_owned),
+            email: Some(email.to_owned()),
+            removed: false,
+        };
+        let removed = |id: &str, label: Option<&str>| AccountRef {
+            id: AccountId::from_string(id),
+            position: None,
+            alias: None,
+            email: label.map(str::to_owned),
+            removed: true,
+        };
+        let alex = current(1, None, "alex@example.com");
+        let work = current(2, Some("work"), "sam@corp.example");
+        let spare = current(3, Some("spare"), "a1@x.co");
+        let ci = current(4, None, "ci@example.com");
+        let ev = |kind,
+                  source,
+                  trigger: Option<&str>,
+                  from: Option<&AccountRef>,
+                  to: Option<&AccountRef>,
+                  detail: Option<Value>| EventView {
+            at_ms: NOW * 1000,
+            kind,
+            source,
+            trigger: trigger.map(str::to_owned),
+            from: from.cloned(),
+            to: to.cloned(),
+            detail,
+            before_pct: None,
+            after_pct: None,
+        };
+        let binding =
+            || Some(json!({"window": "5h", "label": "5h", "pct": 93.4, "threshold": 90.0}));
+        use EventKind as K;
+        use EventSource as S;
+        let cases = [
+            (
+                ev(
+                    K::Switch,
+                    S::Auto,
+                    Some("proactive"),
+                    Some(&alex),
+                    Some(&work),
+                    binding(),
+                ),
+                None,
+                "auto switched 1 alex → 2 work · alex's 5h reached 93%",
+            ),
+            (
+                ev(
+                    K::Switch,
+                    S::Daemon,
+                    Some("at-limit"),
+                    Some(&alex),
+                    Some(&work),
+                    binding(),
+                ),
+                None,
+                "auto switched 1 alex → 2 work · alex's 5h reached 93%",
+            ),
+            (
+                ev(
+                    K::Switch,
+                    S::Auto,
+                    Some("consume-first"),
+                    Some(&alex),
+                    Some(&work),
+                    binding(),
+                ),
+                None,
+                "auto switched 1 alex → 2 work (to use up the account that resets first)",
+            ),
+            (
+                ev(
+                    K::Switch,
+                    S::Auto,
+                    Some("proactive"),
+                    Some(&alex),
+                    Some(&work),
+                    None,
+                ),
+                None,
+                "auto switched 1 alex → 2 work (before it reached the limit)",
+            ),
+            (
+                ev(
+                    K::Switch,
+                    S::Auto,
+                    Some("added-later"),
+                    Some(&alex),
+                    Some(&work),
+                    None,
+                ),
+                None,
+                "auto switched 1 alex → 2 work",
+            ),
+            (
+                ev(
+                    K::Switch,
+                    S::Cli,
+                    Some("manual"),
+                    Some(&work),
+                    Some(&spare),
+                    None,
+                ),
+                None,
+                "you switched 2 work → 3 spare",
+            ),
+            (
+                ev(K::Switch, S::Cli, Some("manual"), None, Some(&spare), None),
+                None,
+                "you switched to 3 spare",
+            ),
+            (
+                ev(
+                    K::Switch,
+                    S::Auto,
+                    Some("proactive"),
+                    Some(&alex),
+                    Some(&removed("c", Some("alex@personal.example"))),
+                    None,
+                ),
+                None,
+                "auto switched 1 alex → alex@personal.example (before it reached the limit)",
+            ),
+            (
+                ev(K::SwitchRecovered, S::Auto, None, None, Some(&work), None),
+                None,
+                "tagteam finished an interrupted switch to 2 work",
+            ),
+            (
+                ev(
+                    K::SwitchFailed,
+                    S::Auto,
+                    None,
+                    Some(&alex),
+                    Some(&spare),
+                    Some(json!({"message": "the Keychain was locked"})),
+                ),
+                None,
+                "auto couldn't switch to 3 spare · the Keychain was locked",
+            ),
+            (
+                ev(
+                    K::SwitchFailed,
+                    S::Auto,
+                    None,
+                    Some(&alex),
+                    Some(&spare),
+                    None,
+                ),
+                None,
+                "auto couldn't switch to 3 spare",
+            ),
+            (
+                ev(K::AllExhausted, S::Auto, None, Some(&alex), None, None),
+                Some("16:40"),
+                "auto couldn't switch · every account is near its limit; the first frees up at 16:40",
+            ),
+            (
+                ev(K::AllExhausted, S::Auto, None, Some(&alex), None, None),
+                None,
+                "auto couldn't switch · every account is near its limit",
+            ),
+            (
+                ev(K::AutoswitchPaused, S::Daemon, None, None, None, None),
+                None,
+                "auto paused",
+            ),
+            (
+                ev(K::AutoswitchResumed, S::Daemon, None, None, None, None),
+                None,
+                "auto resumed",
+            ),
+            (
+                ev(
+                    K::Quarantine,
+                    S::Cli,
+                    None,
+                    None,
+                    Some(&spare),
+                    Some(json!({"reason": "invalid_grant"})),
+                ),
+                None,
+                "3 spare needs a new login · its stored login was refused (invalid_grant)",
+            ),
+            (
+                ev(K::Quarantine, S::Cli, None, None, Some(&spare), None),
+                None,
+                "3 spare needs a new login",
+            ),
+            (
+                ev(
+                    K::Unquarantine,
+                    S::Cli,
+                    None,
+                    None,
+                    Some(&spare),
+                    Some(json!({"reason": CREDENTIALS_REPLACED})),
+                ),
+                None,
+                "3 spare works again · new login stored",
+            ),
+            (
+                ev(
+                    K::Unquarantine,
+                    S::Cli,
+                    None,
+                    None,
+                    Some(&spare),
+                    Some(json!({"reason": ACCOUNT_REPLACED})),
+                ),
+                None,
+                "3 spare works again · account replaced",
+            ),
+            (
+                ev(
+                    K::Unquarantine,
+                    S::Cli,
+                    None,
+                    None,
+                    Some(&spare),
+                    Some(json!({"reason": "other"})),
+                ),
+                None,
+                "3 spare works again",
+            ),
+            (
+                ev(K::Add, S::Cli, None, None, Some(&ci), None),
+                None,
+                "4 ci added",
+            ),
+            (
+                ev(K::Import, S::Cli, None, None, Some(&ci), None),
+                None,
+                "4 ci imported",
+            ),
+            (
+                ev(
+                    K::Remove,
+                    S::Cli,
+                    None,
+                    Some(&removed("id-4", Some("ci@example.com"))),
+                    None,
+                    None,
+                ),
+                None,
+                "ci@example.com removed",
+            ),
+            (
+                ev(
+                    K::Remove,
+                    S::Cli,
+                    None,
+                    Some(&removed("id-4", None)),
+                    None,
+                    None,
+                ),
+                None,
+                "an account removed",
+            ),
+        ];
+        for kind in EventKind::ALL {
+            assert!(
+                cases.iter().any(|(e, _, _)| e.kind == kind),
+                "{} has no sentence",
+                kind.as_str()
+            );
+        }
+        for (e, frees_at, want) in &cases {
+            let said = event(e, *frees_at);
+            assert_eq!(said, *want, "{}", e.kind.as_str());
+            assert!(!said.to_lowercase().contains("claude"), "{said}");
+        }
     }
 
     const NAMES: ProviderNames = ProviderNames {
