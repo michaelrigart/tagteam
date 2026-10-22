@@ -580,7 +580,7 @@ mod tests {
                 matches!(
                     c,
                     Cmd::LoadAccounts { .. }
-                        | Cmd::LoadHistory { .. }
+                        | Cmd::LoadTimeline { .. }
                         | Cmd::LoadReport { .. }
                         | Cmd::CollectDue { .. }
                         | Cmd::FetchStatus { .. }
@@ -617,7 +617,7 @@ mod tests {
         cmds.iter()
             .map(|c| match c {
                 Cmd::LoadAccounts { .. } => "accounts",
-                Cmd::LoadHistory { .. } => "history",
+                Cmd::LoadTimeline { .. } => "history",
                 Cmd::LoadReport { .. } => "report",
                 Cmd::CollectDue { .. } => "collect",
                 Cmd::FetchStatus { .. } => "status",
@@ -626,11 +626,10 @@ mod tests {
             .collect()
     }
 
-    /// On `screen`, with `n` accounts read, History on the first.
+    /// On `screen`, with `n` accounts read, History on all of them.
     fn showing(screen: Screen, n: u32) -> State {
         let mut state = fresh(screen);
         state.accounts.apply(snapshot(many(n)));
-        state.history.select(id(1));
         state
     }
 

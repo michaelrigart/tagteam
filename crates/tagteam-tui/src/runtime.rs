@@ -436,15 +436,19 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
                 Cmd::LoadAccounts { r#gen } => {
                     let _ = self.lanes.views.submit(ViewsReq::Accounts { r#gen });
                 }
-                Cmd::LoadHistory {
+                Cmd::LoadTimeline {
                     r#gen,
-                    account,
+                    provider,
+                    scope,
                     since_s,
+                    columns,
                 } => {
-                    let req = ViewsReq::History {
+                    let req = ViewsReq::Timeline {
                         r#gen,
-                        account,
+                        provider,
+                        scope,
                         since_s,
+                        columns,
                     };
                     let _ = self.lanes.views.submit(req);
                 }
@@ -688,6 +692,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use tagteam_core::AccountId;
     use tagteam_daemon::client::ClientError;
+    use tagteam_engine::timeline::{Scope, TimelineView};
     use tagteam_engine::tokens::{
         IndexProgress, IndexState, RefreshOutcome, TokenPeriod, TokenQuery, TokenReport,
     };
@@ -847,6 +852,19 @@ mod tests {
             })
         }
 
+        fn timeline(
+            &self,
+            _: &ProviderId,
+            _: &Scope,
+            _: i64,
+            _: usize,
+        ) -> Result<TimelineView, SourceError> {
+            Err(SourceError {
+                kind: "test".into(),
+                message: "no timeline in this test".into(),
+            })
+        }
+
         fn collect_due(&self, _accounts: &[AccountId]) -> Result<CollectSummary, SourceError> {
             Ok(CollectSummary {
                 fetched: 0,
@@ -916,6 +934,19 @@ mod tests {
             Err(SourceError {
                 kind: "test".into(),
                 message: "no history in this test".into(),
+            })
+        }
+
+        fn timeline(
+            &self,
+            _: &ProviderId,
+            _: &Scope,
+            _: i64,
+            _: usize,
+        ) -> Result<TimelineView, SourceError> {
+            Err(SourceError {
+                kind: "test".into(),
+                message: "no timeline in this test".into(),
             })
         }
 
@@ -995,6 +1026,19 @@ mod tests {
             Ok(crate::testutil::history_of(v, windows))
         }
 
+        fn timeline(
+            &self,
+            _: &ProviderId,
+            _: &Scope,
+            _: i64,
+            _: usize,
+        ) -> Result<TimelineView, SourceError> {
+            Err(SourceError {
+                kind: "test".into(),
+                message: "no timeline in this test".into(),
+            })
+        }
+
         fn collect_due(&self, _accounts: &[AccountId]) -> Result<CollectSummary, SourceError> {
             Ok(CollectSummary {
                 fetched: 0,
@@ -1038,6 +1082,15 @@ mod tests {
                 fn history(&self, _: &AccountId, _: i64) -> Result<HistoryView, SourceError> {
                     unreachable!("no history is read")
                 }
+                fn timeline(
+                    &self,
+                    _: &ProviderId,
+                    _: &Scope,
+                    _: i64,
+                    _: usize,
+                ) -> Result<TimelineView, SourceError> {
+                    unreachable!("no timeline is read")
+                }
                 fn collect_due(&self, _: &[AccountId]) -> Result<CollectSummary, SourceError> {
                     unreachable!("nothing is collected")
                 }
@@ -1073,6 +1126,18 @@ mod tests {
         }
         fn history(&self, _: &AccountId, _: i64) -> Result<HistoryView, SourceError> {
             Err(no_tokens())
+        }
+        fn timeline(
+            &self,
+            _: &ProviderId,
+            _: &Scope,
+            _: i64,
+            _: usize,
+        ) -> Result<TimelineView, SourceError> {
+            Err(SourceError {
+                kind: "test".into(),
+                message: "no timeline in this test".into(),
+            })
         }
         fn collect_due(&self, _: &[AccountId]) -> Result<CollectSummary, SourceError> {
             Ok(CollectSummary {

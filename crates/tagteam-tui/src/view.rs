@@ -76,74 +76,6 @@ pub(crate) fn body_at(state: &State) -> Rect {
     areas(state, Rect::new(0, 0, w, h)).body
 }
 
-/// `head`, then `parts`, two spaces apart, in lines of at most `width` columns (R20). A part
-/// that does not fit goes on to a continuation line that starts `indent` columns in. One wider
-/// than a whole continuation line breaks at its own ` · `s, and only a piece wider even than
-/// that is cut (`fit`). A line with nothing past `indent` takes its first part unseparated.
-pub(crate) fn flow(
-    head: Vec<Span<'static>>,
-    parts: Vec<String>,
-    indent: usize,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let used = head.iter().map(|s| width_of(&s.content)).sum();
-    let mut flow = Flow {
-        lines: Vec::new(),
-        spans: head,
-        used,
-        indent,
-        width,
-    };
-    for part in parts {
-        if flow.fits("  ", &part) || width_of(&part) <= width.saturating_sub(indent) {
-            flow.put("  ", part);
-            continue;
-        }
-        for (i, piece) in part.split(" · ").enumerate() {
-            flow.put(if i == 0 { "  " } else { " · " }, piece.to_owned());
-        }
-    }
-    flow.lines.push(Line::from(flow.spans));
-    flow.lines
-}
-
-/// `flow`'s lines so far, and the one it is filling.
-struct Flow {
-    lines: Vec<Line<'static>>,
-    spans: Vec<Span<'static>>,
-    used: usize,
-    indent: usize,
-    width: usize,
-}
-
-impl Flow {
-    /// Nothing on this line yet past the indent.
-    fn fresh(&self) -> bool {
-        self.used <= self.indent
-    }
-
-    fn fits(&self, sep: &str, text: &str) -> bool {
-        let sep = if self.fresh() { 0 } else { width_of(sep) };
-        self.used + sep + width_of(text) <= self.width
-    }
-
-    fn put(&mut self, sep: &str, text: String) {
-        if !self.fits(sep, &text) && !self.fresh() {
-            let next = vec![Span::raw(" ".repeat(self.indent))];
-            self.lines
-                .push(Line::from(std::mem::replace(&mut self.spans, next)));
-            self.used = self.indent;
-        }
-        let text = if self.fresh() {
-            fit(&text, self.width.saturating_sub(self.used))
-        } else {
-            format!("{sep}{text}")
-        };
-        self.used += width_of(&text);
-        self.spans.push(Span::raw(text));
-    }
-}
-
 /// The windows a list scrolled to window `from` shows in `rows` lines, given each window's
 /// height (R20): whole windows only, and at least one. `from` goes no further than
 /// `furthest_scroll`.
@@ -555,10 +487,7 @@ mod tests {
             footer_row(&format!("{order}  e disable  a alias  x remove"), 120)
         );
         let history = draw(&fresh(Screen::History), 80, 24);
-        assert_eq!(
-            history[23],
-            footer_row("j/k account  [ ] range  r refresh", 80)
-        );
+        assert_eq!(history[23], footer_row("[ ] range  r refresh", 80));
         let tokens = draw(&fresh(Screen::Tokens), 80, 24);
         assert_eq!(
             tokens[23],
@@ -859,53 +788,6 @@ mod tests {
             }]
         );
         assert!(state.overlay.is_none());
-    }
-
-    #[test]
-    fn flow_wraps_parts_under_the_indent_and_cuts_only_a_piece_too_wide() {
-        let text = |lines: Vec<Line<'static>>| -> Vec<String> {
-            lines
-                .iter()
-                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-                .collect()
-        };
-        let head = vec![Span::raw(" ab   "), Span::raw("99%")];
-        let parts = vec![
-            "resets in 1h".to_owned(),
-            "▲ ahead".to_owned(),
-            "+1.0 pts/h · runs out in 2h (regression)".to_owned(),
-        ];
-        assert_eq!(
-            text(flow(head.clone(), parts.clone(), 6, 30)),
-            [
-                " ab   99%  resets in 1h",
-                "      ▲ ahead  +1.0 pts/h",
-                "      runs out in 2h (regress…",
-            ],
-            "a part that fits nowhere whole breaks at its ` · `; only a piece too wide is cut"
-        );
-        assert_eq!(
-            text(flow(head.clone(), parts.clone(), 6, 120)),
-            [" ab   99%  resets in 1h  ▲ ahead  +1.0 pts/h · runs out in 2h (regression)"]
-        );
-        assert_eq!(
-            text(flow(head, parts[2..].to_vec(), 6, 50)),
-            [
-                " ab   99%",
-                "      +1.0 pts/h · runs out in 2h (regression)",
-            ],
-            "a part that fits a continuation line whole moves there whole"
-        );
-        assert_eq!(
-            text(flow(
-                vec![Span::raw("    ")],
-                vec!["no rate yet".to_owned()],
-                4,
-                30
-            )),
-            ["    no rate yet"],
-            "a line with nothing past the indent takes its first part unseparated"
-        );
     }
 
     #[test]

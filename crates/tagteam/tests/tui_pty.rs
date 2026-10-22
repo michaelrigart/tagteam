@@ -139,7 +139,7 @@ fn truecolor(output: &[u8]) -> bool {
 }
 
 fn history(s: &Screen) -> bool {
-    s.on_alt() && s.contains("No usage history.")
+    s.on_alt() && s.contains(" f all accounts   [ ] 7 days")
 }
 
 /// The terminal handed back, and the wait for Enter on it (R5).
@@ -243,11 +243,11 @@ fn three_shows_history_and_one_the_accounts_again() {
     tui.wait_for(LONG, "the accounts table", accounts);
     tui.type_keys(b"3");
     tui.wait_for(LONG, "History", |s| {
-        s.on_alt() && s.contains("No usage history.")
+        s.on_alt() && s.contains(" f all accounts   [ ] 7 days")
     });
     tui.type_keys(b"1");
     tui.wait_for(LONG, "the accounts table again", |s| {
-        accounts(s) && !s.contains("No usage history.")
+        accounts(s) && !s.contains(" f all accounts   [ ] 7 days")
     });
     tui.type_keys(b"q");
     assert_eq!(tui.finish(LONG).status.code(), Some(0));
@@ -262,7 +262,7 @@ fn a_burst_of_keys_in_one_write_is_handled_whole() {
     tui.wait_for(LONG, "the accounts table", accounts);
     tui.type_keys(b"23");
     tui.wait_for(Duration::from_secs(2), "History", |s| {
-        s.on_alt() && s.contains("No usage history.")
+        s.on_alt() && s.contains(" f all accounts   [ ] 7 days")
     });
     tui.type_keys(b"q");
     assert_eq!(tui.finish(LONG).status.code(), Some(0));
@@ -348,7 +348,7 @@ fn tui_history_opens_on_history() {
     let home = Home::new();
     let mut tui = home.tui(&["tui", "history"]);
     tui.wait_for(LONG, "History", |s| {
-        s.on_alt() && s.contains("No usage history.")
+        s.on_alt() && s.contains(" f all accounts   [ ] 7 days")
     });
     tui.type_keys(b"q");
     assert_eq!(tui.finish(LONG).status.code(), Some(0));

@@ -9,6 +9,7 @@ use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::EventSource;
 use tagteam_engine::daemon::daemon_socket_path;
 use tagteam_engine::settings::Settings;
+use tagteam_engine::timeline::{Scope, TimelineView};
 use tagteam_engine::tokens::{IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport};
 use tagteam_engine::views::{HistoryView, ProviderNames};
 use tagteam_provider::Cancel;
@@ -158,6 +159,16 @@ impl Source for Refused {
         Err(self.0.clone())
     }
 
+    fn timeline(
+        &self,
+        _provider: &ProviderId,
+        _scope: &Scope,
+        _since_s: i64,
+        _columns: usize,
+    ) -> Result<TimelineView, SourceError> {
+        Err(self.0.clone())
+    }
+
     fn collect_due(&self, _accounts: &[AccountId]) -> Result<CollectSummary, SourceError> {
         Err(self.0.clone())
     }
@@ -243,6 +254,11 @@ mod tests {
         };
         assert_eq!(source.accounts(None).unwrap_err(), want, "accounts");
         assert_eq!(source.history(&account, 0).unwrap_err(), want, "history");
+        assert_eq!(
+            source.timeline(&provider, &Scope::All, 0, 70).unwrap_err(),
+            want,
+            "timeline"
+        );
         assert_eq!(
             source
                 .collect_due(std::slice::from_ref(&account))

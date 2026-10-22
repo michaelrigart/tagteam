@@ -18,6 +18,7 @@ use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::{Eligibility, NewAccount, Reserve, Store};
 use tagteam_engine::switch::LiveLogin;
+use tagteam_engine::timeline::Scope;
 use tagteam_engine::tokens::{
     PeriodKey, RefreshOutcome, RowAccount, TokenGrouping, TokenPeriod, TokenQuery, tokens_lock_path,
 };
@@ -386,6 +387,28 @@ fn history_is_the_samples_since_the_range_starts() {
     assert_eq!(pcts, [60.0], "only the day's sample");
     let week = home.source().history(&a, NOW_S - 7 * 86_400).unwrap();
     assert_eq!(week.windows[0].samples.len(), 2);
+}
+
+#[test]
+fn timeline_is_the_engine_s_for_the_scope_and_range() {
+    let home = Home::new();
+    let a = home.add(CLAUDE_CODE, 1, "a@x.co");
+    let b = home.add(CLAUDE_CODE, 2, "b@x.co");
+    home.reading(&a, 3_600, 40.0);
+    home.reading(&b, 7_200, 60.0);
+    let cc = ProviderId::new(CLAUDE_CODE);
+    let since = NOW_S - 86_400;
+    let engine = home.engine_in(RunShell::Outside);
+    assert_eq!(
+        home.source().timeline(&cc, &Scope::All, since, 7).unwrap(),
+        engine.timeline(&cc, Scope::All, since, 7).unwrap()
+    );
+    assert_eq!(
+        home.source()
+            .timeline(&cc, &Scope::Account(b.clone()), since, 7)
+            .unwrap(),
+        engine.timeline(&cc, Scope::Account(b), since, 7).unwrap()
+    );
 }
 
 #[test]
