@@ -84,8 +84,8 @@ pub enum StoreError {
     #[error("a replacement is already pending for this account")]
     ReplacementPending,
     /// §12.5: the metadata a pending replacement recorded (`replacing_meta`) is not JSON, or
-    /// lacks a field the login needs, so the replacement cannot be installed. The detail never
-    /// quotes it.
+    /// lacks `identity_key`, `label` or `kind`, or has a field of the wrong type, so the
+    /// replacement cannot be installed. The detail never quotes it.
     #[error("the pending replacement's recorded login cannot be read: {0}")]
     ReplacementUnreadable(String),
     /// §10.5, Decision 8: the emptied store's WAL could not be truncated, because another

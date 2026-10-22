@@ -28,7 +28,7 @@ impl QuarantineReason {
     /// The reason a stored `quarantine_reason` (§6.1) is acted on as. One this build does not
     /// know, which a newer build may store, holds as `InvalidGrant` does (§7.4).
     pub fn from_stored(stored: &str) -> QuarantineReason {
-        QuarantineReason::parse(stored).unwrap_or(QuarantineReason::InvalidGrant)
+        Self::parse(stored).unwrap_or(Self::InvalidGrant)
     }
 }
 
