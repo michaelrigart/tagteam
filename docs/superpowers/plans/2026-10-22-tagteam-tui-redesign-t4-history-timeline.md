@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/40
 **Goal:** Turn History into one time-based screen (usage charts, a lane per account, auto's events on the same axis, an event list synced to a time cursor) read from the store, record the events that screen needs (failed switches, every account exhausted, pauses and resumes, the window behind an automatic switch, a removed account's label), word them once in the engine, and fill the auto line from the store in both modes, with `w` opening History at its event.
 **Architecture:** A new engine module `timeline.rs` holds `Engine::timeline` (bucketed charts, lanes and events in one read, on the views lane) and `Engine::last_auto_event`; the store gains range and kind reads over `events` and `active_history`, with no index and no migration. The writers live in the auto engine, the switch commit, lifecycle `remove` and purge, and the daemon's provider job, under R4e's `EventSource`. `words::event` says each event. The TUI's History screen is rewritten over `TimelineView` (`screens/history.rs` plus `history/{layout,chart,lanes,list,marks}.rs`), and the auto line reads `AccountsSnapshot.last_auto`.
 **Tech Stack:** Rust 1.88 (edition 2024), ratatui 0.30.2, crossterm =0.29.0, rusqlite. No new dependency.
