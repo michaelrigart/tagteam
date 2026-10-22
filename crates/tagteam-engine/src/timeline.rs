@@ -45,6 +45,19 @@ impl Grid {
         Some((column as usize).min(self.columns - 1))
     }
 
+    /// Where a row stamped at `at_ms` is placed: one less than a second after `now_ms` is
+    /// placed at `now_ms`, in the last column. The view's `now_ms` is a whole second while the
+    /// store stamps rows in milliseconds, so a change later in the current second would
+    /// otherwise fall in no column until the next read. A row from the next second on is left
+    /// where it is, after `now_ms`, in no column.
+    pub fn placed(&self, at_ms: i64) -> i64 {
+        if at_ms > self.now_ms && at_ms < self.now_ms.saturating_add(1000) {
+            self.now_ms
+        } else {
+            at_ms
+        }
+    }
+
     /// Where `column` ends, exclusive, and the next one starts; `now_ms` for the last. While
     /// the span is at least the column count, as a day or more over a screen's columns always
     /// is, `column_of(end_ms(c)) == c + 1`.
@@ -130,16 +143,19 @@ impl TimelineView {
     }
 }
 
-/// Who was in use from when to when (T4-6): each row's account from its `at` to the next
-/// row's, the last to `now_ms`, ends exclusive. A row with no account is no one's.
-fn spans(rows: &[(i64, Option<String>)], now_ms: i64) -> Vec<(&str, i64, i64)> {
+/// Who was in use from when to when (T4-6): each row's account from its `at` (as `Grid::placed`
+/// places it) to the next row's, the last to `now_ms`, ends exclusive. A row with no account is
+/// no one's.
+fn spans<'r>(rows: &'r [(i64, Option<String>)], grid: &Grid) -> Vec<(&'r str, i64, i64)> {
     rows.iter()
         .enumerate()
         .filter_map(|(i, (at, id))| {
             let end = rows
                 .get(i + 1)
-                .map_or(now_ms.saturating_add(1), |(next, _)| *next);
-            id.as_deref().map(|id| (id, *at, end))
+                .map_or(grid.now_ms.saturating_add(1), |(next, _)| {
+                    grid.placed(*next)
+                });
+            id.as_deref().map(|id| (id, grid.placed(*at), end))
         })
         .collect()
 }
@@ -208,7 +224,7 @@ impl Engine {
         };
         let current = store.accounts(provider)?;
         let history = store.active_history_since(provider, grid.since_ms)?;
-        let spans = spans(&history, grid.now_ms);
+        let spans = spans(&history, &grid);
         let in_use = |id: &str| {
             let mut flags = vec![false; columns];
             for (_, start, end) in spans.iter().filter(|(who, ..)| *who == id) {
@@ -358,6 +374,15 @@ mod tests {
             assert_eq!(g.column_of(t), c, "{t}");
         }
         assert_eq!((g.end_ms(0), g.end_ms(6)), (1000, 7000));
+        for (t, placed) in [
+            (6999, 6999),
+            (7000, 7000),
+            (7300, 7000),
+            (7999, 7000),
+            (8000, 8000),
+        ] {
+            assert_eq!(g.placed(t), placed, "{t}");
+        }
 
         let g = Grid {
             since_ms: 0,
