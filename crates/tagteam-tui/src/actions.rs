@@ -422,6 +422,7 @@ mod tests {
     use crossterm::event::KeyCode;
 
     use super::*;
+    use tagteam_engine::timeline::Scope;
     use tagteam_engine::views::UsageStatus;
 
     use crate::host::AccountRef;
@@ -1561,15 +1562,14 @@ mod tests {
             assert!(
                 matches!(
                     cmds,
-                    [Cmd::LoadAccounts { .. }, Cmd::LoadHistory { account, .. }]
-                        if *account == id(1)
+                    [Cmd::LoadAccounts { .. }, Cmd::LoadTimeline { provider, scope, .. }]
+                        if *provider == cc() && *scope == Scope::All
                 ),
                 "{what}: {cmds:?}"
             );
         };
         for exit in [0, 1, 130] {
             let mut state = loaded(1);
-            state.history.select(id(1));
             update(&mut state, ch('R'), NOW_MS);
             let started = update(&mut state, key(KeyCode::Enter), NOW_MS);
             state.screen = Screen::History;
@@ -1598,7 +1598,6 @@ mod tests {
             ),
         ] {
             let mut state = loaded(1);
-            state.history.select(id(1));
             update(&mut state, ch('s'), NOW_MS);
             state.screen = Screen::History;
             on_done(

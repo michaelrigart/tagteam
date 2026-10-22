@@ -23,7 +23,6 @@ use crate::msg::Cmd;
 use crate::source::{AccountsSnapshot, SourceError};
 use crate::state::{Screen, State};
 use crate::theme::Role;
-use crate::update;
 use crate::view::{centred_block, fit, keep_visible, select};
 
 /// Redesign §5.7: drawn until the first `accounts` result arrives.
@@ -233,8 +232,7 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
             let Some(id) = state.accounts.selected.clone() else {
                 return vec![];
             };
-            state.history.select(id);
-            return update::show(state, Screen::History, now_ms);
+            return crate::screens::history::scope_to(state, id, now_ms);
         }
         _ => return vec![],
     }
@@ -482,6 +480,7 @@ mod tests {
     use ratatui::style::{Color, Modifier};
     use tagteam_core::{Pace, ProviderId, WindowKind};
     use tagteam_engine::switch::LiveLogin;
+    use tagteam_engine::timeline::Scope;
     use tagteam_engine::views::{ProviderAccounts, UsageStatus, UsageView};
 
     use super::*;
@@ -2899,12 +2898,24 @@ mod tests {
     }
 
     #[test]
-    fn enter_opens_history_for_the_selected_account() {
+    fn enter_on_accounts_opens_history_scoped_to_the_selected_account() {
         let mut state = loaded(many(3));
         update(&mut state, ch('j'), NOW_MS);
-        update(&mut state, key(KeyCode::Enter), NOW_MS);
+        let cmds = update(&mut state, key(KeyCode::Enter), NOW_MS);
         assert_eq!(state.screen, Screen::History);
-        assert_eq!(state.history.account(), Some(&id(2)));
+        assert_eq!(state.history.scope, Scope::Account(id(2)));
+        assert_eq!(
+            cmds,
+            [Cmd::LoadTimeline {
+                r#gen: state.gens.history,
+                provider: cc(),
+                scope: Scope::Account(id(2)),
+                since_s: NOW_S - 7 * 86_400,
+                columns: 70,
+            }]
+        );
+        let row = body_of(&state, 80, 24, NOW_MS).remove(0);
+        assert!(row.starts_with(" f 2 a2   [ ] 7 days"), "{row:?}");
         let mut empty = loaded(vec![]);
         let cmds = update(&mut empty, key(KeyCode::Enter), NOW_MS);
         assert_eq!((empty.screen, cmds), (Screen::Accounts, vec![]));

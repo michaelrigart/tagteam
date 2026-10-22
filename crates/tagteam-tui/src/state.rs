@@ -3,6 +3,7 @@
 use std::time::SystemTime;
 
 use tagteam_core::{AccountId, ProviderId};
+use tagteam_engine::timeline::Scope;
 use tagteam_engine::views::{ProviderAccounts, ProviderNames};
 
 use crate::autoline;
@@ -224,9 +225,9 @@ impl State {
             .find_map(|(p, pid)| (p == provider).then_some(*pid))
     }
 
-    /// The first `Cmd`s: load `accounts` (gen 1), and on Tokens its report. History needs an
-    /// account, which only the first `accounts` result names, so a TUI started on History loads
-    /// it once that arrives.
+    /// The first `Cmd`s: load `accounts` (gen 1), and on Tokens its report. History's timeline
+    /// is focus's provider's, which only the first `accounts` result names, so a TUI started on
+    /// History reads it once that arrives (T4-19).
     pub fn start(&mut self) -> Vec<Cmd> {
         let mut cmds = vec![self.load_accounts()];
         if self.screen == Screen::Tokens {
@@ -235,8 +236,7 @@ impl State {
         cmds
     }
 
-    /// The views re-read: `accounts`, and on History the account shown, each under a new
-    /// generation.
+    /// The views re-read: `accounts`, and on History its timeline, each under a new generation.
     pub(crate) fn reload_views(&mut self, now_ms: i64) -> Vec<Cmd> {
         let mut cmds = vec![self.load_accounts()];
         if self.screen == Screen::History {
@@ -253,13 +253,22 @@ impl State {
         }
     }
 
-    /// A read of `account`'s history since `since_s`, under the next generation.
-    pub(crate) fn load_history(&mut self, account: AccountId, since_s: i64) -> Cmd {
+    /// A read of `provider`'s timeline for `scope` since `since_s` over `columns`, under
+    /// History's next generation: any read still in flight is stale.
+    pub(crate) fn load_timeline(
+        &mut self,
+        provider: ProviderId,
+        scope: Scope,
+        since_s: i64,
+        columns: usize,
+    ) -> Cmd {
         self.gens.history += 1;
-        Cmd::LoadHistory {
+        Cmd::LoadTimeline {
             r#gen: self.gens.history,
-            account,
+            provider,
+            scope,
             since_s,
+            columns,
         }
     }
 

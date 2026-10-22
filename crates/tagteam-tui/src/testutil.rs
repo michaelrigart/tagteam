@@ -18,6 +18,7 @@ use tagteam_daemon::protocol::{
 };
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::switch::LiveLogin;
+use tagteam_engine::timeline::{Lane, Series, TimelineView};
 use tagteam_engine::tokens::{
     Cost, IndexState, PeriodKey, RowAccount, RowKey, TokenCounts, TokenGrouping, TokenPeriod,
     TokenQuery, TokenReport, TokenRow, TokenTotal,
@@ -422,6 +423,33 @@ pub(crate) fn history_of(account: AccountView, windows: Vec<HistoryWindow>) -> H
         account,
         windows,
         unmatched_window: false,
+    }
+}
+
+/// A view over `columns` columns of the 7 days to NOW_S, threshold 90.
+pub(crate) fn timeline_view(columns: usize, charts: Vec<Series>, lanes: Vec<Lane>) -> TimelineView {
+    TimelineView {
+        since_s: NOW_S - 7 * 86_400,
+        now_s: NOW_S,
+        threshold: 90.0,
+        columns,
+        charts,
+        lanes,
+    }
+}
+
+/// `many()`'s account `position` as a lane.
+pub(crate) fn lane_of(position: u32, peaks: Vec<Option<f64>>, in_use: Vec<bool>) -> Lane {
+    Lane {
+        account: tagteam_engine::timeline::AccountRef {
+            id: id(position),
+            position: Some(position),
+            alias: None,
+            email: Some(format!("a{position}@x.co")),
+            removed: false,
+        },
+        peaks,
+        in_use,
     }
 }
 

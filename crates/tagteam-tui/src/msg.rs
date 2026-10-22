@@ -3,6 +3,7 @@
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_daemon::protocol::Status;
+use tagteam_engine::timeline::{Scope, TimelineView};
 use tagteam_engine::tokens::{IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport};
 use tagteam_engine::views::HistoryView;
 
@@ -18,10 +19,13 @@ pub enum ViewsReq {
     Accounts {
         r#gen: u64,
     },
-    History {
+    /// History's timeline: `provider`'s, for `scope`, since `since_s`, over `columns` (§7.7).
+    Timeline {
         r#gen: u64,
-        account: AccountId,
+        provider: ProviderId,
+        scope: Scope,
         since_s: i64,
+        columns: usize,
     },
     /// The selected account's card: its history since `since_s` (redesign §6.4, T3-21).
     Card {
@@ -82,7 +86,7 @@ impl Coalesce for ViewsReq {
         matches!(
             (self, other),
             (ViewsReq::Accounts { .. }, ViewsReq::Accounts { .. })
-                | (ViewsReq::History { .. }, ViewsReq::History { .. })
+                | (ViewsReq::Timeline { .. }, ViewsReq::Timeline { .. })
                 | (ViewsReq::Card { .. }, ViewsReq::Card { .. })
         )
     }
@@ -139,9 +143,10 @@ pub enum Msg {
         r#gen: u64,
         result: Result<AccountsSnapshot, SourceError>,
     },
-    History {
+    /// History's timeline read (§7.7).
+    Timeline {
         r#gen: u64,
-        result: Result<HistoryView, SourceError>,
+        result: Result<TimelineView, SourceError>,
     },
     /// The selected account's card's history read, for `account` (T3-21).
     Card {
@@ -245,10 +250,13 @@ pub enum Cmd {
     LoadAccounts {
         r#gen: u64,
     },
-    LoadHistory {
+    /// History's timeline read, on the views lane (§7.7).
+    LoadTimeline {
         r#gen: u64,
-        account: AccountId,
+        provider: ProviderId,
+        scope: Scope,
         since_s: i64,
+        columns: usize,
     },
     /// The selected account's card's history read, on the views lane (redesign §6.4, T3-21).
     LoadCard {
@@ -317,10 +325,12 @@ mod tests {
     #[test]
     fn views_requests_of_one_kind_coalesce_whatever_they_ask() {
         let accounts = |g| ViewsReq::Accounts { r#gen: g };
-        let history = |g, a: &str| ViewsReq::History {
+        let history = |g, a: &str| ViewsReq::Timeline {
             r#gen: g,
-            account: id(a),
+            provider: ProviderId::new("claude-code"),
+            scope: Scope::Account(id(a)),
             since_s: 0,
+            columns: 70,
         };
         let card = |g, a: &str| ViewsReq::Card {
             r#gen: g,

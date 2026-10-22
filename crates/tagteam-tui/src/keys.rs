@@ -302,23 +302,6 @@ pub(crate) const KEYS: &[KeyRow] = &[
     },
     KeyRow {
         screen: Some(Screen::History),
-        keys: "j k ↑ ↓",
-        does: "previous or next account",
-        footer: Footer::Show {
-            key: "j/k",
-            label: |_| Some("account"),
-            from: 0,
-        },
-        #[cfg(test)]
-        probes: &[
-            plain('j'),
-            plain('k'),
-            named(KeyCode::Down),
-            named(KeyCode::Up),
-        ],
-    },
-    KeyRow {
-        screen: Some(Screen::History),
         keys: "[ ]",
         does: "range: 1, 7, 14 or 30 days",
         footer: Footer::Show {
@@ -328,14 +311,6 @@ pub(crate) const KEYS: &[KeyRow] = &[
         },
         #[cfg(test)]
         probes: &[plain('['), plain(']')],
-    },
-    KeyRow {
-        screen: Some(Screen::History),
-        keys: "J K",
-        does: "scroll the windows",
-        footer: Footer::No,
-        #[cfg(test)]
-        probes: &[shifted('J'), shifted('K')],
     },
     KeyRow {
         screen: None,
@@ -575,20 +550,14 @@ mod tests {
         state
     }
 
-    /// History showing account 2 of 3 at 7 days, its card holding `windows` windows.
-    fn history(windows: u32) -> State {
+    /// History over 3 accounts at 7 days, its timeline read.
+    fn history() -> State {
         let mut state = fresh(Screen::History);
         state.accounts.apply(snapshot(many(3)));
-        state.history.select(id(2));
-        let windows = (1..=windows)
-            .map(|i| {
-                let (key, label) = (format!("scoped:M{i}"), format!("M{i}"));
-                let w = window(&key, &label, WindowKind::Scoped, 10.0, None);
-                history_window(w, vec![], Pace::default())
-            })
-            .collect();
-        let view = history_of(account(2, "a2@x.co", read(60, 1.0, 1.0, false)), windows);
-        state.history.apply(view);
+        let r#gen = state.gens.history;
+        let view = timeline_view(70, vec![], vec![]);
+        let result = Ok(view);
+        update(&mut state, Msg::Timeline { r#gen, result }, NOW_MS);
         state
     }
 
@@ -660,9 +629,7 @@ mod tests {
             }
             (Some(Tokens), Char('J'), false) => vec![tokens(60)],
             (Some(Tokens), Char('K'), false) => vec![scrolled(tokens(60))],
-            (Some(History), Char('j' | 'k' | '[' | ']') | Down | Up, false) => vec![history(0)],
-            (Some(History), Char('J'), false) => vec![history(20)],
-            (Some(History), Char('K'), false) => vec![scrolled(history(20))],
+            (Some(History), Char('[' | ']'), false) => vec![history()],
             other => panic!("no state in which {other:?} acts: the table's row needs one"),
         }
     }

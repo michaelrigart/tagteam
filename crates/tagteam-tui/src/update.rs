@@ -22,6 +22,7 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
         Msg::Resize { width, height } => {
             state.size = (width, height);
             state.dirty = true;
+            screens::history::on_resize(state, now_ms);
             vec![]
         }
         Msg::Tick => on_tick(state, now_ms),
@@ -60,18 +61,8 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                 }
             }
         }
-        Msg::History { r#gen, result } => {
-            if r#gen != state.gens.history {
-                return vec![];
-            }
-            state.dirty = true;
-            match result {
-                Ok(view) => {
-                    state.history.apply(view);
-                    state.clear_banner(BannerKind::History);
-                }
-                Err(e) => state.raise_banner(BannerKind::History, e.message),
-            }
+        Msg::Timeline { r#gen, result } => {
+            screens::history::on_timeline(state, r#gen, result);
             vec![]
         }
         Msg::Card {
@@ -296,8 +287,7 @@ fn on_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
     }
 }
 
-/// Switches to `screen`; Tokens reads its report and History its account's history as they
-/// open.
+/// Switches to `screen`; Tokens reads its report and History its timeline as they open.
 pub(crate) fn show(state: &mut State, screen: Screen, now_ms: i64) -> Vec<Cmd> {
     if state.screen == screen {
         return vec![];
@@ -329,6 +319,8 @@ fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     cmds.extend(daemon::on_tick(state, now_ms));
     // Redesign §6.4: the selected account's card, read once its selection has settled.
     cmds.extend(screens::accounts::on_tick(state, now_ms));
+    // T4-19: History's timeline, re-read once a resize has settled.
+    cmds.extend(screens::history::on_tick(state, now_ms));
     if state.quitting.is_some() || now_ms < state.refresh.next_ms {
         return cmds;
     }
@@ -358,6 +350,7 @@ mod tests {
     use crate::source::{CollectSummary, SourceError};
     use crate::state::{GUARD_MS, Startup};
     use crate::testutil::*;
+    use tagteam_engine::timeline::Scope;
 
     fn quit_code(cmds: &[Cmd]) -> Option<i32> {
         match cmds {
@@ -656,26 +649,28 @@ mod tests {
         update(&mut state, accounts_msg(2, 2), NOW_MS);
         assert_eq!(state.accounts.shown_ids(), [id(1), id(2)]);
 
-        state.history.select(id(1));
-        let Cmd::LoadHistory { r#gen, .. } = state.load_history(id(1), 0) else {
+        update(&mut state, ch('3'), NOW_MS);
+        let Cmd::LoadTimeline { r#gen, .. } = state.load_timeline(cc(), Scope::All, 0, 70) else {
             unreachable!()
         };
-        state.load_history(id(2), 0);
+        state.load_timeline(cc(), Scope::All, 0, 70);
         update(
             &mut state,
-            Msg::History {
+            Msg::Timeline {
                 r#gen,
-                result: Ok(history_of(
-                    account(1, "a1@x.co", read(60, 1.0, 1.0, false)),
+                result: Ok(timeline_view(
+                    70,
                     vec![],
+                    vec![lane_of(1, vec![None; 70], vec![true; 70])],
                 )),
             },
             NOW_MS,
         );
-        update(&mut state, ch('3'), NOW_MS);
         assert!(
-            body_of(&state, 80, 24, NOW_MS)[0].ends_with("loading…"),
-            "the stale history was dropped"
+            body_of(&state, 80, 24, NOW_MS)
+                .iter()
+                .any(|l| l.trim() == "loading…"),
+            "the stale timeline was dropped"
         );
 
         let Cmd::CollectDue { r#gen, .. } = state.collect_due(vec![id(1)]) else {
@@ -736,7 +731,7 @@ mod tests {
                 Screen::History => assert!(
                     matches!(
                         cmds.as_slice(),
-                        [Cmd::LoadAccounts { .. }, Cmd::LoadHistory { .. }]
+                        [Cmd::LoadAccounts { .. }, Cmd::LoadTimeline { .. }]
                     ),
                     "{cmds:?}"
                 ),
@@ -791,9 +786,9 @@ mod tests {
                 cmds.as_slice(),
                 [
                     Cmd::LoadAccounts { .. },
-                    Cmd::LoadHistory { account, .. },
+                    Cmd::LoadTimeline { scope, .. },
                     Cmd::CollectDue { .. }
-                ] if *account == id(1)
+                ] if *scope == Scope::All
             ),
             "{cmds:?}"
         );
@@ -837,7 +832,7 @@ mod tests {
         assert!(
             matches!(
                 cmds.as_slice(),
-                [Cmd::LoadAccounts { r#gen: 2 }, Cmd::LoadHistory { .. }]
+                [Cmd::LoadAccounts { r#gen: 2 }, Cmd::LoadTimeline { .. }]
             ),
             "{cmds:?}"
         );
@@ -1084,26 +1079,25 @@ mod tests {
     }
 
     #[test]
-    fn the_first_accounts_read_on_history_reads_the_first_accounts_history() {
+    fn the_first_accounts_read_on_history_reads_the_timeline() {
         let mut state = fresh(Screen::History);
         state.start();
         assert_eq!(
             update(&mut state, accounts_msg(1, 2), NOW_MS),
-            [Cmd::LoadHistory {
+            [Cmd::LoadTimeline {
                 r#gen: 1,
-                account: id(1),
+                provider: cc(),
+                scope: Scope::All,
                 since_s: NOW_S - 7 * 86_400,
+                columns: 70,
             }]
         );
     }
 
-    fn history_msg(r#gen: u64) -> Msg {
-        Msg::History {
+    fn timeline_msg(r#gen: u64) -> Msg {
+        Msg::Timeline {
             r#gen,
-            result: Ok(history_of(
-                account(1, "a1@x.co", read(60, 1.0, 1.0, false)),
-                vec![],
-            )),
+            result: Ok(timeline_view(70, vec![], vec![])),
         }
     }
 
@@ -1115,7 +1109,8 @@ mod tests {
         let Cmd::LoadAccounts { r#gen: ag } = state.load_accounts() else {
             unreachable!()
         };
-        let Cmd::LoadHistory { r#gen: hg, .. } = state.load_history(id(1), 0) else {
+        let Cmd::LoadTimeline { r#gen: hg, .. } = state.load_timeline(cc(), Scope::All, 0, 70)
+        else {
             unreachable!()
         };
         update(
@@ -1126,11 +1121,11 @@ mod tests {
             },
             NOW_MS,
         );
-        update(&mut state, history_msg(hg), NOW_MS);
+        update(&mut state, timeline_msg(hg), NOW_MS);
         assert_eq!(
             state.banner_text(),
             Some("the run shell marker is unreadable"),
-            "a history read does not hide a failed accounts read"
+            "a timeline read does not hide a failed accounts read"
         );
         let Cmd::LoadAccounts { r#gen: ag } = state.load_accounts() else {
             unreachable!()
@@ -1154,10 +1149,11 @@ mod tests {
             unreachable!()
         };
         update(&mut state, accounts_msg(ag, 1), NOW_MS);
-        let Cmd::LoadHistory { r#gen: hg, .. } = state.load_history(id(1), 0) else {
+        let Cmd::LoadTimeline { r#gen: hg, .. } = state.load_timeline(cc(), Scope::All, 0, 70)
+        else {
             unreachable!()
         };
-        update(&mut state, history_msg(hg), NOW_MS);
+        update(&mut state, timeline_msg(hg), NOW_MS);
         assert_eq!(state.banner_text(), Some("usage was not collected: locked"));
         let Cmd::CollectDue { r#gen: cg, .. } = state.collect_due(vec![id(1)]) else {
             unreachable!()

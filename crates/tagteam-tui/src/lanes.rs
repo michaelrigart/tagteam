@@ -207,13 +207,15 @@ impl Lanes {
                     r#gen,
                     result: source.accounts(provider.as_ref()),
                 },
-                ViewsReq::History {
+                ViewsReq::Timeline {
                     r#gen,
-                    account,
+                    provider: focus,
+                    scope,
                     since_s,
-                } => Msg::History {
+                    columns,
+                } => Msg::Timeline {
                     r#gen,
-                    result: source.history(&account, since_s),
+                    result: source.timeline(&focus, &scope, since_s, columns),
                 },
                 ViewsReq::Card {
                     r#gen,

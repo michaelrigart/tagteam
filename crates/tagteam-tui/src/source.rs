@@ -11,6 +11,7 @@ use tagteam_engine::daemon::{daemon_lock_path, read_daemon_record};
 use tagteam_engine::error::EngineError;
 use tagteam_engine::failure::FailureKind;
 use tagteam_engine::settings::Settings;
+use tagteam_engine::timeline::{Scope, TimelineView};
 use tagteam_engine::tokens::{
     IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport, Wait,
 };
@@ -64,6 +65,15 @@ pub struct CollectSummary {
 pub trait Source {
     fn accounts(&self, provider: Option<&ProviderId>) -> Result<AccountsSnapshot, SourceError>;
     fn history(&self, account: &AccountId, since_s: i64) -> Result<HistoryView, SourceError>;
+    /// History's timeline (redesign §7.7): `provider`'s, for `scope`, since `since_s`, over
+    /// `columns`. It only reads.
+    fn timeline(
+        &self,
+        provider: &ProviderId,
+        scope: &Scope,
+        since_s: i64,
+        columns: usize,
+    ) -> Result<TimelineView, SourceError>;
     fn collect_due(&self, accounts: &[AccountId]) -> Result<CollectSummary, SourceError>;
     /// The token index's catch-up (token report §5), on the index lane: `Busy` at once while
     /// another process refreshes, and stopped at its next chunk by the shutdown token (§9).
@@ -118,6 +128,19 @@ impl Source for EngineSource {
     /// `history`'s view (core §13.4) of every relevant window since `since_s`.
     fn history(&self, account: &AccountId, since_s: i64) -> Result<HistoryView, SourceError> {
         Ok(self.engine.history(account, None, since_s)?)
+    }
+
+    /// §12.3's `Engine::timeline`.
+    fn timeline(
+        &self,
+        provider: &ProviderId,
+        scope: &Scope,
+        since_s: i64,
+        columns: usize,
+    ) -> Result<TimelineView, SourceError> {
+        Ok(self
+            .engine
+            .timeline(provider, scope.clone(), since_s, columns)?)
     }
 
     /// `list`'s on-demand collection (core §8.3): the collector fetches only what is due.
@@ -255,6 +278,18 @@ mod tests {
         fn history(&self, _: &AccountId, _: i64) -> Result<HistoryView, SourceError> {
             Err(SourceError {
                 kind: "history".into(),
+                message: self.0.into(),
+            })
+        }
+        fn timeline(
+            &self,
+            _: &ProviderId,
+            _: &Scope,
+            _: i64,
+            _: usize,
+        ) -> Result<TimelineView, SourceError> {
+            Err(SourceError {
+                kind: "timeline".into(),
                 message: self.0.into(),
             })
         }
