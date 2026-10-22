@@ -25,6 +25,15 @@ const CURSOR: &str = "│";
 /// A pause's span until the next resume (§7.4), and tier 0's in its place.
 const PAUSED: &str = "┄";
 const PAUSED_PLAIN: &str = "·";
+
+/// A pause's span as `theme`'s tier draws it (T4-13): help's legend shows the same.
+pub(crate) fn pause_span(theme: Theme) -> &'static str {
+    if theme.colourless() {
+        PAUSED_PLAIN
+    } else {
+        PAUSED
+    }
+}
 /// A lane's name in the gutter, after the marker column and before a space (T4-10).
 const NAME: usize = 7;
 /// Each axis label's tick, and the axis's last word (§7.4).
@@ -70,11 +79,7 @@ pub(crate) fn events_row(view: &TimelineView, cursor: usize, theme: Theme) -> Li
     if let Some(start) = from {
         paused.iter_mut().skip(start).for_each(|p| *p = true);
     }
-    let span = if theme.colourless() {
-        PAUSED_PLAIN
-    } else {
-        PAUSED
-    };
+    let span = pause_span(theme);
     let (warn, accent) = (theme.role(Role::Warn), theme.role(Role::Accent));
     let mut spans = vec![Span::raw(" ".repeat(usize::from(CHART_X)))];
     spans.extend(

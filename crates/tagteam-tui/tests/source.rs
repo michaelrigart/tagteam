@@ -384,6 +384,60 @@ fn accounts_carries_each_provider_s_last_auto_line_event() {
 }
 
 #[test]
+fn last_auto_is_each_provider_s_own_and_reaches_back_30_days() {
+    // A switch 31 days old is past the read's 30 days; FakeAgent's event is in its own entry.
+    let home = Home::new();
+    home.add(CLAUDE_CODE, 1, "a@x.co");
+    let b = home.add(CLAUDE_CODE, 2, "b@x.co");
+    let f = home.add(FAKE_AGENT, 1, "f@x.co");
+    let (cc, fake) = (ProviderId::new(CLAUDE_CODE), ProviderId::new(FAKE_AGENT));
+    let switch = |provider: &ProviderId, at: i64, to: &AccountId| EventRow {
+        at,
+        provider: provider.clone(),
+        kind: EventKind::Switch,
+        from_id: None,
+        to_id: Some(to.clone()),
+        trigger: None,
+        source: EventSource::Daemon,
+        detail: None,
+    };
+    let store = home.store();
+    let old = NOW_MS - 31 * 86_400_000;
+    store.insert_event(&switch(&cc, old, &b), false).unwrap();
+    let recent = NOW_MS - 600_000;
+    store
+        .insert_event(&switch(&fake, recent, &f), false)
+        .unwrap();
+    let snap = home.source().accounts(None).unwrap();
+    assert!(snap.providers.iter().any(|p| p.provider == cc));
+    let to = AccountRef {
+        id: f,
+        position: Some(1),
+        alias: None,
+        email: Some("f@x.co".into()),
+        removed: false,
+    };
+    assert_eq!(
+        snap.last_auto,
+        [(
+            fake,
+            EventView {
+                at_ms: recent,
+                kind: EventKind::Switch,
+                source: EventSource::Daemon,
+                trigger: None,
+                from: None,
+                to: Some(to),
+                detail: None,
+                before_pct: None,
+                after_pct: None,
+            }
+        )],
+        "none for Claude Code: its switch is 31 days old"
+    );
+}
+
+#[test]
 fn several_providers_are_listed_and_a_provider_narrows_them() {
     let home = Home::new();
     home.add(CLAUDE_CODE, 1, "a@x.co");

@@ -27,8 +27,8 @@ use crate::theme::Role;
 use crate::update;
 use crate::view::{body_at, centered, centred_block, fit, width_of};
 
-mod chart;
-mod lanes;
+pub(crate) mod chart;
+pub(crate) mod lanes;
 mod layout;
 pub(crate) mod list;
 pub(crate) mod marks;
@@ -2251,5 +2251,19 @@ mod tests {
         update(&mut state, ch('w'), NOW_MS);
         arrived(&mut state, with(drawn(70), three_events()));
         assert_eq!(cursor_said(&state), "now", "rank 2");
+    }
+
+    #[test]
+    fn w_in_a_text_dialog_types_and_opens_nothing() {
+        // A dialog takes every key first: `w` is a letter of an alias.
+        let mut state = accounts_with(Some(switch_at(NOW_MS - 60_000)));
+        update(&mut state, ch('a'), NOW_MS);
+        assert!(matches!(state.overlay, Some(Overlay::Text { .. })));
+        assert!(update(&mut state, ch('w'), NOW_MS).is_empty());
+        assert_eq!(state.screen, Screen::Accounts);
+        let Some(Overlay::Text { input, .. }) = &state.overlay else {
+            panic!("{:?}", state.overlay);
+        };
+        assert_eq!(input, "w");
     }
 }
