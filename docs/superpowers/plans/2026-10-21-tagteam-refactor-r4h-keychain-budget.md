@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/43
 **Branch:** `refactor-r4h-keychain-budget`, based on `refactor-r4g-helpers-comments`
 **Goal:** Fewer Keychain calls per manual switch, with the count pinned (§8.11). On the prototype,
 `switch <N>` drops from 25 `/usr/bin/security` spawns to 20, and from 20 to 15 under Claude Code's
