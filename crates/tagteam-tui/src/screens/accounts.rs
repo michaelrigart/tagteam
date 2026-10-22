@@ -254,7 +254,8 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
     let at = line_of(&state.accounts);
     let rows = visible_rows(state, body, now_ms);
     state.accounts.offset = keep_visible(state.accounts.offset, at, at, rows, lines);
-    crate::screens::history::follow(state, now_ms)
+    crate::screens::history::follow(state);
+    vec![]
 }
 
 /// `J`/`K`: the card's windows move `by` one, stopping once the last one shows, or at the

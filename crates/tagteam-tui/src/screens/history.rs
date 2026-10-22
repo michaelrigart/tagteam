@@ -301,22 +301,32 @@ pub(crate) fn scope_to(state: &mut State, account: AccountId, now_ms: i64) -> Ve
     cmds
 }
 
-/// T4-17: the scope follows the Accounts selection while it names an account.
-pub(crate) fn follow(state: &mut State, now_ms: i64) -> Vec<Cmd> {
+/// T4-17: the scope follows the Accounts selection while it names an account. Only a move on
+/// Accounts changes the selection, so History reads the new scope as it opens.
+pub(crate) fn follow(state: &mut State) {
     let Scope::Account(scoped) = &state.history.scope else {
-        return vec![];
+        return;
     };
     let Some(selected) = state.accounts.selected() else {
-        return vec![];
+        return;
     };
-    if selected.id == *scoped {
-        return vec![];
+    if selected.id != *scoped {
+        state.history.set_scope(Scope::Account(selected.id));
     }
-    state.history.set_scope(Scope::Account(selected.id));
-    if state.screen != Screen::History {
-        return vec![];
-    }
-    reload(state, now_ms).into_iter().collect()
+}
+
+/// The option a digit picks in `f`'s dialog (T4-17): `0` all accounts, else the account of
+/// focus's provider at that position.
+pub(crate) fn scope_of_digit(state: &State, scopes: &[Scope], digit: u32) -> Option<usize> {
+    let want = match digit {
+        0 => Scope::All,
+        _ => {
+            let p = state.view_of(&daemon::focus(state))?;
+            let a = p.accounts.iter().find(|a| a.row.position == digit)?;
+            Scope::Account(a.row.id.clone())
+        }
+    };
+    scopes.iter().position(|s| *s == want)
 }
 
 /// `f`'s choice (T4-17): the scope, and an account chosen selected on Accounts too.
@@ -1171,21 +1181,32 @@ mod tests {
         assert_eq!(cmds, [read_of(2, Scope::Account(id(1)), NOW_S - WEEK, 70)]);
         let row = scope_row(&state);
         assert!(row.starts_with(" f 1 a1   [ ]"), "{row:?}");
-        // A digit picks: `3` is the third option, account 2, preselected as the scope it is.
+        // A digit picks the account at that position; the scope is preselected.
         update(&mut state, ch('f'), NOW_MS);
         assert_eq!(choosing(&state).1, 1, "the current scope is preselected");
-        let cmds = update(&mut state, ch('3'), NOW_MS);
+        let cmds = update(&mut state, ch('2'), NOW_MS);
         assert_eq!(cmds, [read_of(3, Scope::Account(id(2)), NOW_S - WEEK, 70)]);
         assert_eq!(selected_id(&state), Some(id(2)));
         assert!(scope_row(&state).starts_with(" f 2 a2   [ ]"));
-        // `all accounts` leaves the Accounts selection where it is.
+        // `0` picks all accounts, and leaves the Accounts selection where it is.
         update(&mut state, ch('f'), NOW_MS);
-        update(&mut state, ch('k'), NOW_MS);
-        update(&mut state, ch('k'), NOW_MS);
-        let cmds = update(&mut state, key(KeyCode::Enter), NOW_MS);
+        let cmds = update(&mut state, ch('0'), NOW_MS);
         assert_eq!(cmds, [read_of(4, Scope::All, NOW_S - WEEK, 70)]);
         assert_eq!(state.history.scope, Scope::All);
         assert_eq!(selected_id(&state), Some(id(2)));
+        assert!(scope_row(&state).starts_with(" f all accounts   [ ]"));
+        update(&mut state, ch('f'), NOW_MS);
+        update(&mut state, ch('3'), NOW_MS);
+        assert_eq!(state.history.scope, Scope::Account(id(3)));
+        // `⏎` on `all accounts` does too.
+        update(&mut state, ch('f'), NOW_MS);
+        for _ in 0..3 {
+            update(&mut state, ch('k'), NOW_MS);
+        }
+        let cmds = update(&mut state, key(KeyCode::Enter), NOW_MS);
+        assert_eq!(cmds, [read_of(6, Scope::All, NOW_S - WEEK, 70)]);
+        assert_eq!(state.history.scope, Scope::All);
+        assert_eq!(selected_id(&state), Some(id(3)));
         // `Esc` closes it and changes nothing.
         update(&mut state, ch('f'), NOW_MS);
         assert!(update(&mut state, key(KeyCode::Esc), NOW_MS).is_empty());
@@ -1218,7 +1239,7 @@ mod tests {
     fn esc_on_a_scoped_history_returns_to_all_accounts() {
         let (mut state, _) = opened(3);
         update(&mut state, ch('f'), NOW_MS);
-        update(&mut state, ch('2'), NOW_MS);
+        update(&mut state, ch('1'), NOW_MS);
         assert_eq!(state.history.scope, Scope::Account(id(1)));
         assert_eq!(
             update(&mut state, key(KeyCode::Esc), NOW_MS),
@@ -1240,7 +1261,7 @@ mod tests {
     fn while_scoped_the_scope_follows_the_accounts_selection() {
         let (mut state, _) = opened(3);
         update(&mut state, ch('f'), NOW_MS);
-        update(&mut state, ch('3'), NOW_MS);
+        update(&mut state, ch('2'), NOW_MS);
         assert_eq!(state.history.scope, Scope::Account(id(2)));
         update(&mut state, ch('1'), NOW_MS);
         update(&mut state, ch('j'), NOW_MS);
@@ -1249,7 +1270,7 @@ mod tests {
         // Scoped to all accounts, the selection moves alone.
         update(&mut state, ch('3'), NOW_MS);
         update(&mut state, ch('f'), NOW_MS);
-        update(&mut state, ch('1'), NOW_MS);
+        update(&mut state, ch('0'), NOW_MS);
         assert_eq!(state.history.scope, Scope::All);
         update(&mut state, ch('1'), NOW_MS);
         update(&mut state, ch('k'), NOW_MS);
@@ -1261,7 +1282,7 @@ mod tests {
     fn a_scoped_account_gone_from_the_view_returns_history_to_all_accounts() {
         let (mut state, _) = opened(3);
         update(&mut state, ch('f'), NOW_MS);
-        update(&mut state, ch('4'), NOW_MS);
+        update(&mut state, ch('3'), NOW_MS);
         assert_eq!(state.history.scope, Scope::Account(id(3)));
         arrived(&mut state, nothing(70));
         let Cmd::LoadAccounts { r#gen } = state.load_accounts() else {
@@ -1277,7 +1298,7 @@ mod tests {
     fn shift_j_and_k_scroll_one_account_s_charts() {
         let (mut state, _) = opened(3);
         update(&mut state, ch('f'), NOW_MS);
-        update(&mut state, ch('2'), NOW_MS);
+        update(&mut state, ch('1'), NOW_MS);
         let chart = |label: &str| Series {
             label: label.into(),
             peaks: vec![Some(10.0); 70],
@@ -1327,6 +1348,115 @@ mod tests {
         update(&mut state, ch('f'), NOW_MS);
         let options = ["all accounts", "1 ci@example.com"];
         assert_eq!(choosing(&state), (options.map(String::from).to_vec(), 1));
+    }
+
+    #[test]
+    fn the_scope_dialog_names_each_account_by_its_position_alone() {
+        // Minor 1: no `N. ` of the dialog's own before the positions.
+        let (mut state, _) = opened(3);
+        update(&mut state, ch('f'), NOW_MS);
+        let rows = draw(&state, 80, 24);
+        for option in ["all accounts", "1 a1@x.co", "2 a2@x.co", "3 a3@x.co"] {
+            assert!(
+                rows.iter().any(|r| r.contains(&format!(" {option} "))),
+                "{option}: {rows:?}"
+            );
+        }
+        assert!(!rows.iter().any(|r| r.contains("1. ")), "{rows:?}");
+        // A digit with no account at that position picks nothing.
+        assert!(update(&mut state, ch('7'), NOW_MS).is_empty());
+        assert!(state.overlay.is_some());
+    }
+
+    #[test]
+    fn the_at_cursor_readout_follows_the_cursor() {
+        let (mut state, _) = opened(3);
+        arrived(&mut state, drawn(70));
+        let title = |state: &State| body_of(state, 80, 24, NOW_MS).remove(1);
+        assert!(
+            title(&state).contains("at cursor  69%"),
+            "{}",
+            title(&state)
+        );
+        update(&mut state, key(KeyCode::Left), NOW_MS);
+        update(&mut state, key(KeyCode::Left), NOW_MS);
+        assert!(
+            title(&state).contains("at cursor  67%"),
+            "{}",
+            title(&state)
+        );
+        update(&mut state, key(KeyCode::Home), NOW_MS);
+        assert!(
+            title(&state).contains("at cursor   0%"),
+            "{}",
+            title(&state)
+        );
+    }
+
+    #[test]
+    fn a_long_scoped_name_beside_a_dated_cursor_keeps_the_row_within_80_columns() {
+        let mut accounts = many(3);
+        accounts[1].row.alias = Some("work".repeat(15));
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(accounts));
+        update(&mut state, ch('j'), NOW_MS);
+        update(&mut state, key(KeyCode::Enter), NOW_MS);
+        arrived(&mut state, nothing(70));
+        update(&mut state, key(KeyCode::Home), NOW_MS);
+        let row = scope_row(&state);
+        assert_eq!(width_of(&row), 79, "one column in: {row:?}");
+        assert!(row.starts_with(" f 2 work"), "{row:?}");
+        assert!(row.contains('…'), "the name is cut: {row:?}");
+        assert!(
+            row.ends_with("   [ ] 7 days   cursor Sep 14 16:37"),
+            "the range and the cursor whole: {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_resize_leaves_j_and_k_moving_at_once() {
+        let (mut state, _) = opened(3);
+        update(&mut state, ch('f'), NOW_MS);
+        update(&mut state, ch('1'), NOW_MS);
+        let chart = |label: &str| Series {
+            label: label.into(),
+            peaks: vec![Some(10.0); 70],
+        };
+        let charts = ["5h", "7d", "Fable", "Sonnet"].map(chart).to_vec();
+        let lane = lane_of(1, vec![Some(10.0); 70], vec![true; 70]);
+        arrived(&mut state, timeline_view(70, charts, vec![lane]));
+        let resize = |state: &mut State, height| {
+            update(state, Msg::Resize { width: 80, height }, NOW_MS);
+        };
+        // The charts' titles shown, top first, at 80 columns and the state's height.
+        let titles = |state: &State| -> Vec<String> {
+            body_of(state, 80, state.size.1, NOW_MS)
+                .iter()
+                .filter_map(|r| r.split_whitespace().next())
+                .filter(|w| ["5h", "7d", "Fable", "Sonnet"].contains(w))
+                .map(str::to_owned)
+                .collect()
+        };
+        // 35 rows show three charts: `J` past the end stops at 7d–Sonnet; 24 rows show two,
+        // and `K` moves from there at once.
+        resize(&mut state, 35);
+        for _ in 0..3 {
+            update(&mut state, ch('J'), NOW_MS);
+        }
+        assert_eq!(titles(&state), ["7d", "Fable", "Sonnet"]);
+        resize(&mut state, 24);
+        assert_eq!(titles(&state), ["7d", "Fable"]);
+        update(&mut state, ch('K'), NOW_MS);
+        assert_eq!(titles(&state), ["5h", "7d"]);
+        // Back the other way: past the end at 24 rows is past the end at 35, and one `K` moves.
+        for _ in 0..3 {
+            update(&mut state, ch('J'), NOW_MS);
+        }
+        assert_eq!(titles(&state), ["Fable", "Sonnet"]);
+        resize(&mut state, 35);
+        assert_eq!(titles(&state), ["7d", "Fable", "Sonnet"]);
+        update(&mut state, ch('K'), NOW_MS);
+        assert_eq!(titles(&state), ["5h", "7d", "Fable"]);
     }
 
     #[test]

@@ -17,7 +17,7 @@ const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█
 /// Where an account was not in use, and the in-use lane where it was (§7.4).
 const TRACK: &str = "─";
 const IN_USE: &str = "━";
-/// The cursor through a lane's cells where the account was not in use (§7.1).
+/// The cursor through a lane's empty cells and where the account was not in use (§7.1).
 const CURSOR: &str = "│";
 /// A lane's name in the gutter, after the marker column and before a space (T4-10).
 const NAME: usize = 7;
@@ -29,7 +29,7 @@ const HOURS: usize = 3;
 
 /// One account's swimlane: its name in the gutter, then each column's binding usage in
 /// `fill_role` where it was in use (blank without a reading), a faint `─` where it was not, and
-/// there the cursor's `│` in accent in column `cursor`.
+/// in column `cursor` the cursor's `│` in accent through either of the last two.
 pub(crate) fn lane_row(lane: &Lane, cursor: usize, theme: Theme) -> Line<'static> {
     let name = pad(&words::account_name(&lane.account), NAME);
     let mut spans = vec![Span::raw(format!(" {name} "))];
@@ -41,6 +41,7 @@ pub(crate) fn lane_row(lane: &Lane, cursor: usize, theme: Theme) -> Line<'static
             .enumerate()
             .map(|(c, (v, used))| match (used, v) {
                 (true, Some(v)) => Span::styled(LEVELS[level(*v)], theme.role(fill_role(*v))),
+                (true, None) if c == cursor => Span::styled(CURSOR, accent),
                 (true, None) => Span::raw(" "),
                 (false, _) if c == cursor => Span::styled(CURSOR, accent),
                 (false, _) => Span::styled(TRACK, faint),
@@ -192,6 +193,10 @@ mod tests {
             row(in_use_row(&lane, 0, theme)),
             want("         ━──", "aff")
         );
+        // An in-use cell with no reading is empty: the cursor runs through it too.
+        let lane = lane_of(1, vec![None, Some(40.0), None], vec![true, true, false]);
+        assert_eq!(row(lane_row(&lane, 0, theme)), want(" 1 a1    │▄─", "aaf"));
+        assert_eq!(row(lane_row(&lane, 1, theme)), want(" 1 a1     ▄─", " af"));
     }
 
     #[test]
