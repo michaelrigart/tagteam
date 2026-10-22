@@ -14,7 +14,7 @@ use crate::chrome::fit_spans;
 use crate::daemon::words::clock;
 use crate::keys::RIGHT_INSET;
 use crate::state::State;
-use crate::theme::Role;
+use crate::theme::{Role, Theme};
 use crate::view::{keep_visible, pad, select, width_of};
 
 /// Before a row's time: the marker column and two spaces.
@@ -59,22 +59,33 @@ fn sentence(e: &EventView, tz: &TimeZone) -> String {
     words::event(e, frees_at.as_deref())
 }
 
-/// Each event's time as the list shows it (§5.3's form), newest first.
-fn times(view: &TimelineView, now_ms: i64, tz: &TimeZone) -> Vec<String> {
-    view.events
-        .iter()
-        .rev()
-        .map(|e| autoline::when(e.at_ms, now_ms, tz))
-        .collect()
+/// Each event's time as the list shows it (§5.3's form), newest first, and the widest, which
+/// the rows and the head pad to.
+pub(crate) struct Times {
+    at: Vec<String>,
+    wide: usize,
+}
+
+impl Times {
+    pub(crate) fn of(view: &TimelineView, now_ms: i64, tz: &TimeZone) -> Times {
+        let at: Vec<String> = view
+            .events
+            .iter()
+            .rev()
+            .map(|e| autoline::when(e.at_ms, now_ms, tz))
+            .collect();
+        let wide = at.iter().map(|t| width_of(t)).max().unwrap_or(0);
+        Times { at, wide }
+    }
 }
 
 /// The list's rows in `rows` rows, newest first, the selected one kept in view (T4-20).
 pub(crate) fn list_rows(
     state: &State,
     view: &TimelineView,
+    times: &Times,
     rows: u16,
     width: u16,
-    now_ms: i64,
 ) -> Vec<Line<'static>> {
     let (theme, h, tz) = (state.theme, &state.history, state.tokens.tz());
     let muted = theme.role(Role::Muted);
@@ -87,8 +98,6 @@ pub(crate) fn list_rows(
         let none = vec![Span::raw(LEAD), Span::styled(h.range.no_events(), muted)];
         return vec![Line::from(fit_spans(none, room))];
     }
-    let times = times(view, now_ms, tz);
-    let wide = times.iter().map(|t| width_of(t)).max().unwrap_or(0);
     let len = view.events.len();
     let (first, shown, more) = window(len, h.selected, rows, h.list_from);
     let mut lines: Vec<Line<'static>> = (first..first + shown)
@@ -97,7 +106,7 @@ pub(crate) fn list_rows(
             let m = mark(e);
             let spans = vec![
                 Span::raw(LEAD),
-                Span::styled(pad(&times[i], wide), muted),
+                Span::styled(pad(&times.at[i], times.wide), muted),
                 Span::raw(GAP),
                 Span::styled(m.glyph, theme.role(m.role)),
                 Span::raw(" "),
@@ -124,11 +133,12 @@ pub(crate) fn list_rows(
 }
 
 /// The list's head, `WHEN` over the times and `WHAT` over the glyphs, muted (T4-20).
-pub(crate) fn head_row(state: &State, view: &TimelineView, now_ms: i64) -> Line<'static> {
-    let times = times(view, now_ms, state.tokens.tz());
-    let wide = times.iter().map(|t| width_of(t)).max().unwrap_or(0);
-    let text = format!("{LEAD}{}{GAP}{WHAT}", pad(WHEN, wide.max(width_of(WHEN))));
-    Line::from(Span::styled(text, state.theme.role(Role::Muted)))
+pub(crate) fn head_row(times: &Times, theme: Theme) -> Line<'static> {
+    let text = format!(
+        "{LEAD}{}{GAP}{WHAT}",
+        pad(WHEN, times.wide.max(width_of(WHEN)))
+    );
+    Line::from(Span::styled(text, theme.role(Role::Muted)))
 }
 
 #[cfg(test)]
@@ -341,5 +351,130 @@ mod tests {
         assert_eq!(body[1], "▌  13:13       + 1 a1 added", "{body:?}");
         assert_eq!(body[18], "   Sun 20:13   + 1 a1 added", "{body:?}");
         assert_eq!(body[19], "   ⋮ 12 more · z charts", "{body:?}");
+    }
+
+    /// `view` delivered again under the same read: a refresh, keeping the cursor.
+    fn refreshed(state: &mut State, view: TimelineView) {
+        let r#gen = state.gens.history;
+        update(
+            state,
+            Msg::Timeline {
+                r#gen,
+                result: Ok(view),
+            },
+            NOW_MS,
+        );
+    }
+
+    /// Every row `state` draws at `w`×`h` is within `w` columns.
+    fn within(state: &State, w: u16, h: u16) {
+        for (y, row) in draw(state, w, h).iter().enumerate() {
+            assert!(
+                crate::view::width_of(row) <= usize::from(w),
+                "{w}×{h} row {y} is {} wide: {row:?}",
+                crate::view::width_of(row)
+            );
+        }
+    }
+
+    #[test]
+    fn no_row_is_wider_than_the_screen() {
+        // A stored message with control characters reads as one row.
+        let mut failed = event_at(
+            NOW_MS - 3 * HOUR * 1000,
+            EventKind::SwitchFailed,
+            EventSource::Auto,
+        );
+        failed.to = Some(account_ref(2));
+        failed.detail = Some(serde_json::json!({"message": "a\nb\tc", "transient": false}));
+        // A CJK alias, and a removed account's 200-character label.
+        let mut wide = event_at(
+            NOW_MS - 2 * HOUR * 1000,
+            EventKind::Switch,
+            EventSource::Cli,
+        );
+        wide.from = Some(account_ref(1));
+        wide.to = Some(tagteam_engine::timeline::AccountRef {
+            alias: Some("工作用のアカウント".repeat(8)),
+            ..account_ref(2)
+        });
+        let mut long = event_at(NOW_MS - HOUR * 1000, EventKind::Switch, EventSource::Auto);
+        long.from = Some(account_ref(1));
+        long.to = Some(tagteam_engine::timeline::AccountRef {
+            id: tagteam_core::AccountId::from_string("gone"),
+            position: None,
+            alias: None,
+            email: Some(format!("{}@example.com", "x".repeat(188))),
+            removed: true,
+        });
+        let state = shown(with_events(vec![failed, wide, long]));
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert!(
+            body[18].starts_with("   11:13   ✕ auto couldn't switch to 2 a2 · a b c"),
+            "{body:?}"
+        );
+        for (w, h) in [(80, 24), (120, 40), (300, 60)] {
+            within(&state, w, h);
+        }
+        let mut state = state;
+        update(&mut state, ch('j'), NOW_MS);
+        for (w, h) in [(80, 24), (120, 40), (300, 60)] {
+            within(&state, w, h);
+        }
+    }
+
+    #[test]
+    fn a_refresh_with_fewer_events_keeps_the_selection_and_the_window_valid() {
+        let twelve = hourly(12);
+        let mut state = shown(with_events(twelve.clone()));
+        update(&mut state, key(crossterm::event::KeyCode::Home), NOW_MS);
+        assert_eq!(state.history.selected, Some(11), "the last row");
+        // The oldest five: the cursor's event is now the last of five rows.
+        refreshed(&mut state, with_events(twelve[..5].to_vec()));
+        assert_eq!(state.history.selected, Some(4));
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(
+            body[16..20],
+            [
+                "   04:13   + 1 a1 added",
+                "   03:13   + 1 a1 added",
+                "▌  02:13   + 1 a1 added",
+                "   ⋮ 2 more · z full list",
+            ],
+            "{body:?}"
+        );
+        // The newest two, both after the cursor: no selection, and the list from its top.
+        refreshed(&mut state, with_events(twelve[10..].to_vec()));
+        assert_eq!(state.history.selected, None);
+        let body = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(
+            body[16..19],
+            ["   13:13   + 1 a1 added", "   12:13   + 1 a1 added", ""],
+            "{body:?}"
+        );
+        update(&mut state, ch('k'), NOW_MS);
+        assert_eq!(state.history.selected, Some(1));
+    }
+
+    #[test]
+    fn all_exhausted_says_when_the_first_account_frees_up_in_the_tui_s_clock() {
+        // `earliest_reset_at` is stored in seconds: 2h10m after now is 16:23.
+        let mut exhausted = event_at(
+            NOW_MS - HOUR * 1000,
+            EventKind::AllExhausted,
+            EventSource::Auto,
+        );
+        exhausted.from = Some(account_ref(1));
+        exhausted.detail = Some(serde_json::json!({"earliest_reset_at": NOW_S + 2 * HOUR + 600}));
+        let state = shown(with_events(vec![exhausted]));
+        let body = body_of(&state, 120, 40, NOW_MS);
+        let row = body
+            .iter()
+            .find(|r| r.contains("near its limit"))
+            .unwrap_or_else(|| panic!("{body:?}"));
+        assert!(
+            row.ends_with("✕ auto couldn't switch · every account is near its limit; the first frees up at 16:23"),
+            "{row:?}"
+        );
     }
 }
