@@ -12,6 +12,15 @@ const NEUTRAL: [&str; 5] = [
     "tagteam-tui",
 ];
 const LEAKS: [&str; 3] = ["claude", "anthropic", "tagteam_cc"];
+/// Claude Code's field names and record kinds, matched in their exact case: the neutral
+/// `ProcStart` type is not the field `procStart`.
+const FIELDS: [&str; 5] = [
+    "procStart",
+    "oauthAccount",
+    "accountUuid",
+    "claudeAiOauth",
+    "daemon-worker",
+];
 /// Held for the TUI redesign, pinned by file and text. Each must still match, so an entry goes
 /// once its line does.
 const ALLOWED: [(&str, &str); 0] = [];
@@ -111,6 +120,13 @@ fn production(text: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
+/// Whether a production line of a neutral crate names Claude Code: a `LEAKS` word in any case,
+/// or a `FIELDS` name exactly.
+fn names_claude_code(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    LEAKS.iter().any(|w| lower.contains(w)) || FIELDS.iter().any(|f| line.contains(f))
+}
+
 #[test]
 fn the_scanner_keeps_production_and_drops_test_halves_and_comments() {
     assert_eq!(
@@ -122,6 +138,10 @@ fn the_scanner_keeps_production_and_drops_test_halves_and_comments() {
         [(1, "fn a() {}".to_owned())]
     );
     assert_eq!(
+        production("fn a() {}\n// procStart\n#[cfg(test)]\nmod tests {\n    \"oauthAccount\"\n}\n"),
+        [(1, "fn a() {}".to_owned())]
+    );
+    assert_eq!(
         production("#[cfg(test)]\nmod testutil;\nfn b() {}\n").last(),
         Some(&(3, "fn b() {}".to_owned()))
     );
@@ -129,6 +149,28 @@ fn the_scanner_keeps_production_and_drops_test_halves_and_comments() {
         test_mod(&["#[cfg(test)]", "pub(crate) mod testutil;"], 0),
         Some(("testutil".to_owned(), false))
     );
+}
+
+#[test]
+fn a_field_name_leaks_only_in_its_exact_case() {
+    for line in [
+        "o.get(\"procStart\")",
+        "\"daemon-worker\"",
+        "v[\"oauthAccount\"]",
+        "accountUuid",
+        "claudeAiOauth",
+        "Claude",
+    ] {
+        assert!(names_claude_code(line), "{line}");
+    }
+    for line in [
+        "start: ProcStart,",
+        "proc_start",
+        "account_uuid",
+        "daemon_worker",
+    ] {
+        assert!(!names_claude_code(line), "{line}");
+    }
 }
 
 #[test]
@@ -145,8 +187,7 @@ fn no_neutral_crate_names_claude_code() {
             let name = relative(&root, &file);
             let text = fs::read_to_string(&file).unwrap();
             for (line, body) in production(&text) {
-                let lower = body.to_lowercase();
-                if !LEAKS.iter().any(|w| lower.contains(w)) {
+                if !names_claude_code(&body) {
                     continue;
                 }
                 let allowed = ALLOWED
