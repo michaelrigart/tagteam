@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use serde_json::{Value, json};
 use tagteam_core::validate::{is_valid_email, normalize_alias};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::profile::{ProfileMarker, canonical_profile_path, profile_path};
@@ -257,19 +258,50 @@ impl Engine {
         kind: EventKind,
         from: Option<&AccountId>,
         to: Option<&AccountId>,
+        detail: Option<Value>,
     ) -> Result<(), EngineError> {
         self.store()?.insert_event(
-            &EventRow {
-                at: self.now_ms(),
-                provider: provider.clone(),
-                kind,
-                from_id: from.cloned(),
-                to_id: to.cloned(),
-                trigger: None,
-                source: self.source(),
-                detail: None,
-            },
+            &self.event_row(provider, kind, from, to, detail),
             self.registered_id(provider).is_some(),
+        )?;
+        Ok(())
+    }
+
+    fn event_row(
+        &self,
+        provider: &ProviderId,
+        kind: EventKind,
+        from: Option<&AccountId>,
+        to: Option<&AccountId>,
+        detail: Option<Value>,
+    ) -> EventRow {
+        EventRow {
+            at: self.now_ms(),
+            provider: provider.clone(),
+            kind,
+            from_id: from.cloned(),
+            to_id: to.cloned(),
+            trigger: None,
+            source: self.source(),
+            detail,
+        }
+    }
+
+    /// The last step of `remove_locked` and of purge's `remove_unregistered`: the row goes with
+    /// its `remove` event, `{"label"}` its email, else its label (C-12), in one transaction, so
+    /// no account is deleted without the name the timeline keeps for it (T4-27).
+    pub(crate) fn delete_logged(&self, row: &AccountRow) -> Result<(), EngineError> {
+        let label = row.email.as_deref().unwrap_or(&row.label);
+        self.store()?.delete_account_logged(
+            &row.id,
+            &self.event_row(
+                &row.provider,
+                EventKind::Remove,
+                Some(&row.id),
+                None,
+                Some(json!({ "label": label })),
+            ),
+            self.registered_id(&row.provider).is_some(),
         )?;
         Ok(())
     }
@@ -319,8 +351,7 @@ impl Engine {
             self.delete_rescue(path)?;
         }
         self.remove_profile(p.as_ref(), row, pending)?;
-        self.store()?.delete_account(&row.id)?;
-        self.event(&row.provider, EventKind::Remove, Some(&row.id), None)?;
+        self.delete_logged(row)?;
         Ok(rescues.len())
     }
 
@@ -766,7 +797,7 @@ impl Engine {
         if alias.is_some() {
             store.set_alias(&prep.id, alias).map_err(alias_taken)?;
         }
-        self.event(provider, source.event, None, Some(&prep.id))?;
+        self.event(provider, source.event, None, Some(&prep.id), None)?;
         Ok((
             store.account(&prep.id)?.ok_or(StoreError::NoSuchAccount)?,
             prep.existing.is_none(),

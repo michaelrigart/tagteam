@@ -1357,6 +1357,7 @@ fn auto_switch(fx: &Fx, from: &AccountId, target: &AccountId, trigger: Trigger) 
                 left_recovery_at: Some(T0 + 9_630),
                 left_trigger: trigger,
             },
+            cause: None,
         }),
     }
 }
@@ -1382,6 +1383,18 @@ fn the_new_reasons_carry_the_spec_s_tokens() {
     assert_eq!(SwitchReason::LiveChanged.as_str(), "live-changed");
     assert_eq!(SwitchReason::Cooldown.as_str(), "cooldown");
     assert_eq!(SwitchReason::NotCandidate.as_str(), "not-candidate");
+}
+
+/// §12.4: a manual switch has no `auto`, so its `switch` event has no reason.
+#[test]
+fn a_manual_switch_records_no_detail() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live
+    assert!(fx.switch_to(&a, false).unwrap().switched);
+    let last = switch_events(&fx).pop().unwrap();
+    assert_eq!(last.to_id.as_ref(), Some(&a));
+    assert_eq!(last.detail, None);
 }
 
 #[test]

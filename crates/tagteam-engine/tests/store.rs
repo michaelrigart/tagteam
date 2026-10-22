@@ -889,6 +889,60 @@ fn deleting_the_active_account_clears_its_epoch_too() {
 }
 
 #[test]
+fn an_account_is_never_deleted_without_its_remove_event() {
+    // T4-27: the `remove` event goes in the deletion's own transaction, so an event that
+    // cannot be written leaves the account and every row that cascades from it.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("tagteam.db");
+    let s = Store::open(&path).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch(
+        "INSERT INTO usage_state (account_id) VALUES ('a'); \
+         INSERT INTO usage_samples (account_id, window, fetched_at, pct) VALUES ('a', '5h', 1, 10.0); \
+         INSERT INTO mappings (path, provider, account_id, added_at) \
+         VALUES ('/srv/example', 'claude-code', 'a', 1); \
+         CREATE TRIGGER no_events BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .unwrap();
+    let rows = |table: &str, column: &str| -> i64 {
+        raw.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {column} = 'a'"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let remove = EventRow {
+        at: 7,
+        provider: cc(),
+        kind: EventKind::Remove,
+        from_id: Some(a.clone()),
+        to_id: None,
+        trigger: None,
+        source: EventSource::Cli,
+        detail: Some(json!({"label": "a@x.co"})),
+    };
+
+    let err = s.delete_account_logged(&a, &remove, true).unwrap_err();
+    assert!(err.to_string().contains("refused"), "{err}");
+    assert!(s.account(&a).unwrap().is_some());
+    for table in ["usage_state", "usage_samples", "mappings"] {
+        assert_eq!(rows(table, "account_id"), 1, "{table}");
+    }
+    assert!(s.events().unwrap().is_empty());
+
+    raw.execute_batch("DROP TRIGGER no_events;").unwrap();
+    s.delete_account_logged(&a, &remove, true).unwrap();
+    assert!(s.account(&a).unwrap().is_none());
+    assert_eq!(rows("accounts", "id"), 0);
+    for table in ["usage_state", "usage_samples", "mappings"] {
+        assert_eq!(rows(table, "account_id"), 0, "{table}");
+    }
+    assert_eq!(s.events().unwrap(), [remove]);
+}
+
+#[test]
 fn the_live_store_is_stale_only_when_the_active_account_s_epoch_moved() {
     // §12.5: stale-marked when `active_accounts` names the account with an activation epoch
     // other than its `login_epoch`. A row with no epoch is no evidence either way.

@@ -13,6 +13,7 @@ use common::{
     fp, quarantine_of, quiescent, record_reading, sent_refresh_tokens, unblock_rescue,
     usage_requests, usage_window, vault_fp, write_target_credential,
 };
+use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::autoswitch::{
     AutoConfig, AutoState, AutoStrategy, Decision, NoSwitchReason, Outcome, Trigger,
@@ -239,6 +240,31 @@ fn a_proactive_tick_switches_and_records_its_departure() {
                 last.source.as_str()
             ),
             ("switch", Some("proactive"), "auto")
+        );
+    }
+}
+
+/// §12.4, T4-23: an automatic switch's `switch` event records the live account's binding
+/// window, its label and `pct`, and the threshold it was judged by.
+#[test]
+fn an_automatic_switch_records_the_window_that_triggered_it() {
+    for fake in [false, true] {
+        let ffx = FakeFx::new();
+        let t = two(&ffx, fake);
+        read(&ffx.engine, &t.a, &reading(fake, 10.0, 20.0));
+        read(&ffx.engine, &t.b, &reading(fake, 20.0, 95.0));
+        let sink = Recorded::default();
+        let auto = ffx.engine_as(EventSource::Auto);
+        let mut engine = auto.auto(&t.provider, t.config, false).unwrap().unwrap();
+        let (outcome, _) = engine.tick(&sink).unwrap();
+        assert_eq!(outcome, TickOutcome::Switched, "fake={fake}");
+        let window = if fake { "monthly" } else { "7d" };
+        let last = ffx.engine.store().unwrap().events().unwrap().pop().unwrap();
+        assert_eq!(last.kind.as_str(), "switch", "fake={fake}");
+        assert_eq!(
+            last.detail,
+            Some(json!({"window": window, "label": window, "pct": 95.0, "threshold": 90.0})),
+            "fake={fake}"
         );
     }
 }

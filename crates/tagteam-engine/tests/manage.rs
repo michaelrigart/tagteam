@@ -3,12 +3,13 @@ mod common;
 use std::fs;
 
 use common::{Fx, block_rescue, credential, held_guard, unblock_rescue, vault_fp};
+use serde_json::json;
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::AddTokenOptions;
 use tagteam_engine::store::{JournalRow, NewAccount};
 use tagteam_engine::vault::SERVICE;
 use tagteam_engine::views::StatusView;
+use tagteam_engine::{EngineError, EventKind};
 use tagteam_provider::profile::ProfileMarker;
 use tagteam_provider::{ProcessStamp, Provider, Read};
 
@@ -82,6 +83,19 @@ fn remove_deletes_vault_and_row_but_never_the_live_login() {
     assert!(fx.engine.store().unwrap().account(&a).unwrap().is_none());
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a2"));
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+}
+
+/// §12.4, C-12: the `remove` event keeps the account's label, so the timeline can name an
+/// account whose row is gone.
+#[test]
+fn remove_records_the_account_s_label() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.engine.remove(&a).unwrap();
+    let last = fx.engine.store().unwrap().events().unwrap().pop().unwrap();
+    assert_eq!(last.kind, EventKind::Remove);
+    assert_eq!(last.from_id.as_ref(), Some(&a));
+    assert_eq!(last.detail, Some(json!({"label": "a@x.co"})));
 }
 
 #[test]

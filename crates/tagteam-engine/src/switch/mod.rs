@@ -1,3 +1,4 @@
+use serde_json::{Value, json};
 use tagteam_core::autoswitch::{Departure, Trigger};
 use tagteam_core::poll::replan_for_role;
 use tagteam_core::{AccountId, ProviderId};
@@ -82,6 +83,30 @@ pub struct AutoPerform {
     pub trigger: Trigger,
     pub cooldown_s: i64,
     pub departure: Departure,
+    /// The window behind the switch, stored as its `switch` event's `detail` (T4-23); `None`
+    /// when the live account has no decision-grade binding window.
+    pub cause: Option<SwitchCause>,
+}
+
+/// The window that triggered an automatic switch (redesign §12.4), its `switch` event's `detail`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchCause {
+    pub window: String,
+    pub label: String,
+    pub pct: f64,
+    pub threshold: f64,
+}
+
+impl SwitchCause {
+    /// `{"window", "label", "pct", "threshold"}`.
+    pub fn detail(&self) -> Value {
+        json!({
+            "window": self.window,
+            "label": self.label,
+            "pct": self.pct,
+            "threshold": self.threshold,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

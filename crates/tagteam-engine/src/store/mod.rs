@@ -1451,6 +1451,28 @@ impl Store {
     /// `active_accounts` row that named it, but cannot clear a second column, so the orphaned
     /// activation epoch is cleared here too (§6.1: NULL only with `account_id`).
     pub fn delete_account(&self, id: &AccountId) -> Result<(), StoreError> {
+        self.delete_account_with(id, None)
+    }
+
+    /// `delete_account`, with `event` inserted through `insert_event_on` in the same
+    /// transaction (T4-27), then logged, naming its provider only when `name_provider`
+    /// (`log_event`). An event that cannot be written leaves the account as it was.
+    pub fn delete_account_logged(
+        &self,
+        id: &AccountId,
+        event: &EventRow,
+        name_provider: bool,
+    ) -> Result<(), StoreError> {
+        self.delete_account_with(id, Some(event))?;
+        log_event(event, name_provider);
+        Ok(())
+    }
+
+    fn delete_account_with(
+        &self,
+        id: &AccountId,
+        event: Option<&EventRow>,
+    ) -> Result<(), StoreError> {
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM accounts WHERE id = ?1", [id.as_str()])?;
@@ -1462,6 +1484,9 @@ impl Store {
             "UPDATE active_accounts SET login_epoch = NULL WHERE account_id IS NULL",
             [],
         )?;
+        if let Some(e) = event {
+            Self::insert_event_on(&tx, e)?;
+        }
         tx.commit()?;
         Ok(())
     }

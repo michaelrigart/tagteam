@@ -22,7 +22,6 @@ use crate::auto::{engine_lock_path, read_holder};
 use crate::displace::PurgeError;
 use crate::engine::Engine;
 use crate::error::{DeletionRefusal, EngineError, GuardScope, SessionOwner};
-use crate::event::EventKind;
 use crate::fsutil::{FileId, absent};
 use crate::hooks;
 use crate::lifecycle::{PendingLaunches, UnlistedRescues};
@@ -547,8 +546,7 @@ impl Engine {
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(e.into()),
         };
-        self.store()?.delete_account(&row.id)?;
-        self.event(&row.provider, EventKind::Remove, Some(&row.id), None)?;
+        self.delete_logged(row)?;
         if !had_profile {
             return Ok((rescues.len(), None));
         }

@@ -1137,6 +1137,37 @@ fn a_purge_interrupted_after_each_account_is_finished_by_running_it_again() {
 
 #[cfg(feature = "test-hooks")]
 #[test]
+fn a_purged_account_s_remove_event_keeps_its_label() {
+    // §12.4, C-12: purge writes the `remove` event with the deletion, as `remove` does, here
+    // for an account of a provider this build does not register. Stopped after the account,
+    // so step 9 has not yet taken that provider's events with it.
+    let fx = Fx::new();
+    let ghost = ProviderId::new("ghost");
+    let (g, ..) = unregistered_account(&fx, &ghost);
+    let row = fx.engine.store().unwrap().account(&g).unwrap().unwrap();
+    let label = row.email.clone().unwrap_or(row.label.clone());
+    let plan = fx.engine.purge_plan(Some(&ghost)).unwrap();
+    fx.engine.fail_at(Some("purge-account-deleted"));
+    assert!(fx.engine.purge(&plan).is_err());
+    fx.engine.fail_at(None);
+    let store = fx.engine.store().unwrap();
+    assert!(store.account(&g).unwrap().is_none());
+    let removed = store
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind.as_str() == "remove")
+        .collect::<Vec<_>>();
+    assert_eq!(removed.len(), 1, "{removed:?}");
+    assert_eq!(
+        (removed[0].provider.clone(), removed[0].from_id.clone()),
+        (ghost, Some(g))
+    );
+    assert_eq!(removed[0].detail, Some(json!({"label": label})));
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
 fn an_add_waiting_on_the_purge_lands_in_the_emptied_store() {
     // §10.5 step 4: the add waits for `MutationGuard`, which the purge holds to the end.
     use std::sync::{Arc, Mutex, mpsc};
