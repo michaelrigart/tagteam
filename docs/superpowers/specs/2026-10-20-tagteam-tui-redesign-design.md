@@ -684,9 +684,9 @@ range are left out; at most 6 at 80×24 and 10 at 120×40, then `+2 more · f pi
 - **One read:** `Engine::timeline(provider, scope, since_s, columns)` (§12.3) on the views lane,
   returning bucketed series, swimlanes and events, so the UI thread only draws.
 - **Re-read on:** opening the screen, a scope or range change, a resize (debounced to 250 ms), a
-  `switch`, `account-quarantined`, `account-unquarantined`, `usage` or `changed` event (debounced
-  as today), and the 30 s timer in timer mode. In live mode, at most every 30 s for `usage` and
-  `changed`.
+  `switch`, `account-quarantined`, `account-unquarantined`, `poll`, `usage` or `changed` event
+  (debounced as today), the 60 s live poll, and the 30 s timer in timer mode. In live mode, at
+  most every 30 s for `poll`, `usage`, `changed` and the 60 s poll (T4-19).
 - **It never fetches** (core §13.4).
 - **Without a daemon** everything above still shows: the events and `active_history` are the
   store's.
