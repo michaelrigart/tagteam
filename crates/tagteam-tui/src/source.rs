@@ -11,12 +11,14 @@ use tagteam_engine::daemon::{daemon_lock_path, read_daemon_record};
 use tagteam_engine::error::EngineError;
 use tagteam_engine::failure::FailureKind;
 use tagteam_engine::settings::Settings;
-use tagteam_engine::timeline::{Scope, TimelineView};
+use tagteam_engine::timeline::{EventView, Scope, TimelineView};
 use tagteam_engine::tokens::{
     IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport, Wait,
 };
 use tagteam_engine::views::{HistoryView, ProviderAccounts, ShellAccount};
 use tagteam_provider::{Liveness, Read, RunShell, TransientKind};
+
+use crate::autoline;
 
 /// A read that failed, in the CLI's own words (`kind` is the JSON `error.type`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +51,8 @@ pub struct AccountsSnapshot {
     /// `config.toml`'s modification time when this was read (`Settings::mtime`): a change from
     /// the one start-up saw clears the start-up warnings (redesign §5.6, T2-21).
     pub config_mtime: Option<SystemTime>,
+    /// Each listed provider's `last_auto_event` of the last 30 days (§5.3, §12.2).
+    pub last_auto: Vec<(ProviderId, EventView)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,7 +110,8 @@ impl EngineSource {
 impl Source for EngineSource {
     /// `list`'s view (`Engine::accounts`), each provider's live login read once in it
     /// (PERF-R-10a), with what the TUI shows around it: the run shell's own account
-    /// (`shell_account`), whether this is a run shell, and the engine clock.
+    /// (`shell_account`), whether this is a run shell, the engine clock, and each provider's
+    /// last auto-line event of the 30 days before it (§5.3), whose error fails the read (T4-30).
     fn accounts(&self, provider: Option<&ProviderId>) -> Result<AccountsSnapshot, SourceError> {
         let engine = &self.engine;
         let providers = engine.accounts(provider)?;
@@ -115,13 +120,22 @@ impl Source for EngineSource {
             ShellAccount::NotInShell | ShellAccount::Unmanaged => None,
         };
         let auto_holders = foreign_engine_holders(engine, &providers);
+        let read_at_ms = engine.now_ms();
+        let mut last_auto = Vec::new();
+        for p in &providers {
+            let since_ms = read_at_ms - autoline::MONTH_MS;
+            if let Some(e) = engine.last_auto_event(&p.provider, since_ms)? {
+                last_auto.push((p.provider.clone(), e));
+            }
+        }
         Ok(AccountsSnapshot {
             providers,
             this,
             in_run_shell: matches!(engine.run_shell(), RunShell::Inside { .. }),
-            read_at_s: engine.now_ms().div_euclid(1000),
+            read_at_s: read_at_ms.div_euclid(1000),
             auto_holders,
             config_mtime: Settings::mtime(engine.env()),
+            last_auto,
         })
     }
 

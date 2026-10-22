@@ -326,6 +326,90 @@ fn tui_first_frame_p95_is_within_50_ms_when_nothing_is_due() {
     );
 }
 
+/// A year of stored events: `EVENTS` raw `events` rows over 365 days, every kind, and newest an
+/// auto switch from one removed account to another, which `last_auto_event` names from their
+/// `remove` labels: its worst case, the latest-event scan and a label scan for each account.
+fn a_year_of_events(root: &Path) {
+    const EVENTS: i64 = 20_000;
+    const KINDS: [&str; 11] = [
+        "switch",
+        "switch-recovered",
+        "switch-failed",
+        "all-exhausted",
+        "autoswitch-paused",
+        "autoswitch-resumed",
+        "quarantine",
+        "unquarantine",
+        "add",
+        "import",
+        "remove",
+    ];
+    let mut db =
+        rusqlite::Connection::open(Env::for_test(root).data_dir().join("tagteam.db")).unwrap();
+    let tx = db.transaction().unwrap();
+    let now_ms = now_epoch_s() * 1000;
+    let year_ms = 365 * 86_400_000;
+    let insert = |at: i64, kind: &str, from: &str, to: Option<&str>, detail: &str| {
+        tx.execute(
+            "INSERT INTO events (at, provider, kind, from_id, to_id, trigger, source, detail) \
+             VALUES (?1, 'claude-code', ?2, ?3, ?4, 'proactive', 'auto', ?5)",
+            rusqlite::params![at, kind, from, to, detail],
+        )
+        .unwrap();
+    };
+    for n in 0..EVENTS {
+        let at = now_ms - year_ms + n * (year_ms / EVENTS);
+        let kind = KINDS[n as usize % KINDS.len()];
+        let detail = r#"{"label": "alex@personal.example"}"#;
+        insert(
+            at,
+            kind,
+            &format!("gone-{}", n % 50),
+            Some("gone-x"),
+            detail,
+        );
+    }
+    for (id, label) in [
+        ("gone-a", "alex@personal.example"),
+        ("gone-b", "sam@corp.example"),
+    ] {
+        insert(
+            now_ms - 120_000,
+            "remove",
+            id,
+            None,
+            &format!(r#"{{"label": "{label}"}}"#),
+        );
+    }
+    let reached = r#"{"window": "5h", "label": "5h", "pct": 93.0, "threshold": 90.0}"#;
+    insert(now_ms - 60_000, "switch", "gone-a", Some("gone-b"), reached);
+    tx.commit().unwrap();
+}
+
+#[test]
+#[ignore = "timing: run with --release on an idle machine"]
+fn tui_first_frame_p95_is_within_50_ms_with_a_year_of_events() {
+    // Redesign §14: the accounts read behind the first frame now reads each provider's last
+    // auto-line event (§12.2, T4-30), over a store with a year of events.
+    let _one_at_a_time = serial();
+    let d = tempfile::tempdir().unwrap();
+    nothing_due(d.path());
+    a_year_of_events(d.path());
+    let server = MockServer::start();
+    let runs = first_frames(d.path(), &server.base_url());
+    let p = p95(&runs);
+    eprintln!("tui first frame with a year of events p95 {p:?} over {RUNS} runs");
+    assert_eq!(
+        server.requests().len(),
+        0,
+        "a fetch was due, so this measured the wrong path"
+    );
+    assert!(
+        p <= Duration::from_millis(50),
+        "tui first frame p95 {p:?} over {RUNS} runs: {runs:?}"
+    );
+}
+
 #[test]
 #[ignore = "timing: run with --release on an idle machine"]
 fn tui_first_frame_p95_is_within_50_ms_while_the_index_catches_up() {

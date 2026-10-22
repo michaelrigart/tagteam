@@ -16,14 +16,14 @@ use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Window, WindowKi
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;
-use tagteam_engine::store::{Eligibility, NewAccount, Reserve, Store};
+use tagteam_engine::store::{Eligibility, EventRow, NewAccount, Reserve, Store};
 use tagteam_engine::switch::LiveLogin;
-use tagteam_engine::timeline::Scope;
+use tagteam_engine::timeline::{AccountRef, EventView, Scope};
 use tagteam_engine::tokens::{
     PeriodKey, RefreshOutcome, RowAccount, TokenGrouping, TokenPeriod, TokenQuery, tokens_lock_path,
 };
 use tagteam_engine::vault::{KeychainVault, SERVICE, Vault};
-use tagteam_engine::{Engine, EngineConfig, EventSource};
+use tagteam_engine::{Engine, EngineConfig, EventKind, EventSource};
 use tagteam_fake::{FAKE_AGENT, FakeAgent, FakeUsage, append_transcript, usage_line_json};
 use tagteam_provider::http::Method;
 use tagteam_provider::liveness::FakeProcessProbe;
@@ -322,6 +322,65 @@ fn no_store_is_the_default_provider_with_no_accounts_and_creates_nothing() {
     let summary = home.source().collect_due(&[]).unwrap();
     assert_eq!((summary.fetched, summary.warnings.len()), (0, 0));
     assert!(!home.db().exists());
+}
+
+#[test]
+fn accounts_carries_each_provider_s_last_auto_line_event() {
+    // §5.3, §12.2, T4-30: each listed provider's `last_auto_event` of the last 30 days, its
+    // accounts named at read time; an `add` is no auto-line kind.
+    let home = Home::new();
+    assert_eq!(
+        home.source().accounts(None).unwrap().last_auto,
+        [],
+        "without a store"
+    );
+    let a = home.add(CLAUDE_CODE, 1, "a@x.co");
+    let b = home.add(CLAUDE_CODE, 2, "b@x.co");
+    let cc = ProviderId::new(CLAUDE_CODE);
+    let detail = json!({"window": "5h", "label": "5h", "pct": 93.0, "threshold": 90.0});
+    let event = |at: i64, kind: EventKind, from: Option<&AccountId>, to: &AccountId| EventRow {
+        at,
+        provider: cc.clone(),
+        kind,
+        from_id: from.cloned(),
+        to_id: Some(to.clone()),
+        trigger: (kind == EventKind::Switch).then(|| "proactive".to_owned()),
+        source: EventSource::Auto,
+        detail: (kind == EventKind::Switch).then(|| detail.clone()),
+    };
+    let switched_at = NOW_MS - 3_600_000;
+    let store = home.store();
+    store
+        .insert_event(&event(switched_at, EventKind::Switch, Some(&a), &b), false)
+        .unwrap();
+    store
+        .insert_event(&event(NOW_MS - 60_000, EventKind::Add, None, &b), false)
+        .unwrap();
+    let named = |id: &AccountId, position: u32, email: &str| AccountRef {
+        id: id.clone(),
+        position: Some(position),
+        alias: None,
+        email: Some(email.into()),
+        removed: false,
+    };
+    let snap = home.source().accounts(None).unwrap();
+    assert_eq!(
+        snap.last_auto,
+        [(
+            cc,
+            EventView {
+                at_ms: switched_at,
+                kind: EventKind::Switch,
+                source: EventSource::Auto,
+                trigger: Some("proactive".into()),
+                from: Some(named(&a, 1, "a@x.co")),
+                to: Some(named(&b, 2, "b@x.co")),
+                detail: Some(detail),
+                before_pct: None,
+                after_pct: None,
+            }
+        )]
+    );
 }
 
 #[test]

@@ -871,11 +871,18 @@ mod tests {
         };
         let below = || auto_with("no-switch", json!({"reason": "below-threshold"}));
         let poll = json!({"active": {"number": 1}, "headroomPct": {"1": 23.0}});
+        // The auto line, `w why` ending one column in (§5.3).
+        let hinted = |left: &str| {
+            format!(
+                "{left}{}w why",
+                " ".repeat(74 - crate::view::width_of(left))
+            )
+        };
         update(&mut state, auto_with("poll", poll), NOW_MS);
         update(&mut state, below(), NOW_MS);
         assert_eq!(
             draw(&state, 80, 24)[1],
-            "   14:13  no switch needed (switches at 90%)"
+            hinted("   14:13  no switch needed (switches at 90%)")
         );
         let unmatched = json!({"active": {"number": 1}, "headroomPct": {"1": 23.0},
             "windowsPct": {"1": {"5h": 40.0}}});
@@ -883,7 +890,7 @@ mod tests {
         update(&mut state, below(), NOW_MS);
         assert_eq!(
             draw(&state, 80, 24)[1],
-            "   14:13  no switch needed (switches at 90%)",
+            hinted("   14:13  no switch needed (switches at 90%)"),
             "no window near the account's usage"
         );
         let poll = json!({"active": {"number": 1}, "headroomPct": {"1": 23.0},
@@ -892,7 +899,7 @@ mod tests {
         update(&mut state, below(), NOW_MS);
         assert_eq!(
             draw(&state, 80, 24)[1],
-            "   14:13  no switch needed (77%, switches at 90%)",
+            hinted("   14:13  no switch needed (77%, switches at 90%)"),
             "the binding window's usage"
         );
     }

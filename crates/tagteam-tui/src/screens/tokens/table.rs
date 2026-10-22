@@ -2641,6 +2641,8 @@ mod tests {
             reason: "keychain".into(),
             until: "2026-09-21T15:05:00Z".into(),
         });
+        // The auto line says nothing before the first accounts read (T4-30).
+        state.accounts.apply(snapshot(vec![]));
         go_live(&mut state, daemon_status(vec![locked], vec![]));
         let ev = tagteam_daemon::protocol::Event::Auto {
             kind: "error".into(),
@@ -2661,7 +2663,7 @@ mod tests {
             "{lines:?}"
         );
         assert!(lines[1].starts_with(" ! 14:04  xxx"), "{lines:?}");
-        assert!(lines[1].ends_with('…'), "{lines:?}");
+        assert!(lines[1].ends_with("…   w why"), "{lines:?}");
         assert!(
             lines[3..6]
                 .iter()

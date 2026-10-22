@@ -142,6 +142,14 @@ pub(crate) const KEYS: &[KeyRow] = &[
         probes: &[named(KeyCode::Esc)],
     },
     KeyRow {
+        screen: None,
+        keys: "w",
+        does: "History at auto's last action",
+        footer: Footer::No,
+        #[cfg(test)]
+        probes: &[plain('w')],
+    },
+    KeyRow {
         screen: Some(Screen::Accounts),
         keys: "j k ↑ ↓",
         does: "move up or down",
@@ -698,7 +706,7 @@ mod tests {
             (None, Char('?'), false) => vec![accounts(1)],
             (None, Char('q'), false) => vec![opened(accounts(1)), accounts(1)],
             (None, Esc, false) => vec![opened(accounts(1)), warned(accounts(1))],
-            (None, Char('P' | 'r' | 'A' | 'D'), false) => vec![accounts(2)],
+            (None, Char('P' | 'r' | 'A' | 'D' | 'w'), false) => vec![accounts(2)],
             (
                 Some(Accounts),
                 Char('j' | 'k' | 's' | 'b' | 'n' | 'e' | 'a' | 'm' | 'x' | 'R')

@@ -842,6 +842,7 @@ mod tests {
                 read_at_s: 0,
                 auto_holders: vec![],
                 config_mtime: None,
+                last_auto: vec![],
             })
         }
 

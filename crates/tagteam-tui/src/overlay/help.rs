@@ -20,8 +20,8 @@ const TWO_COLUMNS: u16 = 100;
 /// The columns between the two.
 const COLUMN_GAP: usize = 3;
 
-/// §4.4's marks, each with the role it is drawn in and its words (T2-25). Every glyph is one
-/// column wide.
+/// §4.4's marks, each with the role it is drawn in and its words (T2-25), and History's lane
+/// glyphs (T4-31). Every glyph is one column wide.
 pub(crate) const MARKS: &[(&str, Role, &str)] = &[
     ("●", Role::Accent, "in use"),
     ("▶", Role::Accent, "in a session"),
@@ -37,6 +37,10 @@ pub(crate) const MARKS: &[(&str, Role, &str)] = &[
     ("⏎", Role::Accent, "Enter"),
     ("⇄", Role::Accent, "switch"),
     ("‖", Role::Warn, "pause"),
+    ("┄", Role::Warn, "paused meanwhile"),
+    ("+", Role::Muted, "added"),
+    ("-", Role::Muted, "removed"),
+    ("┈", Role::Faint, "the threshold"),
     ("⠋", Role::Accent, "spinner"),
 ];
 
@@ -452,6 +456,29 @@ mod tests {
                         .unwrap_or_else(|| panic!("{glyph} {words} at {width}"));
                     assert_eq!(span.style, theme.role(*role), "{glyph} {words} {theme:?}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_marks_list_history_s_lane_glyphs() {
+        // T4-31: §7.4's lane glyphs, each in its role.
+        for theme in TIERS {
+            let mut state = open(Screen::History);
+            state.theme = theme;
+            let rows = rows(&state, 80);
+            for (glyph, role, words) in [
+                ("┄", Role::Warn, "paused meanwhile"),
+                ("+", Role::Muted, "added"),
+                ("-", Role::Muted, "removed"),
+                ("┈", Role::Faint, "the threshold"),
+            ] {
+                let line = rows
+                    .iter()
+                    .find(|l| l.spans.get(1).is_some_and(|s| s.content.trim() == glyph))
+                    .unwrap_or_else(|| panic!("{glyph} {words}: {rows:?}"));
+                assert_eq!(line.spans[1].style, theme.role(role), "{glyph} {theme:?}");
+                assert_eq!(line.spans[3].content.trim(), words, "{glyph}");
             }
         }
     }
