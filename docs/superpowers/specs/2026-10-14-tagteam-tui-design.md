@@ -165,6 +165,7 @@ The TUI is an Elm-style loop.
 |---|---|
 | `accounts(provider)` | `Engine::accounts` (core §4.2, the view `list` renders) and `shell_account` |
 | `history(account, window, since)` | `Engine::history` (core §13.4) |
+| `timeline(provider, scope, since, columns)` | `Engine::timeline` (redesign §12.3) *(Amended by the TUI redesign spec §12.3.)* |
 | `collect_due(accounts)` | `Engine::collect_usage(CollectMode::OnDemand { accounts })` (core §8.3) |
 | `refresh_tokens(provider, progress)` | `Engine::refresh_tokens`, always with `Wait::Try` and no budget (TR §5, §9) |
 | `token_report(query)` | `Engine::token_report` (TR §10) |
@@ -348,21 +349,44 @@ selected account's card.
 ### 5.4 History
 
 ```
- ACCOUNTS               5h   ▁▂▃▅▇█▁▁▂▃▅▆▁▂▃     9%  +4.1%/h · lasts until it resets
- * 1 alex@…             7d   ▂▂▃▃▄▄▅▅▆▆▆▇▇▇█    77%  +1.2%/h · full in 2d04h
-   2 spare@…            Fable ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁     0%
-                        7 days  [ ] range
+ f all accounts   [ ] 7 days   1 · 7 · 14 · 30                                       cursor Mon 11:28
+
+ in use   the higher of its 5h and 7d: what auto compares with 90%       at cursor  90% →   3%   now  53%
+    100  ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+         (chart, as tall as the body allows)
+      0
+          ⇄     ⇄ ⇄ ⇄         ⇄      ‖┄‖⇄      ✕ ⇄      ✕✓                                       ⇄
+ 1 alex  ▆▇─────────────────────────────▅▅▅▁▁▁▄█─▂▆▆▃▃▃▃▃▃▃▃▄▃▃▃▃▃▃▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▇─
+ 2 work  ─▄▄▄▁▁▁▄─▄▅▇─────────▅▅▅▃▃▃▃▇█▇▇──────────────────────────────────────────────────────────▂▅
+ 3 spare ───────▂▆▇─▃▃▃▁▁▁▄▆▇▇▇────────────────▂▄▇──────────────────────────────────────────────────│─
+             ╵Tue      ╵Wed      ╵Thu      ╵Fri      ╵Sat      ╵Sun                              now
+
+   WHEN        WHAT
+▌  Mon 11:28   ⇄ auto switched 1 alex → 2 work · alex's 5h reached 93%
+   Sat 11:33   ✓ 3 spare works again · new login stored
+   Sat 08:58   ✕ 3 spare needs a new login · its stored login was refused (invalid_grant)
+   Fri 15:38   ⇄ auto switched 3 spare → 1 alex · spare's 5h reached 91%
 ```
 
-- **The account list** is on the left (`j`/`k`). The selected account's windows, as
-  `Engine::history` returns them (core §13.4: the relevant windows), are on the right.
-- **Per window:** a sparkline, the latest `pct`, the burn rate in `%/h`, and when the window is
-  full or whether it lasts until it resets (core §8.7). The projection method is not shown.
-  *(Amended by the TUI redesign spec §11.1.)*
-- **The sparkline** has one bucket per column across the range. Each bucket shows the highest
-  `pct` sampled in it, an empty bucket stays blank, and a reset shows as a drop.
+- **One timeline,** from the top: the scope row, the chart or charts, the events lane, the
+  swimlanes (all accounts) or the in-use lane (one account), the day axis, then the event list.
+- **Scope** (`f`): all accounts, the default, or one account. In the choose dialog a digit picks
+  the account at that position and `0` all accounts. `⏎` on Accounts opens History scoped to the
+  selected account.
+- **Charts.** All accounts: one `in use` chart of the in-use account's binding usage. One account:
+  a chart per relevant window, as `Engine::history` returns them (core §13.4); `J`/`K` scroll them
+  at 80×24. Each column shows the peak in it.
+- **Lanes.** The events lane shows the most severe event in each column. A swimlane shows its
+  account's binding usage where it was in use and a faint `─` elsewhere; the in-use lane shows
+  `━` where the account was in use.
+- **The cursor** moves by column (`←`/`→`) or by event (`j`/`k`), to the oldest event or now
+  (`Home`/`End`), and is the event list's selection. Its `│` runs through empty chart cells and
+  through the swimlanes where the account isn't in use. The chart titles read its values.
+- **The event list** shows each event's stored time, glyph and sentence (redesign §11.4), newest
+  first; control characters in stored text read as spaces. `z` gives it the whole body.
 - **Range** (`[`/`]`): 1, 7, 14 or 30 days. The default is 7, as for `history`.
-- **It never fetches** (core §13.4).
+- **It never fetches** (core §13.4), and without a daemon it all still shows, from the store.
+  *(Amended by the TUI redesign spec §7.)*
 
 ### 5.5 Overlays
 
@@ -380,9 +404,8 @@ selected account's card.
 
 ### 5.6 Keys
 
-The keys are the TUI's one key table (redesign §10's), without `w`, and with History keeping its
-account keys (`j`/`k` account, `[` `]` range, `J`/`K` scroll) until T4. Accounts' `g` and `G` are
-dropped. *(Amended by the TUI redesign spec §10.)*
+The keys are the TUI's one key table (redesign §10's). Accounts' `g` and `G` are dropped.
+*(Amended by the TUI redesign spec §10.)*
 
 ## 6. Data and refresh
 
@@ -581,12 +604,15 @@ The protocol is the daemon spec's D5 (`2026-10-14-tagteam-daemon-design.md`, App
   switches to live mode once the first `status` reply arrives.
 - **What each event does.**
   - `poll`, `switch`, `usage`, `changed`, `account-quarantined` and `account-unquarantined`
-    re-read `accounts`, and `history` when it is open.
+    re-read `accounts`. History's timeline re-reads on a `switch`, `account-quarantined`,
+    `account-unquarantined`, `usage` or `changed` event, in live mode at most every 30 s for
+    `usage` and `changed`. *(Amended by the TUI redesign spec §7.7.)*
   - `mode` re-fetches `status` (§7.4).
   - `token-index` re-runs `token_report` when Tokens is open and the event's `changedAt` is
     newer than the report on screen (§6.4).
-  - The daemon's `no-switch`, `error` and `config-warning` events and its `status.lastSwitch`
-    feed the auto line. *(Amended by the TUI redesign spec §5.3.)*
+  - The auto line comes from the store, read with `accounts`, and the daemon's `no-switch`,
+    `error` and `config-warning` events feed its rank 2. *(Amended by the TUI redesign spec
+    §5.3.)*
 - **Disconnect** (an error, `stopping`, or a full queue). The TUI falls back to timer mode, and
   reconnects with backoff from 1 s up to 30 s. Each reconnection runs the connecting sequence
   above, so whatever the TUI missed is re-read (D5.5). The live thread forwards events to the

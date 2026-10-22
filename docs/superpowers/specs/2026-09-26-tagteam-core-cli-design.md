@@ -494,7 +494,9 @@ CREATE TABLE autoswitch_state (       -- one row per provider; auto-switch never
 CREATE TABLE events (
   at        INTEGER NOT NULL,
   provider  TEXT NOT NULL,
-  kind      TEXT NOT NULL,      -- 'switch' | 'quarantine' | 'unquarantine' | 'add' | 'remove' | ...
+  kind      TEXT NOT NULL,      -- 'switch' | 'switch-recovered' | 'switch-failed' | 'all-exhausted'
+                                -- | 'autoswitch-paused' | 'autoswitch-resumed' | 'quarantine'
+                                -- | 'unquarantine' | 'add' | 'import' | 'remove'
   from_id   TEXT, to_id TEXT,
   trigger   TEXT,               -- 'manual' | 'proactive' | 'at-limit' | 'failover' | 'consume-first'
   source    TEXT NOT NULL,      -- 'cli' | 'auto' | 'daemon'
@@ -523,6 +525,14 @@ CREATE TABLE live_identity_cache (   -- speeds up statusline and list; the file 
   path TEXT, mtime_ns INTEGER, size INTEGER, identity_key TEXT, label TEXT, account_uuid TEXT
 );
 ```
+
+**Event kinds.** `switch-failed` is written by the auto engine when an attempted switch fails,
+with `detail` `{"message", "transient"}`; `all-exhausted` by the auto engine on the first
+`AllExhausted` decision after any other, with `{"earliest_reset_at"}`; `autoswitch-paused` and
+`autoswitch-resumed` by the daemon's provider job when the effective `daemon.autoswitch` changes,
+with `{"at_start": true}` when recorded at daemon start. An automatic `switch` stores
+`{"window", "label", "pct", "threshold"}` and `remove` `{"label"}`. `kind` is free text, so none
+needs a migration. *(Amended by the TUI redesign spec §12.4.)*
 
 **Identity.** An account's identity is `(provider, identity_key)`. The provider derives the key
 (CC: email and org uuid) and the engine never parses it. `account_uuid` corroborates it:
