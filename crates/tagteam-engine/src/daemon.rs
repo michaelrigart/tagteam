@@ -6,8 +6,9 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use tagteam_provider::{Env, FlockGuard, ProcessStamp, Read, ReadError};
+use tagteam_provider::{Env, FlockGuard, ProcessStamp, Read};
 
+use crate::auto::read_lock_record;
 use crate::error::EngineError;
 
 /// The first executable regular file called `name` on a `PATH` value (§12.1's lookup):
@@ -68,34 +69,17 @@ pub fn write_daemon_record(lock: &FlockGuard, version: &str) -> Result<(), Engin
 /// no file, or an empty one. `Unreadable`: anything that is not that shape. Never proof that
 /// the daemon runs: judge that by an exact pid and start-time match (§12.6).
 pub fn read_daemon_record(path: &Path) -> Read<DaemonRecord> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Read::Absent,
-        Err(e) => {
-            return Read::Unreadable(ReadError::new(path.display().to_string(), e.to_string()));
-        }
-    };
-    if bytes.is_empty() {
-        return Read::Absent;
-    }
-    let v: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
-    let pid = v
-        .as_ref()
-        .and_then(|v| v["pid"].as_u64())
-        .and_then(|p| u32::try_from(p).ok());
-    let start = v.as_ref().and_then(|v| v["start"].as_u64());
-    let version = v.as_ref().and_then(|v| v["version"].as_str());
-    match (pid, start, version) {
-        (Some(pid), Some(start), Some(version)) => Read::Present(DaemonRecord {
-            pid,
-            start,
-            version: version.to_owned(),
-        }),
-        _ => Read::Unreadable(ReadError::new(
-            path.display().to_string(),
-            "it is not a pid, a start time and a version",
-        )),
-    }
+    read_lock_record(
+        path,
+        "it is not a pid, a start time and a version",
+        |stamp, v| {
+            Some(DaemonRecord {
+                pid: stamp.pid,
+                start: stamp.start,
+                version: v["version"].as_str()?.to_owned(),
+            })
+        },
+    )
 }
 
 #[cfg(test)]
@@ -182,6 +166,15 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn an_unreadable_daemon_record_names_its_shape() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("daemon.lock");
+        fs::write(&path, "{\"pid\":1,\"start\":2}\n").unwrap();
+        assert!(matches!(read_daemon_record(&path), Read::Unreadable(e)
+                if e.detail == "it is not a pid, a start time and a version"));
     }
 
     #[test]

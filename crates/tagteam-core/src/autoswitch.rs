@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 
 use crate::fmt::span;
 use crate::ids::AccountId;
+use crate::poll::jittered;
 use crate::rank::{binding_window, blocked_until};
 use crate::usage::{Window, headroom};
 
@@ -830,13 +831,7 @@ pub fn next_delay(
             ..
         } if *reason != NoSwitchReason::NoQualifyingCandidate => interval.max(BLOCKED_SLEEP_S),
         _ => {
-            let j = if jitter.is_finite() {
-                jitter.clamp(-1.0, 1.0)
-            } else {
-                0.0
-            };
-            let delay = ((interval as f64) * (1.0 + j * JITTER_FRAC)).round() as i64;
-            let delay = delay.max(1);
+            let delay = jittered(interval, jitter, JITTER_FRAC).max(1);
             match active_next_poll_at {
                 Some(at) => delay.min(at.saturating_sub(now).max(PLAN_FLOOR_S)),
                 None => delay,

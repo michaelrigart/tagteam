@@ -111,7 +111,9 @@ fn grow(base_s: i64, mult: f64) -> i64 {
     (base_s as f64 * mult).round() as i64
 }
 
-fn jittered(interval_s: i64, jitter: f64, frac: f64) -> i64 {
+/// `interval_s × (1 + jitter · frac)`, rounded; `jitter` clamped into [-1, 1], a non-finite
+/// one read as 0 (§8.6, §11.4).
+pub fn jittered(interval_s: i64, jitter: f64, frac: f64) -> i64 {
     let j = if jitter.is_finite() {
         jitter.clamp(-1.0, 1.0)
     } else {

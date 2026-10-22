@@ -273,35 +273,34 @@ impl Engine {
 
     /// Opens the store, creating it (and its directory, 0700) when needed.
     pub fn store(&self) -> Result<Arc<Store>, EngineError> {
-        let mut slot = self.store.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(s) = slot.as_ref() {
-            return Ok(s.clone());
-        }
-        let s = Arc::new(Store::open_seeded(
-            &self.store_file(),
-            &|| self.now_ms(),
-            &|| self.seed_launches(),
-        )?);
-        *slot = Some(s.clone());
-        Ok(s)
+        Ok(self
+            .cached_store(true)?
+            .expect("a store opened to be created is there"))
     }
 
     /// For read-only commands: never creates anything (§5).
     pub fn existing_store(&self) -> Result<Option<Arc<Store>>, EngineError> {
+        self.cached_store(false)
+    }
+
+    /// The cached store, else one opened (created when `create`) and cached (§5, Decision 11).
+    /// `None` only when `!create` and there is no store.
+    fn cached_store(&self, create: bool) -> Result<Option<Arc<Store>>, EngineError> {
         let mut slot = self.store.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(s) = slot.as_ref() {
             return Ok(Some(s.clone()));
         }
-        match Store::open_existing_seeded(&self.store_file(), &|| self.now_ms(), &|| {
-            self.seed_launches()
-        })? {
-            Some(s) => {
-                let s = Arc::new(s);
-                *slot = Some(s.clone());
-                Ok(Some(s))
-            }
-            None => Ok(None),
-        }
+        let (path, now, seed) = (self.store_file(), || self.now_ms(), || self.seed_launches());
+        let opened = if create {
+            Some(Store::open_seeded(&path, &now, &seed)?)
+        } else {
+            Store::open_existing_seeded(&path, &now, &seed)?
+        };
+        Ok(opened.map(|s| {
+            let s = Arc::new(s);
+            *slot = Some(s.clone());
+            s
+        }))
     }
 
     pub fn provider(&self, id: &ProviderId) -> Result<Arc<dyn Provider>, EngineError> {
