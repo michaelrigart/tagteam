@@ -924,7 +924,8 @@ fn exhausted_pair(fx: &Fx) -> (AccountId, AccountId) {
 }
 
 /// T4-24: a failed switch writes `switch-failed`, `from` the live account and `to` the target,
-/// unless the provider's latest one of the last 30 minutes names the same target and message.
+/// unless the provider's latest one of the last 30 minutes names the same target and message:
+/// one exactly 30 minutes old still does.
 #[cfg(feature = "test-hooks")]
 #[test]
 fn a_failed_switch_is_recorded_once_per_target_and_message_for_30_minutes() {
@@ -976,12 +977,19 @@ fn a_failed_switch_is_recorded_once_per_target_and_message_for_30_minutes() {
     );
     read_later(
         &fx,
-        30 * 60_000 + 1_000,
+        30 * 60_000,
         &[
             (&a, reading(false, 10.0, 20.0)),
             (&b, reading(false, 20.0, 95.0)),
         ],
     );
+    assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Error);
+    assert_eq!(
+        stored(&fx, EventKind::SwitchFailed).len(),
+        1,
+        "the 30 minutes include their first instant"
+    );
+    fx.clock.advance_ms(1_000);
     assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Error);
     assert_eq!(stored(&fx, EventKind::SwitchFailed).len(), 2);
     auto.fail_at(Some("after-credential"));
@@ -1068,6 +1076,41 @@ fn an_exhaustion_after_a_switch_is_a_new_episode() {
     assert_eq!(exhausted[1].from_id.as_ref(), Some(&a));
 }
 
+/// T4-24: a failed switch is a decision that is not `all-exhausted`, so every account
+/// exhausted after it is a new episode.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn an_exhaustion_after_a_failed_switch_is_a_new_episode() {
+    let fx = Fx::new();
+    let (a, b) = exhausted_pair(&fx);
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Blocked);
+    assert_eq!(stored(&fx, EventKind::AllExhausted).len(), 1);
+    read_later(
+        &fx,
+        300_000,
+        &[
+            (&a, reading(false, 10.0, 20.0)),
+            (&b, reading(false, 100.0, 40.0)),
+        ],
+    );
+    fx.engine.fail_at(Some("after-journal"));
+    let (outcome, decision) = engine.tick(&sink).unwrap();
+    assert_eq!(outcome, TickOutcome::Error);
+    assert!(matches!(decision, Decision::Switch { .. }), "{decision:?}");
+    assert_eq!(stored(&fx, EventKind::SwitchFailed).len(), 1);
+    fx.engine.fail_at(None);
+    let at_limit = reading(false, 100.0, 40.0);
+    read_later(&fx, 300_000, &[(&a, at_limit.clone()), (&b, at_limit)]);
+    assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Blocked);
+    assert_eq!(stored(&fx, EventKind::AllExhausted).len(), 2);
+}
+
 /// T4-24 (Review Focus 3): an engine's first decision has no previous one, so it writes
 /// `all-exhausted` unless the provider's latest auto-line event already is one with the same
 /// earliest recovery.
@@ -1104,6 +1147,25 @@ fn a_fresh_engine_records_an_exhaustion_the_store_already_has_once() {
         exhausted[1].detail,
         Some(json!({"earliest_reset_at": SHORT_RESETS + 3_600}))
     );
+    // A `switch` since is the latest auto-line event, so the same recovery is a new episode.
+    let store = fx.engine.store().unwrap();
+    store
+        .insert_event(
+            &EventRow {
+                at: fx.engine.now_ms(),
+                provider: fx.provider(),
+                kind: EventKind::Switch,
+                from_id: Some(b.clone()),
+                to_id: Some(a.clone()),
+                trigger: Some("manual".into()),
+                source: EventSource::Cli,
+                detail: None,
+            },
+            true,
+        )
+        .unwrap();
+    tick();
+    assert_eq!(stored(&fx, EventKind::AllExhausted).len(), 3);
 }
 
 /// T4-24: dry-run writes neither `switch-failed` nor `all-exhausted`.
