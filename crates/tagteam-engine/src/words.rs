@@ -41,7 +41,7 @@ const A_YEAR_S: i64 = 365 * 86_400;
 
 /// The account's email (or label when it has none).
 pub fn email(r: &AccountRow) -> String {
-    r.email.clone().unwrap_or_else(|| r.label.clone())
+    r.display_email().to_owned()
 }
 
 pub fn name(r: &AccountRow) -> String {

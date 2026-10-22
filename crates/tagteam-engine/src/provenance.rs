@@ -35,8 +35,7 @@ pub enum ProfileCheck {
 /// only when both sides name one. The one definition: the session-owned usage fetch
 /// (`collect.rs`, Task 12) calls it too.
 pub(crate) fn identity_drifted(identity: &Identity, row: &AccountRow) -> bool {
-    let email = identity.email.as_deref().unwrap_or(&identity.label)
-        != row.email.as_deref().unwrap_or(&row.label);
+    let email = identity.display_email() != row.display_email();
     let org = !identity.org_uuid.is_empty()
         && !row.org_uuid.is_empty()
         && identity.org_uuid != row.org_uuid;

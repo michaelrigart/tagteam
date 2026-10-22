@@ -291,7 +291,7 @@ impl Engine {
     /// its `remove` event, `{"label"}` its email, else its label (C-12), in one transaction, so
     /// no account is deleted without the name the timeline keeps for it (T4-27).
     pub(crate) fn delete_logged(&self, row: &AccountRow) -> Result<(), EngineError> {
-        let label = row.email.as_deref().unwrap_or(&row.label);
+        let label = row.display_email();
         self.store()?.delete_account_logged(
             &row.id,
             &self.event_row(

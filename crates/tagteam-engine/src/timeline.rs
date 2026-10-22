@@ -91,7 +91,7 @@ impl AccountRef {
             id: row.id.clone(),
             position: Some(row.position),
             alias: row.alias.clone(),
-            email: row.email.clone().or_else(|| Some(row.label.clone())),
+            email: Some(row.display_email().to_owned()),
             removed: false,
         }
     }

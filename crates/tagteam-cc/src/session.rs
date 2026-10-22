@@ -550,7 +550,7 @@ pub(crate) fn validity(reply: Captured, spelling: &str, expect: &Identity) -> Va
             "`claude auth status` named no email for the claude.ai login".into(),
         );
     };
-    if email != expect.email.as_deref().unwrap_or(&expect.label) {
+    if email != expect.display_email() {
         return Validity::Invalid("logged in to claude.ai as another account".into());
     }
     if status

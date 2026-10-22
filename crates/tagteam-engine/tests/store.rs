@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::store::{
-    Activation, AutoRecord, DisplacedRow, EventRow, JournalRow, LoginMeta, NewAccount, SeedLaunch,
-    Store, StoreError,
+    AccountRow, Activation, AutoRecord, DisplacedRow, EventRow, JournalRow, LoginMeta, NewAccount,
+    SeedLaunch, Store, StoreError,
 };
 use tagteam_engine::{EventKind, EventSource};
 use tagteam_provider::{Env, Identity, ProcessStamp};
@@ -2728,4 +2728,19 @@ fn four_new_kinds_need_no_migration() {
         before
     );
     assert_eq!(s.events().unwrap(), events);
+}
+
+#[test]
+fn an_account_row_is_named_by_its_email_or_else_its_label() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let id = add(&s, &cc(), "a", "a@x.co", 1);
+    let row = s.account(&id).unwrap().unwrap();
+    assert_eq!(row.display_email(), "a@x.co");
+    let keyed = AccountRow {
+        email: None,
+        label: "key-1".into(),
+        ..row
+    };
+    assert_eq!(keyed.display_email(), "key-1");
 }

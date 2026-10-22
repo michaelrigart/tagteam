@@ -72,10 +72,6 @@ struct Valid {
     alias: Option<String>,
 }
 
-fn email_of(row: &AccountRow) -> String {
-    row.email.clone().unwrap_or_else(|| row.label.clone())
-}
-
 /// What became of a stored account, logged by its ID and position only (§14.2).
 fn imported(row: &AccountRow, outcome: Outcome, message: impl Into<String>) -> Imported {
     tracing::info!(
@@ -87,7 +83,7 @@ fn imported(row: &AccountRow, outcome: Outcome, message: impl Into<String>) -> I
     Imported {
         provider: row.provider.clone(),
         position: row.position,
-        email: email_of(row),
+        email: row.display_email().to_owned(),
         outcome,
         message: message.into(),
     }
@@ -134,10 +130,7 @@ impl Engine {
                     report.accounts.push(Imported {
                         provider: v.record.provider.clone(),
                         position: v.record.position,
-                        email: identity
-                            .email
-                            .clone()
-                            .unwrap_or_else(|| identity.label.clone()),
+                        email: identity.display_email().to_owned(),
                         outcome: Outcome::Failed,
                         message: e.to_string(),
                     });

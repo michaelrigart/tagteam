@@ -190,10 +190,6 @@ fn unmanaged_message(email: &str) -> String {
     format!("the live login ({email}) is not managed by tagteam; add it first, or use --force")
 }
 
-fn login_email(i: &Identity) -> String {
-    i.email.clone().unwrap_or_else(|| i.label.clone())
-}
-
 fn strategy_of(target: &SwitchTarget) -> &'static str {
     match target {
         SwitchTarget::Rotation => "rotation",
@@ -259,7 +255,10 @@ impl Engine {
         p: &dyn Provider,
         req: &SwitchRequest,
     ) -> Result<SwitchOutcome, EngineError> {
-        let unmanaged = self.read_live_identity(p)?.as_ref().map(login_email);
+        let unmanaged = self
+            .read_live_identity(p)?
+            .as_ref()
+            .map(|i| i.display_email().to_owned());
         let (reason, message) = match (&unmanaged, req.force) {
             (Some(email), false) => (SwitchReason::UnmanagedAccount, unmanaged_message(email)),
             _ => (
