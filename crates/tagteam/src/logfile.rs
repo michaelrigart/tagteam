@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn a_disable_callback_may_log_into_the_same_file_without_deadlocking() {
-        // Task 6's `--debug` callback prints through tracing, which reaches this file again.
+        // The `--debug` callback prints through tracing, which reaches this file again.
         // The file is marked disabled before the callback runs, so the re-entrant line returns
         // at once instead of waiting for the mutex the disabling call holds.
         let d = tempfile::tempdir().unwrap();

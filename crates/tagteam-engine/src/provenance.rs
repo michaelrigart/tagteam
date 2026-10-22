@@ -33,7 +33,7 @@ pub enum ProfileCheck {
 /// §12.5 "Identity drift": the profile's login is another account's than `row`. The email is
 /// compared, or the label for a provider whose identities carry none, and the organization
 /// only when both sides name one. The one definition: the session-owned usage fetch
-/// (`collect.rs`, Task 12) calls it too.
+/// (`collect.rs`) calls it too.
 pub(crate) fn identity_drifted(identity: &Identity, row: &AccountRow) -> bool {
     let email = identity.display_email() != row.display_email();
     let org = !identity.org_uuid.is_empty()

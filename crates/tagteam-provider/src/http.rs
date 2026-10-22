@@ -450,7 +450,8 @@ mod tests {
 
     #[test]
     fn the_response_body_cap_is_one_mebibyte() {
-        // The User-Agent is pinned on the wire by Task 3's adapter test, not against its own definition.
+        // The User-Agent is pinned on the wire by the adapter test
+        // `every_request_carries_tagteams_user_agent_and_only_it`, not against its own definition.
         assert_eq!(MAX_BODY, 1_048_576);
     }
 }

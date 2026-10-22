@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn a_panic_before_publication_leaves_no_temp_file() {
-        // L319: a write that unwinds must not leave its 0600 temp file behind.
+        // A write that unwinds must not leave its 0600 temp file behind.
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("c.json");
         fs::write(&p, "old").unwrap();
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn a_temp_file_that_cannot_be_removed_is_logged_with_its_cause() {
-        // §14 (L323): a contained error is logged at WARN with its cause, never discarded. The
+        // §14: a contained error is logged at WARN with its cause, never discarded. The
         // check swaps the temp file for a non-empty directory of the same name, which no
         // `remove_file` deletes, as root or not, and then refuses to publish.
         let d = tempfile::tempdir().unwrap();

@@ -140,7 +140,7 @@ impl Engine {
         hooks::point(self, "launch-locked")?;
         let profile = profile_path(&self.env, &row.id);
         // Through a link at the profile path, everything below would land at its target: the
-        // reservations, the merge-back, the marker, the links and the seed (controller ruling).
+        // reservations, the merge-back, the marker, the links and the seed.
         refuse_linked_profile(&profile)?;
         // A dead (free) reservation never counts (§12.5), so the state is read before step 2
         // removes them, and a quiescent launch refused for its stored login writes nothing.
@@ -355,8 +355,8 @@ impl Engine {
     /// quarantined one is never refreshed (§7.4): once its access token is due it is refused as
     /// `Dead` is, and otherwise this returns the warning that it needs a new login (§7.2).
     ///
-    /// Only for a quiescent launch (controller ruling): a join seeds nothing and touches no
-    /// credential, since the running session's agent owns the token (§12.5 step 3).
+    /// Only for a quiescent launch: a join seeds nothing and touches no credential, since the
+    /// running session's agent owns the token (§12.5 step 3).
     fn locked_login(
         &self,
         p: &dyn Provider,

@@ -1,5 +1,6 @@
 //! D9's service units. `tagteam daemon install` and `uninstall` (the daemon crate) write and
-//! load them, and `doctor` (D10) reads them, so they live in the engine (plan B Decision 4).
+//! load them, and `doctor` (D10) reads them, so they live in the engine (daemon plan B,
+//! Decision 4).
 //! This module holds:
 //! - where each unit lives, and the variables it records (D9.1)
 //! - rendering and quoting (D9.2, D9.3), and a reader for exactly what is rendered

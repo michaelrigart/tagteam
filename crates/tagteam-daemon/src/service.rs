@@ -1,8 +1,8 @@
 //! D9: `tagteam daemon install` and `uninstall`. They write or remove the engine's units
-//! (`tagteam_engine::service`, plan B Decision 4) and load or unload them with `launchctl` or
-//! `systemctl`. Each call goes through the `ProcessSpawner` port with a 10 s timeout (D9.4),
-//! under a token of its own (`run_manager`): unloading the old unit and loading the new one are
-//! one change, which a Ctrl-C between them would leave half made.
+//! (`tagteam_engine::service`, daemon plan B, Decision 4) and load or unload them with
+//! `launchctl` or `systemctl`. Each call goes through the `ProcessSpawner` port with a 10 s
+//! timeout (D9.4), under a token of its own (`run_manager`): unloading the old unit and loading
+//! the new one are one change, which a Ctrl-C between them would leave half made.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

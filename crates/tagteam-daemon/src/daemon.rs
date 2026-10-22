@@ -1,7 +1,7 @@
 //! D4.1 and D4.6: the daemon's start-up and its run. `Daemon::start` covers everything that
 //! can refuse: the run shell, `daemon.lock`, and a store this build cannot open. `Started::serve`
 //! runs the scheduler until a signal or a newer tagteam ends it, then lets everything go in
-//! D4.6's order (Decision 13). Plan B binds the socket between the two.
+//! D4.6's order (Decision 13). The socket is bound between the two (D5.1).
 
 use std::fs::OpenOptions;
 use std::sync::Arc;
@@ -40,7 +40,8 @@ pub struct DaemonOptions {
     /// The path the upgrade watch follows, and the file it resolved to when the caller stamped
     /// it, first thing, before anything that can wait (D4.5, Decision 17).
     pub program: ProgramStamp,
-    /// The upgrade watch's period: 60 000 ms, and shorter only in plan B's tests.
+    /// The upgrade watch's period: 60 000 ms, and shorter only in the multi-process tests
+    /// (`TAGTEAM_TEST_UPGRADE_WATCH_MS`).
     pub upgrade_watch_ms: i64,
     /// Decision 7: the read counts the keychain backoff compares (D4.1); empty on Linux.
     pub keychain_counts: Vec<Arc<ReadCounts>>,
@@ -248,7 +249,7 @@ pub struct Started<'e> {
 }
 
 impl<'e> Started<'e> {
-    /// The snapshot plan B's server answers `status` from (Decision 12).
+    /// The snapshot the socket server answers `status` from (D5.4, Decision 12).
     pub fn board(&self) -> Arc<StatusBoard> {
         Arc::clone(&self.board)
     }
@@ -260,9 +261,9 @@ impl<'e> Started<'e> {
     /// - one provider job per provider (D4.3)
     ///
     /// Every job is first due now, and the scheduler runs a tie in the order the jobs were
-    /// added (Task 7), so the first pass checks the store and the program before any provider
-    /// job ticks or collects: a store replaced since `start` is forgotten, and a newer binary
-    /// or schema stops the daemon, before any provider work touches the store.
+    /// added, so the first pass checks the store and the program before any provider job ticks
+    /// or collects: a store replaced since `start` is forgotten, and a newer binary or schema
+    /// stops the daemon, before any provider work touches the store.
     ///
     /// Every event goes to `sink`, and to the notifier's `NotifySink`, which announces each
     /// notice back to `sink`. When the run ends, `stopping` is emitted. Then the jobs drop
@@ -841,10 +842,10 @@ mod tests {
 
     #[test]
     fn a_store_created_while_serving_wakes_the_provider_jobs_at_once() {
-        // D4.3, D4.4: `serve` builds its store watch waking the provider jobs (Task 10). A
-        // first `tagteam add` from another process creates the store. The watch's next run
-        // reports `changed`, and Claude Code's job leaves `idle` before the scheduler sleeps
-        // again, not at its next 60 s look.
+        // D4.3, D4.4: `serve` builds its store watch waking the provider jobs. A first
+        // `tagteam add` from another process creates the store. The watch's next run reports
+        // `changed`, and Claude Code's job leaves `idle` before the scheduler sleeps again, not
+        // at its next 60 s look.
         let home = Fx::new();
         let other = home.other();
         let started = Daemon::start(&home.engine, options(&home), &mut |n| panic!("{n}")).unwrap();
@@ -868,7 +869,7 @@ mod tests {
     fn a_store_replaced_between_start_and_serving_is_reopened_before_any_provider_work() {
         // Decision 11: `start` takes the store watch's baseline on a fresh connection, after
         // `daemon.lock`. The store is deleted and another process creates a new one before
-        // `serve` (plan B binds its socket in between). The watch's first run sees another
+        // `serve` (the socket is bound in between). The watch's first run sees another
         // file: `changed`, once, at once, and the engine reads the new store from then on.
         // Its invariant: that check precedes all provider work. A provider job's first act in
         // a run is its mode evaluation, which is a `mode` event the first time, and a tick or
