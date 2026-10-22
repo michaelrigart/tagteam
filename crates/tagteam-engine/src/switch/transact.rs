@@ -22,7 +22,8 @@ use super::support::{
     works_until_expiry,
 };
 use super::{
-    SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget, activation_hint, already_active, noop,
+    SwitchCause, SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget, activation_hint,
+    already_active, noop,
 };
 
 /// What a row says about a login, for noticing that it changed: a finished replacement
@@ -703,7 +704,11 @@ impl Engine {
                         .into(),
                 ),
                 source: self.source(),
-                detail: None,
+                detail: req
+                    .auto
+                    .as_ref()
+                    .and_then(|a| a.cause.as_ref())
+                    .map(SwitchCause::detail),
             },
             record.as_ref(),
         )?;

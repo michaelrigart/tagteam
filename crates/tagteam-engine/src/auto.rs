@@ -12,6 +12,7 @@ use tagteam_core::autoswitch::{
     Phase, Snapshot, Trigger, decide, departure,
 };
 use tagteam_core::fmt::span;
+use tagteam_core::rank::binding_window;
 use tagteam_core::time::ms_to_s_ceil;
 use tagteam_core::usage::headroom;
 use tagteam_core::{AccountId, Fingerprint, ProviderId, Window, WindowKind};
@@ -22,7 +23,8 @@ use crate::engine::{Engine, GuardRequest};
 use crate::error::EngineError;
 use crate::store::{AccountRow, Store, backoff_holds};
 use crate::switch::{
-    AutoFreshened, AutoPerform, FreshenFailure, SwitchReason, SwitchRequest, SwitchTarget,
+    AutoFreshened, AutoPerform, FreshenFailure, SwitchCause, SwitchReason, SwitchRequest,
+    SwitchTarget,
 };
 
 /// Where a tick's events go (Decision 6). The CLI renders them as human lines or as JSONL.
@@ -621,6 +623,7 @@ impl AutoEngine<'_> {
                     trigger,
                     cooldown_s: self.cfg.cooldown_s,
                     departure: departure(&t.snap, &self.cfg, &t.live.id, trigger),
+                    cause: cause(&t.snap, &self.cfg, &t.live.id),
                 }),
             };
             match self.engine.switch(req) {
@@ -1035,6 +1038,20 @@ fn recheck_ids(snap: &Snapshot, live: &AccountId) -> Vec<AccountId> {
     std::iter::once(live.clone())
         .chain(candidates.map(|a| a.id.clone()))
         .collect()
+}
+
+/// T4-23: what an automatic switch away from `live` rests on, its binding window over
+/// `cfg.models` (§8.2) with the threshold it was judged by; `None` without a decision-grade
+/// reading or a relevant window.
+fn cause(snap: &Snapshot, cfg: &AutoConfig, live: &AccountId) -> Option<SwitchCause> {
+    let account = snap.accounts.iter().find(|a| &a.id == live)?;
+    let window = binding_window(account.windows.as_deref()?, &cfg.models)?;
+    Some(SwitchCause {
+        window: window.key.clone(),
+        label: window.label.clone(),
+        pct: window.pct,
+        threshold: cfg.threshold,
+    })
 }
 
 #[cfg(test)]
