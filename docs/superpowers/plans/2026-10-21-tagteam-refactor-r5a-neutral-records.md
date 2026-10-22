@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/45
 **Goal:** Session records get a neutral DTO (`SessionRecord` with a `ProcStart`) that `record_is_live` judges. They are read only through two new `Provider` methods and the neutral lister. Every piece of Claude Code's record format is gathered into two regions of `liveness.rs`, which R5b moves into `tagteam-cc` unchanged. Nothing a user sees changes.
 **Architecture:**
 - **Map, then judge.** `record_is_live` stops parsing text. Claude Code's `procStart` maps to one of four `ProcStart` forms (`proc_start_of`), and each form keeps today's outcome (spec §9's table).
