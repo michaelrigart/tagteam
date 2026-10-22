@@ -2110,8 +2110,8 @@ fn an_account_row_is_switchable_when_enabled_with_an_identity_and_a_poll_candida
 
 #[test]
 fn events_leave_out_a_row_this_build_cannot_type_and_keep_it_stored() {
-    // Review refactor §8.7: a newer build's kind or source is left out of the read, not failed
-    // on, and the row stays stored.
+    // Review refactor §8.7: a newer build's kind or source is left out of the read, not failed on,
+    // and the row stays stored.
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("t.db");
     let s = Store::open(&path).unwrap();

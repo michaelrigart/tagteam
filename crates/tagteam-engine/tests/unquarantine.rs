@@ -89,8 +89,8 @@ fn a_landed_replacement_reconciled_by_the_next_lock_holder_records_account_repla
 
 #[test]
 fn a_landed_replacement_reconciled_under_the_daemon_records_the_daemon() {
-    // The replacer died after its vault write; the daemon is the next lock holder, so the
-    // release it finishes is recorded as the daemon's, not as `cli` (review refactor §11).
+    // The replacer died after its vault write; the daemon is the next lock holder, so the release
+    // it finishes is recorded as the daemon's, not as `cli` (review refactor §11).
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b"); // live

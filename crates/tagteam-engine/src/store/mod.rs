@@ -489,8 +489,8 @@ fn journal_from_row(r: &Row<'_>) -> rusqlite::Result<JournalRow> {
     })
 }
 
-/// `None` for a row whose kind or source this build cannot type: a newer build's, left stored
-/// and left out of `events` (review refactor §8.7).
+/// `None` for a row whose kind or source this build cannot type: a newer build's, left stored and
+/// left out of `events` (review refactor §8.7).
 fn event_from_row(r: &Row<'_>) -> rusqlite::Result<Option<EventRow>> {
     let kind: String = r.get("kind")?;
     let source: String = r.get("source")?;
@@ -1164,13 +1164,13 @@ impl Store {
     }
 
     /// The replacement landed: installs its recorded metadata, clears any quarantine and the
-    /// marker, all in one transaction. A quarantine it clears records its `unquarantine` event
-    /// in that transaction, at `at`, as `account-replaced` from `source`: the epoch moved, and
-    /// the holder that finishes the replacement is who records its release (§7.4, §11.4; review
-    /// refactor §8.7, §11). A
-    /// missing `identity_key`, `label` or `kind` in the recorded metadata means the account and
-    /// its marker are left exactly as they were (§12.5) rather than installing an empty
-    /// identity: that is `ReplacementUnreadable`, as is metadata that is not JSON.
+    /// marker, all in one transaction. A quarantine it clears records its `unquarantine` event in
+    /// that transaction, at `at`, as `account-replaced` from `source`: the epoch moved, and the
+    /// holder that finishes the replacement is who records its release (§7.4, §11.4; review
+    /// refactor §8.7, §11). A missing `identity_key`, `label` or `kind` in the recorded metadata
+    /// means the account and its marker are left exactly as they were (§12.5) rather than
+    /// installing an empty identity: that is `ReplacementUnreadable`, as is metadata that is not
+    /// JSON.
     ///
     /// A login taken from the live store (`from_live`, `add`'s) also records the account's new
     /// `login_epoch` as the activation epoch here (§10.1, §12.5): the live store holds exactly
