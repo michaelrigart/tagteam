@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/46
 **Goal:** FakeAgent gets a session record format and supervisor file of its own. Claude Code's record format moves out of `tagteam-provider` into `tagteam-cc` in one pure move. The neutrality test then keeps Claude Code's field names out of the neutral crates. This completes spec §9, and with it the review refactor.
 **Architecture:**
 - **FakeAgent first.** Its records become `procs/<pid>.rec` with its own JSON, and its keeper writes `procs/keeper.lock`. Engine tests drive it through the same neutral lister, lock reader, gate and token-report readers as Claude Code. Once it stops delegating to Claude Code's parser, nothing outside regions A and B uses them.
