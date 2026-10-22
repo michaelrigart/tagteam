@@ -63,6 +63,12 @@ const SPAN_LEVELS: usize = 4;
 const FIGURES_INDENT: usize = 3;
 /// What leads an estimated (inferred) block's span (T5-21).
 const ESTIMATED: &str = "~";
+/// What labels the selected row's detail (T5-23)...
+const SELECTED: &str = "SELECTED";
+/// ... whose rows start this far in: ` SELECTED  `.
+const DETAIL_INDENT: usize = 11;
+/// A footnote's text starts this far in, after its mark or none (T5-24).
+const NOTE_INDENT: usize = 3;
 
 /// The table's columns, in the order they are drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -740,19 +746,21 @@ fn trim(line: Line<'static>) -> Line<'static> {
     Line::from(spans).style(style)
 }
 
-/// `parts` laid out after `head` in rows of at most `width` columns, `sep` between two parts on
-/// a row, each row after the first `indent` columns in (B26). A part that fits no row whole
-/// wraps at its spaces, and a word wider than a row breaks by width (`view::wrap`): nothing is
-/// cut, for what lies below the total scrolls (B29).
+/// `parts` in `style` laid out after `head` in rows of at most `width` columns, `sep` between
+/// two parts on a row, each row after the first `indent` columns in (B26). A part that fits no
+/// row whole wraps at its spaces, and a word wider than a row breaks by width (`view::wrap`):
+/// nothing is cut, for what lies below the total scrolls (B29).
 fn laid_out(
     head: Vec<Span<'static>>,
     parts: &[String],
-    sep: &str,
+    style: Style,
+    sep: Span<'static>,
     indent: usize,
     width: usize,
 ) -> Vec<Line<'static>> {
     let room = width.saturating_sub(indent).max(1);
     let pad = || Span::raw(" ".repeat(indent));
+    let sep_width = width_of(&sep.content);
     let mut lines = Vec::new();
     let mut used: usize = head.iter().map(|s| width_of(&s.content)).sum();
     let mut spans = head;
@@ -760,13 +768,14 @@ fn laid_out(
         let fresh = used <= indent;
         let w = width_of(part);
         if fresh && used + w <= width {
-            spans.push(Span::raw(part.clone()));
+            spans.push(Span::styled(part.clone(), style));
             used += w;
             continue;
         }
-        if !fresh && used + width_of(sep) + w <= width {
-            spans.push(Span::raw(format!("{sep}{part}")));
-            used += width_of(sep) + w;
+        if !fresh && used + sep_width + w <= width {
+            spans.push(sep.clone());
+            spans.push(Span::styled(part.clone(), style));
+            used += sep_width + w;
             continue;
         }
         if !fresh {
@@ -779,7 +788,7 @@ fn laid_out(
                 used = indent;
             }
             used += width_of(&chunk);
-            spans.push(Span::raw(chunk));
+            spans.push(Span::styled(chunk, style));
         }
     }
     lines.push(Line::from(spans));
@@ -859,7 +868,14 @@ impl Rows {
             let parts = figures(row, now_ms).filter(|_| !repeat);
             if let Some(parts) = parts {
                 let head = vec![Span::raw(" ".repeat(FIGURES_INDENT))];
-                for line in laid_out(head, &parts, " · ", FIGURES_INDENT, width) {
+                for line in laid_out(
+                    head,
+                    &parts,
+                    Style::new(),
+                    Span::raw(" · "),
+                    FIGURES_INDENT,
+                    width,
+                ) {
                     items.push((index, Item::Figures(line)));
                 }
             }
@@ -1168,14 +1184,33 @@ fn top(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
     lines
 }
 
-/// The selected row in full (B11, B25), in rows at `width`: its numbers first, laid out by
-/// their parts and never cut; then what tells it apart and what it holds, wrapped: a session's
-/// ID's first 8 characters, its project's path and its times, a block's span and whether it was
-/// observed or estimated, every account and model.
-fn detail_rows(row: &TokenRow, tz: &TimeZone, now_ms: i64, width: usize) -> Vec<Line<'static>> {
+/// The selected row in full (B11, B25, T5-23), in rows at `width`, `DETAIL_INDENT` in: under
+/// `SELECTED`, what tells it apart (its period and its account), with what `Enter` opens from it
+/// when `enter` says; then its numbers, muted; then the rest of what it holds: a session's
+/// project's path and its times, whether a block was observed or estimated, every account when
+/// it has none of its own, and every model in full. Laid out by their parts and never cut.
+fn detail_rows(
+    row: &TokenRow,
+    tz: &TimeZone,
+    now_ms: i64,
+    width: usize,
+    enter: Option<&str>,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let (text, muted) = (theme.role(Role::Text), theme.role(Role::Muted));
+    let sep = || Span::styled(" · ", muted);
+    let pad = || vec![Span::raw(" ".repeat(DETAIL_INDENT))];
     let c = &row.counts;
     let numbers = [
-        words::plural(row.responses, "response"),
+        format!(
+            "{} {}",
+            amounts::grouped(row.responses),
+            if row.responses == 1 {
+                "response"
+            } else {
+                "responses"
+            }
+        ),
         format!(
             "cache write {} (5m {}, 1h {})",
             words::scaled(c.cache_write()),
@@ -1184,57 +1219,125 @@ fn detail_rows(row: &TokenRow, tz: &TimeZone, now_ms: i64, width: usize) -> Vec<
         ),
         format!("cache read {}", words::scaled(c.cache_read)),
     ];
-    let mut text = match &row.period {
+    let (first, mut rest) = match &row.period {
         PeriodKey::Session {
             session_id,
             project,
             first_ms,
             last_ms,
-        } => vec![
+        } => (
             format!("session {}", short_id(session_id)),
-            project.clone().unwrap_or_else(|| "no project".to_owned()),
-            format!("{} – {}", when(*first_ms, tz), when(*last_ms, tz)),
-        ],
+            vec![
+                project.clone().unwrap_or_else(|| "no project".to_owned()),
+                format!("{} – {}", when(*first_ms, tz), when(*last_ms, tz)),
+            ],
+        ),
         PeriodKey::Block {
             start_ms,
             end_ms,
             observed,
             ..
-        } => vec![
+        } => (
             format!("{} – {}", when(*start_ms, tz), when(*end_ms, tz)),
-            if *observed { "observed" } else { "estimated" }.to_owned(),
-        ],
-        p => vec![period_text(p, tz, now_ms, 0)],
+            vec![if *observed { "observed" } else { "estimated" }.to_owned()],
+        ),
+        p => (period_text(p, tz, now_ms, 0), vec![]),
     };
-    if !row.accounts.is_empty() {
-        let names: Vec<String> = row.accounts.iter().map(account_name).collect();
-        text.push(names.join(", "));
+    let mut identity = vec![first];
+    match &row.account {
+        Some(account) => identity.push(account_name(account)),
+        None if !row.accounts.is_empty() => {
+            let names: Vec<String> = row.accounts.iter().map(account_name).collect();
+            rest.push(names.join(", "));
+        }
+        None => {}
     }
     if !row.models.is_empty() {
-        text.push(row.models.join(", "));
+        rest.push(row.models.join(", "));
     }
-    let mut rows = laid_out(vec![Span::raw(" ")], &numbers, " · ", 1, width);
-    rows.extend(laid_out(vec![Span::raw(" ")], &text, " · ", 1, width));
+    let head = vec![
+        Span::styled(format!(" {SELECTED}"), muted),
+        Span::raw(" ".repeat(DETAIL_INDENT - 1 - SELECTED.len())),
+    ];
+    let mut rows = laid_out(head, &identity, text, sep(), DETAIL_INDENT, width);
+    if let Some(to) = enter {
+        let opens = [
+            Span::styled("⏎", theme.role(Role::Accent)),
+            Span::styled(format!(" its {to}"), muted),
+        ];
+        let gap = "   ";
+        let used = rows.last().map_or(0, Line::width);
+        let wanted = width_of(gap) + opens.iter().map(Span::width).sum::<usize>();
+        match rows.last_mut() {
+            Some(last) if used + wanted <= width => {
+                last.spans.push(Span::raw(gap));
+                last.spans.extend(opens);
+            }
+            _ => rows.push(Line::from([pad(), opens.to_vec()].concat())),
+        }
+    }
+    rows.extend(laid_out(
+        pad(),
+        &numbers,
+        muted,
+        sep(),
+        DETAIL_INDENT,
+        width,
+    ));
+    if !rest.is_empty() {
+        rows.extend(laid_out(pad(), &rest, muted, sep(), DETAIL_INDENT, width));
+    }
     rows
 }
 
-/// What lies below the total (B25): the selected row's detail, then the footnotes (TR §11.2,
-/// B15), each wrapped at `width` and never cut, for the region scrolls (B29).
+/// What lies below the total (B25): a blank row and the selected row's detail, then a blank row
+/// and the footnotes (TR §11.2, B15, T5-24), each led by its mark, if it has one, and wrapped
+/// at `width` `NOTE_INDENT` in; never cut, for the region scrolls (B29).
 fn below(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
     let t = &state.tokens;
+    let theme = state.theme;
     let mut lines = Vec::new();
     let Some(report) = t.report().filter(|r| !r.rows.is_empty()) else {
         return lines;
     };
     if let Some(row) = t.selected_row() {
-        lines.extend(detail_rows(row, &report.query.tz, now_ms, width));
+        lines.push(Line::default());
+        lines.extend(detail_rows(
+            row,
+            &report.query.tz,
+            now_ms,
+            width,
+            t.drill_to(),
+            theme,
+        ));
     }
-    for note in words::token_footnotes(report, words::AT_LEAST, true) {
+    let notes = words::token_footnotes(report, words::AT_LEAST, true);
+    if !notes.is_empty() {
+        lines.push(Line::default());
+    }
+    let muted = theme.role(Role::Muted);
+    for note in notes {
+        let head = match note.mark {
+            Some(mark) => {
+                let role = if mark == words::AT_LEAST {
+                    Role::Warn
+                } else {
+                    Role::Muted
+                };
+                vec![
+                    Span::raw(" "),
+                    Span::styled(mark, theme.role(role)),
+                    Span::raw(" ".repeat(NOTE_INDENT - 1 - width_of(mark))),
+                ]
+            }
+            None => vec![Span::raw(" ".repeat(NOTE_INDENT))],
+        };
         lines.extend(laid_out(
-            vec![Span::raw(" ")],
-            &[note.line()],
-            " ",
-            1,
+            head,
+            &[note.text],
+            muted,
+            Span::raw(" "),
+            NOTE_INDENT,
             width,
         ));
     }
@@ -1280,7 +1383,7 @@ fn window(
     let mut out: Vec<Line<'static>> = lines.into_iter().skip(from).take(shown).collect();
     if rows >= 2 {
         let hint = format!(" J K: lines {}–{} of {total}", from + 1, from + shown);
-        out.push(Line::from(Span::styled(hint, theme.strong())));
+        out.push(Line::from(Span::styled(hint, theme.role(Role::Muted))));
     }
     (out, furthest)
 }
@@ -1360,7 +1463,16 @@ fn empty_warnings(index: &tagteam_engine::tokens::IndexState, width: usize) -> V
     }
     notes
         .into_iter()
-        .flat_map(|note| laid_out(vec![Span::raw(" ")], &[note], " ", 1, width))
+        .flat_map(|note| {
+            laid_out(
+                vec![Span::raw(" ")],
+                &[note],
+                Style::new(),
+                Span::raw(" "),
+                1,
+                width,
+            )
+        })
         .collect()
 }
 
@@ -1444,7 +1556,7 @@ mod tests {
     use crossterm::event::KeyCode;
     use ratatui::style::{Color, Modifier};
     use tagteam_core::AccountId;
-    use tagteam_engine::tokens::{ActiveBlock, IndexProgress, IndexState, RefreshOutcome};
+    use tagteam_engine::tokens::{ActiveBlock, IndexProgress, IndexState, RefreshOutcome, RowKey};
 
     use super::*;
     use crate::msg::{Cmd, Msg};
@@ -1573,12 +1685,13 @@ mod tests {
     #[test]
     fn a_day_report_at_80_columns() {
         // Spec §5.3: period, account, input, output, total and cost; the period once per day;
-        // a faint rule above the total (T5-18).
+        // a faint rule above the total (T5-18); the selected row's labelled detail and the
+        // notes, each after a blank row (T5-23, T5-24).
         let state = showing(days(), |_| {});
         let lines = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(lines[0], bar_row(DAY_BAR, "indexed 14:12", 80));
         assert_eq!(
-            lines[1..12],
+            lines[1..16],
             [
                 " $50.95 at API prices    114.2M tokens    414 responses".to_owned(),
                 String::new(),
@@ -1588,15 +1701,15 @@ mod tests {
                 " 2026-09-19  unknown account    5.0K      900  105.9K       —".to_owned(),
                 format!(" {}", "─".repeat(60)),
                 " TOTAL                          1.5M  ≥390.9K  114.2M  $50.95".to_owned(),
-                " 412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M) · cache read 88.0M"
-                    .to_owned(),
-                " 2026-09-20 · 1 a1@x.co".to_owned(),
+                String::new(),
+                " SELECTED  2026-09-20 · 1 a1@x.co   ⏎ its sessions".to_owned(),
+                "           412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M)".to_owned(),
+                "           cache read 88.0M".to_owned(),
+                String::new(),
                 " ≥ at least: 2 subagent responses are still being counted".to_owned(),
+                " $ what this would cost on the API at list prices of 2026-10-01; not your bill"
+                    .to_owned(),
             ]
-        );
-        assert_eq!(
-            lines[12],
-            " $ what this would cost on the API at list prices of 2026-10-01; not your bill"
         );
         assert_eq!(
             draw(&state, 80, 24)[23],
@@ -1605,6 +1718,143 @@ mod tests {
                 80
             )
         );
+    }
+
+    #[test]
+    fn the_selected_row_s_detail_is_labelled_and_says_what_enter_opens() {
+        // T5-23: below the total a blank row, then `SELECTED`, the row's identity and what
+        // `Enter` opens, then its numbers, all `DETAIL_INDENT` in.
+        let mut state = showing(days(), |_| {});
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert_eq!(
+            lines[9..16],
+            [
+                "",
+                " SELECTED  2026-09-20 · 1 a1@x.co   ⏎ its sessions",
+                "           412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M)",
+                "           cache read 88.0M",
+                "",
+                " ≥ at least: 2 subagent responses are still being counted",
+                " $ what this would cost on the API at list prices of 2026-10-01; not your bill",
+            ]
+        );
+        let theme = TIERS[1];
+        state.theme = theme;
+        let buf = draw_buffer(&state, 80, 24, NOW_MS);
+        let numbers = "412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M)";
+        for (n, want) in [
+            (
+                10,
+                letters(&[
+                    (" ", 't'),
+                    ("SELECTED", 'm'),
+                    ("  ", 't'),
+                    ("2026-09-20", 't'),
+                    (" · ", 'm'),
+                    ("1 a1@x.co", 't'),
+                    ("   ", 't'),
+                    ("⏎", 'a'),
+                    (" its sessions", 'm'),
+                ]),
+            ),
+            (11, letters(&[("           ", 't'), (numbers, 'm')])),
+            (
+                12,
+                letters(&[("           ", 't'), ("cache read 88.0M", 'm')]),
+            ),
+        ] {
+            let y = body_y(&state, 80, 24, n);
+            assert_eq!(
+                roles(&buf, theme, y).trim_end(),
+                canon(theme, &want),
+                "body row {n}"
+            );
+        }
+        // An unattributed row names its bucket.
+        for _ in 0..2 {
+            update(&mut state, ch('j'), NOW_MS);
+        }
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
+        assert!(
+            lines[total + 2].starts_with(" SELECTED  2026-09-19 · unknown account   "),
+            "{lines:?}"
+        );
+        // A session's row opens its models; a session's models open nothing.
+        let counts = counts(1_200_000, 310_000, 88_000_000);
+        let day_row = token_row(day(1), Some(me()), None, counts, Some(41_200_000_000));
+        let mut state = showing(vec![day_row], |_| {});
+        let selected = |state: &State| {
+            let lines = body_of(state, 80, 24, NOW_MS);
+            let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
+            lines[total + 2].clone()
+        };
+        for (rows, want) in [
+            (
+                vec![token_row(work_session(), Some(me()), None, counts, None)],
+                " SELECTED  session 3f2a9c1d · 1 alex@example.com   ⏎ its models",
+            ),
+            (
+                work_models(),
+                " SELECTED  session 3f2a9c1d · 1 alex@example.com",
+            ),
+        ] {
+            let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
+            answer_with(&mut state, &down, rows);
+            assert_eq!(selected(&state), want);
+        }
+        assert_eq!(state.tokens.depth(), 2);
+    }
+
+    #[test]
+    fn each_note_is_led_by_its_mark() {
+        // T5-24: ` {mark} {text}`, `≥` in warn and `$` muted, the words muted; a note without a
+        // mark starts where the words do, and so does a note's second row.
+        let theme = TIERS[1];
+        let mut state = showing(days(), |r| {
+            r.unpriced_models = vec!["claude-test-9".into()];
+            r.index.skipped_lines = 12;
+            r.index.unreadable_files = 3;
+            r.price_overrides = vec!["claude-opus-5-5".into()];
+        });
+        state.theme = theme;
+        let lines = body_of(&state, 80, 40, NOW_MS);
+        let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
+        let notes = [
+            "   No price for claude-test-9: counted without cost (≥ marks a partial cost).",
+            " ≥ at least: 2 subagent responses are still being counted",
+            "   12 transcript lines could not be read, so these totals may be low.",
+            "   3 transcript files could not be read; the next refresh tries again.",
+            " $ what this would cost on the API at list prices of 2026-10-01, with",
+            "   config.toml's for claude-opus-5-5; not your bill",
+        ];
+        // The detail is a blank row and three more, then a blank row.
+        let at = total + 5;
+        assert_eq!(lines[at], "", "{lines:?}");
+        assert_eq!(lines[at + 1..at + 7], notes, "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("J K:")), "{lines:?}");
+        let buf = draw_buffer(&state, 80, 40, NOW_MS);
+        let mark = |n: usize, role: char| {
+            let mark: String = notes[n].chars().skip(1).take(1).collect();
+            let text: String = notes[n].chars().skip(3).collect();
+            letters(&[(" ", 't'), (&mark, role), (" ", 't'), (&text, 'm')])
+        };
+        let plain = |n: usize| letters(&[(notes[n], 'm')]);
+        for (n, want) in [
+            (0, plain(0)),
+            (1, mark(1, 'w')),
+            (2, plain(2)),
+            (3, plain(3)),
+            (4, mark(4, 'm')),
+            (5, plain(5)),
+        ] {
+            let y = body_y(&state, 80, 40, (at + 1 + n) as u16);
+            assert_eq!(
+                roles(&buf, theme, y).trim_end(),
+                canon(theme, &want),
+                "note row {n}"
+            );
+        }
     }
 
     #[test]
@@ -1663,6 +1913,10 @@ mod tests {
                 assert!(line.contains(value), "{value} in {line:?}");
             }
         }
+        assert!(
+            reads(&lines[total + 1..], "9,891 responses · cache write"),
+            "and the detail's: {lines:?}"
+        );
         // And the active block's figures under its row.
         let mut big = block(NOON, true);
         if let PeriodKey::Block {
@@ -2070,7 +2324,7 @@ mod tests {
             )
         );
         assert_eq!(
-            lines[1..12],
+            lines[1..14],
             [
                 " $2.46 at API prices    1.8M tokens    2 responses".to_owned(),
                 String::new(),
@@ -2079,9 +2333,12 @@ mod tests {
                 " 09-20 09:12–11:40  tagteam  2 spare    20.0K    3.0K  923.0K  $1.23".to_owned(),
                 format!(" {}", "─".repeat(67)),
                 format!(" TOTAL{}40.0K    6.0K    1.8M  $2.46", " ".repeat(34)),
-                " 1 response · cache write 0 (5m 0, 1h 0) · cache read 900.0K".to_owned(),
-                " session 3f2a9c1d · /Users/alex/Code/tagteam".to_owned(),
-                " 2026-09-20 09:12 – 2026-09-20 11:40 · 1 a1@x.co".to_owned(),
+                String::new(),
+                " SELECTED  session 3f2a9c1d · 1 a1@x.co   ⏎ its models".to_owned(),
+                "           1 response · cache write 0 (5m 0, 1h 0) · cache read 900.0K".to_owned(),
+                "           /Users/alex/Code/tagteam · 2026-09-20 09:12 – 2026-09-20 11:40"
+                    .to_owned(),
+                String::new(),
                 " $ what this would cost on the API at list prices of 2026-10-01; not your bill"
                     .to_owned(),
             ]
@@ -2407,24 +2664,27 @@ mod tests {
 
     #[test]
     fn the_footnotes_say_what_the_report_leaves_out() {
-        // Spec §5.3, token report §11.2: with the TUI's `≥` and the unreadable files.
-        let state = showing(days(), |r| {
+        // Spec §5.3, token report §11.2: with the TUI's `≥` and the unreadable files; after
+        // the detail and a blank row, each note `NOTE_INDENT` in (T5-24), J reaching the last.
+        let mut state = showing(days(), |r| {
             r.unpriced_models = vec!["claude-test-9".into()];
             r.index.skipped_lines = 12;
             r.index.unreadable_files = 3;
             r.price_overrides = vec!["claude-opus-5-5".into()];
         });
-        let lines = body_of(&state, 80, 24, NOW_MS);
+        let seen = scrolled_below(&mut state);
         assert_eq!(
-            lines[11..17],
+            seen[seen.len() - 7..],
             [
-                " No price for claude-test-9: counted without cost (≥ marks a partial cost).",
+                "",
+                "   No price for claude-test-9: counted without cost (≥ marks a partial cost).",
                 " ≥ at least: 2 subagent responses are still being counted",
-                " 12 transcript lines could not be read, so these totals may be low.",
-                " 3 transcript files could not be read; the next refresh tries again.",
+                "   12 transcript lines could not be read, so these totals may be low.",
+                "   3 transcript files could not be read; the next refresh tries again.",
                 " $ what this would cost on the API at list prices of 2026-10-01, with",
-                " config.toml's for claude-opus-5-5; not your bill",
-            ]
+                "   config.toml's for claude-opus-5-5; not your bill",
+            ],
+            "{seen:?}"
         );
     }
 
@@ -2922,7 +3182,8 @@ mod tests {
                     (1..6).all(|x| !buf[(x, total)].modifier.contains(Modifier::DIM)),
                     "{theme:?} TOTAL: a good report is plain"
                 );
-                for needle in needles.iter().filter(|n| !["ACCOUNT", "TOTAL"].contains(n)) {
+                let by_role = ["ACCOUNT", "TOTAL", "what this would cost", "cache write"];
+                for needle in needles.iter().filter(|n| !by_role.contains(n)) {
                     assert!(
                         undimmed(buf, needle),
                         "{theme:?} {needle}: a good report is plain"
@@ -3286,26 +3547,36 @@ mod tests {
         row
     }
 
-    /// What the selected row's detail must let a person read (B25).
+    /// What the selected row's detail must let a person read (B25), as T5-23 lays it out: its
+    /// identity, its numbers, the rest; then the price table's note.
     const DETAIL: [&str; 7] = [
-        "412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M) · cache read 88.0M",
-        "session 3f2a9c1d",
+        "SELECTED  session 3f2a9c1d · 1 a1@x.co   ⏎ its models",
+        "412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M)",
+        "cache read 88.0M",
         "/Users/alex/Code/ExampleCorp/portal-feature-user-manuals",
         "2026-09-20 09:12 – 2026-09-20 11:40",
-        "1 a1@x.co",
         "claude-opus-5-5, claude-sonnet-5-5",
         "$ what this would cost on the API at list prices of 2026-10-01; not your bill",
     ];
 
     #[test]
     fn a_sessions_detail_shows_its_numbers_first_and_every_value_whole() {
-        // B25: the numbers first, never cut; then the session's text, wrapped.
+        // B25, T5-23: after a blank row the identity, then the numbers, never cut; then the
+        // session's text, wrapped, all `DETAIL_INDENT` in.
         let state = showing_after("pp", vec![realistic()]);
         let lines = draw(&state, 80, 24);
         let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
         assert_eq!(
-            lines[total + 1],
-            " 412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M) · cache read 88.0M"
+            lines[total + 1..total + 8],
+            [
+                "",
+                " SELECTED  session 3f2a9c1d · 1 a1@x.co   ⏎ its models",
+                "           412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M)",
+                "           cache read 88.0M",
+                "           /Users/alex/Code/ExampleCorp/portal-feature-user-manuals",
+                "           2026-09-20 09:12 – 2026-09-20 11:40",
+                "           claude-opus-5-5, claude-sonnet-5-5",
+            ]
         );
         let below = &lines[total + 1..];
         for value in DETAIL {
@@ -3317,11 +3588,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn under_a_full_banner_and_toast_j_and_k_reach_every_value_of_the_detail_and_the_notes() {
-        // R21 at 80×24: the auto line, a three-row banner and a three-row toast leave the body
-        // 16 rows, from row 5. The table keeps three rows; the detail and the notes below it
-        // scroll (B25).
+    /// R21 at 80×24: the auto line, a three-row banner and a three-row toast leave the body 16
+    /// rows, from row 5, over ten sessions with every note.
+    fn crowded() -> State {
         let mut rows = vec![realistic()];
         rows.extend((1..=9).map(|n| session(&format!("s-{n}"), row_account(1))));
         rows[0].unfinalized = 1;
@@ -3335,6 +3604,14 @@ mod tests {
         let words = "the store could not be opened because another tagteam holds its lock";
         state.raise_banner(BannerKind::Refusal, [words; 3].join("; "));
         state.toast(crate::state::ToastKind::Info, [words; 3].join("; "), NOW_MS);
+        state
+    }
+
+    #[test]
+    fn under_a_full_banner_and_toast_j_and_k_reach_every_value_of_the_detail_and_the_notes() {
+        // R21 at 80×24 (`crowded`): the table keeps three rows; the detail and the notes below
+        // it scroll (B25).
+        let mut state = crowded();
         let notes = [
             "No price for claude-test-1, claude-test-2, claude-test-3, claude-test-4, claude-test-5, claude-test-6, claude-test-7, claude-test-8, claude-test-9, claude-test-10, claude-test-11, claude-test-12: counted without cost (≥ marks a partial cost).",
             "≥ at least: 1 subagent response is still being counted",
@@ -3345,10 +3622,11 @@ mod tests {
         let lines = draw(&state, 80, 24);
         let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
         assert!(total >= 5 + 1 + 3, "the table keeps three rows: {lines:?}");
+        assert_eq!(lines[total + 1], "", "{lines:?}");
         assert_eq!(
-            lines[total + 1],
+            lines[total + 2],
             format!(" {}", DETAIL[0]),
-            "the numbers first"
+            "the identity first"
         );
         assert!(lines[20].starts_with(" J K: lines 1–"), "{lines:?}");
         let mut seen = lines[total + 1..21].to_vec();
@@ -3366,14 +3644,32 @@ mod tests {
         }
         let lines = draw(&state, 80, 24);
         let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
+        assert_eq!(lines[total + 1], "", "K goes back to the top: {lines:?}");
         assert_eq!(
-            lines[total + 1],
+            lines[total + 2],
             format!(" {}", DETAIL[0]),
             "K goes back to the top"
         );
         assert!(
             lines[21].starts_with("the store could not"),
             "the toast: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_j_k_hint_is_muted() {
+        // T5-24: the hint is muted, not bold, as History's and the cards' are.
+        let mut state = crowded();
+        let theme = TIERS[1];
+        state.theme = theme;
+        let lines = draw(&state, 80, 24);
+        assert!(lines[20].starts_with(" J K: lines 1–"), "{lines:?}");
+        let buf = draw_buffer(&state, 80, 24, NOW_MS);
+        let want = letters(&[(lines[20].as_str(), 'm')]);
+        assert_eq!(roles(&buf, theme, 20).trim_end(), canon(theme, &want));
+        assert!(
+            (0..80).all(|x| !buf[(x, 20)].modifier.contains(Modifier::BOLD)),
+            "not bold"
         );
     }
 
@@ -3449,7 +3745,8 @@ mod tests {
         assert!(lines[8].starts_with(" SESSION"), "{lines:?}");
         let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
         assert!(total >= 9 + 3, "the table keeps three rows: {lines:?}");
-        assert_eq!(lines[total + 1], format!(" {}", DETAIL[0]), "{lines:?}");
+        assert_eq!(lines[total + 1], "", "{lines:?}");
+        assert_eq!(lines[total + 2], format!(" {}", DETAIL[0]), "{lines:?}");
         assert!(lines[20].starts_with(" J K: lines 1–"), "{lines:?}");
         assert!(lines[21].starts_with("the store could not"), "{lines:?}");
         // Every line below the total, read by scrolling: each long piece whole.
@@ -3544,7 +3841,8 @@ mod tests {
             3,
             "the table keeps three rows, then the rule: {lines:?}"
         );
-        assert_eq!(lines[total + 1], format!(" {}", DETAIL[0]), "{lines:?}");
+        assert_eq!(lines[total + 1], "", "{lines:?}");
+        assert_eq!(lines[total + 2], format!(" {}", DETAIL[0]), "{lines:?}");
         assert!(lines[20].starts_with(" J K: lines 1–"), "{lines:?}");
         let seen = scrolled_below(&mut state);
         for value in [
@@ -3591,7 +3889,10 @@ mod tests {
     #[test]
     fn j_reaches_every_account_and_model_of_a_session_whose_lists_wrap_past_three_rows() {
         // B29: the detail's lists wrap in full below the total, and J reaches every name.
+        // A session of no account of its own lists every account it holds (T5-23).
         let mut row = realistic();
+        row.account = None;
+        row.key = RowKey::new(&row.period, None, None);
         row.accounts = (1..=12)
             .map(|n| RowAccount::Account {
                 id: id(n),
@@ -3614,8 +3915,9 @@ mod tests {
         assert!(reads(&seen, &models), "{seen:?}");
     }
 
-    /// Every line below the total at 80×24, read as a person reads it: the first window, then
-    /// the line each `J` brings in, until the hint says the last shows.
+    /// Every line below the total at 80×24, read as a person reads it from the row after the
+    /// total, the blank one included: the first window, then the line each `J` brings in, until
+    /// the hint says the last shows.
     fn scrolled_below(state: &mut State) -> Vec<String> {
         let mut seen: Vec<String> = Vec::new();
         loop {
