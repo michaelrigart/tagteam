@@ -1359,7 +1359,40 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    /// The provider's active-account changes from `since_ms` on, after the last one before it:
+    /// `(at_ms, account_id)` by `(at, rowid)`, `None` meaning no account was active.
+    pub fn active_history_since(
+        &self,
+        provider: &ProviderId,
+        since_ms: i64,
+    ) -> Result<Vec<(i64, Option<String>)>, StoreError> {
+        let mut c = self.lock();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let map = |r: &Row<'_>| Ok((r.get(0)?, r.get(1)?));
+        let mut rows: Vec<(i64, Option<String>)> = tx
+            .query_row(ACTIVE_BEFORE, params![provider.as_str(), since_ms], map)
+            .optional()?
+            .into_iter()
+            .collect();
+        {
+            let mut stmt = tx.prepare(ACTIVE_SINCE)?;
+            for row in stmt.query_map(params![provider.as_str(), since_ms], map)? {
+                rows.push(row?);
+            }
+        }
+        tx.commit()?;
+        Ok(rows)
+    }
 }
+
+/// The provider's last active-account change before `?2`, read from the end of its index.
+const ACTIVE_BEFORE: &str = "SELECT at, account_id FROM active_history \
+     WHERE provider = ?1 AND at < ?2 ORDER BY at DESC, rowid DESC LIMIT 1";
+
+/// The provider's active-account changes from `?2` on, in index order.
+const ACTIVE_SINCE: &str = "SELECT at, account_id FROM active_history \
+     WHERE provider = ?1 AND at >= ?2 ORDER BY at, rowid";
 
 #[cfg(test)]
 mod tests {
@@ -1399,6 +1432,23 @@ mod tests {
             params!["claude-code", 0, i64::MAX, "s"],
         );
         assert!(!one.iter().any(|l| l.contains("TEMP B-TREE")), "{one:?}");
+    }
+
+    #[test]
+    fn active_history_since_reads_along_its_index() {
+        for sql in [ACTIVE_BEFORE, ACTIVE_SINCE] {
+            let steps = plan(sql, params!["claude-code", 0]);
+            assert!(
+                steps.iter().any(|l| l.contains("active_history_by_at")),
+                "{sql}: {steps:?}"
+            );
+            assert!(
+                !steps
+                    .iter()
+                    .any(|l| l.contains("SCAN") || l.contains("TEMP B-TREE")),
+                "{sql}: {steps:?}"
+            );
+        }
     }
 
     #[test]
