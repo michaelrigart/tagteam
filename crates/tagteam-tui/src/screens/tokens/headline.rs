@@ -625,25 +625,41 @@ mod tests {
         assert_eq!(lines[3], "");
         assert!(lines[4].starts_with(" BLOCK"), "{lines:?}");
 
-        let theme = Theme::new(true);
-        let want = letters(&[
-            (" ", 't'),
-            ("▶", 'a'),
-            (" block ", 'm'),
-            ("━━━━━━━━━╸", 'a'),
-            ("────────────", 'f'),
-            (" 2h46m ", 't'),
-            ("left", 'm'),
-            (" · ", 'm'),
-            ("41.2K ", 't'),
-            ("tok/min", 'm'),
-            (" · ", 'm'),
-            ("$3.20", 't'),
-            ("/h", 'm'),
-        ]);
-        let (text, got) = row_at(state(), 80, 2);
-        assert_eq!(text, format!(" {BLOCK_LINE}"), "in colour, on a `─` track");
-        assert_eq!(got, canon(theme, &want));
+        for theme in TIERS {
+            // Tier 0 draws the track `·` (T5-13), colour on a `─` track.
+            let glyph = if theme.colourless() { "·" } else { "─" };
+            let track = glyph.repeat(12);
+            let want = letters(&[
+                (" ", 't'),
+                ("▶", 'a'),
+                (" block ", 'm'),
+                ("━━━━━━━━━╸", 'a'),
+                (&track, 'f'),
+                (" 2h46m ", 't'),
+                ("left", 'm'),
+                (" · ", 'm'),
+                ("41.2K ", 't'),
+                ("tok/min", 'm'),
+                (" · ", 'm'),
+                ("$3.20", 't'),
+                ("/h", 'm'),
+            ]);
+            let mut state = state();
+            state.theme = theme;
+            let buf = draw_buffer(&state, 80, 40, NOW_MS);
+            let y = body_y(&state, 80, 40, 2);
+            let text = body_of(&state, 80, 40, NOW_MS)[2].clone();
+            assert_eq!(
+                text,
+                format!(" {BLOCK_LINE}").replace('─', glyph),
+                "{theme:?}"
+            );
+            assert_eq!(
+                roles(&buf, theme, y).trim_end(),
+                canon(theme, &want),
+                "{theme:?}"
+            );
+        }
     }
 
     #[test]
