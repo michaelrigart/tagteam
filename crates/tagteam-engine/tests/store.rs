@@ -1647,6 +1647,45 @@ fn a_prior_snapshot_whose_pid_exceeds_u32_is_malformed() {
 }
 
 #[test]
+fn a_prior_snapshot_stored_as_an_array_is_malformed() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    let j = JournalRow {
+        provider: cc(),
+        holder: ProcessStamp { pid: 1, start: 2 },
+        from_id: Some(a),
+        to_id: b,
+        from_fp: None,
+        from_identity: None,
+        to_fp: "sha256:b".into(),
+        to_epoch: None,
+        started_at: 5,
+        prior: None,
+    };
+    s.insert_journal(&held_guard(&env), &j).unwrap();
+    drop(s);
+    let array = r#"["claude-code",1,2,"a","b",null,null,"sha256:b",null,5,null]"#;
+    let nested = format!(
+        r#"{{"provider":"claude-code","holder_pid":1,"holder_start":2,"from_id":"a","to_id":"b","from_fp":null,"from_identity":null,"to_fp":"sha256:b","to_epoch":null,"started_at":5,"prior":{array}}}"#
+    );
+    for prior in [array.to_owned(), nested] {
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE switch_journal SET prior = ?1 WHERE provider = ?2",
+                rusqlite::params![prior, "claude-code"],
+            )
+            .unwrap();
+        let s = Store::open(&path).unwrap();
+        assert!(s.journal(&cc()).is_err(), "{prior}");
+    }
+}
+
+#[test]
 fn replacement_metadata_details_say_what_is_wrong_without_quoting_it() {
     let cases = [
         (r#"{"identity_key": "secret@x.co"#, "it is not JSON"),
