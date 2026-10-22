@@ -9,7 +9,7 @@ use tagteam_engine::words;
 use crate::daemon;
 use crate::host::{Action, ActionOutcome};
 use crate::msg::{Answer, AnswerTo, Cmd, Prompt, PromptKind};
-use crate::overlay::{ConfirmThen, Overlay, ProceedThen, TextThen};
+use crate::overlay::{ChooseThen, ConfirmThen, Overlay, ProceedThen, TextThen};
 use crate::screens;
 use crate::source::CollectSummary;
 use crate::state::{Screen, State, ToastKind};
@@ -265,7 +265,7 @@ pub fn on_prompt(state: &mut State, prompt: Prompt) -> Vec<Cmd> {
             question,
             options,
             selected: 0,
-            reply: to,
+            then: ChooseThen::Reply(to),
         },
     });
     replaced.into_iter().collect()
@@ -1098,7 +1098,7 @@ mod tests {
         assert!(matches!(
             state.overlay,
             Some(Overlay::Choose {
-                reply: AnswerTo(2),
+                then: ChooseThen::Reply(AnswerTo(2)),
                 ..
             })
         ));

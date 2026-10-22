@@ -17,6 +17,8 @@ const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█
 /// Where an account was not in use, and the in-use lane where it was (§7.4).
 const TRACK: &str = "─";
 const IN_USE: &str = "━";
+/// The cursor through a lane's cells where the account was not in use (§7.1).
+const CURSOR: &str = "│";
 /// A lane's name in the gutter, after the marker column and before a space (T4-10).
 const NAME: usize = 7;
 /// Each axis label's tick, and the axis's last word (§7.4).
@@ -26,18 +28,21 @@ const NOW: &str = "now";
 const HOURS: usize = 3;
 
 /// One account's swimlane: its name in the gutter, then each column's binding usage in
-/// `fill_role` where it was in use (blank without a reading), a faint `─` where it was not.
-pub(crate) fn lane_row(lane: &Lane, theme: Theme) -> Line<'static> {
+/// `fill_role` where it was in use (blank without a reading), a faint `─` where it was not, and
+/// there the cursor's `│` in accent in column `cursor`.
+pub(crate) fn lane_row(lane: &Lane, cursor: usize, theme: Theme) -> Line<'static> {
     let name = pad(&words::account_name(&lane.account), NAME);
     let mut spans = vec![Span::raw(format!(" {name} "))];
-    let faint = theme.role(Role::Faint);
+    let (faint, accent) = (theme.role(Role::Faint), theme.role(Role::Accent));
     spans.extend(
         lane.peaks
             .iter()
             .zip(&lane.in_use)
-            .map(|(v, used)| match (used, v) {
+            .enumerate()
+            .map(|(c, (v, used))| match (used, v) {
                 (true, Some(v)) => Span::styled(LEVELS[level(*v)], theme.role(fill_role(*v))),
                 (true, None) => Span::raw(" "),
+                (false, _) if c == cursor => Span::styled(CURSOR, accent),
                 (false, _) => Span::styled(TRACK, faint),
             }),
     );
@@ -51,16 +56,14 @@ fn level(v: f64) -> usize {
 }
 
 /// One account's in-use lane under its charts: `━` in accent where it was in use, a faint `─`
-/// elsewhere, after an empty gutter.
-pub(crate) fn in_use_row(lane: &Lane, theme: Theme) -> Line<'static> {
+/// elsewhere and the cursor's `│` in accent in column `cursor`, after an empty gutter.
+pub(crate) fn in_use_row(lane: &Lane, cursor: usize, theme: Theme) -> Line<'static> {
     let (accent, faint) = (theme.role(Role::Accent), theme.role(Role::Faint));
     let mut spans = vec![Span::raw(" ".repeat(usize::from(CHART_X)))];
-    spans.extend(lane.in_use.iter().map(|used| {
-        if *used {
-            Span::styled(IN_USE, accent)
-        } else {
-            Span::styled(TRACK, faint)
-        }
+    spans.extend(lane.in_use.iter().enumerate().map(|(c, used)| match used {
+        true => Span::styled(IN_USE, accent),
+        false if c == cursor => Span::styled(CURSOR, accent),
+        false => Span::styled(TRACK, faint),
     }));
     Line::from(spans)
 }
@@ -156,21 +159,46 @@ mod tests {
             vec![Some(40.0), Some(95.0), None, Some(10.0)],
             vec![true, true, true, false],
         );
-        let buf = buffer_of(vec![lane_row(&lane, theme)], 13);
+        let buf = buffer_of(vec![lane_row(&lane, 0, theme)], 13);
         assert_eq!(text_of(&buf)[0], " 1 a1    ▄█ ─");
         assert_eq!(&roles(&buf, theme, 0)[9..], canon(theme, "ac f"));
 
         let lane = lane_of(1, vec![Some(40.0); 3], vec![true, false, true]);
-        let buf = buffer_of(vec![in_use_row(&lane, theme)], 12);
+        let buf = buffer_of(vec![in_use_row(&lane, 0, theme)], 12);
         assert_eq!(text_of(&buf)[0], "         ━─━");
         assert_eq!(&roles(&buf, theme, 0)[9..], canon(theme, "afa"));
+    }
+
+    #[test]
+    fn the_cursor_runs_through_a_lane_where_the_account_was_not_in_use() {
+        // §7.1's mock-up: a lane's track gives way to the cursor; a value in use stays.
+        let theme = Theme::new(true);
+        let lane = lane_of(1, vec![Some(40.0); 3], vec![true, false, false]);
+        let row = |line| {
+            let buf = buffer_of(vec![line], 12);
+            (
+                text_of(&buf)[0].clone(),
+                roles(&buf, theme, 0)[9..].to_owned(),
+            )
+        };
+        let want = |text: &str, roles: &str| (text.to_owned(), canon(theme, roles));
+        assert_eq!(row(lane_row(&lane, 1, theme)), want(" 1 a1    ▄│─", "aaf"));
+        assert_eq!(row(lane_row(&lane, 0, theme)), want(" 1 a1    ▄──", "aff"));
+        assert_eq!(
+            row(in_use_row(&lane, 2, theme)),
+            want("         ━─│", "afa")
+        );
+        assert_eq!(
+            row(in_use_row(&lane, 0, theme)),
+            want("         ━──", "aff")
+        );
     }
 
     #[test]
     fn a_lane_value_past_100_is_full_and_nan_reads_as_0() {
         let theme = Theme::new(true);
         let lane = lane_of(1, vec![Some(150.0), Some(f64::NAN)], vec![true, true]);
-        let buf = buffer_of(vec![lane_row(&lane, theme)], 11);
+        let buf = buffer_of(vec![lane_row(&lane, 0, theme)], 11);
         assert_eq!(text_of(&buf)[0], " 1 a1    █▁");
         assert_eq!(&roles(&buf, theme, 0)[9..], canon(theme, "ca"));
     }

@@ -302,6 +302,23 @@ pub(crate) const KEYS: &[KeyRow] = &[
     },
     KeyRow {
         screen: Some(Screen::History),
+        keys: "← → Home End",
+        does: "the cursor by column; the oldest event, now",
+        footer: Footer::Show {
+            key: "←/→",
+            label: |_| Some("cursor"),
+            from: 0,
+        },
+        #[cfg(test)]
+        probes: &[
+            named(KeyCode::Left),
+            named(KeyCode::Right),
+            named(KeyCode::Home),
+            named(KeyCode::End),
+        ],
+    },
+    KeyRow {
+        screen: Some(Screen::History),
         keys: "[ ]",
         does: "range: 1, 7, 14 or 30 days",
         footer: Footer::Show {
@@ -311,6 +328,26 @@ pub(crate) const KEYS: &[KeyRow] = &[
         },
         #[cfg(test)]
         probes: &[plain('['), plain(']')],
+    },
+    KeyRow {
+        screen: Some(Screen::History),
+        keys: "f",
+        does: "scope: all accounts or one",
+        footer: Footer::Show {
+            key: "f",
+            label: |_| Some("scope"),
+            from: 0,
+        },
+        #[cfg(test)]
+        probes: &[plain('f')],
+    },
+    KeyRow {
+        screen: Some(Screen::History),
+        keys: "J K",
+        does: "scroll the charts",
+        footer: Footer::No,
+        #[cfg(test)]
+        probes: &[shifted('J'), shifted('K')],
     },
     KeyRow {
         screen: None,
@@ -483,6 +520,7 @@ pub(crate) fn footer_items(state: &State, width: u16) -> Vec<(&'static str, &'st
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tagteam_core::{Pace, WindowKind};
+    use tagteam_engine::timeline::{Scope, Series, TimelineView};
     use tagteam_engine::tokens::TokenPeriod;
     use tagteam_engine::views::UsageView;
 
@@ -552,13 +590,36 @@ mod tests {
 
     /// History over 3 accounts at 7 days, its timeline read.
     fn history() -> State {
+        history_scoped(Scope::All, timeline_view(70, vec![], vec![]))
+    }
+
+    /// History of `scope` over 3 accounts at 7 days, `view` read.
+    fn history_scoped(scope: Scope, view: TimelineView) -> State {
         let mut state = fresh(Screen::History);
         state.accounts.apply(snapshot(many(3)));
+        state.history.scope = scope;
         let r#gen = state.gens.history;
-        let view = timeline_view(70, vec![], vec![]);
         let result = Ok(view);
         update(&mut state, Msg::Timeline { r#gen, result }, NOW_MS);
         state
+    }
+
+    /// The same, the cursor a column before now: each cursor key moves it.
+    fn cursor_moved() -> State {
+        let mut state = history();
+        update(&mut state, key(KeyCode::Left), NOW_MS);
+        state
+    }
+
+    /// Account 1's History with four windows' charts, two of which fit at 80×24.
+    fn four_charts() -> State {
+        let chart = |label: &str| Series {
+            label: label.into(),
+            peaks: vec![Some(10.0); 70],
+        };
+        let charts = ["5h", "7d", "Fable", "Sonnet"].map(chart).to_vec();
+        let lane = lane_of(1, vec![Some(10.0); 70], vec![true; 70]);
+        history_scoped(Scope::Account(id(1)), timeline_view(70, charts, vec![lane]))
     }
 
     /// `state` with a start-up warning showing.
@@ -586,7 +647,7 @@ mod tests {
     /// needs its state here.
     fn states(screen: Option<Screen>, code: KeyCode, ctrl: bool) -> Vec<State> {
         use KeyCode::{BackTab, Backspace, Char, Down, End, Enter, Esc, Home, PageDown, PageUp};
-        use KeyCode::{Tab, Up};
+        use KeyCode::{Left, Right, Tab, Up};
         use Screen::{Accounts, History, Tokens};
         match (screen, code, ctrl) {
             (_, Char('c' | 'z'), true) => vec![accounts(1)],
@@ -629,7 +690,10 @@ mod tests {
             }
             (Some(Tokens), Char('J'), false) => vec![tokens(60)],
             (Some(Tokens), Char('K'), false) => vec![scrolled(tokens(60))],
-            (Some(History), Char('[' | ']'), false) => vec![history()],
+            (Some(History), Char('[' | ']' | 'f'), false) => vec![history()],
+            (Some(History), Left | Right | Home | End, false) => vec![cursor_moved()],
+            (Some(History), Char('J'), false) => vec![four_charts()],
+            (Some(History), Char('K'), false) => vec![scrolled(four_charts())],
             other => panic!("no state in which {other:?} acts: the table's row needs one"),
         }
     }
