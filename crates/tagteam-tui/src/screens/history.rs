@@ -1,7 +1,8 @@
 //! The History screen (redesign §7): focus's provider's timeline, of every account or one
 //! (§7.2), over 1, 7, 14 or 30 days, read on the views lane (§7.7). Its scope row, then
-//! `loading…` before a view or the empty state when nothing is in range (§5.7). It never
-//! fetches (core §13.4).
+//! `loading…` before a view or the empty state when nothing is in range (§5.7). A time cursor
+//! moves by column (§7.5), and the scope stays in step with the Accounts selection (T4-17). It
+//! never fetches (core §13.4).
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -12,15 +13,17 @@ use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::timeline::{AccountRef, Scope, TimelineView};
 use tagteam_engine::words;
 
+use crate::autoline;
 use crate::chrome::{WIDE, fit_spans};
 use crate::daemon;
 use crate::keys::RIGHT_INSET;
 use crate::msg::Cmd;
+use crate::overlay::{ChooseThen, Overlay};
 use crate::source::SourceError;
 use crate::state::{BannerKind, Screen, State};
 use crate::theme::Role;
 use crate::update;
-use crate::view::{centered, centred_block, fit, width_of};
+use crate::view::{body_at, centered, centred_block, fit, width_of};
 
 mod chart;
 mod lanes;
@@ -30,14 +33,18 @@ mod layout;
 const LOADING: &str = "loading…";
 /// The empty state's sentence (§5.7), left out at 30 days.
 const LONGER: &str = "[ ] picks a longer range.";
-/// The scope row's name for every account (§7.2).
+/// The scope row's name for every account, and the scope dialog's first option (§7.2).
 const ALL_ACCOUNTS: &str = "all accounts";
+/// `f`'s question (T4-17).
+const SCOPE_QUESTION: &str = "Show History for";
 /// The ranges, muted beside the current one from `WIDE` columns (§7.2).
 const CHOICES: &str = "1 · 7 · 14 · 30";
 /// Between the scope row's groups (§4.3's group gap).
 const GAP: &str = "   ";
 /// T4-19: a resize re-reads the timeline this long after the last one.
 pub(crate) const RESIZE_DEBOUNCE_MS: i64 = 250;
+/// T4-19: a paced re-read comes at most this often.
+pub(crate) const PACED_MS: i64 = 30_000;
 /// T4-10: the marker column, the 8-column gutter, and the column kept at the right.
 const CHART_MARGIN: u16 = layout::CHART_X + 1;
 
@@ -84,8 +91,16 @@ impl Range {
     }
 }
 
+/// T4-14: where the time cursor is: now, in the last column, or at an instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Cursor {
+    #[default]
+    Now,
+    At(i64),
+}
+
 pub struct HistoryState {
-    /// Whose timeline (§7.2): every account's until `⏎` on Accounts scopes it.
+    /// Whose timeline (§7.2): every account's until `⏎` on Accounts or `f` scopes it.
     pub(crate) scope: Scope,
     range: Range,
     /// Focus's provider when the timeline was last asked for (T4-18); `None` before then.
@@ -94,6 +109,15 @@ pub struct HistoryState {
     view: Option<TimelineView>,
     /// When the terminal was last resized on History, until the re-read it is due (T4-19).
     resized_ms: Option<i64>,
+    pub(crate) cursor: Cursor,
+    /// The first of one account's charts shown (`J`/`K`), when they do not all fit (T4-8).
+    chart_from: usize,
+    /// History was opened by `⏎` on Accounts: `Esc` goes back there (T4-17).
+    from_accounts: bool,
+    /// When the timeline was last asked for (T4-19).
+    read_ms: Option<i64>,
+    /// When the paced re-read that came inside `PACED_MS` of the last read is due (T4-19).
+    paced_due_ms: Option<i64>,
 }
 
 impl Default for HistoryState {
@@ -104,6 +128,11 @@ impl Default for HistoryState {
             provider: None,
             view: None,
             resized_ms: None,
+            cursor: Cursor::Now,
+            chart_from: 0,
+            from_accounts: false,
+            read_ms: None,
+            paced_due_ms: None,
         }
     }
 }
@@ -112,6 +141,44 @@ impl HistoryState {
     /// Now less the range: 1, 7, 14 or 30 days, 7 by default.
     fn since_s(&self, now_s: i64) -> i64 {
         now_s - self.range.days() * 86_400
+    }
+
+    /// A new scope: the view goes until its read (T4-19), and one account's charts start from
+    /// the first. False when it is the scope already.
+    fn set_scope(&mut self, scope: Scope) -> bool {
+        if self.scope == scope {
+            return false;
+        }
+        self.scope = scope;
+        self.view = None;
+        self.chart_from = 0;
+        true
+    }
+}
+
+/// The cursor's column in `view` (T4-14): the last for now, column 0 for a time before the
+/// range.
+fn cursor_column(cursor: Cursor, view: &TimelineView) -> usize {
+    let last = view.columns.saturating_sub(1);
+    match cursor {
+        Cursor::Now => last,
+        Cursor::At(ms) => {
+            let grid = view.grid();
+            if ms < grid.since_ms {
+                0
+            } else {
+                grid.column_of(ms).unwrap_or(last)
+            }
+        }
+    }
+}
+
+/// The cursor on `column` (T4-14): 1 ms before the column ends, or now on the last.
+fn at_column(view: &TimelineView, column: usize) -> Cursor {
+    if column + 1 >= view.columns {
+        Cursor::Now
+    } else {
+        Cursor::At(view.grid().end_ms(column) - 1)
     }
 }
 
@@ -129,28 +196,53 @@ pub(crate) fn reload(state: &mut State, now_ms: i64) -> Option<Cmd> {
     let h = &mut state.history;
     h.provider = Some(provider.clone());
     h.resized_ms = None;
+    h.read_ms = Some(now_ms);
+    h.paced_due_ms = None;
     let since = h.since_s(now_ms.div_euclid(1000));
     let scope = h.scope.clone();
     let columns = columns(state.size.0);
     Some(state.load_timeline(provider, scope, since, columns))
 }
 
-/// History opens on `loading…` and reads its timeline (T4-19).
+/// T4-19: `reload`, unless the last read was asked for under `PACED_MS` ago, in which case
+/// `on_tick` asks for it `PACED_MS` after that one.
+pub(crate) fn reload_paced(state: &mut State, now_ms: i64) -> Option<Cmd> {
+    let h = &mut state.history;
+    match h.read_ms {
+        Some(at) if now_ms < at + PACED_MS => {
+            h.paced_due_ms = Some(at + PACED_MS);
+            None
+        }
+        _ => reload(state, now_ms),
+    }
+}
+
+/// History opens on `loading…` and reads its timeline (T4-19). Only `⏎` on Accounts opens it
+/// from there (`scope_to`).
 pub(crate) fn on_enter(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     state.history.view = None;
+    state.history.from_accounts = false;
     reload(state, now_ms).into_iter().collect()
 }
 
-/// A new accounts read, while History shows: the first one reads the timeline a TUI started on
-/// History waited for, and one that moves focus to another provider reads that provider's
+/// A new accounts read. A scoped account it no longer lists returns the scope to all accounts
+/// (T4-17). While History shows, the first read reads the timeline a TUI started on History
+/// waited for, and one that moves focus to another provider, or ends the scope, reads again
 /// (T4-18, T4-19). Any other leaves the timeline to its own re-reads.
 pub(crate) fn on_accounts(state: &mut State, now_ms: i64) -> Vec<Cmd> {
+    let gone = match &state.history.scope {
+        Scope::Account(id) => !state.accounts.shown_ids().contains(id),
+        Scope::All => false,
+    };
+    if gone {
+        state.history.set_scope(Scope::All);
+    }
     if state.screen != Screen::History {
         return vec![];
     }
     let focus = daemon::focus(state);
     match &state.history.provider {
-        Some(p) if *p == focus => return vec![],
+        Some(p) if *p == focus && !gone => return vec![],
         Some(_) => state.history.view = None,
         None => {}
     }
@@ -185,45 +277,168 @@ pub(crate) fn on_resize(state: &mut State, now_ms: i64) {
     }
 }
 
-/// T4-19: the re-read a resize is due, once it has settled, while History shows.
+/// T4-19: the re-read a resize is due once it has settled, or a paced one once it is due,
+/// while History shows.
 pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
-    let due = state
-        .history
+    let h = &state.history;
+    let resized = h
         .resized_ms
         .is_some_and(|at| now_ms >= at + RESIZE_DEBOUNCE_MS);
-    if !due || state.screen != Screen::History || state.quitting.is_some() {
+    let paced = h.paced_due_ms.is_some_and(|at| now_ms >= at);
+    if !(resized || paced) || state.screen != Screen::History || state.quitting.is_some() {
         return vec![];
     }
     state.history.resized_ms = None;
+    state.history.paced_due_ms = None;
     reload(state, now_ms).into_iter().collect()
 }
 
-/// `⏎` on Accounts: History, scoped to `account` (§7.2).
+/// `⏎` on Accounts: History, scoped to `account` (§7.2), opened from Accounts (T4-17).
 pub(crate) fn scope_to(state: &mut State, account: AccountId, now_ms: i64) -> Vec<Cmd> {
-    state.history.scope = Scope::Account(account);
-    update::show(state, Screen::History, now_ms)
+    state.history.set_scope(Scope::Account(account));
+    let cmds = update::show(state, Screen::History, now_ms);
+    state.history.from_accounts = true;
+    cmds
+}
+
+/// T4-17: the scope follows the Accounts selection while it names an account.
+pub(crate) fn follow(state: &mut State, now_ms: i64) -> Vec<Cmd> {
+    let Scope::Account(scoped) = &state.history.scope else {
+        return vec![];
+    };
+    let Some(selected) = state.accounts.selected() else {
+        return vec![];
+    };
+    if selected.id == *scoped {
+        return vec![];
+    }
+    state.history.set_scope(Scope::Account(selected.id));
+    if state.screen != Screen::History {
+        return vec![];
+    }
+    reload(state, now_ms).into_iter().collect()
+}
+
+/// `f`'s choice (T4-17): the scope, and an account chosen selected on Accounts too.
+pub(crate) fn choose(state: &mut State, scope: Scope, now_ms: i64) -> Vec<Cmd> {
+    if let Scope::Account(id) = &scope {
+        state.accounts.select_id(id);
+    }
+    if !state.history.set_scope(scope) {
+        return vec![];
+    }
+    reload(state, now_ms).into_iter().collect()
 }
 
 pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
-    let by = match key.code {
-        KeyCode::Char('[') => -1,
-        KeyCode::Char(']') => 1,
-        _ => return vec![],
-    };
+    match key.code {
+        KeyCode::Char('[') => step_range(state, -1, now_ms),
+        KeyCode::Char(']') => step_range(state, 1, now_ms),
+        KeyCode::Left => move_cursor(state, -1),
+        KeyCode::Right => move_cursor(state, 1),
+        KeyCode::Home => {
+            // T4-14: the oldest event, or column 0 with none.
+            if let Some(view) = &state.history.view {
+                state.history.cursor = at_column(view, 0);
+            }
+            vec![]
+        }
+        KeyCode::End => {
+            state.history.cursor = Cursor::Now;
+            vec![]
+        }
+        KeyCode::Char('f') => {
+            open_scopes(state);
+            vec![]
+        }
+        KeyCode::Char('J') => scroll_charts(state, 1),
+        KeyCode::Char('K') => scroll_charts(state, -1),
+        KeyCode::Esc => escape(state, now_ms),
+        _ => vec![],
+    }
+}
+
+fn step_range(state: &mut State, by: isize, now_ms: i64) -> Vec<Cmd> {
     let h = &mut state.history;
     h.range = h.range.step(by);
     h.view = None;
     reload(state, now_ms).into_iter().collect()
 }
 
+/// `←`/`→`: the cursor one column, stopping at either end (T4-14).
+fn move_cursor(state: &mut State, by: isize) -> Vec<Cmd> {
+    let h = &mut state.history;
+    if let Some(view) = &h.view {
+        let last = view.columns.saturating_sub(1) as isize;
+        let at = cursor_column(h.cursor, view) as isize;
+        h.cursor = at_column(view, (at + by).clamp(0, last) as usize);
+    }
+    vec![]
+}
+
+/// `f`: a choose dialog of all accounts and focus's provider's accounts (T4-17, T4-18), the
+/// scope preselected.
+fn open_scopes(state: &mut State) {
+    let mut options = vec![ALL_ACCOUNTS.to_owned()];
+    let mut scopes = vec![Scope::All];
+    if let Some(p) = state.view_of(&daemon::focus(state)) {
+        for a in &p.accounts {
+            options.push(format!("{} {}", a.row.position, words::name(&a.row)));
+            scopes.push(Scope::Account(a.row.id.clone()));
+        }
+    }
+    let selected = scopes
+        .iter()
+        .position(|s| *s == state.history.scope)
+        .unwrap_or(0);
+    state.overlay = Some(Overlay::Choose {
+        question: SCOPE_QUESTION.to_owned(),
+        options,
+        selected,
+        then: ChooseThen::Scope(scopes),
+    });
+}
+
+/// `J`/`K`: one account's charts by one, stopping once the last one shows, or at the first
+/// (T4-8).
+fn scroll_charts(state: &mut State, by: isize) -> Vec<Cmd> {
+    let body = body_at(state);
+    let h = &mut state.history;
+    let (Scope::Account(_), Some(view)) = (&h.scope, &h.view) else {
+        return vec![];
+    };
+    // From what shows: a resize or a new read may have left the stored scroll past the end.
+    let furthest = layout::layout(view, &h.scope, body, state.size.1, usize::MAX)
+        .charts
+        .first()
+        .map_or(0, |(i, _)| *i);
+    let from = h.chart_from.min(furthest) as isize;
+    h.chart_from = (from + by).clamp(0, furthest as isize) as usize;
+    vec![]
+}
+
+/// `Esc` (§10, T4-17): History opened from Accounts goes back there, the scope back to all
+/// accounts; a scoped History returns to all accounts.
+fn escape(state: &mut State, now_ms: i64) -> Vec<Cmd> {
+    if std::mem::take(&mut state.history.from_accounts) {
+        state.history.set_scope(Scope::All);
+        return update::show(state, Screen::Accounts, now_ms);
+    }
+    if !state.history.set_scope(Scope::All) {
+        return vec![];
+    }
+    reload(state, now_ms).into_iter().collect()
+}
+
 /// The scope row, then `loading…` before a view, the empty state when nothing is in range
 /// (T4-21), or the charts, the lanes and the axis in their rows (T4-8).
-pub fn render(state: &State, frame: &mut Frame, area: Rect, _now_ms: i64) {
+pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     if area.is_empty() {
         return;
     }
     let scope_row = Rect::new(area.x, area.y, area.width, 1);
-    frame.render_widget(Paragraph::new(scope_line(state, area.width)), scope_row);
+    let line = scope_line(state, area.width, now_ms);
+    frame.render_widget(Paragraph::new(line), scope_row);
     let under = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
     let h = &state.history;
     match &h.view {
@@ -242,24 +457,19 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, _now_ms: i64) {
     }
 }
 
-/// The cursor's column: the last, now's, until the cursor moves.
-fn cursor_column(view: &TimelineView) -> usize {
-    view.columns.saturating_sub(1)
-}
-
 /// `view`'s charts under their titles, its lanes, the more row and the axis (T4-8 to T4-12).
 /// A view read at another width is drawn from the left and clipped until its re-read (T4-19).
 fn draw_view(state: &State, frame: &mut Frame, view: &TimelineView, body: Rect) {
     let theme = state.theme;
     let h = &state.history;
     let all = h.scope == Scope::All;
-    let at = layout::layout(view, &h.scope, body, frame.area().height, 0);
+    let at = layout::layout(view, &h.scope, body, frame.area().height, h.chart_from);
     let line_pct = if all {
         view.threshold
     } else {
         chart::ONE_ACCOUNT_LINE
     };
-    let cursor = cursor_column(view);
+    let cursor = cursor_column(h.cursor, view);
     for (i, rect) in &at.charts {
         let series = &view.charts[*i];
         let mut lines = vec![chart::title_row(state, series, all, body.width)];
@@ -276,9 +486,9 @@ fn draw_view(state: &State, frame: &mut Frame, view: &TimelineView, body: Rect) 
     for (i, rect) in &at.lanes {
         let lane = &view.lanes[*i];
         let line = if all {
-            lanes::lane_row(lane, theme)
+            lanes::lane_row(lane, cursor, theme)
         } else {
-            lanes::in_use_row(lane, theme)
+            lanes::in_use_row(lane, cursor, theme)
         };
         frame.render_widget(Paragraph::new(line), *rect);
     }
@@ -298,11 +508,11 @@ fn nothing_in_range(view: &TimelineView) -> bool {
             .all(|s| s.peaks.iter().all(Option::is_none))
 }
 
-/// ` f {scope}   [ ] {range}`, the choices beside it from `WIDE` columns, and `cursor now` on
-/// the right, one column in (§7.1, §7.2): the keys accent, the words muted, the time bold. The
-/// scope's name alone is cut to what the rest leaves, a group gap before `cursor` kept, so the
-/// range and the right part always keep their place.
-fn scope_line(state: &State, width: u16) -> Line<'static> {
+/// ` f {scope}   [ ] {range}`, the choices beside it from `WIDE` columns, and `cursor now` or
+/// `cursor {when}` on the right, one column in (§7.1, §7.2, T4-14): the keys accent, the words
+/// muted, the time bold. The scope's name alone is cut to what the rest leaves, a group gap
+/// before `cursor` kept, so the range and the right part always keep their place.
+fn scope_line(state: &State, width: u16, now_ms: i64) -> Line<'static> {
     let theme = state.theme;
     let (accent, muted) = (theme.role(Role::Accent), theme.role(Role::Muted));
     let mut range = vec![
@@ -315,10 +525,14 @@ fn scope_line(state: &State, width: u16) -> Line<'static> {
         range.push(Span::raw(GAP));
         range.push(Span::styled(CHOICES, muted));
     }
+    let when = match state.history.cursor {
+        Cursor::Now => "now".to_owned(),
+        Cursor::At(ms) => autoline::when(ms, now_ms, state.tokens.tz()),
+    };
     let right = [
         Span::styled("cursor", muted),
         Span::raw(" "),
-        Span::styled("now", theme.strong()),
+        Span::styled(when, theme.strong()),
     ];
     let used = |spans: &[Span]| spans.iter().map(|s| width_of(&s.content)).sum::<usize>();
     let head = [Span::raw(" "), Span::styled("f", accent), Span::raw(" ")];
@@ -369,6 +583,7 @@ mod tests {
 
     use super::*;
     use crate::msg::Msg;
+    use crate::overlay::Overlay;
     use crate::testutil::*;
     use crate::theme::Theme;
     use crate::update::update;
@@ -816,7 +1031,8 @@ mod tests {
                 );
                 for (i, name) in [" 1 a1 ", " 2 a2 ", " 3 a3 "].into_iter().enumerate() {
                     assert!(body[lane + i].starts_with(name), "{body:?}");
-                    assert_eq!(body[lane + i], text(lanes::lane_row(&view.lanes[i], theme)));
+                    let row = lanes::lane_row(&view.lanes[i], columns - 1, theme);
+                    assert_eq!(body[lane + i], text(row));
                 }
                 assert_eq!(
                     body[axis],
@@ -866,6 +1082,251 @@ mod tests {
             format!("{}{}{}", " ".repeat(9), "─".repeat(35), "━".repeat(35))
         );
         assert!(body[15].ends_with("now"), "{body:?}");
+    }
+
+    /// The cursor as the scope row says it, and the column the chart's top row and the first
+    /// lane draw its `│` in.
+    fn cursor_shown(state: &State) -> (String, usize) {
+        let body = body_of(state, 80, 24, NOW_MS);
+        let said = body[0]
+            .rsplit("cursor ")
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let column = |row: &str| {
+            let x = row.chars().position(|c| c == '│').expect("the cursor's │");
+            x - usize::from(layout::CHART_X)
+        };
+        let lane = body
+            .iter()
+            .find(|r| r.starts_with(" 1 a1 "))
+            .expect("the lane");
+        let (chart, lane) = (column(&body[2]), column(lane));
+        assert_eq!(chart, lane, "the lane's │ in the chart's column: {body:?}");
+        (said, chart)
+    }
+
+    #[test]
+    fn the_cursor_moves_by_column_and_end_goes_to_now() {
+        let (mut state, _) = opened(3);
+        // A chart with no value and a lane never in use, so the cursor's `│` runs through each
+        // of their rows.
+        let chart = Series {
+            label: IN_USE.into(),
+            peaks: vec![None; 70],
+        };
+        let lane = lane_of(1, vec![None; 70], vec![false; 70]);
+        arrived(&mut state, timeline_view(70, vec![chart], vec![lane]));
+        assert_eq!(cursor_shown(&state), ("now".to_owned(), 69));
+        // Column 68 ends 2h24m before now: the cursor reads 1 ms before that.
+        for (code, said, column) in [
+            (KeyCode::Left, "11:49", 68),
+            (KeyCode::Right, "now", 69),
+            (KeyCode::Right, "now", 69),
+            (KeyCode::Home, "Sep 14 16:37", 0),
+            (KeyCode::Left, "Sep 14 16:37", 0),
+            (KeyCode::End, "now", 69),
+        ] {
+            update(&mut state, key(code), NOW_MS);
+            assert_eq!(cursor_shown(&state), (said.to_owned(), column), "{code:?}");
+        }
+    }
+
+    /// The open choose dialog's options and selected index.
+    fn choosing(state: &State) -> (Vec<String>, usize) {
+        match &state.overlay {
+            Some(Overlay::Choose {
+                question,
+                options,
+                selected,
+                ..
+            }) => {
+                assert_eq!(question, "Show History for");
+                (options.clone(), *selected)
+            }
+            other => panic!("no choose dialog: {other:?}"),
+        }
+    }
+
+    fn selected_id(state: &State) -> Option<AccountId> {
+        state.accounts.selected().map(|a| a.id)
+    }
+
+    fn scope_row(state: &State) -> String {
+        body_of(state, 80, 24, NOW_MS).remove(0)
+    }
+
+    #[test]
+    fn f_chooses_all_accounts_or_one_and_the_accounts_selection_follows() {
+        let (mut state, _) = opened(3);
+        arrived(&mut state, nothing(70));
+        assert!(update(&mut state, ch('f'), NOW_MS).is_empty());
+        let options = ["all accounts", "1 a1@x.co", "2 a2@x.co", "3 a3@x.co"];
+        assert_eq!(choosing(&state), (options.map(String::from).to_vec(), 0));
+        update(&mut state, ch('j'), NOW_MS);
+        let cmds = update(&mut state, key(KeyCode::Enter), NOW_MS);
+        assert!(state.overlay.is_none());
+        assert_eq!(state.history.scope, Scope::Account(id(1)));
+        assert_eq!(selected_id(&state), Some(id(1)));
+        assert_eq!(cmds, [read_of(2, Scope::Account(id(1)), NOW_S - WEEK, 70)]);
+        let row = scope_row(&state);
+        assert!(row.starts_with(" f 1 a1   [ ]"), "{row:?}");
+        // A digit picks: `3` is the third option, account 2, preselected as the scope it is.
+        update(&mut state, ch('f'), NOW_MS);
+        assert_eq!(choosing(&state).1, 1, "the current scope is preselected");
+        let cmds = update(&mut state, ch('3'), NOW_MS);
+        assert_eq!(cmds, [read_of(3, Scope::Account(id(2)), NOW_S - WEEK, 70)]);
+        assert_eq!(selected_id(&state), Some(id(2)));
+        assert!(scope_row(&state).starts_with(" f 2 a2   [ ]"));
+        // `all accounts` leaves the Accounts selection where it is.
+        update(&mut state, ch('f'), NOW_MS);
+        update(&mut state, ch('k'), NOW_MS);
+        update(&mut state, ch('k'), NOW_MS);
+        let cmds = update(&mut state, key(KeyCode::Enter), NOW_MS);
+        assert_eq!(cmds, [read_of(4, Scope::All, NOW_S - WEEK, 70)]);
+        assert_eq!(state.history.scope, Scope::All);
+        assert_eq!(selected_id(&state), Some(id(2)));
+        // `Esc` closes it and changes nothing.
+        update(&mut state, ch('f'), NOW_MS);
+        assert!(update(&mut state, key(KeyCode::Esc), NOW_MS).is_empty());
+        assert!(state.overlay.is_none());
+        assert_eq!(state.history.scope, Scope::All);
+    }
+
+    #[test]
+    fn esc_after_enter_returns_to_accounts_and_all_accounts() {
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(many(3)));
+        update(&mut state, ch('j'), NOW_MS);
+        update(&mut state, key(KeyCode::Enter), NOW_MS);
+        assert_eq!(
+            (state.screen, &state.history.scope),
+            (Screen::History, &Scope::Account(id(2)))
+        );
+        assert!(update(&mut state, key(KeyCode::Esc), NOW_MS).is_empty());
+        assert_eq!(
+            (state.screen, &state.history.scope),
+            (Screen::Accounts, &Scope::All)
+        );
+        assert_eq!(
+            update(&mut state, ch('3'), NOW_MS),
+            [read_of(2, Scope::All, NOW_S - WEEK, 70)]
+        );
+    }
+
+    #[test]
+    fn esc_on_a_scoped_history_returns_to_all_accounts() {
+        let (mut state, _) = opened(3);
+        update(&mut state, ch('f'), NOW_MS);
+        update(&mut state, ch('2'), NOW_MS);
+        assert_eq!(state.history.scope, Scope::Account(id(1)));
+        assert_eq!(
+            update(&mut state, key(KeyCode::Esc), NOW_MS),
+            [read_of(3, Scope::All, NOW_S - WEEK, 70)]
+        );
+        assert_eq!(
+            (state.screen, &state.history.scope),
+            (Screen::History, &Scope::All)
+        );
+        // On all accounts, `Esc` does nothing.
+        arrived(&mut state, nothing(70));
+        let before = body_of(&state, 80, 24, NOW_MS);
+        assert!(update(&mut state, key(KeyCode::Esc), NOW_MS).is_empty());
+        assert_eq!(state.screen, Screen::History);
+        assert_eq!(body_of(&state, 80, 24, NOW_MS), before);
+    }
+
+    #[test]
+    fn while_scoped_the_scope_follows_the_accounts_selection() {
+        let (mut state, _) = opened(3);
+        update(&mut state, ch('f'), NOW_MS);
+        update(&mut state, ch('3'), NOW_MS);
+        assert_eq!(state.history.scope, Scope::Account(id(2)));
+        update(&mut state, ch('1'), NOW_MS);
+        update(&mut state, ch('j'), NOW_MS);
+        assert_eq!(selected_id(&state), Some(id(3)));
+        assert_eq!(state.history.scope, Scope::Account(id(3)));
+        // Scoped to all accounts, the selection moves alone.
+        update(&mut state, ch('3'), NOW_MS);
+        update(&mut state, ch('f'), NOW_MS);
+        update(&mut state, ch('1'), NOW_MS);
+        assert_eq!(state.history.scope, Scope::All);
+        update(&mut state, ch('1'), NOW_MS);
+        update(&mut state, ch('k'), NOW_MS);
+        assert_eq!(selected_id(&state), Some(id(2)));
+        assert_eq!(state.history.scope, Scope::All);
+    }
+
+    #[test]
+    fn a_scoped_account_gone_from_the_view_returns_history_to_all_accounts() {
+        let (mut state, _) = opened(3);
+        update(&mut state, ch('f'), NOW_MS);
+        update(&mut state, ch('4'), NOW_MS);
+        assert_eq!(state.history.scope, Scope::Account(id(3)));
+        arrived(&mut state, nothing(70));
+        let Cmd::LoadAccounts { r#gen } = state.load_accounts() else {
+            unreachable!()
+        };
+        let h = state.gens.history;
+        let cmds = update(&mut state, accounts_msg(r#gen, 2), NOW_MS);
+        assert_eq!(state.history.scope, Scope::All);
+        assert_eq!(cmds, [read_of(h + 1, Scope::All, NOW_S - WEEK, 70)]);
+    }
+
+    #[test]
+    fn shift_j_and_k_scroll_one_account_s_charts() {
+        let (mut state, _) = opened(3);
+        update(&mut state, ch('f'), NOW_MS);
+        update(&mut state, ch('2'), NOW_MS);
+        let chart = |label: &str| Series {
+            label: label.into(),
+            peaks: vec![Some(10.0); 70],
+        };
+        let charts = ["5h", "7d", "Fable", "Sonnet"].map(chart).to_vec();
+        let lane = lane_of(1, vec![Some(10.0); 70], vec![true; 70]);
+        arrived(&mut state, timeline_view(70, charts, vec![lane]));
+        // At 80×24 two charts show, their titles on body rows 1 and 7 (T4-8).
+        let titles = |state: &State| {
+            let body = body_of(state, 80, 24, NOW_MS);
+            let first = |row: &str| row.split_whitespace().next().unwrap_or_default().to_owned();
+            (first(&body[1]), first(&body[7]))
+        };
+        let shown = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(titles(&state), shown("5h", "7d"));
+        for (c, a, b) in [
+            ('J', "7d", "Fable"),
+            ('J', "Fable", "Sonnet"),
+            ('J', "Fable", "Sonnet"),
+            ('K', "7d", "Fable"),
+        ] {
+            update(&mut state, ch(c), NOW_MS);
+            assert_eq!(titles(&state), shown(a, b), "{c}");
+        }
+    }
+
+    #[test]
+    fn a_scope_on_another_provider_s_account_reads_that_provider() {
+        // Review Focus 4, T4-18.
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(two_providers());
+        for _ in 0..3 {
+            update(&mut state, ch('j'), NOW_MS);
+        }
+        let cmds = update(&mut state, key(KeyCode::Enter), NOW_MS);
+        let fake = AccountId::from_string("fake-1");
+        assert_eq!(
+            cmds,
+            [Cmd::LoadTimeline {
+                r#gen: 1,
+                provider: ProviderId::new("fake-agent"),
+                scope: Scope::Account(fake),
+                since_s: NOW_S - WEEK,
+                columns: 70,
+            }]
+        );
+        update(&mut state, ch('f'), NOW_MS);
+        let options = ["all accounts", "1 ci@example.com"];
+        assert_eq!(choosing(&state), (options.map(String::from).to_vec(), 1));
     }
 
     #[test]

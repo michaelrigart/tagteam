@@ -487,7 +487,10 @@ mod tests {
             footer_row(&format!("{order}  e disable  a alias  x remove"), 120)
         );
         let history = draw(&fresh(Screen::History), 80, 24);
-        assert_eq!(history[23], footer_row("[ ] range  r refresh", 80));
+        assert_eq!(
+            history[23],
+            footer_row("←/→ cursor  [ ] range  f scope  r refresh", 80)
+        );
         let tokens = draw(&fresh(Screen::Tokens), 80, 24);
         assert_eq!(
             tokens[23],

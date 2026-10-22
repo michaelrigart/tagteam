@@ -14,6 +14,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
+use tagteam_engine::timeline::Scope;
 
 use crate::host::{AccountRef, Action};
 use crate::msg::{Answer, AnswerTo, Cmd};
@@ -35,7 +36,7 @@ pub enum Overlay {
         question: String,
         options: Vec<String>,
         selected: usize,
-        reply: AnswerTo,
+        then: ChooseThen,
     },
     Text {
         prompt: String,
@@ -78,12 +79,19 @@ impl Overlay {
                 to: *to,
                 answer: Answer::CONFIRM_DECLINED,
             }),
-            Overlay::Choose { reply, .. } => Some(Cmd::Answer {
-                to: *reply,
+            Overlay::Choose {
+                then: ChooseThen::Reply(to),
+                ..
+            } => Some(Cmd::Answer {
+                to: *to,
                 answer: Answer::CHOOSE_DECLINED,
             }),
             Overlay::Confirm {
                 then: ConfirmThen::Run(_),
+                ..
+            }
+            | Overlay::Choose {
+                then: ChooseThen::Scope(_),
                 ..
             }
             | Overlay::Help { .. }
@@ -102,6 +110,14 @@ impl Overlay {
 pub enum ConfirmThen {
     Reply(AnswerTo),
     Run(Action),
+}
+
+/// What a choose dialog's answer goes to: a waiting CLI prompt, or History's scope (T4-17),
+/// one scope per option.
+#[derive(Debug)]
+pub enum ChooseThen {
+    Reply(AnswerTo),
+    Scope(Vec<Scope>),
 }
 
 /// What a text dialog's input is for.
@@ -199,9 +215,9 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
         Overlay::Choose {
             options,
             selected,
-            reply,
+            then,
             ..
-        } => choose::key(options, selected, *reply, key),
+        } => choose::key(state, options, selected, then, key, now_ms),
         Overlay::Text {
             input, error, then, ..
         } => text::key(state, input, error, then, key, now_ms),
@@ -526,7 +542,7 @@ mod tests {
             question: "Which?".into(),
             options: vec!["a".into(), "b".into()],
             selected: 1,
-            reply: AnswerTo(8),
+            then: ChooseThen::Reply(AnswerTo(8)),
         });
         assert_eq!(
             update(&mut state, ch('q'), NOW_MS),

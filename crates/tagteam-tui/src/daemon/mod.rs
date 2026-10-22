@@ -19,7 +19,7 @@ use tagteam_daemon::tokens::TOKEN_INDEX;
 use crate::live::{Live, StatusError};
 use crate::msg::Cmd;
 use crate::screens;
-use crate::state::{Screen, State, ToastKind};
+use crate::state::{Reread, Screen, State, ToastKind};
 
 /// Spec §6.3: what an event asks for is read this long after it, and the events that come
 /// meanwhile share that read.
@@ -87,6 +87,9 @@ pub struct DaemonState {
     reread_views: bool,
     /// They read every view shown, the token report among them: the link came up.
     reread_all: bool,
+    /// They read History's timeline at once, not paced (T4-19): a `switch` or a quarantine
+    /// event, or the link came up.
+    reread_timeline: bool,
     /// They fetch `status`: a provider job ran, and publishes its state as the run ends.
     reread_status: bool,
     /// When the `status` out now, the link's only one, is given up on (C-R19, C-R22).
@@ -205,6 +208,7 @@ fn up(state: &mut State, link: u64, now_ms: i64) -> Vec<Cmd> {
     d.reread_ms = Some(now_ms + REREAD_MS);
     d.reread_views = true;
     d.reread_all = true;
+    d.reread_timeline = true;
     d.reread_status = false;
     state.dirty = true;
     fetch(state, now_ms).into_iter().collect()
@@ -233,6 +237,7 @@ fn down(state: &mut State, now_ms: i64) {
     d.reread_ms = None;
     d.reread_views = false;
     d.reread_all = false;
+    d.reread_timeline = false;
     d.reread_status = false;
     state.dirty = true;
     if was_live && state.quitting.is_none() {
@@ -274,8 +279,9 @@ fn broken(state: &mut State, link: u64, now_ms: i64) -> Vec<Cmd> {
 /// `status`, whose words the header shows; `stopping` names its reason. Every event of a
 /// provider job's run (auto's kinds, `usage`) also fetches `status`, since the daemon publishes
 /// a job's state when its run ends, after its events (D5.4): `mode`'s own fetch can read the
-/// state from before the run (C-R5). All but `mode`'s are debounced. A kind this TUI does not
-/// know reads nothing.
+/// state from before the run (C-R5). All but `mode`'s are debounced. An account's change other
+/// than a `poll` reads History's timeline at once; `poll`, `usage` and `changed` pace it (T4-19).
+/// A kind this TUI does not know reads nothing.
 fn on_event(state: &mut State, event: Event, now_ms: i64) -> Vec<Cmd> {
     if state.daemon.link.is_none() || state.quitting.is_some() {
         return vec![];
@@ -285,6 +291,7 @@ fn on_event(state: &mut State, event: Event, now_ms: i64) -> Vec<Cmd> {
         Event::Auto { .. } => {
             let views = event.changes_an_account();
             reread(state, now_ms, views, true);
+            state.daemon.reread_timeline |= views && event.poll().is_none();
         }
         Event::Usage { .. } => reread(state, now_ms, true, true),
         Event::Changed => reread(state, now_ms, true, false),
@@ -451,7 +458,7 @@ fn names_another_provider(error: &str, provider: &ProviderId) -> bool {
 /// Spec §6.3, §7.4 and §8 on the UI's tick: the end of `stopping`'s words, and of the first
 /// collection's wait (C-R20); a link whose `status` did not come (C-R19); the events' debounced
 /// reads; `P`'s fetch of `status`; and every 60 s, `status`, and in live mode `accounts` (and
-/// `history` when History is open).
+/// `history` when History is open, paced as T4-19 says).
 pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     let d = &mut state.daemon;
     if d.stopping
@@ -472,11 +479,15 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
         return broken(state, link, now_ms);
     }
     let (mut views, mut all, mut fetch_now) = (false, false, false);
+    let mut timeline = Reread::Paced;
     if d.reread_ms.is_some_and(|at| now_ms >= at) {
         d.reread_ms = None;
         views = std::mem::take(&mut d.reread_views);
         all = std::mem::take(&mut d.reread_all);
         fetch_now = std::mem::take(&mut d.reread_status);
+        if std::mem::take(&mut d.reread_timeline) {
+            timeline = Reread::Now;
+        }
     }
     if d.recheck_ms.is_some_and(|at| now_ms >= at) {
         d.recheck_ms = None;
@@ -492,7 +503,7 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
         cmds.extend(fetch(state, now_ms));
     }
     if views {
-        cmds.extend(state.reload_views(now_ms));
+        cmds.extend(state.reload_views_as(now_ms, timeline));
         if all && state.screen == Screen::Tokens {
             cmds.extend(screens::tokens::requery(state, now_ms));
         }
@@ -746,9 +757,10 @@ mod tests {
     #[test]
     fn an_event_reads_what_it_affects_250_ms_later_once_for_every_event_until_then() {
         // Spec §8: `poll`, `switch`, `usage`, `changed` and the quarantine events re-read
-        // `accounts`, and `history` while it is open, debounced (§6.3). Every event of a
-        // provider job's run also fetches `status` (C-R5); `changed` is another process's. A
-        // kind this TUI does not know reads nothing.
+        // `accounts`, and `history` while it is open, debounced (§6.3); within 30 s of its last
+        // read, `poll`, `usage` and `changed` leave `history` to a paced read (T4-19). Every
+        // event of a provider job's run also fetches `status` (C-R5); `changed` is another
+        // process's. A kind this TUI does not know reads nothing.
         let mut state = showing(Screen::History, 1);
         go_live(&mut state, auto_on());
         tick(&mut state, NOW_MS + 250);
@@ -757,14 +769,15 @@ mod tests {
             raw: json!({"event": "added-later"}),
         };
         let all = vec!["status", "accounts", "history"];
+        let paced = vec!["status", "accounts"];
         let mut at = NOW_MS + 1_000;
         for (e, want) in [
-            (auto("poll"), all.clone()),
+            (auto("poll"), paced.clone()),
             (auto("switch"), all.clone()),
             (auto("account-quarantined"), all.clone()),
             (auto("account-unquarantined"), all.clone()),
-            (usage(), all.clone()),
-            (Event::Changed, vec!["accounts", "history"]),
+            (usage(), paced.clone()),
+            (Event::Changed, vec!["accounts"]),
             (auto("no-switch"), vec!["status"]),
             (auto("all-exhausted"), vec!["status"]),
             (auto("error"), vec!["status"]),
@@ -785,8 +798,58 @@ mod tests {
         {
             update(&mut state, event(e), at + i as i64 * 20);
         }
-        assert_eq!(names(&tick_answered(&mut state, at + 250)), all);
+        assert_eq!(names(&tick_answered(&mut state, at + 250)), paced);
         assert!(tick(&mut state, at + 500).is_empty());
+    }
+
+    #[test]
+    fn in_live_mode_usage_re_reads_the_timeline_at_most_every_30_s_and_a_switch_at_once() {
+        // T4-19: `usage`, `changed`, `poll` and the 60 s live poll pace History's re-read, at
+        // most every 30 s, one inside 30 s of the last running 30 s after it; a `switch` reads
+        // it at once.
+        let mut state = showing(Screen::History, 1);
+        go_live(&mut state, auto_on());
+        // The link's own re-read asks for the timeline at `t`.
+        let t = NOW_MS + REREAD_MS;
+        assert_eq!(
+            names(&tick_answered(&mut state, t)),
+            ["accounts", "history"]
+        );
+        update(&mut state, event(usage()), t + 10_000);
+        assert_eq!(
+            names(&tick_answered(&mut state, t + 10_250)),
+            ["status", "accounts"]
+        );
+        assert!(tick(&mut state, t + 29_999).is_empty());
+        assert_eq!(names(&tick(&mut state, t + 30_000)), ["history"]);
+        assert!(tick(&mut state, t + 30_001).is_empty(), "once");
+        update(&mut state, event(auto("switch")), t + 31_000);
+        assert_eq!(
+            names(&tick_answered(&mut state, t + 31_250)),
+            ["status", "accounts", "history"]
+        );
+        // `changed` and `poll` pace as `usage` does, from the switch's read.
+        update(&mut state, event(Event::Changed), t + 32_000);
+        assert_eq!(names(&tick_answered(&mut state, t + 32_250)), ["accounts"]);
+        update(&mut state, event(auto("poll")), t + 33_000);
+        assert_eq!(
+            names(&tick_answered(&mut state, t + 33_250)),
+            ["status", "accounts"]
+        );
+        // So does the 60 s poll, due at `NOW_MS + 60_000`.
+        assert_eq!(
+            names(&tick_answered(&mut state, t + 61_249)),
+            ["status", "accounts"]
+        );
+        assert_eq!(names(&tick(&mut state, t + 61_250)), ["history"]);
+        // In timer mode the 30 s timer reads the timeline at once.
+        let mut state = showing(Screen::History, 1);
+        let read = update(&mut state, ch(']'), NOW_MS + 10_000);
+        assert_eq!(names(&read), ["history"]);
+        assert_eq!(
+            names(&tick(&mut state, NOW_MS + 30_000)),
+            ["accounts", "history", "collect"]
+        );
     }
 
     #[test]

@@ -154,6 +154,14 @@ pub struct Gens {
     pub inventory: u64,
 }
 
+/// How History's timeline is re-read with the views (T4-19): at once, or at most every
+/// `history::PACED_MS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reread {
+    Now,
+    Paced,
+}
+
 pub struct Refresh {
     pub next_ms: i64,
 }
@@ -238,9 +246,17 @@ impl State {
 
     /// The views re-read: `accounts`, and on History its timeline, each under a new generation.
     pub(crate) fn reload_views(&mut self, now_ms: i64) -> Vec<Cmd> {
+        self.reload_views_as(now_ms, Reread::Now)
+    }
+
+    /// `reload_views`, History's timeline read at once or paced (T4-19).
+    pub(crate) fn reload_views_as(&mut self, now_ms: i64, timeline: Reread) -> Vec<Cmd> {
         let mut cmds = vec![self.load_accounts()];
         if self.screen == Screen::History {
-            cmds.extend(crate::screens::history::reload(self, now_ms));
+            cmds.extend(match timeline {
+                Reread::Now => crate::screens::history::reload(self, now_ms),
+                Reread::Paced => crate::screens::history::reload_paced(self, now_ms),
+            });
         }
         cmds
     }

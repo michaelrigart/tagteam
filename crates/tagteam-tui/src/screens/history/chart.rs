@@ -103,11 +103,10 @@ pub(crate) fn title_row(state: &State, series: &Series, all: bool, width: u16) -
     let theme = state.theme;
     let muted = theme.role(Role::Muted);
     let provider = state.view_of(&daemon::focus(state));
-    let at_cursor = state
-        .history
-        .view
-        .as_ref()
-        .and_then(|v| series.peaks.get(super::cursor_column(v)).copied().flatten());
+    let at_cursor = state.history.view.as_ref().and_then(|v| {
+        let at = super::cursor_column(state.history.cursor, v);
+        series.peaks.get(at).copied().flatten()
+    });
     let now = provider.and_then(|p| now_pct(state, p, series, all));
     let value = |v: Option<f64>| match v {
         Some(v) => Span::styled(

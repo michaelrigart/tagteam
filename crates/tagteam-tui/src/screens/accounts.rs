@@ -139,10 +139,23 @@ impl AccountsState {
         let at = self.index().unwrap_or(0) as isize;
         let to = (at + by).clamp(0, rows.len() as isize - 1) as usize;
         let id = rows[to].row.id.clone();
+        self.select(id);
+    }
+
+    fn select(&mut self, id: AccountId) {
         if self.selected.as_ref() != Some(&id) {
             self.card_from = 0;
         }
         self.selected = Some(id);
+    }
+
+    /// Selects `id`, when the table shows it: History's scope chose it (T4-17).
+    pub(crate) fn select_id(&mut self, id: &AccountId) -> bool {
+        let shown = self.rows().iter().any(|v| &v.row.id == id);
+        if shown {
+            self.select(id.clone());
+        }
+        shown
     }
 }
 
@@ -241,7 +254,7 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
     let at = line_of(&state.accounts);
     let rows = visible_rows(state, body, now_ms);
     state.accounts.offset = keep_visible(state.accounts.offset, at, at, rows, lines);
-    vec![]
+    crate::screens::history::follow(state, now_ms)
 }
 
 /// `J`/`K`: the card's windows move `by` one, stopping once the last one shows, or at the

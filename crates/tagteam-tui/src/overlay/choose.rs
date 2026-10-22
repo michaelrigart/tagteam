@@ -4,17 +4,23 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 use super::{
-    BOX_COLS, BoxSpec, CHOICE_ROWS, GUTTER, KeyOutcome, boxed, gutter_rows, question_rows,
+    BOX_COLS, BoxSpec, CHOICE_ROWS, ChooseThen, GUTTER, KeyOutcome, boxed, gutter_rows,
+    question_rows,
 };
-use crate::msg::{Answer, AnswerTo, Cmd};
+use crate::msg::{Answer, Cmd};
+use crate::screens::history;
 use crate::state::State;
 use crate::view::{scrolled_windows, width_of, wrap_rows};
 
+/// `⏎` or a digit chooses, `Esc` declines: a CLI prompt is answered, and History takes the
+/// scope chosen (T4-17).
 pub(super) fn key(
+    state: &mut State,
     options: &[String],
     selected: &mut usize,
-    reply: AnswerTo,
+    then: &ChooseThen,
     key: KeyEvent,
+    now_ms: i64,
 ) -> KeyOutcome {
     let last = options.len().saturating_sub(1);
     let digit = match key.code {
@@ -27,8 +33,15 @@ pub(super) fn key(
         _ => digit.filter(|d| *d <= last).map(Some),
     };
     if let Some(answer) = answer {
-        let answer = Answer::Choose(answer);
-        return KeyOutcome::CloseWith(vec![Cmd::Answer { to: reply, answer }]);
+        return KeyOutcome::CloseWith(match then {
+            ChooseThen::Reply(to) => vec![Cmd::Answer {
+                to: *to,
+                answer: Answer::Choose(answer),
+            }],
+            ChooseThen::Scope(scopes) => answer
+                .and_then(|i| scopes.get(i).cloned())
+                .map_or_else(Vec::new, |scope| history::choose(state, scope, now_ms)),
+        });
     }
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
