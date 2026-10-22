@@ -817,6 +817,50 @@ fn the_unknown_usage_count_starts_afresh_on_an_account_switched_to_by_hand() {
     assert_eq!(auto_state(&fx).unhealthy_ticks, 1);
 }
 
+/// T4-23: a switch whose live account has no decision-grade reading has no binding window to
+/// record, so its `switch` event has no detail.
+#[test]
+fn a_failover_from_an_unread_account_records_no_cause() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let c = fx.add("c@x.co", "rt-c"); // live; never read
+    read(&fx.engine, &a, &reading(false, 10.0, 20.0));
+    read(&fx.engine, &b, &reading(false, 10.0, 50.0));
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::NoAction);
+    }
+    let (outcome, decision) = engine.tick(&sink).unwrap();
+    assert_eq!(outcome, TickOutcome::Switched);
+    assert!(
+        matches!(
+            decision,
+            Decision::Switch {
+                trigger: Trigger::Failover,
+                ..
+            }
+        ),
+        "{decision:?}"
+    );
+    let last = fx.engine.store().unwrap().events().unwrap().pop().unwrap();
+    assert_eq!(
+        (
+            last.kind.as_str(),
+            last.trigger.as_deref(),
+            last.from_id.as_ref(),
+            last.to_id.as_ref()
+        ),
+        ("switch", Some("failover"), Some(&c), Some(&a))
+    );
+    assert_eq!(last.detail, None);
+}
+
 #[test]
 fn every_candidate_exhausted_is_blocked_until_the_earliest_recovery() {
     let fx = Fx::new();
