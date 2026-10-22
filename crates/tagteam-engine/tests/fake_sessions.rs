@@ -8,22 +8,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::{FakeFx, LSTART, Recorded, record_json, record_reading, usage_window};
+use common::{FakeFx, Recorded, record_reading, usage_window};
 use serde_json::{Value, json};
 use tagteam_core::autoswitch::{AutoConfig, AutoStrategy, Decision, Trigger};
 use tagteam_core::{AccountId, Window, WindowKind};
 use tagteam_engine::auto::TickOutcome;
 use tagteam_engine::collect::{CollectMode, Collected};
 use tagteam_engine::refresh::{GateOutcome, OwnedBy};
-use tagteam_engine::session::SessionState;
+use tagteam_engine::session::{DamagedKind, SessionState};
+use tagteam_engine::store::SightingSource;
+use tagteam_engine::tokens::{LaunchId, LaunchPoll};
 use tagteam_engine::vault::SERVICE;
-use tagteam_fake::{FakePaths, credential_json};
+use tagteam_fake::{FakePaths, credential_json, session_record};
 use tagteam_provider::http::Method;
-use tagteam_provider::liveness::{FakeProcess, parse_lstart};
-use tagteam_provider::{Clock, IdentitySurface, LinksRecord, Provider, Seed};
+use tagteam_provider::liveness::FakeProcess;
+use tagteam_provider::{Clock, IdentitySurface, LinksRecord, Provider, Seed, session_record_path};
 
 /// The fixture clock's start, in seconds.
 const NOW_S: i64 = 1_790_000_000;
+/// FakeAgent's session start in its records, epoch seconds.
+const STARTED_S: i64 = 1_790_858_096;
 
 /// FakeAgent's fingerprint of `secret`'s generation (§2): its renew token's.
 fn fp(ffx: &FakeFx, secret: &[u8]) -> String {
@@ -75,28 +79,28 @@ fn fake_profile(ffx: &FakeFx, id: &AccountId, handle: &str, token: &str, renew: 
 }
 
 /// A FakeAgent session record for `pid` in FakeAgent's own records directory
-/// (`<profile>/procs`), as a `run` writes it, with `LSTART` as its `procStart`. The pid's
+/// (`<profile>/procs`), as a `run` writes it, with `STARTED_S` as its `since`. The pid's
 /// process is whatever `ffx.fx.process` says; an unknown pid is dead.
 /// (`Fx::plant_record` writes Claude Code's directory, so it does not fit.)
 fn plant_fake_record(ffx: &FakeFx, profile: &Path, pid: u32) {
     let dir = ffx.fake.session_records_dir(profile);
     fs::create_dir_all(&dir).unwrap();
     fs::write(
-        dir.join(format!("{pid}.json")),
-        record_json(pid, "interactive"),
+        session_record_path(&dir, pid, ffx.fake.session_record_ext()),
+        session_record(pid, STARTED_S, "s-1", "driver").to_string(),
     )
     .unwrap();
 }
 
 /// A FakeAgent session running in `profile`: its record in FakeAgent's own records directory,
-/// and its process alive, started exactly at the record's `procStart`.
+/// and its process alive, started exactly at the record's `since`.
 fn start_session(ffx: &FakeFx, profile: &Path) {
     plant_fake_record(ffx, profile, 4242);
     ffx.fx.process.set(
         4242,
         FakeProcess {
             exists: Some(true),
-            start_time_s: parse_lstart(LSTART),
+            start_time_s: Some(STARTED_S),
             ..FakeProcess::default()
         },
     );
@@ -204,6 +208,21 @@ fn fake_agent_session_state_comes_from_its_own_records() {
         state()
     );
 
+    // Nor is Claude Code's file name FakeAgent's: its own extension is `.rec`.
+    let foreign = procs.join("4242.json");
+    fs::create_dir_all(&procs).unwrap();
+    fs::write(
+        &foreign,
+        br#"{"pid": 4242, "procStart": "Thu Oct  1 12:34:56 2026"}"#,
+    )
+    .unwrap();
+    assert!(
+        matches!(state(), SessionState::Quiescent { .. }),
+        "not FakeAgent's file name: {:?}",
+        state()
+    );
+    fs::remove_file(&foreign).unwrap();
+
     plant_fake_record(&ffx, &profile, 4242);
     assert!(
         matches!(state(), SessionState::Owned { .. }),
@@ -224,7 +243,7 @@ fn fake_agent_session_state_comes_from_its_own_records() {
         4242,
         FakeProcess {
             exists: Some(true),
-            start_time_s: parse_lstart(LSTART).map(|s| s + 3_600),
+            start_time_s: Some(STARTED_S + 3_600),
             mentions_launch: Some(false),
             ..FakeProcess::default()
         },
@@ -234,7 +253,7 @@ fn fake_agent_session_state_comes_from_its_own_records() {
         "{:?}",
         state()
     );
-    fs::write(procs.join("7.json"), b"[1, 2").unwrap();
+    fs::write(procs.join("7.rec"), b"[1, 2").unwrap();
     let unreadable = state();
     assert!(
         matches!(unreadable, SessionState::Unreadable { .. }) && unreadable.owned(),
@@ -667,4 +686,147 @@ fn a_tick_never_targets_a_fakeagent_candidate_a_session_owns() {
         }
     );
     assert_eq!(ffx.fake_live_label().as_deref(), Some("carol@ws"));
+}
+
+#[test]
+fn a_live_keeper_file_owns_a_fake_agent_profile_whatever_its_role() {
+    // Review Focus 1 and 2: `procs/keeper.lock` sits beside the records and is never listed as
+    // one, and the lock owns the profile whatever its record's role says.
+    let ffx = FakeFx::new();
+    let (alice, _bob) = alice_and_bob(&ffx);
+    let row = ffx
+        .engine
+        .store()
+        .unwrap()
+        .account(&alice)
+        .unwrap()
+        .unwrap();
+    let state = || ffx.engine.session_state(ffx.fake.as_ref(), &row).unwrap();
+    let profile = ffx.fx.make_profile_for(ffx.fake.as_ref(), &alice);
+    let procs = ffx.fake.session_records_dir(&profile);
+    fs::create_dir_all(&procs).unwrap();
+    let lock = procs.join("keeper.lock");
+    fs::write(
+        &lock,
+        session_record(4343, STARTED_S, "s-k", "driver").to_string(),
+    )
+    .unwrap();
+    let running = |exists: bool| {
+        ffx.fx.process.set(
+            4343,
+            FakeProcess {
+                exists: Some(exists),
+                start_time_s: exists.then_some(STARTED_S),
+                ..FakeProcess::default()
+            },
+        );
+    };
+
+    running(true);
+    assert_eq!(
+        state(),
+        SessionState::Owned {
+            profile: profile.clone(),
+            session: false,
+            daemon: true,
+            damaged: vec![],
+        }
+    );
+    let err = ffx.engine.remove(&alice).unwrap_err();
+    assert_eq!(err.kind(), "session-owned", "{err}");
+    let text = err.to_string();
+    assert!(text.contains("a background supervisor"), "{text}");
+    assert!(
+        text.contains(&format!("delete '{}'", lock.display())),
+        "{text}"
+    );
+
+    running(false);
+    assert_eq!(
+        state(),
+        SessionState::Quiescent {
+            profile: profile.clone()
+        }
+    );
+
+    fs::write(&lock, b"{").unwrap();
+    let torn = state();
+    let SessionState::Unreadable { damaged, .. } = &torn else {
+        panic!("{torn:?}")
+    };
+    assert_eq!(damaged.len(), 1, "{damaged:?}");
+    assert_eq!(damaged[0].kind, DamagedKind::SupervisorLock);
+    assert_eq!(damaged[0].file, lock);
+}
+
+#[test]
+fn fake_agent_records_reach_the_token_report_s_readers() {
+    // Review Focus 3: the scan lists FakeAgent's records, and `observe_launch` and the
+    // statusline each read one by pid. A file name left at Claude Code's would drop its
+    // sightings without a word.
+    let ffx = FakeFx::new();
+    let fake = ffx.fake_provider();
+    let (alice, _bob) = alice_and_bob(&ffx);
+    let running = |pid: u32, ppid: Option<u32>| {
+        ffx.fx.process.set(
+            pid,
+            FakeProcess {
+                exists: Some(true),
+                start_time_s: Some(STARTED_S),
+                ppid,
+                ..FakeProcess::default()
+            },
+        );
+    };
+    let write = |dir: &Path, pid: u32, session: &str| {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            session_record_path(dir, pid, ffx.fake.session_record_ext()),
+            session_record(pid, STARTED_S, session, "driver").to_string(),
+        )
+        .unwrap();
+    };
+    let sightings = || ffx.engine.store().unwrap().sightings(&fake).unwrap();
+
+    // The scan.
+    let default_dir = ffx.fake.default_session_records_dir(&ffx.fx.env).unwrap();
+    write(&default_dir, 4242, "s-f");
+    running(4242, None);
+    assert_eq!(ffx.engine.sight_sessions(&fake).unwrap(), 1);
+    let rows = sightings();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].session_id, "s-f");
+    assert_eq!(rows[0].home, "");
+    assert_eq!(rows[0].started_at, STARTED_S * 1000);
+    assert_eq!(rows[0].source, SightingSource::Scan);
+
+    // The statusline, run under pid 4242.
+    running(std::process::id(), Some(4242));
+    ffx.engine
+        .statusline_sighting(&fake, "s-line", None)
+        .unwrap();
+    let line: Vec<_> = sightings()
+        .into_iter()
+        .filter(|r| r.source == SightingSource::Statusline)
+        .collect();
+    assert_eq!(line.len(), 1, "{line:?}");
+    assert_eq!(line[0].session_id, "s-line");
+    assert_eq!(line[0].started_at, STARTED_S * 1000);
+
+    // run's poll, for the child 777 in alice's profile.
+    let profile = ffx.fx.make_profile_for(ffx.fake.as_ref(), &alice);
+    write(&ffx.fake.session_records_dir(&profile), 777, "s-run");
+    running(777, None);
+    let id = LaunchId {
+        provider: fake.clone(),
+        account: alice.clone(),
+        started_at_ms: STARTED_S * 1000,
+    };
+    let mut state = LaunchPoll::default();
+    ffx.engine
+        .observe_launch(&id, &profile, 777, &mut state)
+        .unwrap();
+    let tenure = state.tenure.expect("the record names a tenure");
+    assert_eq!(tenure.session_id, "s-run");
+    assert_eq!(tenure.started_at, STARTED_S * 1000);
 }

@@ -12,7 +12,6 @@ use tagteam_provider::atomic::{
     ensure_private_dir, remove_target, write_atomic_private_with, write_atomic_with,
 };
 use tagteam_provider::http::{Http, HttpError, HttpRequest};
-use tagteam_provider::liveness::parse_session_record;
 use tagteam_provider::process::ProcessSpawner;
 use tagteam_provider::profile::{
     has_own_file, read_own_bytes, refuse_linked_credential, refuse_linked_file, remove_own_file,
@@ -825,11 +824,17 @@ impl Provider for FakeAgent {
     }
 
     fn parse_session_record(&self, bytes: &[u8]) -> Result<SessionRecord, String> {
-        parse_session_record(bytes)
+        shape::parse_session_record(bytes)
     }
 
     fn session_record_ext(&self) -> &'static str {
-        "json"
+        "rec"
+    }
+
+    /// The keeper's file, beside the records but never one of them: it owns the profile whatever
+    /// its record's role says.
+    fn supervisor_lock(&self, profile: &Path) -> Option<PathBuf> {
+        Some(self.session_records_dir(profile).join("keeper.lock"))
     }
 
     /// `<dir>/credential.json`, a plain file like the live one. FakeAgent keeps no item, so it

@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use serde_json::{Map, Value};
 use tagteam_core::Fingerprint;
-use tagteam_provider::{Identity, KindTraits, ProviderError};
+use tagteam_provider::{Identity, KindTraits, ProcStart, ProviderError, SessionRecord};
 
 /// Refreshable: carries a `renew` token.
 pub const KIND_TOKEN: &str = "fa_token";
@@ -168,6 +168,34 @@ pub(crate) fn import_credential(v: &Value) -> Result<Vec<u8>, ProviderError> {
         ));
     }
     Ok(bytes)
+}
+
+/// A FakeAgent session record, `procs/<pid>.rec`: `process.id`, `process.since` (epoch seconds),
+/// `session` and `role`. The role `keeper` marks its background keeper. A detail never quotes
+/// the bytes.
+pub(crate) fn parse_session_record(bytes: &[u8]) -> Result<SessionRecord, String> {
+    let v: Value = serde_json::from_slice(bytes).map_err(|_| "it is not JSON".to_owned())?;
+    let Value::Object(root) = v else {
+        return Err("it is not a JSON object".into());
+    };
+    let process = root.get("process");
+    let pid = process
+        .and_then(|p| p.get("id"))
+        .and_then(Value::as_i64)
+        .filter(|id| (1..=i64::from(i32::MAX)).contains(id))
+        .and_then(|id| u32::try_from(id).ok())
+        .ok_or_else(|| "its process id is missing or out of range".to_owned())?;
+    let since = process.and_then(|p| p.get("since")).and_then(Value::as_i64);
+    Ok(SessionRecord {
+        pid,
+        start: since.map_or(ProcStart::Unknown, ProcStart::EpochS),
+        started_at_ms: since.map(|s| s.saturating_mul(1000)),
+        session_id: root
+            .get("session")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        background: root.get("role").and_then(Value::as_str) == Some("keeper"),
+    })
 }
 
 #[cfg(test)]

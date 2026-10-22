@@ -46,6 +46,13 @@ pub fn identity_json(handle: &str, workspace: &str, uid: &str) -> Value {
     json!({"handle": handle, "workspace": workspace, "uid": uid})
 }
 
+/// A FakeAgent session record as a run writes it to `procs/<pid>.rec`:
+/// `{"process":{"id":pid,"since":since_s},"session":session,"role":role}`. The role `keeper`
+/// marks its background keeper.
+pub fn session_record(pid: u32, since_s: i64, session: &str, role: &str) -> Value {
+    json!({"process": {"id": pid, "since": since_s}, "session": session, "role": role})
+}
+
 /// What logging in to FakeAgent leaves behind: `identity.json` with the login and an
 /// unrelated `prefs` key, and the credential file at mode 0600. A test helper that panics on
 /// I/O failure.
