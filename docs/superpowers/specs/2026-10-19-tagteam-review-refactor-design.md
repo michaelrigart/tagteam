@@ -122,6 +122,12 @@ and the next provider arrive:
 |---|---|---|
 | D-4 | C-2 after R4c (#33): `tagteam switch` and a not-due `tagteam run` still name an unreadable rescue through `settle_rescues`' own wording, while a due `tagteam run` uses the classifier's file-naming text. Unify them? | **Leave both.** Both name the file; no §11 change |
 
+**Michael's ruling during R4 (2026-10-22, relayed by the coordinator session):**
+
+| # | Question | Ruling |
+|---|---|---|
+| D-5 | §8.11 item 4 skips the managed-key delete when the locked read finds the item absent, and that delete is the panic point of `switch_rollback.rs::a_panic_inside_a_live_write_keeps_the_journal_for_recovery`. May that test gain one setup line, planting a managed-key item, so item 4 keeps its panic point? | **Keep item 4, with the one setup line.** No assertion of that test changes |
+
 **Calls made while drafting** (Michael checks these at sign-off):
 
 | # | Call | Why |
@@ -1201,6 +1207,8 @@ Everything else stays byte-identical (§1.4). Each change gets a `CHANGELOG.md` 
   - §5.3's list;
   - mechanical signature changes (§6.2, §8.2);
   - held-file compile fixes (§3.4);
+  - the one setup line in `switch_rollback.rs`'s panic test that keeps §8.11 item 4's delete as
+    its panic point (D-5);
   - the new tests below.
 - **New tests:**
   - the neutrality test (§5.9), checked once against a planted leak;

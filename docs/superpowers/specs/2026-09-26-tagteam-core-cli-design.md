@@ -1271,6 +1271,10 @@ recovery (§9.6), the active-token refresh's live write (§7.5) and profile boot
     successor or a switch's target.
   - The machine-shared keys are taken from this read, so a CC write made since the earlier
     read is never lost.
+  - **Nothing to delete.** When that read finds the managed-key item already absent, clearing
+    it makes no delete and no existence probe: the item is as the delete would leave it, and
+    the operation's record of the entry is unchanged
+    ([review refactor §8.11](2026-10-19-tagteam-review-refactor-design.md)).
   - **A rollback's restore is stricter** (§9.4 step 10). It puts an entry back byte for byte,
     and only while nothing has written any of the entry's places since tagteam first changed
     them. A marking or any other write since leaves the whole entry as it is.

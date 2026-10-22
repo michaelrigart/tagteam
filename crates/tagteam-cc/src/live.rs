@@ -988,8 +988,9 @@ impl LiveStore {
     }
 
     /// Writing OAuth clears the managed key: the managed-key item is deleted (verified) and
-    /// `primaryApiKey` is dropped. `approved` is kept (B.10). The delete holds CC's
-    /// storage-write lock and refuses if the item moved (§9.1).
+    /// `primaryApiKey` is dropped. `approved` is kept (B.10). The item is deleted, and verified,
+    /// only when the read under CC's storage-write lock finds it; the delete holds that lock and
+    /// refuses if the item moved (§9.1).
     pub fn clear_managed_key(
         &self,
         env: &Env,
@@ -997,8 +998,14 @@ impl LiveStore {
         fence: Fence<'_>,
     ) -> Result<(), ProviderError> {
         if self.mac() {
-            self.under_storage_write(env, paths, ItemKind::ManagedKey, fence, |_, fence| {
-                self.remove_item(env, ItemKind::ManagedKey, fence)
+            self.under_storage_write(env, paths, ItemKind::ManagedKey, fence, |now, fence| {
+                // Core §9.1 ("Nothing to delete"), review refactor §8.11: the strict read under
+                // this hold found no item, so the item is as the delete would leave it and the
+                // operation's record of the entry is unchanged.
+                match now {
+                    None => Ok(()),
+                    Some(_) => self.remove_item(env, ItemKind::ManagedKey, fence),
+                }
             })?;
         }
         config::splice_key(&paths.global_config, "primaryApiKey", None, fence)?;
