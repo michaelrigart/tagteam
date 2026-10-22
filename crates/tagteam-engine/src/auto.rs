@@ -315,6 +315,19 @@ pub(crate) fn lock_file_name(id: &str, plain_prefix: &str, hashed_prefix: &str) 
 /// an engine named, never proof that it still holds the lock. `Absent` when
 /// there is no file, or an empty one: no engine has written its record there yet.
 pub(crate) fn read_holder(path: &Path) -> Read<ProcessStamp> {
+    read_lock_record(path, "it is not a pid and a start time", |stamp, _| {
+        Some(stamp)
+    })
+}
+
+/// A lock holder's record at `path` (§11.1, D4.1), read without trying the lock. `Absent`: no
+/// file, or an empty one. `Unreadable` with `shape` as its detail: not JSON, without a `u32`
+/// `pid` and a `u64` `start`, or refused by `fields`. An I/O failure keeps its own detail.
+pub(crate) fn read_lock_record<T>(
+    path: &Path,
+    shape: &'static str,
+    fields: impl FnOnce(ProcessStamp, &serde_json::Value) -> Option<T>,
+) -> Read<T> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Read::Absent,
@@ -326,17 +339,14 @@ pub(crate) fn read_holder(path: &Path) -> Read<ProcessStamp> {
         return Read::Absent;
     }
     let v: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
-    let pid = v
-        .as_ref()
-        .and_then(|v| v["pid"].as_u64())
-        .and_then(|p| u32::try_from(p).ok());
-    let start = v.as_ref().and_then(|v| v["start"].as_u64());
-    match (pid, start) {
-        (Some(pid), Some(start)) => Read::Present(ProcessStamp { pid, start }),
-        _ => Read::Unreadable(ReadError::new(
-            path.display().to_string(),
-            "it is not a pid and a start time",
-        )),
+    let record = v.as_ref().and_then(|v| {
+        let pid = u32::try_from(v["pid"].as_u64()?).ok()?;
+        let start = v["start"].as_u64()?;
+        fields(ProcessStamp { pid, start }, v)
+    });
+    match record {
+        Some(record) => Read::Present(record),
+        None => Read::Unreadable(ReadError::new(path.display().to_string(), shape)),
     }
 }
 
@@ -1182,6 +1192,27 @@ mod tests {
                 "{name}"
             );
             assert_eq!(name.len(), "engine-".len() + 12 + ".lock".len(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_holder_record_is_absent_present_or_unreadable_in_its_own_words() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("autoswitch-p.lock");
+        assert!(matches!(read_holder(&path), Read::Absent));
+        std::fs::write(&path, "").unwrap();
+        assert!(matches!(read_holder(&path), Read::Absent));
+        std::fs::write(&path, "{\"pid\":1,\"start\":2}\n").unwrap();
+        assert!(
+            matches!(read_holder(&path), Read::Present(s) if s == ProcessStamp { pid: 1, start: 2 })
+        );
+        for text in ["garbage", "{\"pid\":4294967296,\"start\":2}", "{\"pid\":1}"] {
+            std::fs::write(&path, text).unwrap();
+            assert!(
+                matches!(read_holder(&path), Read::Unreadable(e)
+                    if e.detail == "it is not a pid and a start time"),
+                "{text}"
+            );
         }
     }
 }

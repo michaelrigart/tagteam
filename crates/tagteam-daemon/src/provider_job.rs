@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tagteam_core::autoswitch::{
     AutoConfig, Decision, NoSwitchReason, Trigger, announces_sleep, next_delay,
 };
+use tagteam_core::poll::jittered;
 use tagteam_core::time::ms_to_s;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::auto::{AutoEngine, AutoEvent, EventSink, QuarantineWatch, TickOutcome};
@@ -100,12 +101,7 @@ fn collect_delay_s(
     earliest_next_poll_at: Option<i64>,
     jitter: f64,
 ) -> i64 {
-    let j = if jitter.is_finite() {
-        jitter.clamp(-1.0, 1.0)
-    } else {
-        0.0
-    };
-    let mut delay = (interval_s as f64 * (1.0 + j * JITTER_FRAC)).round() as i64;
+    let mut delay = jittered(interval_s, jitter, JITTER_FRAC);
     if let Some(at) = earliest_next_poll_at {
         delay = delay.min(at.saturating_sub(now));
     }
