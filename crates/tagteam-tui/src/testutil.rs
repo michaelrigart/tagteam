@@ -435,6 +435,8 @@ pub(crate) fn timeline_view(columns: usize, charts: Vec<Series>, lanes: Vec<Lane
         columns,
         charts,
         lanes,
+        events: vec![],
+        paused_at_start: false,
     }
 }
 
