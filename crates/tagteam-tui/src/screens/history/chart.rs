@@ -25,6 +25,11 @@ const FULL: &str = "█";
 /// The threshold's line, and tier 0's in its place (§4.2).
 const LINE: &str = "┈";
 const LINE_PLAIN: &str = "·";
+
+/// The threshold row's glyph as `theme`'s tier draws it (T4-9): help's legend shows the same.
+pub(crate) fn threshold_line(theme: Theme) -> &'static str {
+    if theme.colourless() { LINE_PLAIN } else { LINE }
+}
 /// The cursor through a chart's empty cells (§7.3).
 const CURSOR: &str = "│";
 /// One account's charts draw their line at 90 % (§7.3).
@@ -57,7 +62,7 @@ pub(crate) fn chart_rows(
         theme.role(Role::Faint),
         theme.role(Role::Accent),
     );
-    let line_glyph = if theme.colourless() { LINE_PLAIN } else { LINE };
+    let line_glyph = threshold_line(theme);
     (0..n)
         .rev()
         .map(|r| {

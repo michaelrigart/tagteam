@@ -18,7 +18,9 @@ use tagteam_engine::tokens::{
 use tagteam_engine::views::{HistoryView, ProviderAccounts, ShellAccount};
 use tagteam_provider::{Liveness, Read, RunShell, TransientKind};
 
-use crate::autoline;
+/// How far back the accounts read looks for each provider's last auto-line event (§5.3,
+/// §12.2): History's longest range, so `w` can always show it.
+pub(crate) const MONTH_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 /// A read that failed, in the CLI's own words (`kind` is the JSON `error.type`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,7 +125,7 @@ impl Source for EngineSource {
         let read_at_ms = engine.now_ms();
         let mut last_auto = Vec::new();
         for p in &providers {
-            let since_ms = read_at_ms - autoline::MONTH_MS;
+            let since_ms = read_at_ms - MONTH_MS;
             if let Some(e) = engine.last_auto_event(&p.provider, since_ms)? {
                 last_auto.push((p.provider.clone(), e));
             }

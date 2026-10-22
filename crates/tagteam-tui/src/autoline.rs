@@ -20,14 +20,13 @@ use crate::chrome::WIDE;
 use crate::daemon::words::{clock, iso_ms};
 use crate::daemon::{self, Noted, NotedWhat};
 use crate::screens::history::{list, marks};
+use crate::source::MONTH_MS;
 use crate::state::State;
 use crate::theme::Role;
 
-/// A stored event this recent leads the line (rank 1).
+/// A stored event this recent leads the line (rank 1); one within `MONTH_MS` still shows
+/// (rank 3).
 const RECENT_MS: i64 = 30 * 60 * 1000;
-/// A stored event this recent still shows (rank 3): History's longest range, and what the
-/// accounts read asks the store for.
-pub(crate) const MONTH_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// Rank 4's words.
 const NO_SWITCHES: &str = "no switches in the last 30 days";
 
@@ -677,12 +676,17 @@ mod tests {
             email: Some("f@x.co".into()),
             removed: false,
         });
-        snap.last_auto = vec![
-            (cc(), stored_switch("2026-09-21T14:11:20Z")),
-            (fake, refused),
-        ];
+        snap.last_auto = vec![(cc(), stored_switch("2026-09-21T14:11:20Z"))];
         let mut state = fresh(Screen::Accounts);
-        state.accounts.apply(snap);
+        state.accounts.apply(snap.clone());
+        let jobs = vec![auto_on(), daemon_job("fake-agent", "auto", true)];
+        go_live(&mut state, daemon_status(jobs, vec![]));
+        let fake_said = auto_of(
+            "fake-agent",
+            "no-switch",
+            json!({"reason": "no-active-account", "detail": ""}),
+        );
+        update(&mut state, fake_said, NOW_MS);
         assert_eq!(
             line(&state, 80),
             hinted(&format!(" ⇄ 14:11  {SWITCHED}"), 80)
@@ -692,8 +696,56 @@ mod tests {
         }
         assert_eq!(
             line(&state, 80),
+            hinted("   14:13  FakeAgent isn't logged in", 80),
+            "the fake account's provider's own decision, in its own name"
+        );
+        snap.last_auto.push((fake, refused));
+        state.accounts.apply(snap);
+        assert_eq!(
+            line(&state, 80),
             hinted(&format!(" ✕ 14:12  1 f {}", words::NEEDS_LOGIN), 80),
-            "the fake account's provider's stored event"
+            "the fake account's provider's stored event, of the last 30 minutes"
+        );
+    }
+
+    #[test]
+    fn the_ranks_hold_at_exactly_30_minutes_and_30_days() {
+        // Rank 1 to 30 minutes old inclusive, rank 3 to 30 days old inclusive (§5.3).
+        let shown = |age_ms: i64| {
+            let mut state = timer();
+            let mut e = stored_switch("2026-09-21T14:11:20Z");
+            e.at_ms = NOW_MS - age_ms;
+            store(&mut state, e);
+            let said = said(&state, 80, NOW_MS).unwrap();
+            (said.when.is_some(), said.lead.is_some(), said.muted)
+        };
+        let (minutes, days) = (RECENT_MS, MONTH_MS);
+        assert_eq!(shown(minutes), (true, false, false), "rank 1 at 30 minutes");
+        assert_eq!(
+            shown(minutes + 1),
+            (false, true, false),
+            "rank 3 just past it"
+        );
+        assert_eq!(shown(days), (false, true, false), "rank 3 at 30 days");
+        assert_eq!(shown(days + 1), (false, false, true), "rank 4 just past it");
+    }
+
+    #[test]
+    fn next_check_stays_whole_and_the_sentence_is_cut_first() {
+        // At 120 columns, live with auto on: `· next check HH:MM` is never cut before the
+        // sentence; the hint stays.
+        let mut job = auto_on();
+        job.next_tick_at = Some("2026-09-21T14:16:00Z".into());
+        let mut state = live_with(job);
+        let long = json!({"message": "x".repeat(300)});
+        update(&mut state, auto("error", long), NOW_MS);
+        // 120 − 5 − 3 − 1 = 111 columns: ` ! 14:13  ` (10), the cut sentence, then the 19 of
+        // ` · next check 14:16`.
+        let cut = crate::view::fit(&format!("{}…", "x".repeat(300)), 111 - 10 - 19);
+        assert!(cut.ends_with('…'), "{cut}");
+        assert_eq!(
+            line(&state, 120),
+            format!(" ! 14:13  {cut} · next check 14:16   {HINT}")
         );
     }
 

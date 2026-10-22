@@ -82,9 +82,10 @@ pub(crate) fn header(state: &State, width: u16) -> Line<'static> {
 
 /// The auto line (§5.3): ` {mark} {when}  {text}`, with no `when` ` {mark} {text}`, then
 /// ` · next check HH:MM`; the mark in its role, the time, rank 3's `last switch … · ` and the
-/// suffix muted. On the right, ending one column in, `w why`, `w` accent: never cut, it is
-/// dropped only when it would leave the rest under `lead::LEFT_LEAST` columns (T3-19's rule),
-/// and the rest is cut to the room it leaves. Empty before the first snapshot: the row stays.
+/// suffix muted. On the right, ending one column in, `w why`, `w` accent. What gives way, in
+/// order: the sentence is cut; then the hint goes, when it would leave the rest under
+/// `lead::LEFT_LEAST` columns (T3-19's rule); then `next check`, which is never cut. Empty
+/// before the first snapshot: the row stays.
 pub(crate) fn auto_line(state: &State, width: u16, now_ms: i64) -> Line<'static> {
     let theme = state.theme;
     let Some(said) = autoline::said(state, width, now_ms) else {
@@ -103,11 +104,23 @@ pub(crate) fn auto_line(state: &State, width: u16, now_ms: i64) -> Line<'static>
     if let Some(lead) = said.lead {
         spans.push(Span::styled(lead, theme.role(Role::Muted)));
     }
+    // The sentence needs room for at least its `…` beside `next check`.
+    let least = spans_width(&spans) + 1;
     let text = if said.muted { Role::Muted } else { Role::Text };
     spans.push(Span::styled(said.text, theme.role(text)));
-    if let Some(next) = said.next {
-        spans.push(Span::styled(format!(" · {next}"), theme.role(Role::Muted)));
-    }
+    let next = said
+        .next
+        .map(|next| Span::styled(format!(" · {next}"), theme.role(Role::Muted)));
+    let next_w = next.as_ref().map_or(0, |n| width_of(&n.content));
+    let keeps_next = |room: usize| next.is_none() || least + next_w <= room;
+    let left = |room: usize| match &next {
+        Some(next) if keeps_next(room) => {
+            let mut left = fit_spans(spans.clone(), room - next_w);
+            left.push(next.clone());
+            left
+        }
+        _ => fit_spans(spans.clone(), room),
+    };
     let width = usize::from(width);
     let hint = vec![
         Span::styled("w", theme.role(Role::Accent)),
@@ -116,11 +129,11 @@ pub(crate) fn auto_line(state: &State, width: u16, now_ms: i64) -> Line<'static>
     let hint_w = spans_width(&hint);
     let Some(room) = width
         .checked_sub(hint_w + lead::PICK_GAP + keys::RIGHT_INSET)
-        .filter(|&room| room >= lead::LEFT_LEAST)
+        .filter(|&room| room >= lead::LEFT_LEAST && keeps_next(room))
     else {
-        return Line::from(fit_spans(spans, width));
+        return Line::from(left(width));
     };
-    let mut spans = fit_spans(spans, room);
+    let mut spans = left(room);
     let gap = width - keys::RIGHT_INSET - hint_w - spans_width(&spans);
     spans.push(Span::raw(" ".repeat(gap)));
     spans.extend(hint);
