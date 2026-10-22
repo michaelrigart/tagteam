@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use serde_json::{Value, json};
 use tagteam_core::autoswitch::{
     AccountSnapshot, AutoConfig, AutoState, AutoStrategy, Decision, Live, NoSwitchReason, Outcome,
     Phase, Snapshot, Trigger, decide, departure,
@@ -21,6 +22,7 @@ use tagteam_provider::{Env, FlockGuard, LockError, ProcessStamp, Provider, Read,
 use crate::collect::{CollectMode, CollectReport};
 use crate::engine::{Engine, GuardRequest};
 use crate::error::EngineError;
+use crate::event::{AUTO_LINE_KINDS, EventKind};
 use crate::store::{AccountRow, Store, backoff_holds};
 use crate::switch::{
     AutoFreshened, AutoPerform, FreshenFailure, SwitchCause, SwitchReason, SwitchRequest,
@@ -261,6 +263,9 @@ pub struct AutoEngine<'e> {
     judged: Option<AccountId>,
     /// The managed live account as the last tick left it.
     live: Option<AccountId>,
+    /// T4-24: whether this engine's previous decision was an announced `all-exhausted`;
+    /// `None` before its first.
+    exhausted: Option<bool>,
 }
 
 /// Replaces the held engine lock file's whole content with this process's pid and start time,
@@ -373,6 +378,7 @@ impl Engine {
             checked_strategy: None,
             judged: None,
             live: None,
+            exhausted: None,
         }))
     }
 
@@ -390,6 +396,9 @@ impl Engine {
 fn fatal(e: &EngineError) -> bool {
     e.signal().is_some() || matches!(e, EngineError::Store(_))
 }
+
+/// T4-24: how long a `switch-failed` keeps the same target and message from being written again.
+const FAILED_SWITCH_QUIET_MS: i64 = 30 * 60_000;
 
 /// An error a retry at the next tick may clear by itself.
 fn transient(e: &EngineError) -> bool {
@@ -424,11 +433,23 @@ impl AutoEngine<'_> {
     /// the caller's next cancellation point. Every tick ends with `sink.tick_done`.
     pub fn tick(&mut self, sink: &dyn EventSink) -> Result<(TickOutcome, Decision), EngineError> {
         let ticked = match self.run(sink) {
+            Ok(done) => {
+                // T4-24: every decision sets it, a switch's included; a tick that failed before
+                // deciding leaves it.
+                self.exhausted = Some(matches!(
+                    done.1,
+                    Decision::NoSwitch {
+                        reason: NoSwitchReason::AllExhausted,
+                        ..
+                    }
+                ));
+                Ok(done)
+            }
             Err(e) if !fatal(&e) => {
                 self.error(sink, e.to_string(), transient(&e));
                 Ok((TickOutcome::Error, undecided(e.to_string())))
             }
-            done => done,
+            Err(e) => Err(e),
         };
         sink.tick_done(&self.provider);
         ticked
@@ -481,11 +502,7 @@ impl AutoEngine<'_> {
             .report(&self.provider, &rows, &released, sink);
         // Step 2: recovery first, then the live check.
         if let Some(refusal) = self.recover()? {
-            return Ok(self.no_switch(
-                sink,
-                NoSwitchReason::InterruptedSwitch,
-                refusal.to_string(),
-            ));
+            return self.no_switch(sink, NoSwitchReason::InterruptedSwitch, refusal.to_string());
         }
         let live = match self.engine.read_live_identity(p)? {
             None => None,
@@ -495,18 +512,18 @@ impl AutoEngine<'_> {
                     Some(row) => Some(row.clone()),
                     None => {
                         self.live = None;
-                        return Ok(self.no_switch(
+                        return self.no_switch(
                             sink,
                             NoSwitchReason::UnmanagedActiveAccount,
                             String::new(),
-                        ));
+                        );
                     }
                 }
             }
         };
         let (Some(store), Some(live)) = (store, live) else {
             self.live = None;
-            return Ok(self.no_switch(sink, NoSwitchReason::NoActiveAccount, String::new()));
+            return self.no_switch(sink, NoSwitchReason::NoActiveAccount, String::new());
         };
         self.live = Some(live.id.clone());
         // Step 3.
@@ -558,7 +575,7 @@ impl AutoEngine<'_> {
             } => self.perform(p, &ticked, trigger, targets, &decided.decision, sink),
             decision => {
                 self.count(&ticked)?;
-                self.announce(sink, &decision);
+                self.announce(sink, &decision)?;
                 Ok((TickOutcome::of(&decision), decision))
             }
         }
@@ -646,7 +663,7 @@ impl AutoEngine<'_> {
                     SwitchReason::Cooldown => {
                         self.count(t)?;
                         let left = self.cooldown_left(t.store)?;
-                        return Ok(self.no_switch(sink, NoSwitchReason::Cooldown, left));
+                        return self.no_switch(sink, NoSwitchReason::Cooldown, left);
                     }
                     SwitchReason::LiveChanged => {
                         // The count belonged to the account this tick judged, which is no
@@ -654,11 +671,7 @@ impl AutoEngine<'_> {
                         if t.stored != 0 {
                             t.store.set_unhealthy_ticks(&self.provider, 0)?;
                         }
-                        return Ok(self.no_switch(
-                            sink,
-                            NoSwitchReason::LiveChanged,
-                            String::new(),
-                        ));
+                        return self.no_switch(sink, NoSwitchReason::LiveChanged, String::new());
                     }
                     // No other no-op answers a direct switch to an account other than the live
                     // one; should one ever, it is reported, never taken for a switch.
@@ -684,6 +697,7 @@ impl AutoEngine<'_> {
                 }
                 Err(e) => {
                     self.count(t)?;
+                    self.switch_failed(&t.live.id, id, &e)?;
                     self.error(
                         sink,
                         format!(
@@ -706,7 +720,7 @@ impl AutoEngine<'_> {
             );
             return Ok((TickOutcome::Error, decision.clone()));
         }
-        Ok(self.no_switch(sink, NoSwitchReason::NoViableTarget, String::new()))
+        self.no_switch(sink, NoSwitchReason::NoViableTarget, String::new())
     }
 
     /// §11.2 step 2: an unresolved switch journal for the provider is recovered first, under
@@ -959,19 +973,20 @@ impl AutoEngine<'_> {
         sink: &dyn EventSink,
         reason: NoSwitchReason,
         detail: String,
-    ) -> (TickOutcome, Decision) {
+    ) -> Result<(TickOutcome, Decision), EngineError> {
         let decision = Decision::NoSwitch {
             reason,
             outcome: reason.outcome(),
             detail,
             earliest_reset: None,
         };
-        self.announce(sink, &decision);
-        (TickOutcome::of(&decision), decision)
+        self.announce(sink, &decision)?;
+        Ok((TickOutcome::of(&decision), decision))
     }
 
-    /// `no-switch`, then `all-exhausted` with its earliest recovery when that is the reason.
-    fn announce(&self, sink: &dyn EventSink, decision: &Decision) {
+    /// `no-switch`, then `all-exhausted` with its earliest recovery when that is the reason,
+    /// stored when it begins an episode (T4-24).
+    fn announce(&self, sink: &dyn EventSink, decision: &Decision) -> Result<(), EngineError> {
         let Decision::NoSwitch {
             reason,
             detail,
@@ -979,7 +994,7 @@ impl AutoEngine<'_> {
             ..
         } = decision
         else {
-            return;
+            return Ok(());
         };
         self.emit(sink, |provider| AutoEvent::NoSwitch {
             provider,
@@ -991,7 +1006,74 @@ impl AutoEngine<'_> {
                 provider,
                 earliest_reset_at: *earliest_reset,
             });
+            self.all_exhausted(*earliest_reset)?;
         }
+        Ok(())
+    }
+
+    /// T4-24: `all-exhausted` when this engine's previous decision was not one. An engine's
+    /// first decision has none, so it writes unless the provider's latest auto-line event is an
+    /// `all-exhausted` with the same earliest recovery. Dry-run writes nothing.
+    fn all_exhausted(&self, earliest_reset: Option<i64>) -> Result<(), EngineError> {
+        if self.dry_run || self.exhausted == Some(true) {
+            return Ok(());
+        }
+        let detail = json!({"earliest_reset_at": earliest_reset});
+        if self.exhausted.is_none() {
+            let latest =
+                self.engine
+                    .store()?
+                    .latest_event(&self.provider, &AUTO_LINE_KINDS, None, None)?;
+            if latest.is_some_and(|e| {
+                e.kind == EventKind::AllExhausted
+                    && e.detail.as_ref().and_then(|d| d.get("earliest_reset_at"))
+                        == detail.get("earliest_reset_at")
+            }) {
+                return Ok(());
+            }
+        }
+        self.engine.event(
+            &self.provider,
+            EventKind::AllExhausted,
+            self.live.as_ref(),
+            None,
+            Some(detail),
+        )
+    }
+
+    /// T4-24: `switch-failed` from `live` to `target`, unless the provider's latest one of the
+    /// last 30 minutes names the same target and message.
+    fn switch_failed(
+        &self,
+        live: &AccountId,
+        target: &AccountId,
+        e: &EngineError,
+    ) -> Result<(), EngineError> {
+        let message = e.to_string();
+        let since = self.engine.now_ms() - FAILED_SWITCH_QUIET_MS;
+        let latest = self.engine.store()?.latest_event(
+            &self.provider,
+            &[EventKind::SwitchFailed],
+            Some(since),
+            None,
+        )?;
+        if latest.is_some_and(|l| {
+            l.to_id.as_ref() == Some(target)
+                && l.detail
+                    .as_ref()
+                    .and_then(|d| d.get("message"))
+                    .and_then(Value::as_str)
+                    == Some(message.as_str())
+        }) {
+            return Ok(());
+        }
+        self.engine.event(
+            &self.provider,
+            EventKind::SwitchFailed,
+            Some(live),
+            Some(target),
+            Some(json!({"message": message, "transient": transient(e)})),
+        )
     }
 }
 
