@@ -125,6 +125,7 @@ fn name_of(
 /// One stored event as History shows it (§12.3), its accounts resolved at read time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventView {
+    /// The stored time; its column is `grid.column_of(grid.placed(at_ms))`.
     pub at_ms: i64,
     pub kind: EventKind,
     pub source: EventSource,
@@ -395,10 +396,10 @@ impl Engine {
         for e in store.events_since(provider, grid.since_ms)? {
             // As in-use changes are: a row later in the current second is placed at now, one
             // from the next second on is left for the next read.
-            let at_ms = grid.placed(e.at);
-            if !keeps(&e) || at_ms > grid.now_ms {
+            if !keeps(&e) || grid.placed(e.at) > grid.now_ms {
                 continue;
             }
+            let at_ms = e.at;
             let switch = matches!(e.kind, EventKind::Switch | EventKind::SwitchRecovered);
             let (from_id, to_id) = (e.from_id.clone(), e.to_id.clone());
             let mut event = EventView::of(e, at_ms, &mut name)?;
