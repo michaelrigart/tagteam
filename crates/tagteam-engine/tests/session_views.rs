@@ -8,10 +8,11 @@ use std::path::Path;
 
 use common::{FakeFx, Fx, LSTART};
 use serde_json::json;
+use tagteam_cc::records::parse_lstart;
 use tagteam_core::AccountId;
 use tagteam_engine::Engine;
 use tagteam_engine::views::{AccountView, ShellAccount, StatusView, StatuslineView};
-use tagteam_provider::{FakeProcess, MARKER_FILE, Provider, parse_lstart};
+use tagteam_provider::{FakeProcess, MARKER_FILE, Provider};
 
 /// `id`'s row as `engine`'s list shows it.
 fn listed(engine: &Engine, id: &AccountId) -> AccountView {

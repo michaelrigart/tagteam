@@ -18,8 +18,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
+use tagteam_cc::records::{CcRecord, parse_cc_record};
 use tagteam_provider::Cancel;
-use tagteam_provider::liveness::{CcRecord, parse_cc_record};
 use tagteam_provider::term::{self, ByteRead, Readiness};
 
 use super::ctx::Ctx;

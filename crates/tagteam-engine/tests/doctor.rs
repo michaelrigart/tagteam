@@ -1466,7 +1466,7 @@ fn live_supervisor(fx: &Fx, dir: &Path, pid: u32) {
         pid,
         FakeProcess {
             exists: Some(true),
-            start_time_s: tagteam_provider::parse_lstart(LSTART),
+            start_time_s: tagteam_cc::records::parse_lstart(LSTART),
             ..FakeProcess::default()
         },
     );
@@ -1737,7 +1737,7 @@ fn a_live_background_daemon_supervisor_in_a_profile_is_information_naming_how_to
         4343,
         FakeProcess {
             exists: Some(true),
-            start_time_s: tagteam_provider::parse_lstart(LSTART),
+            start_time_s: tagteam_cc::records::parse_lstart(LSTART),
             ..FakeProcess::default()
         },
     );

@@ -1656,7 +1656,7 @@ fn an_automatic_switch_to_a_target_a_daemon_or_an_unreadable_lock_holds_says_so(
         4343,
         tagteam_provider::liveness::FakeProcess {
             exists: Some(true),
-            start_time_s: tagteam_provider::parse_lstart(common::LSTART),
+            start_time_s: tagteam_cc::records::parse_lstart(common::LSTART),
             ..Default::default()
         },
     );

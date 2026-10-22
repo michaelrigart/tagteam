@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::{LiveStore, Platform};
+use tagteam_cc::records::parse_lstart;
 use tagteam_cc::shape::compose;
 use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Window, WindowKind};
@@ -31,7 +32,7 @@ use tagteam_engine::{Engine, EngineConfig, EngineError, EventSource};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::http::Method;
 use tagteam_provider::keychain::Keychain;
-use tagteam_provider::liveness::{FakeProcess, FakeProcessProbe, ProcessProbe, parse_lstart};
+use tagteam_provider::liveness::{FakeProcess, FakeProcessProbe, ProcessProbe};
 use tagteam_provider::process::{Captured, ProcessSpawner, ScriptedSpawner};
 use tagteam_provider::profile::{
     LAUNCH_DIR, ProfileMarker, RunShell, Seed, canonical_profile_path, profile_path,
