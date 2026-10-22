@@ -12,8 +12,8 @@ use tagteam_cc::ItemKind;
 use tagteam_cc::locks::{STORAGE_WRITE_STALE, acquire_storage_write};
 use tagteam_provider::atomic::write_atomic_private;
 use tagteam_provider::{
-    Cancel, MkdirLock, MkdirLockSpec, Read, SystemProcessProbe, read_supervisor_lock,
-    record_is_live,
+    Cancel, MkdirLock, MkdirLockSpec, Read, SystemProcessProbe, parse_session_record,
+    read_supervisor_lock, record_is_live,
 };
 
 use super::{changes, new_record, read_json, records, snapshot};
@@ -669,7 +669,7 @@ pub fn session_records(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
         let (mut supervisor, mut workers, mut kinds) = (false, false, Vec::new());
         wait_until(Duration::from_secs(60), || {
             supervisor = matches!(
-                read_supervisor_lock(&home.join("daemon.lock")),
+                read_supervisor_lock(&home.join("daemon.lock"), &parse_session_record),
                 Read::Present(r) if record_is_live(&SystemProcessProbe, &r, "claude")
             );
             let live: Vec<_> = records(&sessions)
@@ -744,7 +744,7 @@ pub fn session_records(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
         p.expect(
             "--bg: daemon.lock is gone or names a dead process",
             !matches!(
-                read_supervisor_lock(&home.join("daemon.lock")),
+                read_supervisor_lock(&home.join("daemon.lock"), &parse_session_record),
                 Read::Present(r) if record_is_live(&SystemProcessProbe, &r, "claude")
             ),
             json!(null),

@@ -109,8 +109,8 @@ pub enum ProcStart {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum RecordEntry {
-    Record(SessionRecord),
+pub enum RecordEntry<R = SessionRecord> {
+    Record(R),
     /// Present but not a readable record (§12.6: it counts as unreadable). `detail` never
     /// quotes the file's bytes.
     Unreadable {
@@ -119,25 +119,19 @@ pub enum RecordEntry {
     },
 }
 
-/// Every `*.json` in `dir`, in name order. A missing `dir` is `Present(vec![])`, and so is one
-/// that is not a directory, or under a profile path that is not one (`ENOTDIR`): no record can
-/// be written there. A `dir` that cannot be listed is `Unreadable`. A record that vanishes between the listing and its read
-/// has been removed by its session's exit, so it is skipped.
-pub fn read_session_records(dir: &Path) -> Read<Vec<RecordEntry>> {
-    match read_session_records_dated(dir, &mut || 0) {
-        Read::Present(entries) => Read::Present(entries.into_iter().map(|(e, _)| e).collect()),
-        Read::Absent => Read::Absent,
-        Read::Unreadable(e) => Read::Unreadable(e),
-    }
-}
-
-/// `read_session_records`, each entry with the time `clock` gives right after its file was
-/// read, before it is parsed and before the next one is read: what dates a sighting (token
-/// report spec §6.4). `clock` is asked once for each file read.
-pub fn read_session_records_dated(
+/// Every `<dir>/*.<ext>` in name order, each parsed by `parse` and dated by `clock` right after
+/// its read, before it is parsed and before the next read: what dates a sighting (token report
+/// spec §6.4). `clock` is asked once for each file read. A missing `dir` is `Present(vec![])`,
+/// and so is one that is not a directory, or under a profile path that is not one (`ENOTDIR`):
+/// no record can be written there. A `dir` that cannot be listed is `Unreadable`. A record that
+/// vanishes between the listing and its read has been removed by its session's exit, so it is
+/// skipped.
+pub fn read_session_records<R>(
     dir: &Path,
+    ext: &str,
+    parse: &dyn Fn(&[u8]) -> Result<R, String>,
     clock: &mut dyn FnMut() -> i64,
-) -> Read<Vec<(RecordEntry, i64)>> {
+) -> Read<Vec<(RecordEntry<R>, i64)>> {
     let unreadable =
         |e: io::Error| Read::Unreadable(ReadError::new(dir.display().to_string(), e.to_string()));
     // Nothing that is not a directory, the profile's own path included, holds a record.
@@ -158,7 +152,7 @@ pub fn read_session_records_dated(
         match entry {
             Ok(e) => {
                 let path = e.path();
-                if path.extension().is_some_and(|x| x == "json") {
+                if path.extension().is_some_and(|x| x == ext) {
                     paths.push(path);
                 }
             }
@@ -172,7 +166,7 @@ pub fn read_session_records_dated(
         let read = fs::read(&path);
         let at = clock();
         let entry = match read {
-            Ok(bytes) => match parse_session_record(&bytes) {
+            Ok(bytes) => match parse(&bytes) {
                 Ok(r) => RecordEntry::Record(r),
                 Err(detail) => RecordEntry::Unreadable { path, detail },
             },
@@ -187,16 +181,22 @@ pub fn read_session_records_dated(
     Read::Present(out)
 }
 
+/// `<dir>/<pid>.<ext>`.
+pub fn session_record_path(dir: &Path, pid: u32, ext: &str) -> PathBuf {
+    dir.join(format!("{pid}.{ext}"))
+}
+
 /// A background supervisor's lock file (CC 2.1.292: `<profile>/daemon.lock`, JSON with at least
-/// `pid`, `origin` and `procStart`), read as a session record is (§12.6): the supervisor's `pid`
-/// and `procStart` are what liveness needs. A missing file, or one under a profile path that is
-/// not a directory, is `Absent`; one that cannot be read or parsed is `Unreadable`, and counts
-/// as owned like an unreadable record. `detail` never quotes the file's bytes.
-pub fn read_supervisor_lock(path: &Path) -> Read<SessionRecord> {
+/// `pid`, `origin` and `procStart`), read with `parse` as a session record is (§12.6): the
+/// supervisor's `pid` and start are what liveness needs. A missing file, or one under a profile
+/// path that is not a directory, is `Absent`; one that cannot be read or parsed is
+/// `Unreadable`, and counts as owned like an unreadable record. `detail` never quotes the
+/// file's bytes.
+pub fn read_supervisor_lock<R>(path: &Path, parse: &dyn Fn(&[u8]) -> Result<R, String>) -> Read<R> {
     let unreadable =
         |detail: String| Read::Unreadable(ReadError::new(path.display().to_string(), detail));
     match fs::read(path) {
-        Ok(bytes) => match parse_session_record(&bytes) {
+        Ok(bytes) => match parse(&bytes) {
             Ok(r) => Read::Present(r),
             Err(detail) => unreadable(detail),
         },
@@ -725,33 +725,54 @@ mod tests {
         );
     }
 
+    /// A test-local record format: UTF-8 decimal text, a pid above 0.
+    fn pid_text(bytes: &[u8]) -> Result<u32, String> {
+        let text = std::str::from_utf8(bytes).map_err(|_| "not text".to_string())?;
+        match text.parse::<u32>() {
+            Ok(pid) if pid > 0 => Ok(pid),
+            _ => Err("not a pid".to_string()),
+        }
+    }
+
     #[test]
     fn records_are_listed_in_name_order_and_a_malformed_one_is_unreadable() {
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("sessions");
         assert!(
-            matches!(read_session_records(&dir), Read::Present(v) if v.is_empty()),
+            matches!(
+                read_session_records(&dir, "rec", &pid_text, &mut || 0),
+                Read::Present(v) if v.is_empty()
+            ),
             "a missing directory holds no records"
         );
         fs::create_dir(&dir).unwrap();
-        fs::write(dir.join("20.json"), br#"{"pid": 20}"#).unwrap();
-        fs::write(dir.join("10.json"), br#"{"pid": 10}"#).unwrap();
-        fs::write(dir.join("30.json"), b"{").unwrap();
+        fs::write(dir.join("20.rec"), b"20").unwrap();
+        fs::write(dir.join("10.rec"), b"10").unwrap();
+        fs::write(dir.join("30.rec"), b"{").unwrap();
         fs::write(dir.join("notes.txt"), b"not a record").unwrap();
-        fs::create_dir(dir.join("40.json")).unwrap();
-        let Read::Present(entries) = read_session_records(&dir) else {
+        fs::write(dir.join("50.json"), b"50").unwrap();
+        fs::write(dir.join("keeper.lock"), b"60").unwrap();
+        fs::create_dir(dir.join("40.rec")).unwrap();
+        let Read::Present(entries) = read_session_records(&dir, "rec", &pid_text, &mut || 0) else {
             panic!("the directory lists");
         };
-        let pid = |p| RecordEntry::Record(record(json!({"pid": p})).unwrap());
-        assert_eq!(entries[..2], [pid(10), pid(20)]);
-        assert!(
-            matches!(&entries[2], RecordEntry::Unreadable { path, .. } if path == &dir.join("30.json"))
+        let entries: Vec<RecordEntry<u32>> = entries.into_iter().map(|(e, _)| e).collect();
+        assert_eq!(
+            entries[..2],
+            [RecordEntry::Record(10), RecordEntry::Record(20)]
         );
         assert!(
-            matches!(&entries[3], RecordEntry::Unreadable { path, .. } if path == &dir.join("40.json")),
+            matches!(&entries[2], RecordEntry::Unreadable { path, .. } if path == &dir.join("30.rec"))
+        );
+        assert!(
+            matches!(&entries[3], RecordEntry::Unreadable { path, .. } if path == &dir.join("40.rec")),
             "a directory named like a record cannot be read"
         );
-        assert_eq!(entries.len(), 4, "notes.txt is not a record");
+        assert_eq!(
+            entries.len(),
+            4,
+            "notes.txt, 50.json and keeper.lock are not records"
+        );
     }
 
     #[test]
@@ -762,24 +783,25 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("sessions");
         fs::create_dir(&dir).unwrap();
-        fs::write(dir.join("20.json"), br#"{"pid": 20}"#).unwrap();
-        fs::write(dir.join("10.json"), br#"{"pid": 10}"#).unwrap();
-        fs::write(dir.join("30.json"), b"{").unwrap();
+        fs::write(dir.join("20.rec"), b"20").unwrap();
+        fs::write(dir.join("10.rec"), b"10").unwrap();
+        fs::write(dir.join("30.rec"), b"{").unwrap();
         fs::write(dir.join("notes.txt"), b"not a record").unwrap();
         let mut calls = 0;
         let mut clock = || {
             calls += 1;
             calls * 1_000
         };
-        let Read::Present(entries) = read_session_records_dated(&dir, &mut clock) else {
+        let Read::Present(entries) = read_session_records(&dir, "rec", &pid_text, &mut clock)
+        else {
             panic!("the directory lists");
         };
         let dates: Vec<i64> = entries.iter().map(|(_, at)| *at).collect();
         assert_eq!(dates, [1_000, 2_000, 3_000]);
-        let pid = |p| RecordEntry::Record(record(json!({"pid": p})).unwrap());
-        assert_eq!(entries[0].0, pid(10));
-        assert_eq!(entries[1].0, pid(20));
+        assert_eq!(entries[0].0, RecordEntry::Record(10));
+        assert_eq!(entries[1].0, RecordEntry::Record(20));
         assert!(matches!(&entries[2].0, RecordEntry::Unreadable { .. }));
+        assert_eq!(calls, 3, "only the three record files are dated");
     }
 
     #[test]
@@ -789,7 +811,7 @@ mod tests {
         let dir = d.path().join("sessions");
         fs::create_dir(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
-        let found = read_session_records(&dir);
+        let found = read_session_records(&dir, "rec", &pid_text, &mut || 0);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(found, Read::Unreadable(_)), "{found:?}");
     }
@@ -801,9 +823,12 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let file = d.path().join("sessions");
         fs::write(&file, b"").unwrap();
-        assert!(matches!(read_session_records(&file), Read::Present(v) if v.is_empty()));
         assert!(matches!(
-            read_session_records(&file.join("sessions")),
+            read_session_records(&file, "rec", &pid_text, &mut || 0),
+            Read::Present(v) if v.is_empty()
+        ));
+        assert!(matches!(
+            read_session_records(&file.join("sessions"), "rec", &pid_text, &mut || 0),
             Read::Present(v) if v.is_empty()
         ));
     }
@@ -811,42 +836,34 @@ mod tests {
     #[test]
     fn a_supervisor_lock_is_read_as_a_record_and_absent_or_unreadable_otherwise() {
         let d = tempfile::tempdir().unwrap();
-        let lock = d.path().join("daemon.lock");
-        assert!(matches!(read_supervisor_lock(&lock), Read::Absent));
+        let lock = d.path().join("keeper.lock");
+        assert!(matches!(
+            read_supervisor_lock(&lock, &pid_text),
+            Read::Absent
+        ));
         assert!(
             matches!(
-                read_supervisor_lock(&d.path().join("no-such-dir/daemon.lock")),
+                read_supervisor_lock(&d.path().join("no-such-dir/keeper.lock"), &pid_text),
                 Read::Absent
             ),
             "nothing is written under a profile that is missing"
         );
-        fs::write(
-            &lock,
-            json!({"pid": 77, "origin": "transient", "procStart": "Thu Oct  1 12:34:56 2026"})
-                .to_string(),
-        )
-        .unwrap();
-        let Read::Present(r) = read_supervisor_lock(&lock) else {
-            panic!("a supervisor lock reads");
-        };
-        assert_eq!(r.pid, 77);
-        assert_eq!(r.proc_start.as_deref(), Some("Thu Oct  1 12:34:56 2026"));
-        for bytes in [
-            &b"{"[..],
-            b"[1]",
-            br#"{"origin": "transient"}"#,
-            br#"{"pid": 0}"#,
-        ] {
+        fs::write(&lock, b"77").unwrap();
+        assert!(matches!(
+            read_supervisor_lock(&lock, &pid_text),
+            Read::Present(77)
+        ));
+        for bytes in [&b"{"[..], b"seven", b"", b"0"] {
             fs::write(&lock, bytes).unwrap();
-            let Read::Unreadable(e) = read_supervisor_lock(&lock) else {
+            let Read::Unreadable(e) = read_supervisor_lock(&lock, &pid_text) else {
                 panic!("{bytes:?} is unreadable");
             };
-            assert!(e.what.ends_with("daemon.lock"), "{e:?}");
+            assert!(e.what.ends_with("keeper.lock"), "{e:?}");
         }
         fs::remove_file(&lock).unwrap();
         fs::create_dir(&lock).unwrap();
         assert!(
-            matches!(read_supervisor_lock(&lock), Read::Unreadable(_)),
+            matches!(read_supervisor_lock(&lock, &pid_text), Read::Unreadable(_)),
             "a directory is no lock file"
         );
     }

@@ -294,9 +294,14 @@ impl Engine {
                 detail: e.detail,
             }),
         }
-        match read_session_records(&p.session_records_dir(&profile)) {
+        match read_session_records(
+            &p.session_records_dir(&profile),
+            p.session_record_ext(),
+            &|b| p.parse_session_record(b),
+            &mut || 0,
+        ) {
             Read::Present(entries) => {
-                for entry in entries {
+                for (entry, _) in entries {
                     match entry {
                         RecordEntry::Record(r) => {
                             if record_is_live(self.process.as_ref(), &r, p.launch_command()) {
@@ -322,10 +327,10 @@ impl Engine {
                 detail: e.detail,
             }),
         }
-        // The supervisor of a background daemon writes no record of its own (CC 2.1.292); its
-        // lock file is judged as a record is (§12.6).
+        // A supervisor which writes no record has a lock file, read with its provider's parser
+        // and judged as a record is (§12.6).
         if let Some(lock) = p.supervisor_lock(&profile) {
-            match read_supervisor_lock(&lock) {
+            match read_supervisor_lock(&lock, &|b| p.parse_session_record(b)) {
                 Read::Present(r) => {
                     daemon |= record_is_live(self.process.as_ref(), &r, p.launch_command());
                 }

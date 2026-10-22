@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 use tagteam_core::tokens::PriceTable;
 use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::http::Http;
+use tagteam_provider::liveness::parse_session_record;
 use tagteam_provider::process::{ProcessSpawner, SpawnSpec};
 use tagteam_provider::profile::refuse_linked_credential;
 use tagteam_provider::provider::{DeadReason, RefreshResult};
@@ -17,8 +18,8 @@ use tagteam_provider::{
     ForeignFormat, FreshCredential, Identity, IdentitySurface, Keychain, KindTraits, LineError,
     LiveAuth, LiveChange, LiveLockSet, LiveLocks, LockError, LockState, MergeReport, MustShare,
     MutationGuard, Pace, PollBudget, Provider, ProviderError, ProviderVars, ProviderWords, Read,
-    SessionEnv, SharePolicy, StoredLogin, Undo, UsageLine, UsageResult, ValidateRequest, Validity,
-    Window, Written,
+    SessionEnv, SessionRecord, SharePolicy, StoredLogin, Undo, UsageLine, UsageResult,
+    ValidateRequest, Validity, Window, Written,
 };
 
 use crate::CLAUDE_CODE;
@@ -696,6 +697,14 @@ impl Provider for ClaudeCode {
 
     fn supervisor_lock(&self, profile: &Path) -> Option<PathBuf> {
         Some(profile.join("daemon.lock"))
+    }
+
+    fn parse_session_record(&self, bytes: &[u8]) -> Result<SessionRecord, String> {
+        parse_session_record(bytes)
+    }
+
+    fn session_record_ext(&self) -> &'static str {
+        "json"
     }
 
     /// The hashed Keychain item named from `spelling`, the recorded spelling, then

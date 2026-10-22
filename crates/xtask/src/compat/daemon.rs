@@ -115,7 +115,7 @@ fn roster_records(roster: &Value) -> (Vec<(String, SessionRecord)>, Vec<String>)
 /// `daemon.lock` (CC 2.1.292) into `s`: a live supervisor is alive, a lock that cannot be read
 /// is unreadable, as tagteam judges both (§12.6).
 fn read_lock(home: &Path, probe: &dyn ProcessProbe, s: &mut Survey) {
-    match read_supervisor_lock(&home.join("daemon.lock")) {
+    match read_supervisor_lock(&home.join("daemon.lock"), &parse_session_record) {
         Read::Present(r) if record_is_live(probe, &r, LAUNCH) => {
             s.alive
                 .push(format!("the supervisor in daemon.lock (pid {})", r.pid));
@@ -128,9 +128,14 @@ fn read_lock(home: &Path, probe: &dyn ProcessProbe, s: &mut Survey) {
 /// The home's session records into `s`: a live one is alive (`only_daemons` keeps to the
 /// daemon kinds, `DAEMON_KINDS`), one that cannot be read is unreadable.
 fn read_records(home: &Path, probe: &dyn ProcessProbe, only_daemons: bool, s: &mut Survey) {
-    match read_session_records(&home.join("sessions")) {
+    match read_session_records(
+        &home.join("sessions"),
+        "json",
+        &parse_session_record,
+        &mut || 0,
+    ) {
         Read::Present(entries) => {
-            for entry in entries {
+            for (entry, _) in entries {
                 match entry {
                     RecordEntry::Record(r) => {
                         let daemon = r.kind.as_deref().is_some_and(|k| DAEMON_KINDS.contains(&k));
