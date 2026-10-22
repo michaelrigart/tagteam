@@ -1,6 +1,6 @@
 //! The bars the Accounts and Tokens screens draw (spec §4.4, T3-17): the lead card's lead bar,
 //! the table's line gauge and the card's sparkline; the Tokens headline's block progress line
-//! and its sparkline of cost per day.
+//! and its sparkline of cost per day; the Tokens table's share line.
 
 use ratatui::text::Span;
 use tagteam_core::Sample;
@@ -66,6 +66,14 @@ pub(crate) fn line_gauge(
 /// (tier 0 `·`), `cells` wide.
 pub(crate) fn progress_line(pct: f64, cells: usize, theme: Theme) -> Vec<Span<'static>> {
     gauge(pct, None, Role::Accent, cells, theme)
+}
+
+/// Tokens' share line (§4.4, T5-17): `━` whole cells and a `╸` half, at least `╸` above 0.
+pub(crate) fn share_line(pct: f64, cells: usize) -> String {
+    let x = filled(pct, cells);
+    let whole = x.floor() as usize;
+    let half = x - x.floor() >= 0.5 || (whole == 0 && x > 0.0);
+    format!("{}{}", "━".repeat(whole), if half { "╸" } else { "" })
 }
 
 /// `line_gauge`'s drawing with its fill in `fill`.
@@ -370,6 +378,14 @@ mod tests {
             // Accent whatever the share: a block's progress is no severity.
             let (_, letters) = drawn(progress_line(95.0, 10, theme), theme);
             assert_eq!(letters, canon(theme, "aaaaaaaaaa"), "{theme:?}");
+        }
+    }
+
+    #[test]
+    fn a_share_line_is_its_share_of_eight_cells() {
+        for (pct, want) in [(100.0, "━━━━━━━━"), (23.67, "━╸"), (1.0, "╸"), (0.0, "")]
+        {
+            assert_eq!(share_line(pct, 8), want, "{pct}");
         }
     }
 

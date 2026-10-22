@@ -16,25 +16,28 @@ use tagteam_engine::tokens::{
     AccountSel, Cost, PeriodKey, RowAccount, TokenCounts, TokenGrouping, TokenPeriod, TokenReport,
     TokenRow,
 };
-use tagteam_engine::words::{self, Severity};
+use tagteam_engine::words;
 
-use super::{TokensState, headline};
+use super::{TokensState, amounts, headline};
 use crate::autoline;
 use crate::chrome::fit_spans;
+use crate::gauge;
 use crate::keys::RIGHT_INSET;
 use crate::state::State;
 use crate::theme::{Role, Theme};
 use crate::view::{centred_block, fit, keep_visible, select, width_of, wrap};
 
-/// From this width the table adds the cache, the response count and a cost bar (spec §5.3).
+/// From this width the table adds the cache, the response count and a share line (spec §5.3).
 pub const WIDE: usize = 120;
+/// From this width the cache write splits into its 5-minute and 1-hour halves (§8).
+const CACHE_SPLIT_FROM: usize = 160;
 /// Drawn while a query for a report not yet read runs.
 pub const LOADING: &str = "loading…";
 /// What an empty report says while the index has never completed a refresh (redesign §5.7): the
 /// usage is not missing from the range, it is not read in yet.
 const NOT_INDEXED: &str = "No token usage yet";
-/// The cost bar's cells.
-const BAR: usize = 8;
+/// The share line's cells (T5-17).
+const SHARE: usize = 8;
 /// The table keeps this many rows at least; the detail and the notes below it scroll (B25).
 const TABLE_MIN: usize = 3;
 /// The control bar's filter is cut no narrower than this before the index's words give way
@@ -75,7 +78,8 @@ enum Col {
     Total,
     Responses,
     Cost,
-    Bar,
+    /// The row's share of the largest row cost (T5-17), headless.
+    Share,
 }
 
 impl Col {
@@ -94,7 +98,7 @@ impl Col {
         Col::Total,
         Col::Responses,
         Col::Cost,
-        Col::Bar,
+        Col::Share,
     ];
 
     fn head(self, period: TokenPeriod) -> &'static str {
@@ -105,19 +109,19 @@ impl Col {
                 TokenPeriod::Session => "SESSION",
                 TokenPeriod::Block => "BLOCK",
             },
-            Col::Kind | Col::Bar => "",
+            Col::Kind | Col::Share => "",
             Col::Project => "PROJECT",
             Col::Account => "ACCOUNT",
             Col::Model => "MODEL",
             Col::Input => "INPUT",
             Col::Output => "OUTPUT",
             Col::CacheWrite => "CACHE W",
-            Col::CacheWrite5m => "CW 5M",
-            Col::CacheWrite1h => "CW 1H",
+            Col::CacheWrite5m => "CACHE W 5M",
+            Col::CacheWrite1h => "1H",
             Col::CacheRead => "CACHE R",
             Col::Total => "TOTAL",
-            Col::Responses => "RESP",
-            Col::Cost => "COST",
+            Col::Responses => "RESPONSES",
+            Col::Cost => "API $",
         }
     }
 
@@ -130,24 +134,31 @@ impl Col {
     fn number(self) -> bool {
         !matches!(
             self,
-            Col::Period | Col::Kind | Col::Project | Col::Account | Col::Model | Col::Bar
+            Col::Period | Col::Kind | Col::Project | Col::Account | Col::Model | Col::Share
         )
+    }
+
+    /// Its cells' role (T5-15): the counts but TOTAL muted, the share line accent, the rest
+    /// text.
+    fn role(self) -> Role {
+        match self {
+            Col::Input
+            | Col::Output
+            | Col::CacheWrite
+            | Col::CacheWrite5m
+            | Col::CacheWrite1h
+            | Col::CacheRead
+            | Col::Responses => Role::Muted,
+            Col::Share => Role::Accent,
+            _ => Role::Text,
+        }
     }
 }
 
-/// A cell's text, and a style for when it says `≥`.
+/// A cell's text and its style.
 struct Cell {
     text: String,
     style: Style,
-}
-
-impl Cell {
-    fn plain(text: impl Into<String>) -> Cell {
-        Cell {
-            text: text.into(),
-            style: Style::new(),
-        }
-    }
 }
 
 /// `n` bytes as the control bar shows a refresh's progress: decimal units to one decimal place
@@ -261,11 +272,12 @@ pub fn account_name(account: &RowAccount) -> String {
     }
 }
 
-/// A cost as a cell says it: dollars and cents, `≥` before a partial one, `—` for none.
+/// A cost as a cell says it: dollars and cents, grouped (T5-11), `≥` before a partial one, `—`
+/// for none.
 fn cost_text(cost: Option<&Cost>) -> String {
     match cost {
-        Some(c) if c.partial => format!("{}{}", words::AT_LEAST, words::dollars(c.usd_nanos)),
-        Some(c) => words::dollars(c.usd_nanos),
+        Some(c) if c.partial => format!("{}{}", words::AT_LEAST, amounts::dollars(c.usd_nanos)),
+        Some(c) => amounts::dollars(c.usd_nanos),
         None => words::MISSING.to_owned(),
     }
 }
@@ -292,7 +304,7 @@ struct Table<'a> {
     lead: Col,
     /// How compact the period's spans are (`span`).
     level: usize,
-    /// The largest row cost, for the bar.
+    /// The largest row cost, for the share line.
     most: u64,
     theme: Theme,
     now_ms: i64,
@@ -302,8 +314,10 @@ impl<'a> Table<'a> {
     /// The columns `report` takes at `width` (spec §5.3): period, account, input, output, total
     /// and cost always, with the project for sessions, the kind for blocks and the model when
     /// grouped by it; but not the period and the project for one session's models, whose rows all
-    /// share them, and which the header's drill-down and the detail say. From `WIDE` columns, the cache write (split into 5-minute and 1-hour when
-    /// that still fits), the cache read, the responses and the bar. Text columns share the rest.
+    /// share them, and which the header's drill-down and the detail say. From `WIDE` columns,
+    /// the cache write (split into 5-minute and 1-hour from `CACHE_SPLIT_FROM` columns, when
+    /// that still fits), the cache read, the responses and the share line. Text columns share
+    /// the rest.
     fn new(
         report: &'a TokenReport,
         widths: &'a Widths,
@@ -341,7 +355,7 @@ impl<'a> Table<'a> {
         }
         cols.push(Col::Cost);
         if wide {
-            cols.push(Col::Bar);
+            cols.push(Col::Share);
         }
         let most = report
             .rows
@@ -368,7 +382,7 @@ impl<'a> Table<'a> {
                 .map(|c| table.widest(*c) + 2)
                 .sum::<usize>()
                 .saturating_sub(table.widest(Col::CacheWrite) + 2);
-            if natural + extra <= width {
+            if width >= CACHE_SPLIT_FROM && natural + extra <= width {
                 table.cols.splice(at..=at, split.map(|c| (c, 0)));
             }
         }
@@ -404,8 +418,8 @@ impl<'a> Table<'a> {
     }
 
     fn widest_cell(&self, col: Col, level: usize) -> usize {
-        if col == Col::Bar {
-            return BAR;
+        if col == Col::Share {
+            return SHARE;
         }
         let tz = &self.report.query.tz;
         let cell = |r: &TokenRow| match col {
@@ -518,52 +532,55 @@ impl<'a> Table<'a> {
         }
     }
 
-    fn counts_cell(&self, col: Col, c: &TokenCounts, unfinalized: u64, responses: u64) -> Cell {
-        let warning = self.theme.severity(Severity::Warning);
-        match col {
-            Col::Input => Cell::plain(words::scaled(c.input)),
-            Col::Output if unfinalized > 0 => Cell {
-                text: format!("{}{}", words::AT_LEAST, words::scaled(c.output)),
-                style: warning,
-            },
-            Col::Output => Cell::plain(words::scaled(c.output)),
-            Col::CacheWrite => Cell::plain(words::scaled(c.cache_write())),
-            Col::CacheWrite5m => Cell::plain(words::scaled(c.cache_write_5m)),
-            Col::CacheWrite1h => Cell::plain(words::scaled(c.cache_write_1h)),
-            Col::CacheRead => Cell::plain(words::scaled(c.cache_read)),
-            Col::Total => Cell::plain(words::scaled(c.total())),
-            Col::Responses => Cell::plain(responses.to_string()),
-            _ => Cell::plain(""),
+    /// `text` in `col`'s role (T5-15): a `≥` cell warn, a `—` cell faint.
+    fn styled(&self, col: Col, text: String) -> Cell {
+        let role = if text.starts_with(words::AT_LEAST) {
+            Role::Warn
+        } else if text == words::MISSING {
+            Role::Faint
+        } else {
+            col.role()
+        };
+        Cell {
+            text,
+            style: self.theme.role(role),
         }
     }
 
-    fn cost_cell(&self, cost: Option<&Cost>) -> Cell {
-        let style = match cost {
-            Some(c) if c.partial => self.theme.severity(Severity::Warning),
-            _ => Style::new(),
-        };
-        Cell {
-            text: cost_text(cost),
-            style,
+    fn counts_text(col: Col, c: &TokenCounts, unfinalized: u64, responses: u64) -> String {
+        match col {
+            Col::Input => words::scaled(c.input),
+            Col::Output if unfinalized > 0 => {
+                format!("{}{}", words::AT_LEAST, words::scaled(c.output))
+            }
+            Col::Output => words::scaled(c.output),
+            Col::CacheWrite => words::scaled(c.cache_write()),
+            Col::CacheWrite5m => words::scaled(c.cache_write_5m),
+            Col::CacheWrite1h => words::scaled(c.cache_write_1h),
+            Col::CacheRead => words::scaled(c.cache_read),
+            Col::Total => words::scaled(c.total()),
+            Col::Responses => amounts::grouped(responses),
+            _ => String::new(),
         }
     }
 
     /// `row`'s cell in `col`.
     fn cell(&self, col: Col, row: &TokenRow, tz: &TimeZone) -> Cell {
-        match col {
-            Col::Period => Cell::plain(period_text(&row.period, tz, self.now_ms, self.level)),
-            Col::Kind => Cell::plain(match row.period {
+        let text = match col {
+            Col::Period => period_text(&row.period, tz, self.now_ms, self.level),
+            Col::Kind => match row.period {
                 PeriodKey::Block { observed: true, .. } => "observed",
                 PeriodKey::Block { .. } => "inferred",
                 _ => "",
-            }),
-            Col::Project => Cell::plain(match &row.period {
+            }
+            .to_owned(),
+            Col::Project => match &row.period {
                 PeriodKey::Session {
                     project: Some(p), ..
                 } => p.clone(),
                 _ => words::MISSING.to_owned(),
-            }),
-            Col::Account => Cell::plain(match &row.account {
+            },
+            Col::Account => match &row.account {
                 Some(a) => account_text(a),
                 None => row
                     .accounts
@@ -571,30 +588,36 @@ impl<'a> Table<'a> {
                     .map(account_text)
                     .collect::<Vec<_>>()
                     .join(", "),
-            }),
-            Col::Model => Cell::plain(row.model.clone().unwrap_or_else(|| row.models.join(", "))),
-            Col::Cost => self.cost_cell(row.cost.as_ref()),
-            Col::Bar => Cell::plain(match row.cost {
-                Some(c) if self.most > 0 && c.usd_nanos > 0 => {
-                    let cells =
-                        (u128::from(c.usd_nanos) * BAR as u128).div_ceil(u128::from(self.most));
-                    "█".repeat((cells as usize).clamp(1, BAR))
+            },
+            Col::Model => row.model.clone().unwrap_or_else(|| row.models.join(", ")),
+            Col::Cost => cost_text(row.cost.as_ref()),
+            Col::Share => match row.cost {
+                Some(c) if self.most > 0 => {
+                    let pct = c.usd_nanos as f64 / self.most as f64 * 100.0;
+                    gauge::share_line(pct, SHARE)
                 }
                 _ => String::new(),
-            }),
-            _ => self.counts_cell(col, &row.counts, row.unfinalized, row.responses),
-        }
+            },
+            _ => Self::counts_text(col, &row.counts, row.unfinalized, row.responses),
+        };
+        self.styled(col, text)
     }
 
-    /// The total line's cell in `col`.
+    /// The total line's cell in `col`: `TOTAL` alone bold (T5-18).
     fn total_cell(&self, col: Col) -> Cell {
         let t = &self.report.total;
-        match col {
-            _ if col == self.lead => Cell::plain("TOTAL"),
-            Col::Kind | Col::Project | Col::Account | Col::Model | Col::Bar => Cell::plain(""),
-            Col::Cost => self.cost_cell(t.cost.as_ref()),
-            _ => self.counts_cell(col, &t.counts, t.unfinalized, t.responses),
-        }
+        let text = match col {
+            _ if col == self.lead => {
+                return Cell {
+                    text: "TOTAL".to_owned(),
+                    style: self.theme.strong(),
+                };
+            }
+            Col::Kind | Col::Project | Col::Account | Col::Model | Col::Share => String::new(),
+            Col::Cost => cost_text(t.cost.as_ref()),
+            _ => Self::counts_text(col, &t.counts, t.unfinalized, t.responses),
+        };
+        self.styled(col, text)
     }
 
     /// One line of cells: each padded or cut to its column, numbers on the right, two columns
@@ -625,14 +648,19 @@ impl<'a> Table<'a> {
         trim(Line::from(spans))
     }
 
+    /// The heads, muted capitals, never bold (T5-15).
     fn header(&self) -> Line<'static> {
         let period = self.report.query.period;
+        let muted = self.theme.role(Role::Muted);
         let cells = self
             .cols
             .iter()
-            .map(|(c, _)| Cell::plain(c.head(period)))
+            .map(|(c, _)| Cell {
+                text: c.head(period).to_owned(),
+                style: muted,
+            })
             .collect();
-        self.line(cells, false, false).style(self.theme.strong())
+        self.line(cells, false, false)
     }
 
     fn row(&self, row: &TokenRow, blank: bool) -> Line<'static> {
@@ -645,9 +673,19 @@ impl<'a> Table<'a> {
         self.line(cells, blank, true)
     }
 
+    /// The faint rule above the total (T5-18), from column 1 across the table's columns.
+    fn rule(&self) -> Line<'static> {
+        let width =
+            self.cols.iter().map(|(_, w)| w).sum::<usize>() + 2 * self.cols.len().saturating_sub(1);
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled("─".repeat(width), self.theme.role(Role::Faint)),
+        ])
+    }
+
     fn total(&self) -> Line<'static> {
         let cells = self.cols.iter().map(|(c, _)| self.total_cell(*c)).collect();
-        self.line(cells, false, false).style(self.theme.strong())
+        self.line(cells, false, false)
     }
 }
 
@@ -1175,8 +1213,8 @@ fn below(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
     lines
 }
 
-/// What the body holds under the rows above the table (`top`), at its size: the table's rows,
-/// then the total, then what lies below it (`below`) in as many rows as it needs, half the body
+/// What the body holds under the rows above the table (`top`), at its size: the table's head and
+/// rows, then the rule and the total, then what lies below it (`below`) in as many rows as it needs, half the body
 /// at most and leaving the table `TABLE_MIN` rows. What does not fit there scrolls with `J`/`K`
 /// (B25), and its last row says which lines show. The total follows the last row shown, so it is at the foot of a
 /// table that fills the body.
@@ -1186,10 +1224,13 @@ struct Plan {
     below: Vec<Line<'static>>,
 }
 
+/// The table's rows that are not report rows: the head, the rule and the total (T5-18).
+const TABLE_FIXED: usize = 3;
+
 /// How many rows what lies below the total takes: as many as its `lines`, half of `height` at
 /// most, and never the table's last `TABLE_MIN`.
 fn below_rows(lines: usize, top: usize, height: usize) -> usize {
-    let fixed = top + 2;
+    let fixed = top + TABLE_FIXED;
     lines.min(height.saturating_sub(fixed + TABLE_MIN).min(height / 2))
 }
 
@@ -1232,7 +1273,7 @@ fn plan(state: &State, area: Rect, now_ms: i64) -> Plan {
     let lines = below(state, width, now_ms);
     let rows = below_rows(lines.len(), top.len(), height);
     let (below, _) = window(state.theme, lines, below_from(&state.tokens), rows);
-    let table = height.saturating_sub(top.len() + 2 + below.len());
+    let table = height.saturating_sub(top.len() + TABLE_FIXED + below.len());
     Plan {
         top,
         rows: table,
@@ -1359,6 +1400,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
             Item::Figures(line) => line.clone(),
         }));
     }
+    lines.push(dim(table.rule()));
     lines.push(dim(table.total()));
     lines.extend(plan.below.into_iter().map(dim));
     frame.render_widget(Paragraph::new(lines), area);
@@ -1500,27 +1542,30 @@ mod tests {
 
     #[test]
     fn a_day_report_at_80_columns() {
-        // Spec §5.3: period, account, input, output, total and cost; the period once per day.
+        // Spec §5.3: period, account, input, output, total and cost; the period once per day;
+        // a faint rule above the total (T5-18).
         let state = showing(days(), |_| {});
         let lines = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(lines[0], bar_row(DAY_BAR, "indexed 14:12", 80));
         assert_eq!(
-            lines[1..11],
+            lines[1..12],
             [
-                " $50.95 at API prices    114.2M tokens    414 responses",
-                "",
-                " DAY         ACCOUNT        INPUT   OUTPUT   TOTAL    COST",
-                "▌2026-09-20  1 a1@x.co       1.2M  ≥310.0K   93.6M  $41.20",
-                "             2 spare       300.0K    80.0K   20.5M   $9.75",
-                " 2026-09-19  unattributed    5.0K      900  105.9K       —",
-                " TOTAL                       1.5M  ≥390.9K  114.2M  $50.95",
-                " 412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M) · cache read 88.0M",
-                " 2026-09-20 · 1 a1@x.co",
-                " ≥ at least: 2 subagent responses are still being counted",
+                " $50.95 at API prices    114.2M tokens    414 responses".to_owned(),
+                String::new(),
+                " DAY         ACCOUNT        INPUT   OUTPUT   TOTAL   API $".to_owned(),
+                "▌2026-09-20  1 a1@x.co       1.2M  ≥310.0K   93.6M  $41.20".to_owned(),
+                "             2 spare       300.0K    80.0K   20.5M   $9.75".to_owned(),
+                " 2026-09-19  unattributed    5.0K      900  105.9K       —".to_owned(),
+                format!(" {}", "─".repeat(57)),
+                " TOTAL                       1.5M  ≥390.9K  114.2M  $50.95".to_owned(),
+                " 412 responses · cache write 4.1M (5m 3.0M, 1h 1.1M) · cache read 88.0M"
+                    .to_owned(),
+                " 2026-09-20 · 1 a1@x.co".to_owned(),
+                " ≥ at least: 2 subagent responses are still being counted".to_owned(),
             ]
         );
         assert_eq!(
-            lines[11],
+            lines[12],
             " $ what this would cost on the API at list prices of 2026-10-01; not your bill"
         );
         assert_eq!(
@@ -1533,7 +1578,8 @@ mod tests {
     }
 
     #[test]
-    fn from_120_columns_the_cache_the_responses_and_a_cost_bar_join_them() {
+    fn from_120_columns_the_cache_the_responses_and_a_share_line_join_them() {
+        // T5-16, T5-17: one `CACHE W` below 160 columns; the share line in place of the bar.
         let state = showing(days(), |_| {});
         let lines = body_of(&state, 120, 40, NOW_MS);
         assert!(
@@ -1542,15 +1588,249 @@ mod tests {
             lines[0]
         );
         assert_eq!(
-            lines[3..8],
+            lines[3..9],
             [
-                " DAY         ACCOUNT        INPUT   OUTPUT  CW 5M  CW 1H  CACHE R   TOTAL  RESP    COST",
-                "▌2026-09-20  1 a1@x.co       1.2M  ≥310.0K   3.0M   1.1M    88.0M   93.6M   412  $41.20  ████████",
-                "             2 spare       300.0K    80.0K      0      0    20.1M   20.5M     1   $9.75  ██",
-                " 2026-09-19  unattributed    5.0K      900      0      0   100.0K  105.9K     1       —",
-                " TOTAL                       1.5M  ≥390.9K   3.0M   1.1M   108.2M  114.2M   414  $50.95",
+                " DAY         ACCOUNT        INPUT   OUTPUT  CACHE W  CACHE R   TOTAL  RESPONSES   API $".to_owned(),
+                "▌2026-09-20  1 a1@x.co       1.2M  ≥310.0K     4.1M    88.0M   93.6M        412  $41.20  ━━━━━━━━".to_owned(),
+                "             2 spare       300.0K    80.0K        0    20.1M   20.5M          1   $9.75  ━╸".to_owned(),
+                " 2026-09-19  unattributed    5.0K      900        0   100.0K  105.9K          1       —".to_owned(),
+                format!(" {}", "─".repeat(96)),
+                " TOTAL                       1.5M  ≥390.9K     4.1M   108.2M  114.2M        414  $50.95".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn the_cache_write_splits_into_5m_and_1h_from_160_columns() {
+        // T5-16: `CACHE W 5M` and `1H` only from `CACHE_SPLIT_FROM` columns.
+        let state = showing(days(), |_| {});
+        let head = |w: u16| body_of(&state, w, 40, NOW_MS)[3].clone();
+        assert!(
+            head(160).contains("  CACHE W 5M    1H  CACHE R  "),
+            "{}",
+            head(160)
+        );
+        assert!(head(159).contains("  CACHE W  CACHE R  "), "{}", head(159));
+        assert!(!head(159).contains("5M"), "{}", head(159));
+    }
+
+    #[test]
+    fn thousands_separators_go_on_dollars_and_responses() {
+        // T5-11: the TUI groups dollars and responses; token counts stay scaled.
+        let mut row = token_row(
+            day(1),
+            Some(row_account(1)),
+            None,
+            counts(1_000_000_000, 200_000_000, 500_000_000),
+            Some(1_541_640_000_000),
+        );
+        row.responses = 9_891;
+        let state = showing(vec![row], |_| {});
+        let lines = body_of(&state, 120, 40, NOW_MS);
+        let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
+        for line in [&lines[4], &lines[total]] {
+            for value in ["$1,541.64", "  9,891  ", "1.7B"] {
+                assert!(line.contains(value), "{value} in {line:?}");
+            }
+        }
+        // And the active block's figures under its row.
+        let mut big = block(NOON, true);
+        if let PeriodKey::Block {
+            active: Some(a), ..
+        } = &mut big.period
+        {
+            a.cost_per_hour = Some(Cost {
+                usd_nanos: 1_234_000_000_000,
+                partial: false,
+            });
+        }
+        let blocks = showing_after("ppp", vec![big]);
+        let lines = body_of(&blocks, 80, 24, NOW_MS);
+        assert!(
+            under_the_block(&lines).ends_with(" · $1,234.00/h"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_table_draws_its_roles_in_every_tier() {
+        // §16, T5-15, T5-17, T5-18: muted heads and counts, text values, a warn `≥`, a faint
+        // `—` and rule, the share line in accent, `TOTAL` alone bold, `sel-bg` on the selection.
+        let at_80 = [
+            letters(&[(
+                " DAY         ACCOUNT        INPUT   OUTPUT   TOTAL   API $",
+                'm',
+            )]),
+            letters(&[
+                ("▌", 'a'),
+                ("2026-09-20", 'B'),
+                ("  ", 't'),
+                ("1 a1@x.co", 't'),
+                ("       ", 't'),
+                ("1.2M", 'm'),
+                ("  ", 't'),
+                ("≥310.0K", 'w'),
+                ("   ", 't'),
+                ("93.6M", 't'),
+                ("  ", 't'),
+                ("$41.20", 't'),
+            ]),
+            letters(&[
+                ("             ", 't'),
+                ("2 spare", 't'),
+                ("       ", 't'),
+                ("300.0K", 'm'),
+                ("    ", 't'),
+                ("80.0K", 'm'),
+                ("   ", 't'),
+                ("20.5M", 't'),
+                ("   ", 't'),
+                ("$9.75", 't'),
+            ]),
+            letters(&[
+                (" ", 't'),
+                ("2026-09-19", 't'),
+                ("  ", 't'),
+                ("unattributed", 't'),
+                ("    ", 't'),
+                ("5.0K", 'm'),
+                ("      ", 't'),
+                ("900", 'm'),
+                ("  ", 't'),
+                ("105.9K", 't'),
+                ("       ", 't'),
+                ("—", 'f'),
+            ]),
+            letters(&[(" ", 't'), ("─".repeat(57).as_str(), 'f')]),
+            letters(&[
+                (" ", 't'),
+                ("TOTAL", 'B'),
+                ("                       ", 't'),
+                ("1.5M", 'm'),
+                ("  ", 't'),
+                ("≥390.9K", 'w'),
+                ("  ", 't'),
+                ("114.2M", 't'),
+                ("  ", 't'),
+                ("$50.95", 't'),
+            ]),
+        ];
+        let at_120 = [
+            letters(&[(
+                " DAY         ACCOUNT        INPUT   OUTPUT  CACHE W  CACHE R   TOTAL  RESPONSES   API $",
+                'm',
+            )]),
+            letters(&[
+                ("▌", 'a'),
+                ("2026-09-20", 'B'),
+                ("  ", 't'),
+                ("1 a1@x.co", 't'),
+                ("       ", 't'),
+                ("1.2M", 'm'),
+                ("  ", 't'),
+                ("≥310.0K", 'w'),
+                ("     ", 't'),
+                ("4.1M", 'm'),
+                ("    ", 't'),
+                ("88.0M", 'm'),
+                ("   ", 't'),
+                ("93.6M", 't'),
+                ("        ", 't'),
+                ("412", 'm'),
+                ("  ", 't'),
+                ("$41.20", 't'),
+                ("  ", 't'),
+                ("━━━━━━━━", 'a'),
+            ]),
+            letters(&[
+                ("             ", 't'),
+                ("2 spare", 't'),
+                ("       ", 't'),
+                ("300.0K", 'm'),
+                ("    ", 't'),
+                ("80.0K", 'm'),
+                ("        ", 't'),
+                ("0", 'm'),
+                ("    ", 't'),
+                ("20.1M", 'm'),
+                ("   ", 't'),
+                ("20.5M", 't'),
+                ("          ", 't'),
+                ("1", 'm'),
+                ("   ", 't'),
+                ("$9.75", 't'),
+                ("  ", 't'),
+                ("━╸", 'a'),
+            ]),
+            letters(&[
+                (" ", 't'),
+                ("2026-09-19", 't'),
+                ("  ", 't'),
+                ("unattributed", 't'),
+                ("    ", 't'),
+                ("5.0K", 'm'),
+                ("      ", 't'),
+                ("900", 'm'),
+                ("        ", 't'),
+                ("0", 'm'),
+                ("   ", 't'),
+                ("100.0K", 'm'),
+                ("  ", 't'),
+                ("105.9K", 't'),
+                ("          ", 't'),
+                ("1", 'm'),
+                ("       ", 't'),
+                ("—", 'f'),
+            ]),
+            letters(&[(" ", 't'), ("─".repeat(96).as_str(), 'f')]),
+            letters(&[
+                (" ", 't'),
+                ("TOTAL", 'B'),
+                ("                       ", 't'),
+                ("1.5M", 'm'),
+                ("  ", 't'),
+                ("≥390.9K", 'w'),
+                ("     ", 't'),
+                ("4.1M", 'm'),
+                ("   ", 't'),
+                ("108.2M", 'm'),
+                ("  ", 't'),
+                ("114.2M", 't'),
+                ("        ", 't'),
+                ("414", 'm'),
+                ("  ", 't'),
+                ("$50.95", 't'),
+            ]),
+        ];
+        for theme in TIERS {
+            let mut state = showing(days(), |_| {});
+            state.theme = theme;
+            for ((w, h), want) in [((80, 24), &at_80), ((120, 40), &at_120)] {
+                let buf = draw_buffer(&state, w, h, NOW_MS);
+                for (n, row) in want.iter().enumerate() {
+                    let y = body_y(&state, w, h, 3 + n as u16);
+                    assert_eq!(
+                        roles(&buf, theme, y).trim_end(),
+                        canon(theme, row),
+                        "{theme:?} at {w}: body row {}",
+                        3 + n
+                    );
+                    let bg = if n == 1 {
+                        theme.sel_bg().bg.unwrap_or(Color::Reset)
+                    } else {
+                        Color::Reset
+                    };
+                    for x in 0..w {
+                        assert_eq!(buf[(x, y)].bg, bg, "{theme:?} at {w}: ({x}, {y})");
+                    }
+                }
+                let head = body_y(&state, w, h, 3);
+                assert!(
+                    (0..w).all(|x| !buf[(x, head)].modifier.contains(Modifier::BOLD)),
+                    "{theme:?} at {w}: no head is bold"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1760,18 +2040,25 @@ mod tests {
             )
         );
         assert_eq!(
-            lines[1..11],
+            lines[1..12],
             [
-                " $2.46 at API prices    1.8M tokens    2 responses",
-                "",
-                " SESSION            PROJECT              ACCOUNT    INPUT  OUTPUT   TOTAL   COST",
-                "▌09-20 09:12–11:40  …/alex/Code/tagteam  1 a1@x.co  20.0K    3.0K  923.0K  $1.23",
-                " 09-20 09:12–11:40  …/alex/Code/tagteam  2 spare    20.0K    3.0K  923.0K  $1.23",
-                " TOTAL                                              40.0K    6.0K    1.8M  $2.46",
-                " 1 response · cache write 0 (5m 0, 1h 0) · cache read 900.0K",
-                " session 3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c · /Users/alex/Code/tagteam",
-                " 2026-09-20 09:12 – 2026-09-20 11:40 · 1 a1@x.co",
-                " $ what this would cost on the API at list prices of 2026-10-01; not your bill",
+                " $2.46 at API prices    1.8M tokens    2 responses".to_owned(),
+                String::new(),
+                " SESSION            PROJECT              ACCOUNT    INPUT  OUTPUT   TOTAL  API $"
+                    .to_owned(),
+                "▌09-20 09:12–11:40  …/alex/Code/tagteam  1 a1@x.co  20.0K    3.0K  923.0K  $1.23"
+                    .to_owned(),
+                " 09-20 09:12–11:40  …/alex/Code/tagteam  2 spare    20.0K    3.0K  923.0K  $1.23"
+                    .to_owned(),
+                format!(" {}", "─".repeat(79)),
+                " TOTAL                                              40.0K    6.0K    1.8M  $2.46"
+                    .to_owned(),
+                " 1 response · cache write 0 (5m 0, 1h 0) · cache read 900.0K".to_owned(),
+                " session 3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c · /Users/alex/Code/tagteam"
+                    .to_owned(),
+                " 2026-09-20 09:12 – 2026-09-20 11:40 · 1 a1@x.co".to_owned(),
+                " $ what this would cost on the API at list prices of 2026-10-01; not your bill"
+                    .to_owned(),
             ]
         );
         let month = PeriodKey::Month {
@@ -1798,8 +2085,8 @@ mod tests {
             )
         );
         assert_eq!(lines[1], " — at API prices    6 tokens    1 response");
-        assert_eq!(lines[3], " MONTH    ACCOUNT    INPUT  OUTPUT  TOTAL  COST");
-        assert_eq!(lines[4], "▌2026-09  1 a1@x.co      1       2      6     —");
+        assert_eq!(lines[3], " MONTH    ACCOUNT    INPUT  OUTPUT  TOTAL  API $");
+        assert_eq!(lines[4], "▌2026-09  1 a1@x.co      1       2      6      —");
     }
 
     #[test]
@@ -1820,17 +2107,18 @@ mod tests {
             )
         );
         assert_eq!(
-            lines[1..10],
+            lines[1..11],
             [
-                " $10.00 at API prices    10.9M tokens    2 responses",
-                " ▶ block ━━━━━━━━━╸············ 2h46m left · 41.2K tok/min · $3.20/h",
-                "",
-                " BLOCK                        ACCOUNT     INPUT  OUTPUT  TOTAL    COST",
-                "▌09-21 12:00–17:00  observed  1 a1@x.co  400.0K   50.0K   5.5M   $5.00",
-                "   active · 2h13m elapsed · 2h46m left · 41.2K tokens/min · $3.20/h",
-                "   projected 9.8M tokens, —",
-                " 09-21 07:00–12:00  inferred  1 a1@x.co  400.0K   50.0K   5.5M   $5.00",
-                " TOTAL                                   800.0K  100.0K  10.9M  $10.00",
+                " $10.00 at API prices    10.9M tokens    2 responses".to_owned(),
+                " ▶ block ━━━━━━━━━╸············ 2h46m left · 41.2K tok/min · $3.20/h".to_owned(),
+                String::new(),
+                " BLOCK                        ACCOUNT     INPUT  OUTPUT  TOTAL   API $".to_owned(),
+                "▌09-21 12:00–17:00  observed  1 a1@x.co  400.0K   50.0K   5.5M   $5.00".to_owned(),
+                "   active · 2h13m elapsed · 2h46m left · 41.2K tokens/min · $3.20/h".to_owned(),
+                "   projected 9.8M tokens, —".to_owned(),
+                " 09-21 07:00–12:00  inferred  1 a1@x.co  400.0K   50.0K   5.5M   $5.00".to_owned(),
+                format!(" {}", "─".repeat(69)),
+                " TOTAL                                   800.0K  100.0K  10.9M  $10.00".to_owned(),
             ]
         );
         assert_eq!(blocks.tokens.grouping(), TokenGrouping::None);
@@ -1847,14 +2135,20 @@ mod tests {
         );
         let end = NOON + 5 * HOUR_MS;
         assert!(figures(end - 60_000).starts_with("   active · 4h59m elapsed · 1m left"));
+        let lines = body_of(&blocks, 80, 24, end);
+        let at = lines.iter().position(|l| l.contains("400.0K")).unwrap();
         assert_eq!(
-            figures(end),
-            " TOTAL                                   400.0K   50.0K   5.5M  $5.00",
+            lines[at + 1..at + 3],
+            [
+                format!(" {}", "─".repeat(68)),
+                " TOTAL                                   400.0K   50.0K   5.5M  $5.00".to_owned(),
+            ],
             "no longer active, until the query its end asks for returns"
         );
     }
 
-    /// The body row under `block()`'s row: its figures while it is active, else the total.
+    /// The body row under `block()`'s row: its figures while it is active, else the rule above
+    /// the total.
     fn under_the_block(lines: &[String]) -> String {
         let at = lines.iter().position(|l| l.contains("400.0K"));
         let at = at.unwrap_or_else(|| panic!("no block row: {lines:?}"));
@@ -1897,11 +2191,11 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            " DAY         ACCOUNT             MODEL            INPUT  OUTPUT  TOTAL  COST"
+            " DAY         ACCOUNT             MODEL            INPUT  OUTPUT  TOTAL  API $"
         );
         assert_eq!(
             lines[4],
-            "▌2026-09-20  1 a1@x.co, 2 spare  claude-opus-5-5      1       2      6     —"
+            "▌2026-09-20  1 a1@x.co, 2 spare  claude-opus-5-5      1       2      6      —"
         );
         opus.model = None;
         let none = showing_after("ggg", vec![opus]);
@@ -1916,7 +2210,7 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            " DAY         ACCOUNT             INPUT  OUTPUT  TOTAL  COST"
+            " DAY         ACCOUNT             INPUT  OUTPUT  TOTAL  API $"
         );
     }
 
@@ -1969,7 +2263,7 @@ mod tests {
         });
         let lines = body_of(&state, 80, 24, NOW_MS);
         assert_eq!(
-            lines[10..16],
+            lines[11..17],
             [
                 " No price for claude-test-9: counted without cost (≥ marks a partial cost).",
                 " ≥ at least: 2 subagent responses are still being counted",
@@ -2319,8 +2613,9 @@ mod tests {
                 "{model} whole: {lines:?}"
             );
         }
-        assert!(lines[8].starts_with(" TOTAL"), "{lines:?}");
-        assert!(lines[8].contains("1.2M"), "{lines:?}");
+        assert!(lines[8].starts_with(" ─"), "{lines:?}");
+        assert!(lines[9].starts_with(" TOTAL"), "{lines:?}");
+        assert!(lines[9].contains("1.2M"), "{lines:?}");
     }
 
     #[test]
@@ -2349,18 +2644,17 @@ mod tests {
 
     #[test]
     fn the_cache_write_is_one_column_where_its_halves_do_not_fit() {
+        // At 160 a 70-column alias leaves no room for the halves; it stays whole.
+        let alias = format!("alias-{}", "x".repeat(64));
         let mut rows = days();
-        if let Some(RowAccount::Account { alias, .. }) = &mut rows[1].account {
-            *alias = Some("an-alias-thirty-five-characters-long".into());
+        if let Some(RowAccount::Account { alias: a, .. }) = &mut rows[1].account {
+            *a = Some(alias.clone());
         }
         let state = showing(rows, |_| {});
-        let lines = body_of(&state, 120, 40, NOW_MS);
+        let lines = body_of(&state, 160, 40, NOW_MS);
         assert!(lines[3].contains("  CACHE W  CACHE R  "), "{}", lines[3]);
-        assert!(
-            lines[5].contains("2 an-alias-thirty-five-characters-long  "),
-            "{}",
-            lines[5]
-        );
+        assert!(!lines[3].contains("5M"), "{}", lines[3]);
+        assert!(lines[5].contains(&format!("2 {alias}  ")), "{}", lines[5]);
     }
 
     /// `n` days of account 1, newest first.
@@ -2399,22 +2693,43 @@ mod tests {
             let (x, y) = locate(buf, needle).unwrap();
             (x..x + width_of(needle) as u16).all(|x| !buf[(x, y)].modifier.contains(Modifier::DIM))
         };
+        // A good report: plain on every cell where muted and faint are hues (tier 2); where they
+        // are DIM by their role (tiers 0 and 1, T5-15's muted heads and counts), on its text.
+        let good = |buf: &ratatui::buffer::Buffer, theme: Theme, needles: &[&str]| {
+            if theme.role(Role::Muted).add_modifier.contains(Modifier::DIM) {
+                let rows = text_of(buf);
+                let total = rows.iter().position(|l| l.starts_with(" TOTAL")).unwrap() as u16;
+                assert!(
+                    (1..6).all(|x| !buf[(x, total)].modifier.contains(Modifier::DIM)),
+                    "{theme:?} TOTAL: a good report is plain"
+                );
+                for needle in needles.iter().filter(|n| !["ACCOUNT", "TOTAL"].contains(n)) {
+                    assert!(
+                        undimmed(buf, needle),
+                        "{theme:?} {needle}: a good report is plain"
+                    );
+                }
+            } else {
+                for needle in needles {
+                    assert!(
+                        plain(buf, needle),
+                        "{theme:?} {needle}: a good report is plain"
+                    );
+                }
+            }
+        };
         for theme in TIERS {
             let mut state = showing(many_days(3), |_| {});
             state.theme = theme;
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
-            for needle in [
+            let needles = [
                 "ACCOUNT",
                 "2026-09-21",
                 "2026-09-20",
                 "TOTAL",
                 "what this would cost",
-            ] {
-                assert!(
-                    plain(&buf, needle),
-                    "{theme:?} {needle}: a good report is plain"
-                );
-            }
+            ];
+            good(&buf, theme, &needles);
             assert!(undimmed(&buf, "[ ] 30 days"), "{theme:?}");
             assert!(undimmed(&buf, "$0.03"), "{theme:?}");
             let asked = update(&mut state, ch('p'), NOW_MS);
@@ -2423,10 +2738,8 @@ mod tests {
             };
             let r#gen = *r#gen;
             assert!(state.tokens.pending());
-            assert!(
-                plain(&draw_buffer(&state, 80, 24, NOW_MS), "2026-09-21"),
-                "{theme:?}: only a failure dims it"
-            );
+            // Only a failure dims it.
+            good(&draw_buffer(&state, 80, 24, NOW_MS), theme, &["2026-09-21"]);
             let failed = Err(SourceError {
                 kind: "store".into(),
                 message: "the index is locked".into(),
@@ -2490,15 +2803,17 @@ mod tests {
                 !text_of(&buf).iter().any(|l| l.contains("couldn't read")),
                 "{theme:?}"
             );
-            for needle in [
-                "ACCOUNT",
-                "2026-09-21",
-                "TOTAL",
-                "what this would cost",
-                "cache write",
-            ] {
-                assert!(plain(&buf, needle), "{theme:?} {needle}: cleared");
-            }
+            good(
+                &buf,
+                theme,
+                &[
+                    "ACCOUNT",
+                    "2026-09-21",
+                    "TOTAL",
+                    "what this would cost",
+                    "cache write",
+                ],
+            );
             assert!(undimmed(&buf, "$0.03"), "{theme:?}: the headline cleared");
             assert!(undimmed(&buf, "[ ] 30 days"), "{theme:?}");
         }
@@ -2581,7 +2896,8 @@ mod tests {
                 .iter()
                 .position(|l| from_1(l).starts_with("2026-08-23"));
             assert!(last.is_some(), "{w}x{h}: {lines:?}");
-            assert!(lines[last.unwrap() + 1].starts_with(" TOTAL"), "{w}x{h}");
+            assert!(lines[last.unwrap() + 1].starts_with(" ─"), "{w}x{h}");
+            assert!(lines[last.unwrap() + 2].starts_with(" TOTAL"), "{w}x{h}");
         }
         update(&mut state, key(KeyCode::Home), NOW_MS);
         assert_eq!(
@@ -2663,10 +2979,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             lines[head],
-            " SESSION      AC…  MODEL                       INPUT  OUTPUT  TOTAL         COST"
+            " SESSION      AC…  MODEL                      INPUT  OUTPUT  TOTAL         API $"
         );
         let big = &lines[head + 1];
-        for value in ["09-20 09:12", "9.9B", "≥1.2B", "16.7B", "≥$123456.79"] {
+        for value in ["09-20 09:12", "9.9B", "≥1.2B", "16.7B", "≥$123,456.79"] {
             assert!(big.contains(value), "{value} in {big:?}");
         }
         assert!(
@@ -2674,24 +2990,25 @@ mod tests {
             "the account by position, cut: {big:?}"
         );
         assert!(
-            big.contains("claude-opus-5-5-with-a-ve…"),
+            big.contains("claude-opus-5-5-with-a-v…"),
             "the model, cut last: {big:?}"
         );
         assert!(!lines[head].contains("PROJ"), "the project gave way first");
         let small = &lines[head + 2];
         assert!(small.contains("09-20 09:00"), "{small:?}");
-        let total = &lines[head + 3];
-        for value in ["9.9B", "≥1.2B", "16.7B", "≥$123456.80"] {
+        assert!(lines[head + 3].starts_with(" ─"), "{:?}", lines[head + 3]);
+        let total = &lines[head + 4];
+        for value in ["9.9B", "≥1.2B", "16.7B", "≥$123,456.80"] {
             assert!(total.contains(value), "{value} in {total:?}");
         }
-        // At 120 the cache, the responses and the bar take room, and the span is cut to its
-        // start, with the model whole to 30 columns; wider still, it shows the span and the years.
+        // At 120 the cache, the responses and the share line take room, and the span is cut to its
+        // start, the account to its position and the model to what is left; wider still, it
+        // shows the span and the years.
         let at_120 = draw(&state, 120, 40);
         assert!(
             at_120
                 .iter()
-                .any(|l| l.contains("▌09-20 09:12  3 ")
-                    && l.contains("claude-opus-5-5-with-a-very-l…")),
+                .any(|l| l.contains("▌09-20 09:12  3 …  claude-opus-5-5-with-a-ve…  ")),
             "{at_120:?}"
         );
         let at_160 = draw(&state, 160, 40);
@@ -2713,7 +3030,11 @@ mod tests {
             )],
         );
         let lines = body_of(&day, 80, 24, NOW_MS);
-        assert!(lines[4].starts_with("▌2026-09-20  3 山田"), "{}", lines[4]);
+        assert!(
+            lines[4].starts_with("▌2026-09-20  3 山…   claude-opus"),
+            "{}",
+            lines[4]
+        );
     }
 
     /// A session as the engine gives one: a UUID, a long project, two models and the cache.
@@ -2991,7 +3312,11 @@ mod tests {
             .iter()
             .position(|l| l.starts_with(" SESSION"))
             .unwrap();
-        assert_eq!(total - head - 1, 3, "the table keeps three rows: {lines:?}");
+        assert_eq!(
+            total - head - 2,
+            3,
+            "the table keeps three rows, then the rule: {lines:?}"
+        );
         assert_eq!(lines[total + 1], format!(" {}", DETAIL[0]), "{lines:?}");
         assert!(lines[20].starts_with(" J K: lines 1–"), "{lines:?}");
         let seen = scrolled_below(&mut state);
@@ -3009,9 +3334,9 @@ mod tests {
             .position(|l| l.starts_with(" SESSION"))
             .unwrap();
         assert_eq!(
-            total - head - 1,
+            total - head - 2,
             3,
-            "scrolled, the table keeps three rows: {lines:?}"
+            "scrolled, the table keeps three rows, then the rule: {lines:?}"
         );
     }
 
@@ -3184,7 +3509,7 @@ mod tests {
         }
         assert!(figures(base).contains("1m left"), "{}", figures(base));
         assert!(figures(base + 100).contains("<1m left"));
-        assert!(figures(base + 60_000).starts_with(" TOTAL"));
+        assert!(figures(base + 60_000).starts_with(" ─"));
     }
 
     #[test]
