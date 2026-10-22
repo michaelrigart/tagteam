@@ -493,9 +493,9 @@ pub enum ScreenArg {
 }
 
 impl Command {
-    /// Who the events the command's engine records are from (review refactor §8.7): `auto` and
-    /// the daemon's foreground run are their own sources, every other command, `daemon`'s
-    /// service actions included, is `cli`.
+    /// Who the events the command's engine records are from (review refactor §8.7): `auto` and the
+    /// daemon's foreground run are their own sources, every other command, `daemon`'s service
+    /// actions included, is `cli`.
     pub fn event_source(&self) -> EventSource {
         match self {
             Command::Auto { .. } => EventSource::Auto,
