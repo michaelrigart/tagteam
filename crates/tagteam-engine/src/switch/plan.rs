@@ -129,7 +129,7 @@ impl Engine {
                 }
             }
         };
-        if !self.has_login(&target)? {
+        if !self.has_login(&target, None)? {
             return Err(EngineError::NoStoredCredential(format!(
                 "{} cannot be activated: it has no stored credential; log in and run `tagteam add` again",
                 target.label

@@ -272,7 +272,7 @@ impl Engine {
     ) -> Result<Option<(AccountRow, Vec<AccountId>)>, EngineError> {
         let mut walked = Vec::new();
         for row in order {
-            if self.vault_holds_login(&row)? {
+            if self.vault_holds_login(&row, None)? {
                 return Ok(Some((row, walked)));
             }
             walked.push(row.id);
@@ -668,7 +668,7 @@ impl Engine {
         } else if state.owned() {
             // The same words as `session-owned`'s refusal: every owner and every file.
             Some(SessionOwner::of(&state, p).reason("it"))
-        } else if !self.has_login(&target)? {
+        } else if !self.has_login(&target, None)? {
             Some("it has no stored credential".to_owned())
         } else {
             None

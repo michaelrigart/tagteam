@@ -8,6 +8,7 @@ use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::session::{SessionState, session_owned_error};
 use crate::store::{AccountRow, Store};
+use crate::vault::VaultMemo;
 
 /// §9.4 step 3: never back up an empty value, because a Keychain timeout can look empty. It is
 /// reported as unreadable, on either axis: the value could not be read with confidence.
@@ -161,6 +162,9 @@ pub(crate) struct Settle<'a> {
     pub(super) live_identity: Option<&'a Identity>,
     pub(super) own_secret: Option<&'a [u8]>,
     pub(crate) warnings: Vec<String>,
+    /// The switch attempt's vault reads, under its account locks (review refactor §8.11);
+    /// `None` outside a switch, which reads the vault every time.
+    pub(super) memo: Option<&'a VaultMemo<'a>>,
 }
 
 impl<'a> Settle<'a> {
@@ -178,16 +182,18 @@ impl<'a> Settle<'a> {
             live_identity: None,
             own_secret: None,
             warnings,
+            memo: None,
         }
     }
 
     /// Records the generations `id`'s vault holds, current and `.prev`. One that cannot be read
     /// is left out, so what it may hold is saved rather than assumed kept.
     pub(crate) fn hold_vault(&mut self, engine: &Engine, id: &AccountId) {
-        for bytes in [engine.vault.read(id), engine.vault.read_prev(id)]
-            .into_iter()
-            .filter_map(Read::present)
-        {
+        let reads = match self.memo {
+            Some(m) => [m.read(id), m.read_prev(id)],
+            None => [engine.vault.read(id), engine.vault.read_prev(id)],
+        };
+        for bytes in reads.into_iter().filter_map(Read::present) {
             self.held.hold(self.p, &bytes);
         }
     }
@@ -312,8 +318,12 @@ pub(crate) fn profile_conflict(target: &AccountRow) -> EngineError {
 impl Engine {
     /// Whether `row`'s vault holds a credential. A vault that cannot be read is reported,
     /// naming the account, never taken for a missing credential (§4.3, §9.3).
-    pub(super) fn vault_holds_login(&self, row: &AccountRow) -> Result<bool, EngineError> {
-        match self.vault.read(&row.id) {
+    pub(super) fn vault_holds_login(
+        &self,
+        row: &AccountRow,
+        memo: Option<&VaultMemo<'_>>,
+    ) -> Result<bool, EngineError> {
+        match self.read_vault(&row.id, memo) {
             Read::Present(b) => Ok(!b.is_empty()),
             Read::Absent => Ok(false),
             Read::Unreadable(source) => Err(EngineError::UnreadableAccount {
@@ -324,9 +334,22 @@ impl Engine {
         }
     }
 
-    /// An identity and a non-empty vault credential.
-    pub(super) fn has_login(&self, row: &AccountRow) -> Result<bool, EngineError> {
-        Ok(row.identity_json.is_object() && self.vault_holds_login(row)?)
+    /// An identity and a non-empty vault credential. Pass a `memo` only under the switch's
+    /// account locks (review refactor §8.11).
+    pub(super) fn has_login(
+        &self,
+        row: &AccountRow,
+        memo: Option<&VaultMemo<'_>>,
+    ) -> Result<bool, EngineError> {
+        Ok(row.identity_json.is_object() && self.vault_holds_login(row, memo)?)
+    }
+
+    /// `id`'s vault entry: through `memo` when there is one, from the vault otherwise.
+    pub(super) fn read_vault(&self, id: &AccountId, memo: Option<&VaultMemo<'_>>) -> Read<Vec<u8>> {
+        match memo {
+            Some(m) => m.read(id),
+            None => self.vault.read(id),
+        }
     }
 
     pub(super) fn matches_vault(&self, p: &dyn Provider, row: &AccountRow, live: &[u8]) -> bool {

@@ -131,3 +131,33 @@ fn the_direct_branch_settles_the_target_s_rescues_too() {
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a-2"));
 }
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_rescue_that_lands_after_planning_is_adopted_under_the_locks() {
+    // Review refactor §8.11 item 2: freshen has run, so only `settle_pre` adopts the rescue,
+    // after `rederive` read the target into the memo; the adoption's write makes the
+    // activation read the vault again.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let path = fx.plant_rescue(&a, &vault_fp(&fx, &a), &credential("a@x.co", "rt-a-2"));
+    let bytes = fs::read(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    let planted = path.clone();
+    fx.engine.on_point(
+        "planned",
+        Box::new(move || {
+            if !planted.exists() {
+                fs::write(&planted, &bytes).unwrap();
+            }
+        }),
+    );
+    fx.switch_to(&a, false).unwrap();
+    assert_eq!(
+        fx.live_refresh_token().as_deref(),
+        Some("rt-a-2"),
+        "never the spent rt-a"
+    );
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a-2"));
+    assert!(!path.exists());
+}
