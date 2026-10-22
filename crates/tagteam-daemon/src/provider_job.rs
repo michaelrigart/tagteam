@@ -899,6 +899,16 @@ mod tests {
     }
 
     #[test]
+    fn a_collect_round_clamps_a_jitter_out_of_range_and_reads_a_non_finite_one_as_zero() {
+        // `poll::jittered`'s clamp reaches the daemon's round: 7.0 is 1.0, -7.0 is -1.0,
+        // and a jitter that is not finite is 0.
+        assert_eq!(collect_delay_s(300, T0, None, 7.0), 330);
+        assert_eq!(collect_delay_s(300, T0, None, -7.0), 270);
+        assert_eq!(collect_delay_s(300, T0, None, f64::INFINITY), 300);
+        assert_eq!(collect_delay_s(300, T0, None, f64::NEG_INFINITY), 300);
+    }
+
+    #[test]
     fn accounts_added_move_the_provider_from_idle_to_collect_to_auto_and_back() {
         // D4.3 as `add`, a second `add` and a disable change the store: no store is `idle`,
         // one switchable account `collect`, two `auto` with the engine lock, and one again
