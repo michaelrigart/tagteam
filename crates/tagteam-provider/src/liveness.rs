@@ -95,6 +95,19 @@ pub fn parse_session_record(bytes: &[u8]) -> Result<SessionRecord, String> {
     })
 }
 
+/// When a recorded process started, in the form its record gives it (§12.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcStart {
+    /// Epoch seconds.
+    EpochS(i64),
+    /// Linux boot ticks, `/proc/<pid>/stat` field 22.
+    BootTicks(u64),
+    /// Boot ticks too large for a `u64`.
+    BootTicksIndeterminate,
+    /// None given, or none this build can read.
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecordEntry {
     Record(SessionRecord),
@@ -269,6 +282,22 @@ pub fn parse_lstart(s: &str) -> Option<i64> {
             + i64::from(m) * 60
             + i64::from(sec),
     )
+}
+
+/// Claude Code's `procStart`, trimmed: `lstart` text is `EpochS`; otherwise non-empty all-digit
+/// text is `BootTicks`, or `BootTicksIndeterminate` when it overflows `u64`; anything else,
+/// absence included, is `Unknown`.
+pub fn proc_start_of(text: Option<&str>) -> ProcStart {
+    let text = text.map(str::trim).unwrap_or("");
+    if let Some(epoch_s) = parse_lstart(text) {
+        return ProcStart::EpochS(epoch_s);
+    }
+    if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+        return text
+            .parse::<u64>()
+            .map_or(ProcStart::BootTicksIndeterminate, ProcStart::BootTicks);
+    }
+    ProcStart::Unknown
 }
 
 /// §4.2's process port: the OS facts §12.6 judges a session record by. Every answer is
@@ -518,9 +547,10 @@ impl ProcessProbe for FakeProcessProbe {
 /// judged a recycled pid (§12.6).
 const RECYCLE_GRACE_MS: i64 = 120_000;
 
-/// §12.6: live if the pid exists and still belongs to the record's writer. `launch_command`
-/// is the provider's (`claude`), used by the heuristic for an absent `procStart` and, under
-/// Decision 16, to judge an `lstart` mismatch (recycled only if the process does not mention it).
+/// §12.6: live if the pid exists and still belongs to the record's writer, judged by the form of
+/// its process start. `launch_command` is the provider's (`claude`), used by the heuristic for an
+/// unknown start and, under Decision 16, to judge an epoch-seconds mismatch (recycled only if the
+/// process does not mention it).
 /// Anything that cannot be determined counts as live.
 pub fn record_is_live(probe: &dyn ProcessProbe, r: &SessionRecord, launch_command: &str) -> bool {
     match probe.exists(r.pid) {
@@ -528,33 +558,36 @@ pub fn record_is_live(probe: &dyn ProcessProbe, r: &SessionRecord, launch_comman
         None => return true,
         Some(true) => {}
     }
-    let proc_start = r.proc_start.as_deref().map(str::trim).unwrap_or("");
-    if let Some(recorded) = parse_lstart(proc_start) {
-        // The OS start time equal to the record's within ±1 s, or unknown, is live. A mismatch
-        // alone is no proof (Decision 16): a Linux start time moves with the wall clock, so it
-        // is recycled only when the process does not mention the launch command either. An
-        // unknown answer counts as mentioning it.
-        let matches = probe
-            .start_time_s(r.pid)
-            .is_none_or(|actual| (actual - recorded).abs() <= 1);
-        return matches || probe.mentions(r.pid, launch_command).unwrap_or(true);
-    }
-    if !proc_start.is_empty() && proc_start.bytes().all(|b| b.is_ascii_digit()) {
-        return match (proc_start.parse::<u64>().ok(), probe.start_ticks(r.pid)) {
-            (Some(recorded), Some(actual)) => actual == recorded,
-            _ => true,
-        };
-    }
-    // Absent or unparseable: recycled only if the process started more than 120 s after
-    // `startedAt` and neither its executable name nor its arguments mention the launch command.
-    let started_late = match (r.started_at_ms, probe.start_time_s(r.pid)) {
-        // Whole seconds round the start down, so this never calls a process late early.
-        (Some(at_ms), Some(start_s)) => {
-            start_s.saturating_mul(1000) > at_ms.saturating_add(RECYCLE_GRACE_MS)
+    match proc_start_of(r.proc_start.as_deref()) {
+        ProcStart::EpochS(recorded) => {
+            // The OS start time equal to the record's within ±1 s, or unknown, is live. A
+            // mismatch alone is no proof (Decision 16): a Linux start time moves with the wall
+            // clock, so it is recycled only when the process does not mention the launch command
+            // either. An unknown answer counts as mentioning it.
+            let matches = probe
+                .start_time_s(r.pid)
+                .is_none_or(|actual| (actual - recorded).abs() <= 1);
+            matches || probe.mentions(r.pid, launch_command).unwrap_or(true)
         }
-        _ => false,
-    };
-    !started_late || probe.mentions(r.pid, launch_command) != Some(false)
+        ProcStart::BootTicks(recorded) => probe
+            .start_ticks(r.pid)
+            .is_none_or(|actual| actual == recorded),
+        // Too large to compare with any start tick, so it cannot show a recycled pid.
+        ProcStart::BootTicksIndeterminate => true,
+        ProcStart::Unknown => {
+            // No usable start: recycled only if the process started more than 120 s after
+            // `startedAt` and neither its executable name nor its arguments mention the launch
+            // command.
+            let started_late = match (r.started_at_ms, probe.start_time_s(r.pid)) {
+                // Whole seconds round the start down, so this never calls a process late early.
+                (Some(at_ms), Some(start_s)) => {
+                    start_s.saturating_mul(1000) > at_ms.saturating_add(RECYCLE_GRACE_MS)
+                }
+                _ => false,
+            };
+            !started_late || probe.mentions(r.pid, launch_command) != Some(false)
+        }
+    }
 }
 
 #[cfg(test)]
