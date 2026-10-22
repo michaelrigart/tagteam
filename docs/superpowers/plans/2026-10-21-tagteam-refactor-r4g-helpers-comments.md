@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Status:** Approved
-**Branch:** `refactor-r4g-helpers-comments`, based on `refactor-r4f2-typed-items`
+**Branch:** `refactor-r4g-helpers-comments`, based on `refactor-r4f2-typed-items`; rebased onto `main` after R4f2 (#39) and T4 (#40) merged (see "Task 3 amendment")
 **Goal:** CC-E-13's shared helpers (`display_email`, one lock-record reader, one jitter, one store cache), CC-E-16's `try_target`, and §14's sweep of comments citing plan-local numbering; every output unchanged.
 **Architecture:** `display_email` on `Identity` and `AccountRow` replaces 14 copies (Task 1). `read_lock_record`, a public `poll::jittered` and `Engine::cached_store` each serve their copies (Task 2). `perform` loops over `try_target`, handing a decision back only when it replaces the `Switch` (Task 3). Task 4 rewrites comments only.
 **Tech Stack:** Rust 1.88 (edition 2024); serde_json.
@@ -192,3 +192,44 @@ fn perform(&mut self, p: &dyn Provider, t: &Ticked<'_>, trigger: Trigger,
 6. **`TargetStep` adds `NoSwitch` to the review's three outcomes:** a cooldown or a changed live login reports its own decision. `perform` gives `Option<Decision>`; `run` moves the `Switch` decision.
 7. **§14's rule:** a "Task N" or "controller ruling" goes where the sentence states the rule, and is rewritten where it carried it. A bare "plan A/B" becomes the rule, or "daemon plan A/B" where it qualifies a Decision. "Decision N", milestone names (M2–M5), commit hashes and review IDs (`R-T9-sidecars`) stay: they resolve against tracked records (§14).
 8. **Skipped:** hardening's `refresh.rs` (6), `notify.rs` (2) and `server.rs` (1); `provider_job.rs`'s "(Task 11)", which R4b's Task 4 removes; `tests/` and the held files. `bootstrap.rs`'s stale clause already went in R1–R3, leaving a reflow.
+
+## Task 3 amendment: `try_target` over T4's `perform` (TUI redesign T4, PR #40)
+
+T4 merges before R4g and changes `auto.rs::perform`. Task 3 was planned and done against the code before T4. This amendment states how Task 3's extraction reads on top of T4. It runs when R4g is rebased onto the main that contains T4. Everything in Task 3 not named here stands.
+
+**What T4 changes in the code Task 3 moves:**
+- `SwitchRequest`'s `AutoPerform` gains `cause: cause(&t.snap, &self.cfg, &t.live.id)`.
+- The non-fatal `Err(e)` arm of `self.engine.switch(req)` calls `self.switch_failed(&t.live.id, id, &e)?` after `self.error(..)` and before returning `TickOutcome::Error`.
+- `no_switch` returns `Result<(TickOutcome, Decision), EngineError>`. `announce` can now fail, because it stores `all-exhausted`. Its callers return it directly, without wrapping it in `Ok`.
+- `tick` sets `self.exhausted` from the decision in `run`'s `Ok((_, decision))`.
+
+**The mapping on top of T4** (it replaces Step 2's mapping only where it differs):
+- **The request** is built inside `try_target` with T4's `cause` line, moved with the rest of the body.
+- **The non-fatal error arm.** `try_target` does `self.count(t)?`, then `self.error(..)`, then `self.switch_failed(&t.live.id, id, &e)?`, in that order, and then returns `Ok(TargetStep::Stop(TickOutcome::Error))`. An `Err` from `switch_failed` propagates out of `try_target`, `perform` and `run`, as it does from T4's `perform`.
+- **`Cooldown` and `LiveChanged`.** `let (outcome, decision) = self.no_switch(..)?;` then `Ok(TargetStep::NoSwitch(outcome, decision))`. An `Err` from `no_switch` propagates. Each arm's other side effects stay where T4 has them: `count` and `cooldown_left` for `Cooldown`, and `set_unhealthy_ticks(.., 0)` for `LiveChanged`.
+- **Step 12's no-viable-target.** `let (outcome, decision) = self.no_switch(..)?;` then `Ok((outcome, Some(decision)))`.
+- **`run`** still returns `instead.unwrap_or(decided.decision)`. `tick`'s exhaustion flag is not edited: it reads the decision `run` returns, which is the same decision T4's code returns on every path.
+- `TargetStep`'s variants and `perform`'s signature are as Task 3 defined them. `perform` takes no `decision` parameter.
+
+**The net** adds T4's tests to Step 1's list. They must pass unchanged after the rebase:
+- `auto_tick.rs`:
+  - `an_automatic_switch_records_the_window_that_triggered_it`
+  - `a_failover_from_an_unread_account_records_no_cause`
+  - `a_failed_switch_is_recorded_once_per_target_and_message_for_30_minutes`
+  - `every_account_exhausted_is_recorded_on_entry_only`
+  - `an_exhaustion_after_a_switch_is_a_new_episode`
+  - `an_exhaustion_after_a_failed_switch_is_a_new_episode`
+  - `a_fresh_engine_records_an_exhaustion_the_store_already_has_once`
+  - `a_dry_run_records_no_failed_switch_and_no_exhaustion`
+- `switch.rs`: `a_manual_switch_records_no_detail`.
+
+**Procedure:**
+1. `git rebase --onto origin/main <old base> refactor-r4g-helpers-comments`.
+2. Resolve Task 1's and Task 2's hunks by keeping both sides' intent: `display_email()` in place of `email_of` wherever T4's new code names an account, and T4's `existing_store()` calls kept, now backed by `cached_store`.
+3. Redo Task 3's hunk as `try_target` over T4's `perform`, following the mapping above.
+4. Task 4's comment rows apply to the text as it stands after T4. A T4 comment that cites plan-local numbering in a file this branch may edit (for example "T4-24", "T4-25") stays: it names the redesign's tracked finding IDs, which §14 keeps.
+5. Verify: the net above, the engine and daemon focused suites, and both clippy variants. `git diff --color-moved=zebra --color-moved-ws=allow-indentation-change` against T4's `perform` shows only control-flow edges unmoved.
+
+**Recorded in the PR's Rulings:** T4 landed first, and this amendment resolved the overlap. Review refactor §8.9's CC-E-16 is unchanged in intent.
+
+Codex approved this amendment in its own plan round (`xr-1792662078-111d3415`) before the rebase ran.
