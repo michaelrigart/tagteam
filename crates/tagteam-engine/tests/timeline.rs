@@ -43,11 +43,16 @@ fn raw(fx: &Fx) -> rusqlite::Connection {
 
 /// `id` became the provider's active account at `at_s`.
 fn in_use(fx: &Fx, id: &AccountId, at_s: i64) {
+    in_use_ms(fx, id, at_s * 1000);
+}
+
+/// `id` became the provider's active account at `at_ms`, as SQLite stamps it.
+fn in_use_ms(fx: &Fx, id: &AccountId, at_ms: i64) {
     raw(fx)
         .execute(
             "INSERT INTO active_history (provider, at, account_id, recorded_at) \
              VALUES (?1, ?2, ?3, ?2)",
-            rusqlite::params![fx.provider().as_str(), at_s * 1000, id.as_str()],
+            rusqlite::params![fx.provider().as_str(), at_ms, id.as_str()],
         )
         .unwrap();
 }
@@ -306,6 +311,34 @@ fn a_removed_account_in_use_in_the_range_keeps_its_lane() {
             in_use: vec![true; COLUMNS],
         }]
     );
+}
+
+#[test]
+fn a_change_later_in_the_current_second_is_in_the_last_column() {
+    // The view's grid ends at `now_s`; SQLite stamps the row in ms, 300 ms after it.
+    let (fx, a, b, _) = fixture();
+    in_use(&fx, &a, day(5, 0));
+    in_use_ms(&fx, &b, T0 * 1000 + 300);
+    let v = timeline(&fx, Scope::All);
+    assert_eq!(ids(&v.lanes), ["a", "b"]);
+    assert_eq!(v.lanes[0].in_use, flags("ffffftt"));
+    assert_eq!(v.lanes[1].in_use, flags("fffffft"));
+    // `a`'s span ends where `b`'s starts: at `now`, so a sample there is `b`'s.
+    sample(&fx, &a, "5h", T0, 80.0);
+    sample(&fx, &b, "5h", T0, 5.0);
+    let v = timeline(&fx, Scope::All);
+    assert_eq!(v.charts[0].peaks, peaks(&[(6, 5.0)]));
+}
+
+#[test]
+fn a_change_from_the_next_second_on_is_in_no_column() {
+    let (fx, a, b, c) = fixture();
+    in_use(&fx, &a, day(5, 0));
+    in_use_ms(&fx, &b, T0 * 1000 + 300);
+    in_use_ms(&fx, &c, (T0 + 1) * 1000);
+    let v = timeline(&fx, Scope::All);
+    assert_eq!(ids(&v.lanes), ["a", "b"], "c is not in use yet");
+    assert_eq!(v.lanes[1].in_use, flags("fffffft"));
 }
 
 #[test]
