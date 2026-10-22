@@ -20,8 +20,9 @@ use tagteam_core::autoswitch::{
 };
 use tagteam_core::{AccountId, ProviderId, Window, WindowKind};
 use tagteam_engine::auto::{AutoEvent, EventSink, TickOutcome};
+use tagteam_engine::store::EventRow;
 use tagteam_engine::vault::SERVICE;
-use tagteam_engine::{Engine, EventSource};
+use tagteam_engine::{Engine, EventKind, EventSource};
 use tagteam_fake::FakePaths;
 use tagteam_provider::profile::{SEED_FILE, Seed};
 use tagteam_provider::{Keychain, Provider, Read};
@@ -895,6 +896,248 @@ fn every_candidate_exhausted_is_blocked_until_the_earliest_recovery() {
             },
         ]
     );
+}
+
+/// Moves the fixture's clock `ms` on, then records each reading as taken then, its next poll
+/// five minutes out. Every account is read, so no tick finds one due.
+fn read_later(fx: &Fx, ms: i64, readings: &[(&AccountId, Vec<Window>)]) {
+    fx.clock.advance_ms(ms);
+    let now = fx.engine.now_ms().div_euclid(1000);
+    for (id, windows) in readings {
+        record_reading(&fx.engine, id, windows, now, now + 300);
+    }
+}
+
+/// The stored events of `kind`, in order.
+fn stored(fx: &Fx, kind: EventKind) -> Vec<EventRow> {
+    let events = fx.engine.store().unwrap().events().unwrap();
+    events.into_iter().filter(|e| e.kind == kind).collect()
+}
+
+/// `a` at position 1 and `b` at position 2, live, both at their short window's limit.
+fn exhausted_pair(fx: &Fx) -> (AccountId, AccountId) {
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    read(&fx.engine, &a, &reading(false, 100.0, 40.0));
+    read(&fx.engine, &b, &reading(false, 100.0, 40.0));
+    (a, b)
+}
+
+/// T4-24: a failed switch writes `switch-failed`, `from` the live account and `to` the target,
+/// unless the provider's latest one of the last 30 minutes names the same target and message.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_failed_switch_is_recorded_once_per_target_and_message_for_30_minutes() {
+    use tagteam_engine::error::EngineError;
+
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    read(&fx.engine, &a, &reading(false, 10.0, 20.0));
+    read(&fx.engine, &b, &reading(false, 20.0, 95.0));
+    let auto = fx.engine_as(EventSource::Auto);
+    auto.fail_at(Some("after-journal"));
+    let sink = Recorded::default();
+    let mut engine = auto
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    // The switch's `Err`, as `perform` meets it: the injected failure, rolled back.
+    let message = |point: &str| {
+        let injected = EngineError::InvalidInput(format!("injected failure at {point}"));
+        EngineError::RolledBack(injected.to_string()).to_string()
+    };
+    assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Error);
+    let last = fx.engine.store().unwrap().events().unwrap().pop().unwrap();
+    assert_eq!(
+        (
+            last.kind,
+            last.from_id.as_ref(),
+            last.to_id.as_ref(),
+            last.source
+        ),
+        (
+            EventKind::SwitchFailed,
+            Some(&b),
+            Some(&a),
+            EventSource::Auto
+        )
+    );
+    assert_eq!(
+        last.detail,
+        Some(json!({"message": message("after-journal"), "transient": false}))
+    );
+    let before = fx.engine.store().unwrap().events().unwrap();
+    assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Error);
+    assert_eq!(
+        fx.engine.store().unwrap().events().unwrap(),
+        before,
+        "the same target and message within 30 minutes add none"
+    );
+    read_later(
+        &fx,
+        30 * 60_000 + 1_000,
+        &[
+            (&a, reading(false, 10.0, 20.0)),
+            (&b, reading(false, 20.0, 95.0)),
+        ],
+    );
+    assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Error);
+    assert_eq!(stored(&fx, EventKind::SwitchFailed).len(), 2);
+    auto.fail_at(Some("after-credential"));
+    assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Error);
+    let failed = stored(&fx, EventKind::SwitchFailed);
+    assert_eq!(failed.len(), 3, "another message is another failure");
+    assert_eq!(
+        failed[2].detail,
+        Some(json!({"message": message("after-credential"), "transient": false}))
+    );
+}
+
+/// T4-24: every account exhausted writes one `all-exhausted` when the episode begins, and
+/// again only after a decision that was not one.
+#[test]
+fn every_account_exhausted_is_recorded_on_entry_only() {
+    let fx = Fx::new();
+    let (a, b) = exhausted_pair(&fx);
+    let auto = fx.engine_as(EventSource::Auto);
+    let sink = Recorded::default();
+    let mut engine = auto
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Blocked);
+    }
+    let exhausted = stored(&fx, EventKind::AllExhausted);
+    assert_eq!(exhausted.len(), 1, "{exhausted:?}");
+    let e = &exhausted[0];
+    assert_eq!(
+        (e.from_id.as_ref(), e.to_id.as_ref(), e.source),
+        (Some(&b), None, EventSource::Auto)
+    );
+    assert_eq!(e.detail, Some(json!({"earliest_reset_at": SHORT_RESETS})));
+    let at_limit = reading(false, 100.0, 40.0);
+    read_later(
+        &fx,
+        300_000,
+        &[(&a, at_limit.clone()), (&b, reading(false, 50.0, 40.0))],
+    );
+    assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::NoAction);
+    read_later(&fx, 300_000, &[(&a, at_limit.clone()), (&b, at_limit)]);
+    assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Blocked);
+    assert_eq!(stored(&fx, EventKind::AllExhausted).len(), 2);
+}
+
+/// T4-24: a successful switch is a decision that is not `all-exhausted`, though it is never
+/// announced, so every account exhausted after it is a new episode.
+#[test]
+fn an_exhaustion_after_a_switch_is_a_new_episode() {
+    let fx = Fx::new();
+    let (a, b) = exhausted_pair(&fx);
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Blocked);
+    assert_eq!(stored(&fx, EventKind::AllExhausted).len(), 1);
+    read_later(
+        &fx,
+        300_000,
+        &[
+            (&a, reading(false, 10.0, 20.0)),
+            (&b, reading(false, 100.0, 40.0)),
+        ],
+    );
+    assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Switched);
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    // The switch re-planned b's poll five minutes out, jittered by up to 10%.
+    read_later(
+        &fx,
+        360_000,
+        &[
+            (&a, reading(false, 100.0, 40.0)),
+            (&b, reading(false, 100.0, 40.0)),
+        ],
+    );
+    assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Blocked);
+    let exhausted = stored(&fx, EventKind::AllExhausted);
+    assert_eq!(exhausted.len(), 2, "{exhausted:?}");
+    assert_eq!(exhausted[1].from_id.as_ref(), Some(&a));
+}
+
+/// T4-24 (Review Focus 3): an engine's first decision has no previous one, so it writes
+/// `all-exhausted` unless the provider's latest auto-line event already is one with the same
+/// earliest recovery.
+#[test]
+fn a_fresh_engine_records_an_exhaustion_the_store_already_has_once() {
+    let fx = Fx::new();
+    let (a, b) = exhausted_pair(&fx);
+    let sink = Recorded::default();
+    let tick = || {
+        let mut engine = fx
+            .engine
+            .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Blocked);
+    };
+    tick();
+    assert_eq!(stored(&fx, EventKind::AllExhausted).len(), 1);
+    tick();
+    assert_eq!(
+        stored(&fx, EventKind::AllExhausted).len(),
+        1,
+        "the same earliest recovery is the same episode"
+    );
+    let later = vec![
+        usage_window("5h", WindowKind::Short, 100.0, SHORT_RESETS + 3_600),
+        usage_window("7d", WindowKind::Long, 40.0, LONG_RESETS + 3_600),
+    ];
+    read_later(&fx, 300_000, &[(&a, later.clone()), (&b, later)]);
+    tick();
+    let exhausted = stored(&fx, EventKind::AllExhausted);
+    assert_eq!(exhausted.len(), 2, "{exhausted:?}");
+    assert_eq!(
+        exhausted[1].detail,
+        Some(json!({"earliest_reset_at": SHORT_RESETS + 3_600}))
+    );
+}
+
+/// T4-24: dry-run writes neither `switch-failed` nor `all-exhausted`.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_dry_run_records_no_failed_switch_and_no_exhaustion() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    read(&fx.engine, &a, &reading(false, 10.0, 20.0));
+    read(&fx.engine, &b, &reading(false, 20.0, 95.0));
+    fx.engine.fail_at(Some("after-journal"));
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), true)
+        .unwrap()
+        .unwrap();
+    let before = fx.engine.store().unwrap().events().unwrap();
+    assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Switched);
+    assert_eq!(fx.engine.store().unwrap().events().unwrap(), before);
+    read_later(
+        &fx,
+        300_000,
+        &[
+            (&a, reading(false, 100.0, 40.0)),
+            (&b, reading(false, 100.0, 40.0)),
+        ],
+    );
+    let before = fx.engine.store().unwrap().events().unwrap();
+    for _ in 0..2 {
+        assert_eq!(engine.tick(&sink).unwrap().0, TickOutcome::Blocked);
+    }
+    assert_eq!(fx.engine.store().unwrap().events().unwrap(), before);
 }
 
 #[test]
