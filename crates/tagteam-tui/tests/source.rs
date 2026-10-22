@@ -438,6 +438,34 @@ fn last_auto_is_each_provider_s_own_and_reaches_back_30_days() {
 }
 
 #[test]
+fn last_auto_reaches_a_switch_29_days_old() {
+    // A switch 29 days old is inside the read's 30 days and is the entry, not the 31-day one.
+    let home = Home::new();
+    home.add(CLAUDE_CODE, 1, "a@x.co");
+    let b = home.add(CLAUDE_CODE, 2, "b@x.co");
+    let cc = ProviderId::new(CLAUDE_CODE);
+    let switch = |at: i64| EventRow {
+        at,
+        provider: cc.clone(),
+        kind: EventKind::Switch,
+        from_id: None,
+        to_id: Some(b.clone()),
+        trigger: None,
+        source: EventSource::Daemon,
+        detail: None,
+    };
+    let store = home.store();
+    store
+        .insert_event(&switch(NOW_MS - 31 * 86_400_000), false)
+        .unwrap();
+    let within = NOW_MS - 29 * 86_400_000;
+    store.insert_event(&switch(within), false).unwrap();
+    let snap = home.source().accounts(None).unwrap();
+    let last: Vec<(&ProviderId, i64)> = snap.last_auto.iter().map(|(p, e)| (p, e.at_ms)).collect();
+    assert_eq!(last, [(&cc, within)]);
+}
+
+#[test]
 fn several_providers_are_listed_and_a_provider_narrows_them() {
     let home = Home::new();
     home.add(CLAUDE_CODE, 1, "a@x.co");
