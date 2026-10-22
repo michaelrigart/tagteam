@@ -181,8 +181,9 @@ fn one_response(home: &Home) {
 /// The Tokens screen, its report read from an index that has completed a refresh.
 fn token_report(s: &Screen) -> bool {
     s.on_alt()
-        && s.contains("[Day] Month Session Block")
-        && s.contains("refreshed ")
+        && s.contains("[ ] 30 days")
+        && s.contains("g by account")
+        && s.contains("indexed ")
         && s.contains("1.1K")
 }
 
@@ -325,7 +326,7 @@ fn two_shows_the_token_report_and_one_the_accounts_again() {
     tui.wait_for(LONG, "the token report", token_report);
     tui.type_keys(b"1");
     tui.wait_for(LONG, "the accounts table again", |s| {
-        accounts(s) && !s.contains("[Day]")
+        accounts(s) && !s.contains("[ ] 30 days")
     });
     tui.type_keys(b"q");
     let f = tui.finish(LONG);
@@ -498,7 +499,7 @@ const SHORT_DA1: &[u8] = b"\x1b[?62c";
 const HELD: &str = "the terminal sent an unfinished colour report";
 
 fn tokens(s: &Screen) -> bool {
-    s.on_alt() && s.contains("[Day]")
+    s.on_alt() && s.contains("[ ] 30 days") && s.contains("g by ")
 }
 
 fn help(s: &Screen) -> bool {
