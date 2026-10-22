@@ -8,14 +8,14 @@ use tagteam_core::pace::ProjectionMethod;
 use tagteam_core::usage::WindowKind;
 use tagteam_fake::{
     FAKE_AGENT, FakeAgent, FakePaths, KIND_STATIC, KIND_TOKEN, LOGIN_EXPIRES, credential_json,
-    identity_json, login,
+    identity_json, login, session_record,
 };
 use tagteam_provider::http::{HttpError, HttpResponse, Method, RecordedRequest, ScriptedHttp};
 use tagteam_provider::provider::{TransientKind, ValidateRequest};
 use tagteam_provider::{
     Capabilities, Credential, EntryKind, Env, LiveChange, LockError, MustShare, MutationGuard,
-    Pace, PollBudget, Provenance, Provider, ProviderError, Read, SecretStore, SharePolicy,
-    StoredLogin, UsageResult, Window, Written,
+    Pace, PollBudget, ProcStart, Provenance, Provider, ProviderError, Read, SecretStore,
+    SessionRecord, SharePolicy, StoredLogin, UsageResult, Window, Written,
 };
 
 struct Fx {
@@ -1215,4 +1215,60 @@ fn a_settled_profile_read_waits_out_the_profile_s_own_lock() {
         Some(Fingerprint::of_secret(b"renew-p2"))
     );
     assert!(!lock.exists(), "released on return");
+}
+
+#[test]
+fn its_session_records_are_its_own_format() {
+    let f = fx();
+    assert_eq!(f.fake.session_record_ext(), "rec");
+    assert_eq!(
+        f.fake.supervisor_lock(std::path::Path::new("/p/0193")),
+        Some(std::path::PathBuf::from("/p/0193/procs/keeper.lock"))
+    );
+    let parse = |v: &Value| f.fake.parse_session_record(v.to_string().as_bytes());
+
+    let keeper = session_record(7, 1_790_858_096, "s-7", "keeper");
+    assert_eq!(
+        parse(&keeper),
+        Ok(SessionRecord {
+            pid: 7,
+            start: ProcStart::EpochS(1_790_858_096),
+            started_at_ms: Some(1_790_858_096_000),
+            session_id: Some("s-7".into()),
+            background: true,
+        })
+    );
+    let driver = session_record(7, 1_790_858_096, "s-7", "driver");
+    assert!(!parse(&driver).unwrap().background);
+
+    for bare in [
+        json!({"process": {"id": 7}}),
+        json!({"process": {"id": 7, "since": "soon"}}),
+    ] {
+        assert_eq!(
+            parse(&bare),
+            Ok(SessionRecord {
+                pid: 7,
+                start: ProcStart::Unknown,
+                started_at_ms: None,
+                session_id: None,
+                background: false,
+            }),
+            "{bare}"
+        );
+    }
+
+    let refused = [
+        json!({"pid": 7, "procStart": "SENTINEL"}).to_string(),
+        json!({"process": {"id": 0}}).to_string(),
+        json!({"process": {"id": -1}}).to_string(),
+        json!({"process": {"id": 2_147_483_648_i64}}).to_string(),
+        json!({"process": {"id": "SENTINEL"}}).to_string(),
+        json!(["SENTINEL"]).to_string(),
+        "SENTINEL{".to_owned(),
+    ];
+    for bytes in &refused {
+        let err = f.fake.parse_session_record(bytes.as_bytes()).unwrap_err();
+        assert!(!err.contains("SENTINEL"), "{bytes}: {err}");
+    }
 }
