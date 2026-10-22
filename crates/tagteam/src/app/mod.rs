@@ -289,11 +289,6 @@ impl App<'_, '_> {
         }
     }
 
-    /// Now, in epoch seconds, by the engine's clock: what countdowns and ages count from.
-    fn now_s(&self) -> i64 {
-        self.engine.now_ms().div_euclid(1000)
-    }
-
     /// Whether `list` and `status` colour their percentages (§13.1).
     fn color(&self) -> bool {
         self.color.enabled(self.engine.settings().color)

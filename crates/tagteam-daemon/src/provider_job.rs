@@ -235,10 +235,6 @@ impl<'e> ProviderJob<'e> {
         }
     }
 
-    fn now_s(&self) -> i64 {
-        self.engine.now_ms().div_euclid(1000)
-    }
-
     /// The secret reads made so far, over every Keychain instance the job was given (D4.1).
     fn reads(&self) -> ReadTally {
         self.ctx
@@ -404,7 +400,7 @@ impl<'e> ProviderJob<'e> {
         self.last_outcome = Some(LastOutcome {
             kind: OutcomeKind::Error,
             reason: Some(message),
-            at: self.now_s(),
+            at: self.engine.now_s(),
         });
     }
 
@@ -461,7 +457,7 @@ impl<'e> ProviderJob<'e> {
         let watching = Watching::new(cx.sink);
         let auto = self.auto.as_mut().expect("a job in auto holds its engine");
         let ticked = auto.tick(&watching);
-        let at = self.now_s();
+        let at = self.engine.now_s();
         let (outcome, decision) = match ticked {
             Ok(done) => done,
             Err(e) if e.signal().is_some() => return None,
@@ -510,7 +506,7 @@ impl<'e> ProviderJob<'e> {
                 Err(e) => self.failed(cx, &e),
             }
         }
-        let now = self.now_s();
+        let now = self.engine.now_s();
         let next_poll = self.auto.as_ref().and_then(|a| a.active_next_poll_at());
         let delay = next_delay(&decision, &self.cfg, now, next_poll, (cx.jitter)());
         if announces_sleep(delay, &self.cfg) {
@@ -534,7 +530,7 @@ impl<'e> ProviderJob<'e> {
                 self.last_outcome = Some(LastOutcome {
                     kind: OutcomeKind::Collect,
                     reason: None,
-                    at: self.now_s(),
+                    at: self.engine.now_s(),
                 });
             }
             Err(e) if e.signal().is_some() => return None,
@@ -542,7 +538,12 @@ impl<'e> ProviderJob<'e> {
         }
         // An engine error plans nothing: the round waits its interval, never under 60 s (D4.3).
         let earliest = self.engine.earliest_poll_at(&self.provider).unwrap_or(None);
-        let delay = collect_delay_s(self.cfg.interval_s, self.now_s(), earliest, (cx.jitter)());
+        let delay = collect_delay_s(
+            self.cfg.interval_s,
+            self.engine.now_s(),
+            earliest,
+            (cx.jitter)(),
+        );
         Some(Worked {
             delay_ms: delay * 1000,
             switched: false,

@@ -134,7 +134,7 @@ impl Daemon {
             DaemonInfo {
                 pid: std::process::id(),
                 version: opts.version.clone(),
-                started_at: engine.now_ms().div_euclid(1000),
+                started_at: engine.now_s(),
                 socket: None,
                 log: engine.env().log_file(),
             },

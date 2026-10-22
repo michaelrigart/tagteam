@@ -4,6 +4,7 @@
 //! due, or every item was absent) changes nothing. It is not a mode (D4.3), and it carries
 //! over a mode change, since the keychain is no less locked.
 
+use tagteam_core::time::ms_to_s_ceil;
 use tagteam_provider::keychain::ReadTally;
 
 use crate::events::Backoff;
@@ -53,7 +54,7 @@ impl KeychainBackoff {
     /// The backoff as `status` and the `mode` event show it, while it holds.
     pub fn current(&self) -> Option<Backoff> {
         self.until_ms.map(|ms| Backoff {
-            until: (ms + 999).div_euclid(1000),
+            until: ms_to_s_ceil(ms),
         })
     }
 

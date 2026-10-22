@@ -36,7 +36,7 @@ impl App<'_, '_> {
             Some(a) => self.resolve(a)?,
             None => self.live_row()?,
         };
-        let now_s = self.now_s();
+        let now_s = self.engine.now_s();
         // The engine's relevance filter is the one rule for which windows show (§8.2).
         let view = self
             .engine

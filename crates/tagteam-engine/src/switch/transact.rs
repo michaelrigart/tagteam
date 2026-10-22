@@ -681,7 +681,7 @@ impl Engine {
             .as_ref()
             .zip(outgoing)
             .map(|(auto, from)| AutoRecord {
-                at: self.now_ms().div_euclid(1000),
+                at: self.now_s(),
                 from: from.id.clone(),
                 to: target.id.clone(),
                 departure: auto.departure.clone(),

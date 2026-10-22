@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
 use tagteam_core::backoff::{CAP_429_S, failure_backoff_s};
 use tagteam_core::poll::budget_next_free;
+use tagteam_core::time::ms_to_s;
 use tagteam_core::trust::{FUTURE_STAMP_SLACK_S, is_future_stamped};
 use tagteam_core::usage::{windows_from_json, windows_to_json};
 use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Sample, Window};
@@ -402,7 +403,7 @@ impl Store {
         eligibility: Eligibility,
         budget: &PollBudget,
     ) -> Result<Reserve, StoreError> {
-        let now_s = now_ms.div_euclid(1000);
+        let now_s = ms_to_s(now_ms);
         let id = &account.id;
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -508,7 +509,7 @@ impl Store {
         now_ms: i64,
         budget: &PollBudget,
     ) -> Result<SendGrant, StoreError> {
-        let now_s = now_ms.div_euclid(1000);
+        let now_s = ms_to_s(now_ms);
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let quarantined: bool = tx.query_row(

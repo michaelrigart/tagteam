@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use tagteam_core::autoswitch::AutoStrategy;
 use tagteam_core::fmt::span;
+use tagteam_core::time::ms_to_s;
 use tagteam_core::trust::is_future_stamped;
 use tagteam_core::usage::WindowKind;
 use tagteam_provider::doctor::quoted;
@@ -239,9 +240,9 @@ impl Run<'_> {
                 let left = at - self.now_ms;
                 if left <= EXPIRY_NOTICE_MS {
                     let when = if left > 0 {
-                        format!("expires in {}", span(left / 1000))
+                        format!("expires in {}", span(ms_to_s(left)))
                     } else {
-                        format!("expired {} ago", span(-left / 1000))
+                        format!("expired {} ago", span(ms_to_s(-left)))
                     };
                     found.push(
                         Check::warn(
@@ -374,7 +375,7 @@ impl Run<'_> {
         let Ok(rows) = store.accounts(&id) else {
             return;
         };
-        let now_s = self.now_ms.div_euclid(1000);
+        let now_s = ms_to_s(self.now_ms);
         let budget = p.poll_budget();
         let mut found = Vec::new();
         let mut identities = BTreeSet::new();

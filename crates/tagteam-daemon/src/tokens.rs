@@ -178,7 +178,7 @@ impl Common {
 
     /// D5.4's `jobs` entry for one run.
     fn report(&self, name: &str, engine: &Engine, delay_ms: i64, error: Option<String>) {
-        let now_s = engine.now_ms().div_euclid(1000);
+        let now_s = engine.now_s();
         self.board.set_job(JobStatus {
             name: name.to_owned(),
             last_run_at: Some(now_s),
