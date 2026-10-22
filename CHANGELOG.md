@@ -94,7 +94,8 @@ with the one before, so any release may contain breaking changes. Each section s
   and a headline with the report's cost, tokens and responses; from 120 columns, today's cost and
   a sparkline of cost per day; with 5-hour blocks, the active block's progress. Its table says
   `API $` and `RESPONSES`, short model names, a project's name, `~` for an estimated block, and
-  `removed account` or `unknown account`; the selected row's detail is labelled `SELECTED`.
+  `removed account` or `unknown account`; the selected row's detail is labelled `SELECTED`. The
+  screen no longer names the time zone; help explains `CACHE W 5M` and `1H`.
 - `tagteam tokens` and `tagteam tui` word two notes anew: `≥ at least: N subagent responses are
   still being counted` and `$ what this would cost on the API at list prices of <date>; not your
   bill`.
