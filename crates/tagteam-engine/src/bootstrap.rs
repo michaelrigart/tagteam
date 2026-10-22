@@ -476,12 +476,11 @@ impl Engine {
 
 #[cfg(feature = "test-hooks")]
 impl Engine {
-    /// Tests only: what a quiescent launch runs between its
-    /// locks and its reservation, provenance aside. That is the marker, the link sync, then a
-    /// bootstrap for a §12.3 trigger, else the seed, under `MutationGuard` (30 s) and the
-    /// account lock. Returns the trigger that applied. With no plan to resolve it, the
-    /// validation's program is the launch command by name: the scripted spawner records it and
-    /// never runs it.
+    /// Tests only: what a quiescent launch runs between its locks and its reservation,
+    /// provenance aside. That is the marker, the link sync, then a bootstrap for a §12.3
+    /// trigger, else the seed, under `MutationGuard` (30 s) and the account lock. Returns the
+    /// trigger that applied. With no plan to resolve it, the validation's program is the launch
+    /// command by name: the scripted spawner records it and never runs it.
     pub fn bootstrap_quiescent(
         &self,
         id: &AccountId,
@@ -530,9 +529,9 @@ mod tests {
     #[test]
     fn a_bootstrap_of_a_linked_profile_refuses_before_anything_is_written() {
         // Behind `mark_profile`, which a launch runs first and which refuses the same path: the
-        // bootstrap itself never writes through a link at the profile path (controller ruling).
-        // The target holds the account's own marker, as a profile moved and linked back does,
-        // so nothing but the link stops the bootstrap.
+        // bootstrap itself never writes through a link at the profile path. The target holds the
+        // account's own marker, as a profile moved and linked back does, so nothing but the link
+        // stops the bootstrap.
         let t = T::new();
         let row = t.account("a@x.co", &cred("rt-a", NOW + 86_400_000));
         let p = t.engine.provider(&row.provider).unwrap();

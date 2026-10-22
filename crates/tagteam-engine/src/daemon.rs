@@ -27,9 +27,9 @@ pub fn daemon_socket_path(env: &Env) -> PathBuf {
 }
 
 /// D5.1: the longest socket path, in bytes, that `sockaddr_un.sun_path` holds with its NUL:
-/// 108 bytes on Linux. Plan B's server refuses a longer path rather than bind a truncated one,
-/// and `doctor` reports it (D10). A constant, since the engine forbids the `unsafe` that sizing
-/// a `sockaddr_un` would take.
+/// 108 bytes on Linux. The daemon's server refuses a longer path rather than bind a truncated
+/// one, and `doctor` reports it (D10). A constant, since the engine forbids the `unsafe` that
+/// sizing a `sockaddr_un` would take.
 #[cfg(target_os = "linux")]
 pub const MAX_SOCKET_PATH: usize = 107;
 

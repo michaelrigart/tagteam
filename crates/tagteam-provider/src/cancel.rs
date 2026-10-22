@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn a_store_into_the_cell_is_a_request() {
-        // What a signal handler does (Task 6): it stores the number and nothing else.
+        // What a signal handler does: it stores the number and nothing else.
         let c = Cancel::new();
         c.cell().store(1, Ordering::SeqCst);
         assert_eq!(c.requested(), Some(1));

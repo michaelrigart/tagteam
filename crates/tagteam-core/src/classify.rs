@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn precedence_follows_the_table_order_when_facts_combine() {
-        // L300: a vault match outranks any oracle answer; a wiped or tokenless credential
+        // §9.4 step 4: a vault match outranks any oracle answer; a wiped or tokenless credential
         // outranks the oracle; and a foreign answer is displaced whatever else holds.
         let ours = OutgoingFacts {
             fp_equal_vault: true,

@@ -222,8 +222,8 @@ pub enum ShellAccount {
 
 /// Decision 10's table; the first row that matches wins. `state` is the account's
 /// `usage_state` row, if any. Its `last_error` counts only while failures are being retried:
-/// a success resets them. A reading is a `fetched_at`: Task 8 stores a reading with no windows
-/// as a null `last_good`.
+/// a success resets them. A reading is a `fetched_at`: a reading with no windows is
+/// stored with a null `last_good`.
 fn usage_status(
     supported: bool,
     kind: &KindTraits,

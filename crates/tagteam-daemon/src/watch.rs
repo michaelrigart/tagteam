@@ -373,7 +373,7 @@ mod tests {
             .count()
     }
 
-    /// The store watch's baseline as `Daemon::start` takes it (Task 12).
+    /// The store watch's baseline as `Daemon::start` takes it.
     fn baseline(fx: &Fx) -> StoreBaseline {
         StoreBaseline::take(&fx.engine).unwrap()
     }
@@ -585,8 +585,8 @@ mod tests {
 
     #[test]
     fn the_first_run_compares_with_the_baseline() {
-        // Decision 11: `Daemon::start` takes the baseline, and serving begins later (plan B
-        // binds its socket in between). With nothing changed since, the first run reports
+        // Decision 11: `Daemon::start` takes the baseline, and serving begins later (the
+        // socket is bound in between). With nothing changed since, the first run reports
         // nothing. Another process's commit since is reported at the first run, which a first
         // run that only recorded would miss.
         let fx = Fx::new();
@@ -814,9 +814,9 @@ mod tests {
     #[test]
     fn the_watch_compares_with_the_stamp_it_is_given_never_with_the_file_when_built() {
         // D4.5, Decision 17: `tagteam daemon` stamps its program first thing, and builds the
-        // watch only after the unlock offer and the `daemon.lock` wait (Task 12). A tagteam
-        // installed in between is an upgrade at the watch's first run, never the stamp of a
-        // daemon that still runs the old binary.
+        // watch only after the unlock offer and the `daemon.lock` wait. A tagteam installed in
+        // between is an upgrade at the watch's first run, never the stamp of a daemon that still
+        // runs the old binary.
         let fx = Fx::new();
         let dir = tempfile::tempdir().unwrap();
         let exe = program(dir.path(), "tagteam", b"binary v1", 1_000);

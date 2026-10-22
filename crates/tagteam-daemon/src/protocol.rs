@@ -429,8 +429,8 @@ pub fn home_relative(path: &Path, home: &Path) -> String {
     }
 }
 
-/// D5.4's `status` result, built from the board's snapshot (Decision 12 of plan A), so it never
-/// touches the store or waits for a job. Every key is written, null when empty.
+/// D5.4's `status` result, built from the board's snapshot (daemon plan A, Decision 12), so it
+/// never touches the store or waits for a job. Every key is written, null when empty.
 pub fn status_json(s: &StatusSnapshot, home: &Path) -> Value {
     let d = &s.daemon;
     json!({

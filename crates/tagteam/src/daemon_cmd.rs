@@ -230,10 +230,10 @@ impl DaemonSink for DaemonJson<'_> {
     }
 }
 
-/// Plan B Decision 7: the multi-process tests' hooks, read only by a `test-support` build.
-/// `TAGTEAM_TEST_UPGRADE_WATCH_MS` shortens the upgrade watch's period (D4.5), so an exit-75
-/// test takes seconds. `TAGTEAM_TEST_DAEMON_PROGRAM` names the file the watch follows, so a
-/// test can replace it without touching the binary it runs.
+/// Daemon plan B, Decision 7: the multi-process tests' hooks, read only by a `test-support`
+/// build. `TAGTEAM_TEST_UPGRADE_WATCH_MS` shortens the upgrade watch's period (D4.5), so an
+/// exit-75 test takes seconds. `TAGTEAM_TEST_DAEMON_PROGRAM` names the file the watch follows,
+/// so a test can replace it without touching the binary it runs.
 #[cfg(any(test, feature = "test-support"))]
 const TEST_UPGRADE_WATCH_MS: &str = "TAGTEAM_TEST_UPGRADE_WATCH_MS";
 #[cfg(any(test, feature = "test-support"))]
