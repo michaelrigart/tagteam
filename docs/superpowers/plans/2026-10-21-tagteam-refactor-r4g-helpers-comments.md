@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/41
 **Branch:** `refactor-r4g-helpers-comments`, based on `refactor-r4f2-typed-items`; rebased onto `main` after R4f2 (#39) and T4 (#40) merged (see "Task 3 amendment")
 **Goal:** CC-E-13's shared helpers (`display_email`, one lock-record reader, one jitter, one store cache), CC-E-16's `try_target`, and §14's sweep of comments citing plan-local numbering; every output unchanged.
 **Architecture:** `display_email` on `Identity` and `AccountRow` replaces 14 copies (Task 1). `read_lock_record`, a public `poll::jittered` and `Engine::cached_store` each serve their copies (Task 2). `perform` loops over `try_target`, handing a decision back only when it replaces the `Switch` (Task 3). Task 4 rewrites comments only.
