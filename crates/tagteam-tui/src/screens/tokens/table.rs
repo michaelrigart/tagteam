@@ -470,23 +470,26 @@ impl<'a> Table<'a> {
 
     /// Lays the columns out in `width` (B17, B24, T5-20). The numbers take their widest and are
     /// never cut. The period takes the fullest form of its spans that leaves each text column
-    /// its least: the model its whole value up to `MODEL_KEEP`, the account `TEXT_MIN` and the
-    /// project `PROJECT_KEEP` (or its own width when that is less). Where no form does, the
-    /// project gives way first: to `PROJECT_MIN`, then it is left out. Where still none does,
-    /// the most compact period is used, and the account gives way to `ACCOUNT_LEAST` and the
-    /// model to one column, and the period itself is cut when that leaves the text columns no
-    /// more. What is left over then goes, in turn, to the model up to `MODEL_KEEP`, the
-    /// account, the project, and the model beyond `MODEL_KEEP`, and the text columns are cut by
-    /// display width to what they got. A number is never cut.
+    /// its least: the model its whole value up to `MODEL_KEEP`, the account its whole name and
+    /// the project `PROJECT_KEEP` (or its own width when that is less). Where no form does, the
+    /// account gives way to `TEXT_MIN`, with the most compact period; then the project: to
+    /// `PROJECT_MIN`, then it is left out, each time with the account whole again first. Where
+    /// still none does, the most compact period is used, and the account gives way to
+    /// `ACCOUNT_LEAST` and the model to one column, and the period itself is cut when that
+    /// leaves the text columns no more. What is left over then goes, in turn, to the model up
+    /// to `MODEL_KEEP`, the account, the project, and the model beyond `MODEL_KEEP`, and the
+    /// text columns are cut by display width to what they got. A number is never cut.
     fn fit(&mut self, width: usize) {
         let periods = self.found().periods;
         let period_on = self.cols.iter().any(|(c, _)| *c == Col::Period);
-        let least = |t: &Table, col: Col, project: usize| match col {
+        let least = |t: &Table, col: Col, project: usize, account: bool| match col {
             Col::Model => t.widest(col).min(MODEL_KEEP),
             Col::Project => t.widest(col).min(project),
+            Col::Account if account => t.widest(col),
             _ => t.widest(col).min(TEXT_MIN),
         };
         let mut project = PROJECT_KEEP;
+        let mut account = true;
         let squeezed = |t: &Table, col: Col| match col {
             Col::Model => t.widest(col).min(1),
             _ => t.widest(col).min(ACCOUNT_LEAST),
@@ -504,9 +507,10 @@ impl<'a> Table<'a> {
                 .collect();
             let wanted: usize = texts
                 .iter()
-                .map(|&i| least(self, self.cols[i].0, project))
+                .map(|&i| least(self, self.cols[i].0, project, account))
                 .sum();
-            let level = (0..SPAN_LEVELS).find(|&l| {
+            let shortest = if account { 0 } else { SPAN_LEVELS - 1 };
+            let level = (shortest..SPAN_LEVELS).find(|&l| {
                 let period = if period_on { periods[l] } else { 0 };
                 fixed + gaps + period + wanted <= width
             });
@@ -514,9 +518,14 @@ impl<'a> Table<'a> {
                 level,
                 self.cols.iter().position(|(c, _)| *c == Col::Project),
             ) {
-                (None, Some(_)) if project > PROJECT_MIN => project = PROJECT_MIN,
+                (None, _) if account => account = false,
+                (None, Some(_)) if project > PROJECT_MIN => {
+                    project = PROJECT_MIN;
+                    account = true;
+                }
                 (None, Some(at)) => {
                     self.cols.remove(at);
+                    account = true;
                 }
                 (Some(level), _) => break (level, false, gaps, fixed, texts, wanted),
                 (None, None) => {
@@ -539,7 +548,7 @@ impl<'a> Table<'a> {
                 if tight {
                     squeezed(self, col)
                 } else {
-                    least(self, col, project)
+                    least(self, col, project, account)
                 }
             })
             .collect();
@@ -1338,7 +1347,7 @@ fn below(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
                 vec![
                     Span::raw(" "),
                     Span::styled(mark, theme.role(role)),
-                    Span::raw(" ".repeat(NOTE_INDENT - 1 - width_of(mark))),
+                    Span::raw(" ".repeat(NOTE_INDENT.saturating_sub(1 + width_of(mark)))),
                 ]
             }
             None => vec![Span::raw(" ".repeat(NOTE_INDENT))],
@@ -1549,7 +1558,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
                     row
                 }
             }
-            Item::Figures(line) => line.clone(),
+            Item::Figures(line) => line.clone().style(state.theme.role(Role::Muted)),
         }));
     }
     lines.push(dim(table.rule()));
@@ -2514,11 +2523,12 @@ mod tests {
     #[test]
     fn a_session_s_project_is_its_basename_and_keeps_it_before_the_period_shortens() {
         // T5-20: the project is its basename, cut from its end; it keeps `PROJECT_KEEP` columns
-        // before the span compacts, and the account takes what is left.
+        // before the span compacts, and so does the account its name; the project takes what is
+        // left.
         let state = showing_after("pp", vec![realistic()]);
         let lines = body_of(&state, 80, 24, NOW_MS);
         assert!(
-            lines[4].starts_with("▌09-20 09:12–11:40  portal-feature-user…  1 a1@x.…  "),
+            lines[4].starts_with("▌09-20 09:12  portal-feature-user-manu…  1 a1@x.co  "),
             "{lines:?}"
         );
         let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
@@ -2546,6 +2556,44 @@ mod tests {
     }
 
     #[test]
+    fn the_span_compacts_before_the_account_s_name_is_cut() {
+        // T5-20 and the final review's ruling: the account keeps its whole name while a more
+        // compact span makes room for it; the project still keeps `PROJECT_KEEP` first.
+        let late = PeriodKey::Session {
+            session_id: "3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c".into(),
+            project: Some("/Users/alex/Code/tagteam".into()),
+            first_ms: YESTERDAY - 2 * DAY_MS + 21 * HOUR_MS + 7 * 60_000,
+            last_ms: YESTERDAY - DAY_MS + 60_000,
+        };
+        let sam = RowAccount::Account {
+            id: id(2),
+            position: 2,
+            label: "sam@corp.example".into(),
+            alias: None,
+        };
+        let rows = vec![
+            token_row(
+                late.clone(),
+                Some(me()),
+                None,
+                counts(1_200_000, 310_000, 88_000_000),
+                Some(41_200_000_000),
+            ),
+            token_row(late, Some(sam), None, counts(1, 2, 3), Some(10_000_000)),
+        ];
+        let state = showing_after("pp", rows);
+        let lines = body_of(&state, 120, 40, NOW_MS);
+        assert_eq!(
+            lines[3..6],
+            [
+                " SESSION               PROJECT  ACCOUNT             INPUT  OUTPUT  CACHE W  CACHE R  TOTAL  RESPONSES   API $",
+                "▌09-18 21:07–00:01+1d  tagteam  1 alex@example.com   1.2M  310.0K        0    88.0M  89.5M          1  $41.20  ━━━━━━━━",
+                "                                2 sam@corp.example      1       2        0        3      6          1   $0.01  ╸",
+            ]
+        );
+    }
+
+    #[test]
     fn the_active_block_counts_down_between_queries_and_is_no_longer_active_at_its_end() {
         let blocks = showing_after("ppp", vec![block(NOON, true)]);
         let figures = |at: i64| under_the_block(&body_of(&blocks, 80, 24, at));
@@ -2554,6 +2602,24 @@ mod tests {
             figures(NOW_MS + 61_000).starts_with("   active · 2h14m elapsed · 2h45m left"),
             "from its start and end, with no query between"
         );
+        // Its figures are muted (§4.1's secondary figures), whatever the tier.
+        let lines = body_of(&blocks, 80, 24, NOW_MS);
+        let n = lines
+            .iter()
+            .position(|l| l.starts_with("   active"))
+            .unwrap();
+        for theme in TIERS {
+            let mut state = showing_after("ppp", vec![block(NOON, true)]);
+            state.theme = theme;
+            let buf = draw_buffer(&state, 80, 24, NOW_MS);
+            let y = body_y(&state, 80, 24, n as u16);
+            let want = letters(&[(lines[n].as_str(), 'm')]);
+            assert_eq!(
+                roles(&buf, theme, y).trim_end(),
+                canon(theme, &want),
+                "{theme:?}"
+            );
+        }
         let end = NOON + 5 * HOUR_MS;
         assert!(figures(end - 60_000).starts_with("   active · 4h59m elapsed · 1m left"));
         let lines = body_of(&blocks, 80, 24, end);
@@ -3061,8 +3127,8 @@ mod tests {
 
     #[test]
     fn the_sessions_by_account_and_model_keep_their_models_apart_at_80_columns() {
-        // The short model IDs (T5-22) leave the project its room; the account gives way before
-        // the model is cut.
+        // The short model IDs (T5-22) leave the project its room; the span compacts before the
+        // account is cut, and the account gives way before the model is cut.
         let mut state = fresh(Screen::Tokens);
         state.start();
         let mut last = vec![];
@@ -3074,10 +3140,10 @@ mod tests {
         assert_eq!(
             lines[3..7],
             [
-                " SESSION            PROJECT  ACCOUNT   MODEL        INPUT  OUTPUT  TOTAL   API $",
-                "▌09-20 09:12–11:40  tagteam  1 alex@…  opus-4-5    400.0K  100.0K  30.5M  $13.00",
-                "                             1 alex@…  sonnet-4-5  400.0K  100.0K  30.5M  $13.00",
-                "                             1 alex@…  haiku-4-5   400.0K  100.0K  30.5M  $13.00",
+                " SESSION      PROJECT  ACCOUNT         MODEL        INPUT  OUTPUT  TOTAL   API $",
+                "▌09-20 09:12  tagteam  1 alex@exampl…  opus-4-5    400.0K  100.0K  30.5M  $13.00",
+                "                       1 alex@exampl…  sonnet-4-5  400.0K  100.0K  30.5M  $13.00",
+                "                       1 alex@exampl…  haiku-4-5   400.0K  100.0K  30.5M  $13.00",
             ]
         );
     }
@@ -3503,8 +3569,8 @@ mod tests {
         }
         // At 120 the cache, the responses and the share line take room, and the span is cut to its
         // start, the account to its position and the model to what is left. At 160 the project
-        // keeps `PROJECT_KEEP` columns and the span drops its years first (T5-20); wider still,
-        // it shows the span and the years.
+        // keeps `PROJECT_KEEP` columns (T5-20) and the account, still cut, leaves the span its
+        // start; wider still, it shows the span and the years.
         let at_120 = draw(&state, 120, 40);
         assert!(
             at_120
@@ -3516,15 +3582,15 @@ mod tests {
         assert!(
             at_160
                 .iter()
-                .any(|l| l.contains("▌09-20 09:12–11:40+1d  portal-feature-user…  ")),
+                .any(|l| l.contains("▌09-20 09:12  portal-feature-user…  3 山田太郎のアカ…  ")),
             "{at_160:?}"
         );
-        let at_180 = draw(&state, 180, 40);
+        let at_190 = draw(&state, 190, 40);
         assert!(
-            at_180
+            at_190
                 .iter()
                 .any(|l| l.contains("2025-09-20 09:12–2025-09-21 11:40")),
-            "{at_180:?}"
+            "{at_190:?}"
         );
         // Day by account and model: the CJK alias is cut on a character, never in one.
         let day = showing_after(
