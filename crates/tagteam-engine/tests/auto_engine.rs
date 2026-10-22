@@ -15,7 +15,7 @@ use tagteam_core::autoswitch::{AutoConfig, AutoState, AutoStrategy, Decision, No
 use tagteam_core::{AccountId, ProviderId, Window, WindowKind};
 use tagteam_engine::auto::{AutoEvent, QuarantineWatch, TickOutcome};
 use tagteam_engine::store::AccountRow;
-use tagteam_engine::{EngineError, EventSource};
+use tagteam_engine::{EngineError, EventKind, EventSource};
 use tagteam_provider::{FlockGuard, ProcessStamp, Provider, Read};
 
 const T0: i64 = 1_790_000_000;
@@ -328,6 +328,63 @@ fn a_daemon_engine_releases_an_unbound_quarantine_as_the_daemon() {
         .unwrap();
     engine.tick(&Recorded::default()).unwrap();
     assert_eq!(last_event(&fx), ("unquarantine".into(), "daemon".into()));
+}
+
+/// The provider's stored pauses and resumes, oldest first, as `(kind, source, detail)`.
+fn pauses(fx: &Fx) -> Vec<(EventKind, EventSource, Option<Value>)> {
+    fx.engine
+        .store()
+        .unwrap()
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                EventKind::AutoswitchPaused | EventKind::AutoswitchResumed
+            )
+        })
+        .inspect(|e| assert_eq!((&e.from_id, &e.to_id), (&None, &None)))
+        .map(|e| (e.kind, e.source, e.detail))
+        .collect()
+}
+
+#[test]
+fn a_pause_is_recorded_at_start_only_when_it_differs_from_the_store() {
+    // Redesign §12.4, T4-25: at start, only a setting the provider's latest stored pause or
+    // resume does not already say, none reading as resumed; a reload's change always. Never
+    // without a store.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let daemon = fx.engine_as(EventSource::Daemon);
+    assert!(!daemon.record_autoswitch(&cc, false, true).unwrap());
+    assert!(!daemon.record_autoswitch(&cc, false, false).unwrap());
+    assert!(
+        !fx.env.data_dir().join("tagteam.db").exists(),
+        "no store is created"
+    );
+    fx.engine.store().unwrap();
+    let at_start = Some(json!({"at_start": true}));
+    assert!(daemon.record_autoswitch(&cc, false, true).unwrap());
+    assert_eq!(
+        pauses(&fx),
+        [(
+            EventKind::AutoswitchPaused,
+            EventSource::Daemon,
+            at_start.clone()
+        )]
+    );
+    assert!(!daemon.record_autoswitch(&cc, false, true).unwrap());
+    assert_eq!(pauses(&fx).len(), 1);
+    assert!(daemon.record_autoswitch(&cc, true, true).unwrap());
+    assert!(daemon.record_autoswitch(&cc, true, false).unwrap());
+    assert_eq!(
+        pauses(&fx)[1..],
+        [
+            (EventKind::AutoswitchResumed, EventSource::Daemon, at_start),
+            (EventKind::AutoswitchResumed, EventSource::Daemon, None),
+        ]
+    );
 }
 
 #[test]

@@ -178,6 +178,8 @@ pub struct ProviderJob<'e> {
     /// The warnings of the read `new` made, emitted as `config-warning` events at the start of
     /// the first run; emptied then, or by a reload before it, which reports its own read.
     first_warnings: Vec<String>,
+    /// The first run has been: it records a pause or resume the store lacks (T4-25).
+    started: bool,
     cfg: AutoConfig,
     /// The auto-switch engine while in `auto`. It holds the engine lock (§11.1).
     auto: Option<AutoEngine<'e>>,
@@ -220,6 +222,7 @@ impl<'e> ProviderJob<'e> {
             long_window,
             settings,
             first_warnings,
+            started: false,
             cfg,
             auto: None,
             quarantines: QuarantineWatch::new(),
@@ -388,6 +391,22 @@ impl<'e> ProviderJob<'e> {
             holder_pid: self.holder_pid,
             backoff,
         });
+    }
+
+    /// Redesign §12.4, T4-25: the provider's `daemon.autoswitch` stored as a pause or resume,
+    /// at start only when the store says otherwise. A store whose schema is newer is never
+    /// written (D4.1 step 4), and a failure is a failed run's.
+    fn record_autoswitch(&mut self, cx: &JobCx<'_>, at_start: bool) {
+        if self.ctx.schema_newer {
+            return;
+        }
+        let on = self.settings.daemon_autoswitch;
+        if let Err(e) = self.engine.record_autoswitch(&self.provider, on, at_start) {
+            // An interruption is the scheduler's, at its next cancellation point.
+            if e.signal().is_none() {
+                self.failed(cx, &e);
+            }
+        }
     }
 
     /// D4.3: a run that fails is an `error` event, and the job keeps its cadence.
@@ -658,13 +677,18 @@ impl Job for ProviderJob<'_> {
     }
 
     /// Decision 8: the first run starts with the warnings of the job's first settings read,
-    /// before its mode is evaluated, as a reload's come before its evaluation.
+    /// before its mode is evaluated, as a reload's come before its evaluation. Then it records
+    /// a pause or resume the store does not have (T4-25).
     fn run(&mut self, cx: &mut JobCx<'_>) -> Ran {
         for message in std::mem::take(&mut self.first_warnings) {
             cx.sink.emit(&DaemonEvent::Auto(AutoEvent::ConfigWarning {
                 provider: self.provider.clone(),
                 message,
             }));
+        }
+        if !self.started {
+            self.started = true;
+            self.record_autoswitch(cx, true);
         }
         let ran = self.step(cx);
         self.publish();
@@ -677,6 +701,7 @@ impl Job for ProviderJob<'_> {
     /// here, before the scheduler's next job or sleep. A file that cannot be read gives the
     /// defaults, so switching resumes, and its warning comes first (Review Focus 1). A reload
     /// before the first run supersedes the first read, whose warnings are then never emitted.
+    /// A reload that changes `daemon.autoswitch` records the pause or resume (T4-25).
     fn settings_changed(&mut self, cx: &mut JobCx<'_>) {
         self.first_warnings.clear();
         let (settings, warnings) = Settings::load(self.engine.env(), &self.provider);
@@ -691,9 +716,13 @@ impl Job for ProviderJob<'_> {
             &AutoFlags::default(),
             self.long_window.as_deref(),
         );
+        let changed = settings.daemon_autoswitch != self.settings.daemon_autoswitch;
         self.settings = settings;
         if let Some(auto) = self.auto.as_mut() {
             auto.set_config(self.cfg.clone());
+        }
+        if changed {
+            self.record_autoswitch(cx, false);
         }
         if let Err(e) = self.evaluate(cx) {
             // An interruption is the scheduler's, at its next cancellation point.
@@ -710,9 +739,9 @@ mod tests {
     use std::cell::Cell;
 
     use serde_json::{Value, json};
-    use tagteam_engine::EventSource;
     use tagteam_engine::lifecycle::AddTokenOptions;
     use tagteam_engine::settings::config_path;
+    use tagteam_engine::{EventKind, EventSource};
     use tagteam_provider::{FlockGuard, Method};
 
     use super::*;
@@ -1159,6 +1188,146 @@ mod tests {
             "{:?}",
             events.events()
         );
+    }
+
+    /// The provider's stored pauses and resumes, oldest first, as `(kind, source, detail)`.
+    fn pauses(fx: &Fx) -> Vec<(EventKind, EventSource, Option<Value>)> {
+        fx.engine
+            .store()
+            .unwrap()
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                e.provider == cc()
+                    && matches!(
+                        e.kind,
+                        EventKind::AutoswitchPaused | EventKind::AutoswitchResumed
+                    )
+            })
+            .inspect(|e| assert_eq!((&e.from_id, &e.to_id), (&None, &None)))
+            .map(|e| (e.kind, e.source, e.detail))
+            .collect()
+    }
+
+    #[test]
+    fn a_reload_that_pauses_or_resumes_records_it_once_as_the_daemon_s() {
+        // Redesign §12.4, T4-25: a reload writes when the effective `daemon.autoswitch` differs
+        // from the job's previous settings, and only then.
+        let fx = Fx::new();
+        read_two(&fx, 50.0);
+        let board = board();
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        let mut job = ProviderJob::new(&fx.engine, cc(), job_ctx(&board));
+        job.run(&mut cx);
+        assert_eq!(pauses(&fx), []);
+        fx.settings("[daemon]\nautoswitch = false\n", 1);
+        job.settings_changed(&mut cx);
+        let paused = (EventKind::AutoswitchPaused, EventSource::Daemon, None);
+        assert_eq!(pauses(&fx), [paused.clone()]);
+        fx.settings(
+            "[daemon]\nautoswitch = false\n\n[autoswitch]\nthreshold = 80\n",
+            2,
+        );
+        job.settings_changed(&mut cx);
+        assert_eq!(pauses(&fx), [paused.clone()]);
+        fx.settings("[daemon]\nautoswitch = true\n", 3);
+        job.settings_changed(&mut cx);
+        assert_eq!(
+            pauses(&fx),
+            [
+                paused,
+                (EventKind::AutoswitchResumed, EventSource::Daemon, None)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_first_run_records_a_pause_the_store_does_not_have() {
+        // Redesign §12.4, T4-25: a job's first run writes when the setting differs from the
+        // provider's latest stored pause or resume, none reading as resumed.
+        let at_start = Some(json!({"at_start": true}));
+        let fx = Fx::new();
+        read_two(&fx, 50.0);
+        fx.settings("[daemon]\nautoswitch = false\n", 1);
+        let board = board();
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        let mut job = ProviderJob::new(&fx.engine, cc(), job_ctx(&board));
+        assert_eq!(pauses(&fx), [], "building the job writes nothing");
+        job.run(&mut cx);
+        let paused = (
+            EventKind::AutoswitchPaused,
+            EventSource::Daemon,
+            at_start.clone(),
+        );
+        assert_eq!(pauses(&fx), [paused.clone()]);
+        job.run(&mut cx);
+        let mut again = ProviderJob::new(&fx.engine, cc(), job_ctx(&board));
+        again.run(&mut cx);
+        assert_eq!(pauses(&fx), [paused.clone()], "the store already says so");
+
+        // Stored paused, and the next daemon starts with switching on.
+        fx.settings("[daemon]\nautoswitch = true\n", 2);
+        let mut resumed = ProviderJob::new(&fx.engine, cc(), job_ctx(&board));
+        resumed.run(&mut cx);
+        assert_eq!(
+            pauses(&fx),
+            [
+                paused,
+                (EventKind::AutoswitchResumed, EventSource::Daemon, at_start)
+            ]
+        );
+
+        // Nothing stored, and switching on.
+        let fx = Fx::new();
+        read_two(&fx, 50.0);
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        let mut job = ProviderJob::new(&fx.engine, cc(), job_ctx(&board));
+        job.run(&mut cx);
+        assert_eq!(pauses(&fx), []);
+    }
+
+    #[test]
+    fn a_newer_store_records_no_pause() {
+        // T4-25: a store whose schema is newer is never written (D4.1 step 4).
+        let fx = Fx::new();
+        read_two(&fx, 50.0);
+        fx.settings("[daemon]\nautoswitch = false\n", 1);
+        let board = board();
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        let ctx = ProviderJobCtx {
+            schema_newer: true,
+            ..job_ctx(&board)
+        };
+        let mut job = ProviderJob::new(&fx.engine, cc(), ctx);
+        job.run(&mut cx);
+        fx.settings("[daemon]\nautoswitch = true\n", 2);
+        job.settings_changed(&mut cx);
+        assert_eq!(pauses(&fx), []);
     }
 
     #[test]
