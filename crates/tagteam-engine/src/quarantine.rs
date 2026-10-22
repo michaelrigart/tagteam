@@ -1,7 +1,7 @@
 //! §7.4: one strike quarantines an account, bound to the fingerprint that was sent.
 
 use serde_json::json;
-use tagteam_core::{AccountId, ProviderId};
+use tagteam_core::{AccountId, ProviderId, str_enum};
 use tagteam_provider::{DeadReason, Provenance, Provider, Read};
 
 use crate::account_lock::AccountLock;
@@ -12,36 +12,23 @@ use crate::refresh::fp_str;
 use crate::store::{ACCOUNT_REPLACED, AccountRow, CREDENTIALS_REPLACED, EventRow};
 use crate::switch::Axis;
 
-/// The `quarantine_reason` column's values (§6.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuarantineReason {
-    InvalidGrant,
-    NoRefreshToken,
-    IdentityConflict,
-    /// A refresh received a successor and could store it nowhere (§7.3 `Unpersisted`): the
-    /// vault's generation is consumed (§7.4).
-    SuccessorLost,
+str_enum! {
+    /// The `quarantine_reason` column's values (§6.1).
+    pub enum QuarantineReason {
+        InvalidGrant => "invalid_grant",
+        NoRefreshToken => "no_refresh_token",
+        IdentityConflict => "identity_conflict",
+        /// A refresh received a successor and could store it nowhere (§7.3 `Unpersisted`): the
+        /// vault's generation is consumed (§7.4).
+        SuccessorLost => "successor_lost",
+    }
 }
 
 impl QuarantineReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            QuarantineReason::InvalidGrant => "invalid_grant",
-            QuarantineReason::NoRefreshToken => "no_refresh_token",
-            QuarantineReason::IdentityConflict => "identity_conflict",
-            QuarantineReason::SuccessorLost => "successor_lost",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        [
-            QuarantineReason::InvalidGrant,
-            QuarantineReason::NoRefreshToken,
-            QuarantineReason::IdentityConflict,
-            QuarantineReason::SuccessorLost,
-        ]
-        .into_iter()
-        .find(|r| r.as_str() == s)
+    /// The reason a stored `quarantine_reason` (§6.1) is acted on as. One this build does not
+    /// know, which a newer build may store, holds as `InvalidGrant` does (§7.4).
+    pub fn from_stored(stored: &str) -> QuarantineReason {
+        QuarantineReason::parse(stored).unwrap_or(QuarantineReason::InvalidGrant)
     }
 }
 
@@ -253,6 +240,20 @@ mod tests {
             QuarantineReason::from(DeadReason::NoRefreshToken),
             QuarantineReason::NoRefreshToken
         );
+    }
+
+    #[test]
+    fn a_stored_reason_this_build_does_not_know_holds_as_invalid_grant() {
+        for r in QuarantineReason::ALL {
+            assert_eq!(QuarantineReason::from_stored(r.as_str()), r);
+        }
+        for stored in ["refresh_revoked", "", "Invalid_Grant"] {
+            assert_eq!(
+                QuarantineReason::from_stored(stored),
+                QuarantineReason::InvalidGrant,
+                "{stored:?}"
+            );
+        }
     }
 
     #[test]

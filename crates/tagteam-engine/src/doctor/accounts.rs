@@ -10,6 +10,7 @@ use tagteam_provider::doctor::quoted;
 use tagteam_provider::{Check, Liveness, Provider, Read};
 
 use crate::auto::{engine_lock_path, read_holder};
+use crate::quarantine::QuarantineReason;
 use crate::settings::Settings;
 use crate::store::{
     AccountRow, Store, backoff_holds, backoff_is_skewed, plan_is_skewed, replacing_meta_parses,
@@ -56,12 +57,12 @@ fn engine_record_check(pid: u32, liveness: Liveness, daemon: bool) -> Check {
 
 /// §7.4's quarantine reasons, in words.
 fn quarantine_words(reason: &str) -> &'static str {
-    match reason {
-        "invalid_grant" => "the token endpoint refused its refresh token",
-        "no_refresh_token" => "it has no refresh token to renew it with",
-        "identity_conflict" => "the token endpoint named another account",
-        "successor_lost" => "a refreshed login could not be stored anywhere",
-        _ => "it cannot be refreshed",
+    match QuarantineReason::parse(reason) {
+        Some(QuarantineReason::InvalidGrant) => "the token endpoint refused its refresh token",
+        Some(QuarantineReason::NoRefreshToken) => "it has no refresh token to renew it with",
+        Some(QuarantineReason::IdentityConflict) => "the token endpoint named another account",
+        Some(QuarantineReason::SuccessorLost) => "a refreshed login could not be stored anywhere",
+        None => "it cannot be refreshed",
     }
 }
 

@@ -284,7 +284,7 @@ impl Engine {
         let Some(reason) = &row.quarantine_reason else {
             return Ok(None);
         };
-        let reason = QuarantineReason::parse(reason).unwrap_or(QuarantineReason::InvalidGrant);
+        let reason = QuarantineReason::from_stored(reason);
         let Some(bound) = &row.quarantine_fp else {
             return Ok(Some(reason));
         };
