@@ -593,7 +593,17 @@ fn binding_reached(e: &EventView, trigger: Option<Trigger>) -> Option<String> {
 
 /// A stored event in plain words (spec §11.4, T4-29), for History's event list and the auto
 /// line. `frees_at` is `all-exhausted`'s `detail.earliest_reset_at` in the caller's clock form.
+/// Each control character the store's text holds (a message, a reason, a label) reads as a
+/// space, so the sentence stays one row of its own width.
 pub fn event(e: &EventView, frees_at: Option<&str>) -> String {
+    event_words(e, frees_at)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// `event`, the store's text as stored.
+fn event_words(e: &EventView, frees_at: Option<&str>) -> String {
     let to = || named(e.to.as_ref());
     let subject = || named(e.to.as_ref().or(e.from.as_ref()));
     match e.kind {
@@ -2174,6 +2184,41 @@ mod tests {
         assert_eq!(
             event(&proactive(Some(&account(None, None)), valid), None),
             "auto switched an account → 2 work (before it reached the limit)"
+        );
+    }
+
+    #[test]
+    fn control_characters_in_the_store_s_text_read_as_spaces() {
+        let gone = AccountRef {
+            id: AccountId::from_string("id-9"),
+            position: None,
+            alias: None,
+            email: Some("old\nlabel".into()),
+            removed: true,
+        };
+        let failed = EventView {
+            at_ms: NOW * 1000,
+            kind: EventKind::SwitchFailed,
+            source: EventSource::Auto,
+            trigger: None,
+            from: None,
+            to: Some(gone.clone()),
+            detail: Some(json!({"message": "a\nb\tc", "transient": false})),
+            before_pct: None,
+            after_pct: None,
+        };
+        assert_eq!(
+            event(&failed, None),
+            "auto couldn't switch to old label · a b c"
+        );
+        let refused = EventView {
+            kind: EventKind::Quarantine,
+            detail: Some(json!({"reason": "bad\r\ngrant"})),
+            ..failed
+        };
+        assert_eq!(
+            event(&refused, None),
+            "old label needs a new login · its stored login was refused (bad  grant)"
         );
     }
 

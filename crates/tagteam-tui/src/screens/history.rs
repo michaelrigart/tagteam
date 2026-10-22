@@ -234,15 +234,18 @@ fn at_or_before(view: &TimelineView, cursor: Cursor) -> Option<usize> {
     Some(view.events.len() - 1 - j)
 }
 
-/// The selected event when it is a switch in the cursor's column: its binding usage just
-/// before and just after it, for the in-use chart's readout (T4-11).
+/// The newest switch in the cursor's column, whatever the selection there: its binding usage
+/// just before and just after it, for the in-use chart's readout (T4-11, §7.3).
 fn switch_at_cursor(h: &HistoryState) -> Option<(Option<f64>, Option<f64>)> {
     let view = h.view.as_ref()?;
-    let e = listed(view, h.selected?)?;
     let grid = view.grid();
-    let switched = matches!(e.kind, EventKind::Switch | EventKind::SwitchRecovered);
-    let here = grid.column_of(grid.placed(e.at_ms)) == Some(cursor_column(h.cursor, view));
-    (switched && here).then_some((e.before_pct, e.after_pct))
+    let column = cursor_column(h.cursor, view);
+    view.events
+        .iter()
+        .rev()
+        .filter(|e| matches!(e.kind, EventKind::Switch | EventKind::SwitchRecovered))
+        .find(|e| grid.column_of(grid.placed(e.at_ms)) == Some(column))
+        .map(|e| (e.before_pct, e.after_pct))
 }
 
 /// Whether the view has events for `j`/`k` to move through (the footer's `j/k event`).
@@ -361,7 +364,10 @@ pub(crate) fn on_accounts(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     let focus = daemon::focus(state);
     match &state.history.provider {
         Some(p) if *p == focus && !gone => return vec![],
-        Some(_) => state.history.view = None,
+        Some(_) => {
+            state.history.view = None;
+            state.history.place = Some(Place::Open);
+        }
         None => {}
     }
     reload(state, now_ms).into_iter().collect()
@@ -612,23 +618,24 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
         return;
     }
     let scope = Paragraph::new(scope_line(state, area.width, now_ms));
+    let scope_row = Rect::new(area.x, area.y, area.width, 1);
+    let under = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
     let h = &state.history;
     match &h.view {
-        Some(view) if !nothing_in_range(view) => {
-            return draw_view(state, frame, view, area, scope, now_ms);
+        None => {
+            frame.render_widget(scope, scope_row);
+            let line = Line::from(Span::styled(LOADING, state.theme.role(Role::Muted)));
+            frame.render_widget(
+                Paragraph::new(line.centered()),
+                centered(under, under.width, 1),
+            );
         }
-        _ => frame.render_widget(scope, Rect::new(area.x, area.y, area.width, 1)),
-    }
-    let under = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
-    if h.view.is_none() {
-        let line = Line::from(Span::styled(LOADING, state.theme.role(Role::Muted)));
-        frame.render_widget(
-            Paragraph::new(line.centered()),
-            centered(under, under.width, 1),
-        );
-    } else {
-        let sentence = (h.range != Range::Month).then_some(LONGER);
-        centred_block(frame, under, &h.range.nothing(), sentence, state.theme);
+        Some(view) if nothing_in_range(view) => {
+            frame.render_widget(scope, scope_row);
+            let sentence = (h.range != Range::Month).then_some(LONGER);
+            centred_block(frame, under, &h.range.nothing(), sentence, state.theme);
+        }
+        Some(view) => draw_view(state, frame, view, area, scope, now_ms),
     }
 }
 
@@ -692,10 +699,11 @@ fn draw_view(
         let axis = lanes::axis_row(view.grid(), h.range.days(), state.tokens.tz(), theme);
         frame.render_widget(Paragraph::new(axis), at.axis);
     }
+    let times = list::Times::of(view, now_ms, state.tokens.tz());
     if let Some(head) = at.head.filter(|_| !view.events.is_empty()) {
-        frame.render_widget(Paragraph::new(list::head_row(state, view, now_ms)), head);
+        frame.render_widget(Paragraph::new(list::head_row(&times, theme)), head);
     }
-    let rows = list::list_rows(state, view, at.list.height, body.width, now_ms);
+    let rows = list::list_rows(state, view, &times, at.list.height, body.width);
     frame.render_widget(Paragraph::new(rows), at.list);
 }
 
@@ -2007,6 +2015,70 @@ mod tests {
         assert_eq!(cursor_said(&state), "now");
         let buf = draw_buffer(&state, 80, 24, NOW_MS);
         assert_eq!(buf[(layout::CHART_X + 69, lane_y)].symbol(), "│");
+    }
+
+    #[test]
+    fn a_provider_change_places_the_cursor_once_its_view_arrives() {
+        // T4-15: another provider's timeline is another dataset, as another scope is.
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(two_providers());
+        for _ in 0..3 {
+            update(&mut state, ch('j'), NOW_MS);
+        }
+        update(&mut state, ch('3'), NOW_MS);
+        arrived(&mut state, with(drawn(70), vec![switch_at(in_column(30))]));
+        update(&mut state, key(KeyCode::Left), NOW_MS);
+        let moved = state.history.cursor;
+        // Focus moves to Claude Code: its view places the cursor on its own switch.
+        let Cmd::LoadAccounts { r#gen } = state.load_accounts() else {
+            unreachable!()
+        };
+        update(&mut state, accounts_msg(r#gen, 3), NOW_MS);
+        assert_eq!(state.history.view, None);
+        let other = switch_at(in_column(50));
+        arrived(&mut state, with(drawn(70), vec![other.clone()]));
+        assert_ne!(state.history.cursor, moved);
+        assert_eq!(state.history.cursor, Cursor::At(other.at_ms));
+        assert_eq!(state.history.selected, Some(0));
+    }
+
+    #[test]
+    fn the_readout_reads_a_switch_in_the_cursor_s_column_under_a_newer_event() {
+        // Controller ruling: "a switch at the cursor" is one in the cursor's column, though the
+        // selection is a newer event there.
+        let mut accounts = many(3);
+        accounts[1].usage = read(60, 53.0, 6.0, false);
+        accounts[1].active = true;
+        let mut state = fresh(Screen::History);
+        state.start();
+        let result = Ok(snapshot(accounts));
+        update(&mut state, Msg::Accounts { r#gen: 1, result }, NOW_MS);
+        let mut switch = switch_at(in_column(40));
+        switch.before_pct = Some(93.0);
+        switch.after_pct = Some(3.0);
+        let added = of_three(in_column(40) + 60_000, EventKind::Add);
+        let newest = of_three(in_column(41), EventKind::Quarantine);
+        arrived(&mut state, with(drawn(70), vec![switch, added, newest]));
+        let body = |state: &State| body_of(state, 80, 24, NOW_MS);
+        assert!(
+            body(&state)[1].ends_with("at cursor  41%   now  53%"),
+            "{:?}",
+            body(&state)
+        );
+        update(&mut state, key(KeyCode::Left), NOW_MS);
+        assert_eq!(
+            state.history.selected,
+            Some(1),
+            "the add, the newest in column 40"
+        );
+        let lane = &body(&state)[11];
+        let column = lane.chars().nth(usize::from(layout::CHART_X) + 40);
+        assert_eq!(column, Some('⇄'), "{lane:?}");
+        assert!(
+            body(&state)[1].ends_with("at cursor  93% →   3%   now  53%"),
+            "{:?}",
+            body(&state)
+        );
     }
 
     #[test]
