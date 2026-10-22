@@ -202,6 +202,11 @@ pub struct AccountRow {
 }
 
 impl AccountRow {
+    /// The stored email, or the label: how tagteam names an account (§13.1).
+    pub fn display_email(&self) -> &str {
+        self.email.as_deref().unwrap_or(&self.label)
+    }
+
     /// Enabled and with an identity: an account a switch can ever land on (§9.3).
     pub fn is_switchable(&self) -> bool {
         !self.disabled && self.identity_json.is_object()

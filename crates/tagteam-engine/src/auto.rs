@@ -178,14 +178,14 @@ impl QuarantineWatch {
                 sink.emit(&AutoEvent::AccountUnquarantined {
                     provider: provider.clone(),
                     number: row.position,
-                    email: email_of(row),
+                    email: row.display_email().to_owned(),
                     reason: reason(),
                 });
             } else if let Some(reason) = row.quarantine_reason.as_ref().filter(|_| was_clear) {
                 sink.emit(&AutoEvent::AccountQuarantined {
                     provider: provider.clone(),
                     number: row.position,
-                    email: email_of(row),
+                    email: row.display_email().to_owned(),
                     reason: reason.clone(),
                 });
             }
@@ -226,7 +226,7 @@ impl QuarantineWatch {
         sink.emit(&AutoEvent::AccountQuarantined {
             provider: provider.clone(),
             number: row.position,
-            email: email_of(row),
+            email: row.display_email().to_owned(),
             reason,
         });
     }
@@ -448,11 +448,6 @@ fn undecided(detail: String) -> Decision {
         detail,
         earliest_reset: None,
     }
-}
-
-/// How events name an account: its email, or its label when its provider's logins have none.
-fn email_of(row: &AccountRow) -> String {
-    row.email.clone().unwrap_or_else(|| row.label.clone())
 }
 
 impl AutoEngine<'_> {
@@ -915,7 +910,7 @@ impl AutoEngine<'_> {
             .collect();
         self.emit(sink, |provider| AutoEvent::Poll {
             provider,
-            active: Some((live.position, email_of(live))),
+            active: Some((live.position, live.display_email().to_owned())),
             headroom_pct,
             threshold: self.cfg.threshold,
             fetch_errors,

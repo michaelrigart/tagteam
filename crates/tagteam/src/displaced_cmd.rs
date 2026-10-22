@@ -39,10 +39,10 @@ fn fp12(fingerprint: &str) -> &str {
 pub(crate) fn identity(engine: &Engine, e: &DisplacedEntry) -> Option<String> {
     let provider = engine.provider(e.provider.as_ref()?).ok()?;
     let identity = provider.parse_identity(e.identity.as_ref()?).ok()?;
-    let email = identity.email.unwrap_or(identity.label);
-    Some(match identity.org_name {
+    let email = identity.display_email();
+    Some(match &identity.org_name {
         Some(org) => format!("{email} [{org}]"),
-        None => email,
+        None => email.to_owned(),
     })
 }
 

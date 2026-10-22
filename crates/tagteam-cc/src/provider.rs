@@ -317,11 +317,7 @@ impl Provider for ClaudeCode {
     }
 
     fn identity_key(&self, id: &Identity) -> IdentityKey {
-        IdentityKey::new(format!(
-            "{}\n{}",
-            id.email.as_deref().unwrap_or(&id.label),
-            id.org_uuid
-        ))
+        IdentityKey::new(format!("{}\n{}", id.display_email(), id.org_uuid))
     }
 
     fn credential_kinds(&self) -> &'static [&'static str] {

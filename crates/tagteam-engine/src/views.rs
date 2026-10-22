@@ -358,7 +358,7 @@ impl CachedLogin {
     fn of(p: &dyn Provider, i: &Identity) -> Self {
         CachedLogin {
             key: p.identity_key(i).as_str().to_owned(),
-            label: i.email.clone().unwrap_or_else(|| i.label.clone()),
+            label: i.display_email().to_owned(),
             account_uuid: i.account_uuid.clone(),
         }
     }
@@ -573,7 +573,7 @@ impl Engine {
             })
             .collect::<Result<Vec<_>, EngineError>>()?;
         let active_position = accounts.iter().find(|v| v.active).map(|v| v.row.position);
-        let live_label = live.identity.map(|i| i.email.unwrap_or(i.label));
+        let live_label = live.identity.map(|i| i.display_email().to_owned());
         // T3-5: the account the view marks active, the stored-active fallback included.
         let live = match (active_position, &live_label) {
             (Some(position), _) => LiveLogin::Managed { position },

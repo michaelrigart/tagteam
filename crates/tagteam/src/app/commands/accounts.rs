@@ -95,7 +95,7 @@ impl App<'_, '_> {
         let p = self.engine.provider(&marker.provider).ok()?;
         p.profile_identity(self.engine.env(), profile)
             .present()
-            .map(|i| i.email.unwrap_or(i.label))
+            .map(|i| i.display_email().to_owned())
     }
 
     fn notices(&mut self, notices: &[String]) {

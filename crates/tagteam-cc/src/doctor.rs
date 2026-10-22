@@ -599,7 +599,7 @@ fn auth(
             return;
         }
     };
-    let email = live.email.as_deref().unwrap_or(&live.label);
+    let email = live.display_email();
     let other_email = status.email.as_deref().is_some_and(|e| e != email);
     let other_org = status
         .org_id

@@ -39,6 +39,13 @@ pub struct Identity {
     pub raw: Value,
 }
 
+impl Identity {
+    /// The email, or the label when the login has none: how tagteam names a login.
+    pub fn display_email(&self) -> &str {
+        self.email.as_deref().unwrap_or(&self.label)
+    }
+}
+
 /// Stands in for a value `Debug` must not show.
 struct Redacted;
 
@@ -957,6 +964,21 @@ mod tests {
         assert!(!Capabilities::default().transcripts);
         assert_eq!(EMPTY_PRICES.as_of, "");
         assert!(EMPTY_PRICES.models.is_empty());
+    }
+
+    #[test]
+    fn a_login_is_named_by_its_email_or_else_its_label() {
+        let mut id = Identity {
+            label: "A".into(),
+            email: Some("a@x.co".into()),
+            org_uuid: String::new(),
+            org_name: None,
+            account_uuid: None,
+            raw: serde_json::json!({}),
+        };
+        assert_eq!(id.display_email(), "a@x.co");
+        id.email = None;
+        assert_eq!(id.display_email(), "A");
     }
 
     #[test]

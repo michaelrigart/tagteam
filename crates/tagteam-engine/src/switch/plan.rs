@@ -9,8 +9,8 @@ use crate::store::{AccountRow, Store};
 use super::select::{Ranked, Rotation};
 use super::support::{Axis, OracleHint, answer_for};
 use super::{
-    SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget, already_active, login_email, noop,
-    strategy_of, unmanaged_message,
+    SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget, already_active, noop, strategy_of,
+    unmanaged_message,
 };
 
 /// Where planning gets its oracle answer.
@@ -64,7 +64,7 @@ impl Engine {
             return Ok(Planned::Done(refused));
         }
         let unmanaged_email = match (&live, &live_row) {
-            (Some(i), None) => Some(login_email(i)),
+            (Some(i), None) => Some(i.display_email().to_owned()),
             _ => None,
         };
         let done = |reason: SwitchReason, message: String, warnings: Vec<String>| {
