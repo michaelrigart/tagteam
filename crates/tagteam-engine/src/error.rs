@@ -402,9 +402,9 @@ pub(crate) fn daemon_advice(p: &dyn Provider, profile: &Path) -> String {
     let mut out = "stop it".to_owned();
     if let Some(stop) = p.words().supervisor_stop {
         out.push_str(&format!(" with `{stop}`"));
-    }
-    if let Some(var) = p.session_dir_var() {
-        out.push_str(&format!(" run with {var} set to {}", quoted(profile)));
+        if let Some(var) = p.session_dir_var() {
+            out.push_str(&format!(" run with {var} set to {}", quoted(profile)));
+        }
     }
     if let Some(lock) = p.supervisor_lock(profile) {
         out.push_str(&format!(
@@ -1285,6 +1285,22 @@ mod tests {
             EngineError::UnmanagedLiveLogin { app: "Claude Code" }.to_string(),
             "the live login is not managed by tagteam; only Claude Code refreshes it"
         );
+    }
+
+    #[test]
+    fn the_daemon_advice_runs_the_stop_command_with_the_profile_only_when_there_is_one() {
+        let cc = tagteam_cc::ClaudeCode::new(
+            std::sync::Arc::new(tagteam_provider::FakeKeychain::new()),
+            tagteam_provider::Platform::MacOs,
+        );
+        assert_eq!(
+            daemon_advice(&cc, Path::new("/p")),
+            "stop it with `claude daemon stop --any` run with CLAUDE_CONFIG_DIR set to '/p'; if nothing is running at that pid, delete '/p/daemon.lock'"
+        );
+        let fake = tagteam_fake::FakeAgent::new();
+        let advice = daemon_advice(&fake, Path::new("/p"));
+        assert!(advice.starts_with("stop it; if nothing is running at that pid, delete '"));
+        assert!(!advice.contains("run with"), "{advice}");
     }
 
     #[test]
