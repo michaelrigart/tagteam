@@ -452,7 +452,8 @@ impl Footnote {
 /// is a lower bound (token report §2.3), skipped lines, the transcript files the last refresh
 /// could not read when `unreadable` asks for them, and the price table's date. `mark` is what
 /// marks a partial cost: `*` in the CLI, `≥` in the TUI (TUI spec §5.3). The lower bound's
-/// note and the price table's are led by their marks (redesign §8).
+/// note and the price table's carry their marks (redesign §8); the CLI prints the lower bound's
+/// without its `≥`.
 pub fn token_footnotes(report: &TokenReport, mark: &str, unreadable: bool) -> Vec<Footnote> {
     let mut notes = Vec::new();
     if !report.unpriced_models.is_empty() {

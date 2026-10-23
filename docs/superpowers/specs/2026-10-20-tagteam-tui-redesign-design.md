@@ -728,7 +728,9 @@ Behaviour stays TUI §5.3's and §6.4's; the screen changes:
     breadcrumbs and details as their first 8 characters (VIS-15).
 - **Labelled sections:** `SELECTED` with the selected row's detail and `⏎ its sessions`, then the
   notes, each led by its mark (`≥ at least: 3 subagent responses are still being counted`, `$ what
-  this would cost on the API at list prices of 2026-10-01; not your bill`).
+  this would cost on the API at list prices of 2026-10-01; not your bill`). `tagteam tokens` prints
+  the `$` note with its mark and the lower bound's without its `≥` (it marks a partial cost with
+  `*`). *(Amended 2026-10-23.)*
 - **Breadcrumbs** muted, joined by `›`; the filter keeps its room before them (VIS-15).
 - **A failed re-query** keeps the last report, DIM, under the error banner (VIS-10). Today
   `TokensState::reset()` drops it before the read (`tokens/mod.rs:294-298`); the reset keeps the
@@ -1169,7 +1171,7 @@ its user-visible changes, and records rulings under "Rulings".
 | T2 | Visual system and chrome: the tiers and detection, the header (with `threshold`, `strategy`, `names` and the engine-lock check, §5.2, §12.2), the auto line from live events (§5.3), footer, toasts, banner, empty states, overlays, help and legend, outcomes, labels, key guards, `r` feedback, §11.3's sentences as new functions | VIS-2, -7, -8, -10, -11; UX-1, -4, -5, -6, -7, -8, -10, -13, -14, -15, -16 | T1 | — |
 | T3 | Accounts and the shared words: lead card, table, cards, status, remedies, Now strip, `best_candidate`, the rest of §12.2, PERF-R-10a; §11.1 (`list`, `status`, `history`) and §11.2; `tagteam auto`'s human output adopts §11.3 | VIS-1, -3, -4, -5, -6, -13; UX-2, -9, -12 | T2 | R4 (C-15) |
 | T4 | History: `Engine::timeline`, the new readers, `last_auto_event`, the event writers, §11.4's sentences, the store-fed auto line, the screen | VIS-5, -12; UX-3, -11 | T3 | R4 |
-| T5 | Tokens: §8, the token report's footnote words (`tagteam tokens` reads them too), PERF-D-2 | VIS-4 (Tokens), -9, -14, -15 | T4 | R4 |
+| T5 | Tokens: §8, the token report's footnote words (`tagteam tokens` reads them too, §8), PERF-D-2 | VIS-4 (Tokens), -9, -14, -15 | T4 | R4 |
 
 - **The R3 items** (D-2, CC-O-2/3, §12.5) go in the first PR planned after R3 merges: T2 if it has
   merged by then, else the next.

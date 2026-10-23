@@ -96,9 +96,9 @@ with the one before, so any release may contain breaking changes. Each section s
   `API $` and `RESPONSES`, short model names, a project's name, `~` for an estimated block, and
   `removed account` or `unknown account`; the selected row's detail is labelled `SELECTED`. The
   screen no longer names the time zone; help explains `CACHE W 5M` and `1H`.
-- `tagteam tokens` and `tagteam tui` word two notes anew: `≥ at least: N subagent responses are
-  still being counted` and `$ what this would cost on the API at list prices of <date>; not your
-  bill`.
+- `tagteam tokens` and `tagteam tui` word two notes anew: `at least: N subagent responses are
+  still being counted` (led by `≥` in the TUI only) and `$ what this would cost on the API at list
+  prices of <date>; not your bill`.
 - `tagteam tui` re-reads the token report on the daemon's index events at most every 30 s, every
   5 s while its own refresh runs, and at once after `r`. A report it could not read again keeps
   its banner over a collection's warnings.
