@@ -37,7 +37,7 @@ const PARTIAL: &str = "the token index has not completed its first refresh, so t
 const FOOTNOTES: &str = concat!(
     "\n",
     "No price for claude-test-9: counted without cost (* marks a partial cost).\n",
-    "≥ at least: 1 subagent response is still being counted\n",
+    "at least: 1 subagent response is still being counted\n",
 );
 
 /// Midnight UTC, `days` days before today's.

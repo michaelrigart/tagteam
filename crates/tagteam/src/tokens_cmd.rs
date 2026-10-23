@@ -795,13 +795,17 @@ pub(crate) fn block_note(observed: bool, active: Option<&ActiveBlock>) -> String
 
 /// Spec §11.2's footnotes, after a blank line: unpriced models, responses whose output is a
 /// lower bound (spec §2.3), skipped lines, and the date of the price table. Unreadable files
-/// are warned of on stderr instead (spec §11.3).
+/// are warned of on stderr instead (spec §11.3). The lower bound's note prints without its `≥`:
+/// this table marks a partial cost with `*` and draws no `≥` cell.
 fn footnotes(report: &TokenReport) -> String {
     format!(
         "\n{}\n",
         words::token_footnotes(report, "*", false)
             .iter()
-            .map(words::Footnote::line)
+            .map(|note| match note.mark {
+                Some(words::AT_LEAST) => note.text.clone(),
+                _ => note.line(),
+            })
             .collect::<Vec<_>>()
             .join("\n")
     )

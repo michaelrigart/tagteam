@@ -991,9 +991,11 @@ tagteam tokens [day|month|session|block] [ACCOUNT...] [--unattributed] [--model 
   - A total line closes the table.
   - Footnotes cover unpriced models, unfinalized responses ("output is a lower bound for N
     subagent responses"), skipped lines, and the price table's date. The unfinalized
-    responses' note reads `≥ at least: N subagent responses are still being counted`, and the
-    price table's `$ what this would cost on the API at list prices of <date>; not your bill`.
-    *(Amended by the TUI redesign spec §8.)*
+    responses' note reads `≥ at least: N subagent responses are still being counted` in the TUI
+    and `at least: N subagent responses are still being counted` in the CLI, which marks a
+    partial cost with `*` and draws no `≥` cell. The price table's note reads `$ what this would
+    cost on the API at list prices of <date>; not your bill` in both.
+    *(Amended by the TUI redesign spec §8; the CLI's note without its `≥`, 2026-10-23.)*
   - Session rows add the project and first and last times. Block rows add the start and end,
     `observed`, and for the active block the remaining time, burn rate and projection.
   - While a refresh runs longer than one second, progress goes to stderr.
