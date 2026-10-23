@@ -193,7 +193,7 @@ impl ProcessProbe for SystemProcessProbe {
     fn start_time_s(&self, pid: u32) -> Option<i64> {
         let ticks = crate::process::start_of(pid).ok()??;
         let hz = clock_ticks_per_s()?;
-        Some(boot_time_s()? + i64::try_from(ticks / hz).ok()?)
+        boot_time_s()?.checked_add(i64::try_from(ticks / hz).ok()?)
     }
 
     #[cfg(target_os = "macos")]
@@ -407,7 +407,7 @@ pub fn record_is_live(probe: &dyn ProcessProbe, r: &SessionRecord, launch_comman
             // either. An unknown answer counts as mentioning it.
             let matches = probe
                 .start_time_s(r.pid)
-                .is_none_or(|actual| (actual - recorded).abs() <= 1);
+                .is_none_or(|actual| actual.abs_diff(recorded) <= 1);
             matches || probe.mentions(r.pid, launch_command).unwrap_or(true)
         }
         ProcStart::BootTicks(recorded) => probe
@@ -625,6 +625,34 @@ mod tests {
                 "OS start {actual}"
             );
         }
+    }
+
+    #[test]
+    fn an_epoch_start_far_from_the_os_start_time_is_a_mismatch_and_never_an_overflow() {
+        // The record is read from disk, so its start can be any `i64`.
+        for (recorded, actual) in [
+            (i64::MIN, STARTED),
+            (i64::MAX, -1),
+            (i64::MIN, i64::MAX),
+            (i64::MAX, i64::MIN),
+        ] {
+            let probe = FakeProcessProbe::new();
+            probe.set(100, stranger(actual));
+            assert!(
+                !record_is_live(&probe, &rec(ProcStart::EpochS(recorded), None), "claude"),
+                "recorded {recorded}, OS start {actual}"
+            );
+        }
+        let probe = FakeProcessProbe::new();
+        probe.set(100, stranger(i64::MAX));
+        assert!(
+            record_is_live(
+                &probe,
+                &rec(ProcStart::EpochS(i64::MAX - 1), None),
+                "claude"
+            ),
+            "a neighbour of the extreme is still within a second"
+        );
     }
 
     #[test]
