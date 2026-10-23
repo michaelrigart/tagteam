@@ -277,6 +277,8 @@ a `Modifier`.
 
 - **Bold is rare:** at most one bold per row. The active or selected account's name, TOTAL, a
   warn/crit percentage, a card or chart title. Column heads are muted capitals, never bold.
+  - **Under NO_COLOR (tier 0)** accent and warn are drawn bold (§4.1), so a row can carry two
+    bolds: TOTAL beside a `≥` total, or the control bar's four keys. *(Accepted 2026-10-23.)*
 - **Severity** colours the percentage, the gauge fill and the status word, never a whole row. The
   one exception: a disabled row is entirely DIM.
 - **Selection** is `▌` in accent in column 0, plus bold on the row's name; tier 2 adds `sel-bg`.
