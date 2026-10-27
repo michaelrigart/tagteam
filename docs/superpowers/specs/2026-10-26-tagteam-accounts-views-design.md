@@ -114,7 +114,7 @@ SELECTED  2 work  sam@corp.example
           IN USE · updated 2m ago · login valid 27 more days
   5h     ▆▆▆▆▆▆▆▁▁▁▁▁▁▁▁▁  44%    resets in 2h25m · +16.9%/h · lasts
   7d     ▆▆▆▆▆▆▆▆▆▆▆▆▆▁▁▁  82% ▲  resets in 5d04h · +2.3%/h · full in 7h47m
-  Fable  ▆▆▆▆▁▁▁▁▁▁▁▁▁▁▁▁  28%    resets in 5d04h · +0.9%/h · full in 3d12h
+  Fable  ▆▆▆▆▁▁▁▁▁▁▁▁▁▁▁▁  28%    resets in 5d04h · +0.9%/h · full in 3d08h
           ⏎ history   e disable   a alias   x remove
 
 
@@ -131,8 +131,8 @@ With account 1 selected, the card and the footer read:
 SELECTED  1 alex@example.com
           not in use · updated 1m ago · login valid 27 more days
   5h     ────────────────   0%    not started
-  7d     ━━━━━━━━━━━━━━━╸  98% ▲  resets in 1d02h · +0.5%/h · full in 4h00m
-  Fable  ────────────────   0%    resets in 1d02h
+  7d     ━━━━━━━━━━━━━━━╸  98% ▲  resets in 1d18h · +0.5%/h · full in 4h00m
+  Fable  ────────────────   0%    resets in 1d18h
           s switch   ⏎ history   e disable   a alias   x remove
 s switch  b best  n next  ⏎ history  P pause auto  v full list   ? keys  q quit
 ```
@@ -159,7 +159,7 @@ SELECTED  2 work  sam@corp.example · Example Corp
           IN USE · updated 2m ago · login valid 27 more days · next update in 1m
   5h     ▆▆▆▆▆▆▆▆▆▆▆▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁  44%    resets in 2h25m · +16.9%/h · lasts until it resets
   7d     ▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▁▁▁▁▁  82% ▲  resets in 5d04h · +2.3%/h · full in 7h47m · 26% expected by now
-  Fable  ▆▆▆▆▆▆▆▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁  28%    resets in 5d04h · +0.9%/h · full in 3d12h
+  Fable  ▆▆▆▆▆▆▆▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁  28%    resets in 5d04h · +0.9%/h · full in 3d08h
           ⏎ history   e disable   a alias   x remove
                                    (spare rows)
 b best  n next  ⏎ history  P pause auto  v full list  r refresh  e disable  a alias  x remove            ? keys  q quit
@@ -209,6 +209,12 @@ full list replaces it.
   again before then`, as the lead card had it (redesign §6.2). A row too wide is cut at its end.
 - **A row per window,** every window the account has, in §4's format; thick bars for the account
   in use, thin gauges otherwise.
+- **No windows** (no reading, or a reading with an empty list): an account with a problem shows
+  its problem rows in the windows' place. One without (an API key, an unsupported provider, an
+  empty list) shows one row from column 2 with the words the table puts across its window
+  columns (`status.rs:124-136` `unread_words`, redesign §6.3), in their role:
+  `api key · has no usage limits to show`. Today's card shows nothing there (`card.rs:49-52`).
+  This rule is the full list's too (§6.1).
 - **Problems** under the windows, as redesign §6.4: the sentence, then the remedy, in their role.
   For the account in use too: no lead card shows them any more (M-9 no longer applies).
 - **Keys row** last, from column 10: `s switch` (not shown for the account in use, §8), `⏎ history`,
@@ -285,7 +291,8 @@ When the body is shorter than compact needs, in order:
 2. the card's keys row (help lists the keys; the footer keeps `s` and `⏎` at every width);
 3. the two rules;
 4. today's split (`accounts.rs:282-330`, T3-22): the table reserves `min(its lines,
-   TABLE_LEAST)` lines (`TABLE_LEAST` is 4, `accounts.rs:301-302`) and scrolls with the
+   TABLE_LEAST)` lines (`TABLE_LEAST` is 4, `accounts.rs:36`; the reservation at
+   `accounts.rs:301-302`) and scrolls with the
    selection; the card keeps its least and its windows scroll with `J`/`K`.
 
 Problem rows never drop. At 80×24 with four accounts and three windows nothing drops; with seven
@@ -308,8 +315,8 @@ order, separated as §5.2. At 80×24 with account 1 selected:
 ▌  1   alex@example.com
 ▌      not in use · updated 1m ago · login valid 27 more days
 ▌      5h     ────────────────   0%    not started
-▌      7d     ━━━━━━━━━━━━━━━╸  98% ▲  resets in 1d02h · +0.5%/h · full in 4h00m
-▌      Fable  ────────────────   0%    resets in 1d02h
+▌      7d     ━━━━━━━━━━━━━━━╸  98% ▲  resets in 1d18h · +0.5%/h · full in 4h00m
+▌      Fable  ────────────────   0%    resets in 1d18h
 
    ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
 
@@ -317,7 +324,7 @@ order, separated as §5.2. At 80×24 with account 1 selected:
        IN USE · updated 2m ago · login valid 27 more days
        5h     ▆▆▆▆▆▆▆▁▁▁▁▁▁▁▁▁  44%    resets in 2h25m · +16.9%/h · lasts
        7d     ▆▆▆▆▆▆▆▆▆▆▆▆▆▁▁▁  82% ▲  resets in 5d04h · +2.3%/h · full in 7h47m
-       Fable  ▆▆▆▆▁▁▁▁▁▁▁▁▁▁▁▁  28%    resets in 5d04h · +0.9%/h · full in 3d12h
+       Fable  ▆▆▆▆▁▁▁▁▁▁▁▁▁▁▁▁  28%    resets in 5d04h · +0.9%/h · full in 3d08h
 
    ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
 
@@ -332,8 +339,8 @@ reader the list goes on.
   selected), the org muted from 120 columns.
 - **Facts row** as §3.4, from column 7.
 - **Problems** under the windows, as the card's. A disabled account's block is DIM throughout, as
-  its table row (redesign §4.3). An account with no reading shows its status words in place of
-  its windows, as the table does (redesign §6.3).
+  its table row (redesign §4.3). An account with no windows follows §3.4's rule, its row from
+  column 7.
 - **No keys row:** the footer carries the selected account's keys (`s` (not for the account in
   use), `⏎`, and from 120 columns `e`, `a`, `x`), as it already does.
 - **Several providers:** a muted provider heading before each provider's blocks, as the table
@@ -486,8 +493,13 @@ changing the design.
 13. **A spend window keeps its amount;** the value column widens to the widest value (§4.1).
 14. **The Now strip gains `▲`** on every screen, where its gauges lose the pace mark (§3.2).
 15. **`s` on the account in use:** only its hint is hidden; the key keeps working (§8).
-16. **Card facts and keys start at column 10,** under the position; in the full list at column 7,
-    under the name (§3.4, §6.1).
+16. **Compact's card facts and keys start at column 10,** under the position (§3.4). The full
+    list's facts start at column 7, under the name; its blocks have no keys row (§6.1).
+17. **An account with no windows** shows the table's no-reading words in their place, or its
+    problem rows when it has a problem, in both views (§3.4).
+18. **The mocks' numbers follow the engine:** `▲` only where the reading is 15 points or more
+    ahead of the even pace (`tagteam-core/src/pace.rs:17`), and each projection follows from
+    its rate.
 
 ## 11. Verification
 
@@ -506,6 +518,8 @@ changing the design.
   today's tests at `accounts.rs:1975-2035`).
 - `s` with the account in use selected: no hint in the footer or the card, and the key still
   dispatches the switch.
+- An API-key account and one needing a login, selected in compact and shown in the full list:
+  the same replacement row or problem rows in both views (§3.4).
 - Tokens: a day, a month, a session and a block wholly before the epoch read `before tracking`;
   one spanning it, one after it, every row with no epoch, and a session with a response exactly
   at the epoch read `unknown account`; an attributed pre-epoch row keeps its account's name; the filter's
