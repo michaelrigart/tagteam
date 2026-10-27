@@ -6,6 +6,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::chrome::WIDE;
 use crate::daemon;
+use crate::screens::accounts::View;
 use crate::screens::history;
 use crate::state::{Screen, State};
 use crate::view::width_of;
@@ -171,7 +172,13 @@ pub(crate) const KEYS: &[KeyRow] = &[
         does: "switch to the selected account",
         footer: Footer::Show {
             key: "s",
-            label: |state| on_account(state, "switch"),
+            label: |state| {
+                state
+                    .accounts
+                    .selected_view()
+                    .filter(|v| !v.active)
+                    .map(|_| "switch")
+            },
             from: 0,
         },
         #[cfg(test)]
@@ -393,6 +400,27 @@ pub(crate) const KEYS: &[KeyRow] = &[
         },
         #[cfg(test)]
         probes: &[shifted('P')],
+    },
+    KeyRow {
+        screen: Some(Screen::Accounts),
+        keys: "v",
+        does: "full list, or back to compact",
+        footer: Footer::Show {
+            key: "v",
+            label: |state| {
+                on_account(
+                    state,
+                    if state.accounts.view() == View::List {
+                        "compact"
+                    } else {
+                        "full list"
+                    },
+                )
+            },
+            from: 0,
+        },
+        #[cfg(test)]
+        probes: &[plain('v')],
     },
     KeyRow {
         screen: None,
@@ -709,7 +737,7 @@ mod tests {
             (None, Char('P' | 'r' | 'A' | 'D' | 'w'), false) => vec![accounts(2)],
             (
                 Some(Accounts),
-                Char('j' | 'k' | 's' | 'b' | 'n' | 'e' | 'a' | 'm' | 'x' | 'R')
+                Char('j' | 'k' | 's' | 'b' | 'n' | 'e' | 'a' | 'm' | 'x' | 'R' | 'v')
                 | Down
                 | Up
                 | PageDown
@@ -786,13 +814,14 @@ mod tests {
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snapshot(many(1)));
         let all = footer_items(&state, 200);
-        assert_eq!(all.len(), 9);
+        assert_eq!(all.len(), 10);
         assert!(all.iter().all(|(k, l)| !k.is_empty() && !l.is_empty()));
-        for width in [80, 100, 119] {
+        // `r refresh` waits for the room beyond 80 columns (S§8).
+        for (width, n) in [(80, 6), (100, 7), (119, 7)] {
             let shown = footer_items(&state, width);
             assert_eq!(
                 shown,
-                all[..6],
+                all[..n],
                 "{width}: the 120-column items wait for 120"
             );
         }

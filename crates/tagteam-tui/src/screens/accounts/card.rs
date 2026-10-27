@@ -42,7 +42,7 @@ const SOON_S: i64 = 7 * 86_400;
 const LOG_IN_AGAIN: &str = "log in again before then";
 
 /// An account's windows, as its reading lists them; none without a reading.
-fn windows_of(v: &AccountView) -> &[(Window, Pace)] {
+pub(super) fn windows_of(v: &AccountView) -> &[(Window, Pace)] {
     v.usage.windows.as_deref().unwrap_or_default()
 }
 
@@ -220,22 +220,34 @@ fn title(state: &State, v: &AccountView, width: u16) -> Line<'static> {
         Span::styled("SELECTED", theme.role(Role::Muted)),
         Span::raw(format!("{GAP}{} ", v.row.position)),
     ];
-    spans.extend(name_spans(&v.row, width, theme));
+    spans.extend(name_spans(&v.row, width, true, theme));
     Line::from(fit_spans(spans, usize::from(width)))
 }
 
 /// A card's name (§6.2, §6.4): the alias bold, two spaces and the email muted, or the email
-/// bold; the org muted from 120 columns.
-pub(super) fn name_spans(row: &AccountRow, width: u16, theme: Theme) -> Vec<Span<'static>> {
+/// bold (`strong`, else plain); the org muted from 120 columns.
+pub(super) fn name_spans(
+    row: &AccountRow,
+    width: u16,
+    strong: bool,
+    theme: Theme,
+) -> Vec<Span<'static>> {
     let muted = theme.role(Role::Muted);
     let email = words::email(row);
+    let main = |text: String| {
+        if strong {
+            Span::styled(text, theme.strong())
+        } else {
+            Span::raw(text)
+        }
+    };
     let mut name = match &row.alias {
         Some(alias) => vec![
-            Span::styled(alias.clone(), theme.strong()),
+            main(alias.clone()),
             Span::raw(GAP),
             Span::styled(email, muted),
         ],
-        None => vec![Span::styled(email, theme.strong())],
+        None => vec![main(email)],
     };
     if let Some(org) = row.org_name.as_deref().filter(|_| width >= WIDE) {
         name.push(Span::styled(format!("{FACT_SEP}{org}"), muted));

@@ -307,7 +307,7 @@ fn a_resize_while_idle_redraws_at_the_new_size() {
             s.text()
                 .split('\n')
                 .nth(29)
-                .is_some_and(|row| row.starts_with("s switch"))
+                .is_some_and(|row| row.starts_with("b best"))
         },
     );
     tui.type_keys(b"q");

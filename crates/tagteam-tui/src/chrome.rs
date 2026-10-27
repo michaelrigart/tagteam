@@ -1679,7 +1679,7 @@ mod tests {
         drawn(state, w).pop().unwrap()
     }
 
-    const ACCOUNTS_80: &str = "s switch  b best  n next  ⏎ history  P pause auto  r refresh";
+    const ACCOUNTS_80: &str = "s switch  b best  n next  ⏎ history  P pause auto  v full list";
 
     #[test]
     fn the_footer_pins_keys_and_quit_on_every_screen_at_80_columns() {
@@ -1715,7 +1715,10 @@ mod tests {
         assert_eq!(last(&state, 80), footer_row(ACCOUNTS_80, 80));
         assert_eq!(
             last(&state, 120),
-            footer_row(&format!("{ACCOUNTS_80}  e disable  a alias  x remove"), 120)
+            footer_row(
+                &format!("{ACCOUNTS_80}  r refresh  e disable  a alias  x remove"),
+                120
+            )
         );
     }
 

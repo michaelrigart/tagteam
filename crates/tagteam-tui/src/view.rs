@@ -481,11 +481,14 @@ mod tests {
         // The footer half of the old header-and-footer test; the header half is `chrome`'s.
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snapshot(many(2)));
-        let order = "s switch  b best  n next  ⏎ history  P pause auto  r refresh";
+        let order = "s switch  b best  n next  ⏎ history  P pause auto  v full list";
         assert_eq!(draw(&state, 80, 24)[23], footer_row(order, 80));
         assert_eq!(
             draw(&state, 120, 40)[39],
-            footer_row(&format!("{order}  e disable  a alias  x remove"), 120)
+            footer_row(
+                &format!("{order}  r refresh  e disable  a alias  x remove"),
+                120
+            )
         );
         let history = draw(&fresh(Screen::History), 80, 24);
         assert_eq!(

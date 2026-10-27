@@ -3,6 +3,7 @@
 
 pub(crate) mod card;
 pub(crate) mod lead;
+mod list;
 pub(crate) mod status;
 pub(crate) mod table;
 
@@ -46,9 +47,25 @@ pub struct AccountsState {
     /// The first of the selected account's windows the card shows (`J`/`K`), when they do not
     /// all fit.
     card_from: usize,
+    /// Compact, or every account in full (`v`); it lasts for the session.
+    view: View,
+    /// The first block the full list shows, as last kept whole around the selection.
+    list_from: usize,
+}
+
+/// What the Accounts screen shows (S§6): the table and the selected card, or every account.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum View {
+    #[default]
+    Compact,
+    List,
 }
 
 impl AccountsState {
+    pub(crate) fn view(&self) -> View {
+        self.view
+    }
+
     pub fn snapshot(&self) -> Option<&AccountsSnapshot> {
         self.snapshot.as_ref()
     }
@@ -162,7 +179,17 @@ pub fn banner(state: &State) -> Option<String> {
 
 pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
     let body = crate::view::body_at(state);
-    let page = visible_rows(state, body, now_ms).max(1) as isize;
+    let list = state.accounts.view == View::List;
+    if list {
+        // From what is on screen now: a resize or a read may have left the stored origin stale.
+        list::follow(state, body, now_ms);
+    }
+    let page = if list {
+        list::page(state, body, now_ms)
+    } else {
+        visible_rows(state, body, now_ms)
+    }
+    .max(1) as isize;
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => state.accounts.step(1),
         KeyCode::Char('k') | KeyCode::Up => state.accounts.step(-1),
@@ -173,6 +200,18 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
         KeyCode::Esc => {
             // The start-up warnings stay until a person has seen them (redesign §5.6, T2-21).
             state.startup.warnings.clear();
+            return vec![];
+        }
+        KeyCode::Char('v') => {
+            let st = &mut state.accounts;
+            st.view = match st.view {
+                View::Compact => View::List,
+                View::List => View::Compact,
+            };
+            st.list_from = 0;
+            if st.view == View::List {
+                list::follow(state, body, now_ms);
+            }
             return vec![];
         }
         KeyCode::Char('J') => {
@@ -191,10 +230,14 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
         }
         _ => return vec![],
     }
-    let lines = layout(&state.accounts).len();
-    let at = line_of(&state.accounts);
-    let rows = visible_rows(state, body, now_ms);
-    state.accounts.offset = keep_visible(state.accounts.offset, at, at, rows, lines);
+    if list {
+        list::follow(state, body, now_ms);
+    } else {
+        let lines = layout(&state.accounts).len();
+        let at = line_of(&state.accounts);
+        let rows = visible_rows(state, body, now_ms);
+        state.accounts.offset = keep_visible(state.accounts.offset, at, at, rows, lines);
+    }
     crate::screens::history::follow(state);
     vec![]
 }
@@ -375,6 +418,10 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
         let launch = state.names_of(&daemon::focus(state)).launch_command;
         let sentence = format!("Log in with {launch}, then press A to add that login.");
         centred_block(frame, area, NO_ACCOUNTS, Some(&sentence), state.theme);
+        return;
+    }
+    if st.view == View::List {
+        list::render(state, frame, area, now_ms);
         return;
     }
     let now_s = now_ms.div_euclid(1000);
@@ -3680,6 +3727,366 @@ mod tests {
                 check(y + 2, "resets in 2h40m", 't');
                 check(y + 4, "history", 'm');
             }
+        }
+    }
+
+    fn resize(state: &mut State, width: u16, height: u16) {
+        update(state, Msg::Resize { width, height }, NOW_MS);
+    }
+
+    /// The first row of the body (from row 4, under the chrome and the Now strip) that holds
+    /// `needle`.
+    fn row_of(rows: &[String], needle: &str) -> usize {
+        (4..rows.len())
+            .find(|&y| rows[y].contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} in {rows:?}"))
+    }
+
+    /// The footer row at 80×24.
+    fn footer_80(state: &State) -> String {
+        draw(state, 80, 24)[23].clone()
+    }
+
+    #[test]
+    fn v_toggles_the_full_list_and_keeps_the_selection() {
+        let mut state = loaded(three());
+        update(&mut state, key(KeyCode::Down), NOW_MS);
+        let before = state.accounts.selected();
+        update(&mut state, ch('v'), NOW_MS);
+        assert_eq!(state.accounts.view(), View::List);
+        assert_eq!(state.accounts.selected(), before);
+        assert!(draw(&state, 80, 24)[23].contains("v compact"));
+        update(&mut state, ch('v'), NOW_MS);
+        assert_eq!(state.accounts.view(), View::Compact);
+        assert!(draw(&state, 80, 24)[23].contains("v full list"));
+    }
+
+    #[test]
+    fn the_full_list_at_80_by_24_matches_the_spec() {
+        // S§6.1's mock: Task 4's `mock()` (three windows each), account 1 selected (`k`), then
+        // `v`, in every tier (tier 0, `fresh`'s default, has `·` separators).
+        for theme in TIERS {
+            let mut state = loaded(mock());
+            state.theme = theme;
+            update(&mut state, ch('k'), NOW_MS);
+            update(&mut state, ch('v'), NOW_MS);
+            let rows = draw(&state, 80, 24);
+            let dot = if theme == TIERS[0] { "·" } else { "┈" };
+            assert_eq!(rows[3], "");
+            assert_eq!(rows[5], "");
+            assert!(
+                rows[4]
+                    .chars()
+                    .all(|c| c == rows[4].chars().next().unwrap())
+            );
+            assert!(rows[6].starts_with("▌  1   alex@example.com"));
+            for r in &rows[6..11] {
+                assert!(r.starts_with('▌'), "{r}");
+            }
+            assert!(rows[11..].iter().all(|r| !r.starts_with('▌')));
+            assert_eq!(rows[12], format!("   {}", dot.repeat(74))); // ends three columns in
+            assert!(rows[14].starts_with("   2 ● work  sam@corp.example"));
+            assert_eq!(col(&rows[15], "IN USE"), 7);
+            assert!(rows[16].starts_with("       5h     ▆")); // thick, from column 7
+            assert!(rows[8].starts_with("▌      5h     ") && !rows[8].contains('▆')); // thin
+            assert_eq!(col(&rows[8], "%"), col(&rows[16], "%")); // one % column
+            assert!(rows[22].starts_with("   3   spare")); // cut at the body's end
+            assert!(
+                !rows
+                    .iter()
+                    .any(|r| r.contains("x remove") && !r.contains("q quit"))
+            ); // no keys row
+        }
+    }
+
+    #[test]
+    fn the_full_list_at_120_by_40_lines_every_block_up_in_every_tier() {
+        // `loaded(mock())`, View::List, for every tier in TIERS: every window row's `%` column is
+        // the same in every block; 26-cell bars; `Example Corp` on `work`'s title; thick bars only
+        // on `work`'s rows; the separator rows are `┈` from tier 1 and `·` in tier 0.
+        for theme in TIERS {
+            let mut state = loaded(mock());
+            state.theme = theme;
+            update(&mut state, ch('v'), NOW_MS);
+            let rows = draw(&state, 120, 40);
+            let dot = if theme == TIERS[0] { "·" } else { "┈" };
+            let emails = [
+                "alex@example.com",
+                "sam@corp.example",
+                "alex@personal.example",
+                "kim@example.org",
+            ];
+            for (i, email) in emails.iter().enumerate() {
+                let title = row_of(&rows, email);
+                assert_eq!(rows[title].contains("Example Corp"), i == 1, "{theme:?}");
+                for row in &rows[title + 2..title + 5] {
+                    // Bars start at column 14 and take 26 cells, then a space and the value.
+                    assert_eq!(col(row, "%"), 44, "{theme:?} {row}");
+                    assert_eq!(row.contains('▁'), i == 1, "{theme:?} {row}");
+                }
+            }
+            let rules = rows
+                .iter()
+                .filter(|r| !r.trim().is_empty() && r.trim().chars().all(|c| c.to_string() == dot))
+                .count();
+            assert_eq!(rules, 3, "{theme:?}");
+        }
+    }
+
+    #[test]
+    fn blocks_without_windows_match_the_compact_card() {
+        // An ApiKey account and a ReloginRequired one: the first block is exactly title, facts and
+        // `api key · has no usage limits to show` from column 7; the second is exactly title, facts
+        // and the compact card's problem rows (each once, the same text), the sentence's `✕` at
+        // column 7 like the window rows and the remedy at 9.
+        let mut api = account(1, "a1@x.co", unread(UsageStatus::ApiKey, None, None));
+        api.kind = API_KEY;
+        let mut relogin = account(
+            2,
+            "a2@x.co",
+            unread(UsageStatus::ReloginRequired, None, None),
+        );
+        relogin.row.quarantine_reason = Some("invalid_grant".into());
+        let mut state = loaded(vec![api, relogin]);
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        let card = card_rows(&state, 80, 24).1;
+        update(&mut state, ch('v'), NOW_MS);
+        let rows = draw(&state, 80, 24);
+        assert!(rows[6].contains("a1@x.co") && rows[7].contains("not in use"));
+        assert_eq!(rows[8], "       api key · has no usage limits to show");
+        assert_eq!(rows[9], "");
+        assert!(rows[12].contains("a2@x.co") && rows[13].contains("not in use"));
+        // The selected block's rows start with `▌`; the text is the card's, five columns in.
+        assert_eq!(rows[14], format!("▌    {}", card[2]));
+        assert_eq!(rows[15], format!("▌    {}", card[3]));
+        assert_eq!(col(&rows[14], "✕"), 7);
+        assert_eq!(col(&rows[15], "Log in"), 9);
+        assert_eq!(rows[16], "");
+    }
+
+    #[test]
+    fn a_title_keeps_its_name_at_column_7_whatever_its_position() {
+        // `many(12)` with account 10 in use (so selected), View::List at 80×40: block 10's title
+        // is `▌ 10 ● a10@x.co` (a space between `10` and `●`); `j` to 11, then `Home`: block 1's
+        // title is `▌  1   a1@x.co` and block 10's `  10 ● a10@x.co` (column 0 blank, `10` in columns
+        // 2-3); in every title the name
+        // starts at column 7.
+        let mut accounts = many(12);
+        accounts[9].active = true;
+        let mut state = loaded(accounts);
+        resize(&mut state, 80, 40);
+        update(&mut state, ch('v'), NOW_MS);
+        let rows = draw(&state, 80, 40);
+        let title = row_of(&rows, "a10@x.co");
+        assert!(
+            rows[title].starts_with("▌ 10 ● a10@x.co"),
+            "{}",
+            rows[title]
+        );
+        assert_eq!(col(&rows[title], "a10@x.co"), 7);
+        // Block 10 does not fit in the same frame as block 1, so it is read after `j`.
+        update(&mut state, ch('j'), NOW_MS);
+        let rows = draw(&state, 80, 40);
+        let title = row_of(&rows, "a10@x.co");
+        assert!(
+            rows[title].starts_with("  10 ● a10@x.co"),
+            "{}",
+            rows[title]
+        );
+        assert_eq!(col(&rows[title], "a10@x.co"), 7);
+        update(&mut state, key(KeyCode::Home), NOW_MS);
+        let rows = draw(&state, 80, 40);
+        let title = row_of(&rows, "a1@x.co");
+        assert!(rows[title].starts_with("▌  1   a1@x.co"), "{}", rows[title]);
+        assert_eq!(col(&rows[title], "a1@x.co"), 7);
+    }
+
+    #[test]
+    fn a_disabled_block_is_dim_on_every_row() {
+        // `mock()` with account 3 disabled (`row.disabled = true`), View::List at 120×40, in every
+        // tier: every non-blank cell of block 3's rows carries `Modifier::DIM`. Muted carries
+        // DIM in tiers 0 and 1, faint also in tier 0 (`theme.rs:71`, :77-78), so for block 1 (enabled)
+        // assert instead that its cells' styles equal block 1's in the same draw of `mock()` with
+        // no account disabled, and that its title's name cell has no DIM in any tier.
+        for theme in TIERS {
+            let mut accounts = mock();
+            accounts[2].row.disabled = true;
+            let mut off = loaded(accounts);
+            let mut on = loaded(mock());
+            for state in [&mut off, &mut on] {
+                state.theme = theme;
+                update(state, ch('v'), NOW_MS);
+            }
+            let (off_buf, on_buf) = (
+                draw_buffer(&off, 120, 40, NOW_MS),
+                draw_buffer(&on, 120, 40, NOW_MS),
+            );
+            let rows = text_of(&off_buf);
+            let first = row_of(&rows, "alex@example.com") as u16;
+            let third = row_of(&rows, "alex@personal.example") as u16;
+            for y in first..first + 5 {
+                for x in 0..120 {
+                    assert_eq!(off_buf[(x, y)].style(), on_buf[(x, y)].style(), "{theme:?}");
+                }
+            }
+            assert!(!off_buf[(7, first)].modifier.contains(Modifier::DIM));
+            for y in third..third + 5 {
+                for x in 0..120 {
+                    let cell = &off_buf[(x, y)];
+                    assert!(
+                        cell.symbol() == " " || cell.modifier.contains(Modifier::DIM),
+                        "{theme:?} {x},{y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moving_past_the_last_whole_block_scrolls_one_block() {
+        // `loaded(mock())` (blocks of 5 rows, 8 with the separator above), View::List at 80×24
+        // (17 rows below the pinned three), account 1 selected: `j` → 2 (no scroll); `j` → 3:
+        // rows[6] is block 2's title. `k`, `k` back to 1: rows[6] is block 1's title again.
+        let mut state = loaded(mock());
+        update(&mut state, ch('k'), NOW_MS);
+        update(&mut state, ch('v'), NOW_MS);
+        update(&mut state, ch('j'), NOW_MS);
+        assert!(draw(&state, 80, 24)[6].contains("alex@example.com"));
+        update(&mut state, ch('j'), NOW_MS);
+        assert!(draw(&state, 80, 24)[6].contains("sam@corp.example"));
+        update(&mut state, ch('k'), NOW_MS);
+        update(&mut state, ch('k'), NOW_MS);
+        assert!(draw(&state, 80, 24)[6].contains("alex@example.com"));
+    }
+
+    #[test]
+    fn page_keys_move_by_the_whole_blocks_shown() {
+        // `many(8)` (4-row blocks; two whole blocks fit in the 17-row viewport at 80×24): from 1,
+        // PgDn selects 3, PgDn 5; PgUp 3. One block shown: eight accounts with four windows each
+        // (`read` plus two scoped windows, as `with_windows(&["M1", "M2"])` builds; 6-row blocks,
+        // two need 6 + 3 + 6 = 15 rows) under a three-row banner (a 14-row viewport): PgDn moves
+        // exactly one account.
+        let position = |state: &State| state.accounts.selected().unwrap().position;
+        let mut state = loaded(many(8));
+        update(&mut state, ch('v'), NOW_MS);
+        update(&mut state, key(KeyCode::PageDown), NOW_MS);
+        assert_eq!(position(&state), 3);
+        update(&mut state, key(KeyCode::PageDown), NOW_MS);
+        assert_eq!(position(&state), 5);
+        update(&mut state, key(KeyCode::PageUp), NOW_MS);
+        assert_eq!(position(&state), 3);
+        let accounts = (1..=8)
+            .map(|p| account(p, &format!("a{p}@x.co"), with_windows(&["M1", "M2"])))
+            .collect();
+        let mut state = loaded(accounts);
+        state.raise_banner(
+            BannerKind::Refusal,
+            ["the store could not be read"; 12].join("; "),
+        );
+        update(&mut state, ch('v'), NOW_MS);
+        update(&mut state, key(KeyCode::PageDown), NOW_MS);
+        assert_eq!(position(&state), 2);
+    }
+
+    #[test]
+    fn v_into_the_list_starts_at_the_top_and_scrolls_the_selection_into_view() {
+        // `many(8)`, account 7 selected in compact; `v`: the list's first block is the fewest moves
+        // from block 1 that make block 7 whole (rows[6] is block 6's title); `v`, `v` again from
+        // account 1: rows[6] is block 1's title.
+        let mut state = loaded(many(8));
+        assert!(state.accounts.select_id(&id(7)));
+        update(&mut state, ch('v'), NOW_MS);
+        assert!(draw(&state, 80, 24)[6].contains("a6@x.co"));
+        update(&mut state, ch('v'), NOW_MS);
+        update(&mut state, key(KeyCode::Home), NOW_MS);
+        update(&mut state, ch('v'), NOW_MS);
+        assert!(draw(&state, 80, 24)[6].contains("a1@x.co"));
+    }
+
+    #[test]
+    fn v_before_the_first_read_or_with_no_accounts_shows_the_same_state() {
+        // `fresh(Screen::Accounts)`: `v` then draw: `Loading accounts…` centred; `loaded(vec![])`:
+        // `No accounts yet`; `v` again: compact, same text. In both views and both states the
+        // footer has no `v` hint (VIS-10, S§8): at 80 and 120 it reads `r refresh` before the
+        // pinned keys, as `with_no_accounts_the_footer_hides_the_account_keys` expects.
+        for (mut state, words) in [
+            (fresh(Screen::Accounts), LOADING),
+            (loaded(vec![]), NO_ACCOUNTS),
+        ] {
+            let first = draw(&state, 80, 24);
+            for want in [View::List, View::Compact] {
+                update(&mut state, ch('v'), NOW_MS);
+                assert_eq!(state.accounts.view(), want);
+                assert_eq!(draw(&state, 80, 24), first);
+                assert!(first.iter().any(|r| r.contains(words)));
+                for (w, h) in [(80, 24), (120, 40)] {
+                    let rows = draw(&state, w, h);
+                    assert_eq!(
+                        rows[usize::from(h) - 1],
+                        footer_row("r refresh", usize::from(w))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn after_a_resize_a_key_moves_the_list_from_what_is_on_screen() {
+        // `many(8)` at 120×40, View::List, from account 1 `j` to account 6 (a 33-row viewport:
+        // the stored first block is 2); `Msg::Resize` to 80×24: the frame shows block 5 first
+        // (rows[6]; 17 rows hold blocks 5 and 6, not 4). Then `k`
+        // to account 5: rows[6] is still block 5's title (it was whole, nothing moves). The same
+        // set-up, then `PgUp`: the selection moves by the whole blocks shown, and rows[6] is the
+        // new selection's title or the fewest moves from block 5 that make it whole.
+        let at_6 = || {
+            let mut state = loaded(many(8));
+            resize(&mut state, 120, 40);
+            update(&mut state, ch('v'), NOW_MS);
+            for _ in 0..5 {
+                update(&mut state, ch('j'), NOW_MS);
+            }
+            resize(&mut state, 80, 24);
+            assert!(draw(&state, 80, 24)[6].contains("a5@x.co"));
+            state
+        };
+        let mut state = at_6();
+        update(&mut state, ch('k'), NOW_MS);
+        assert!(draw(&state, 80, 24)[6].contains("a5@x.co"));
+        let mut state = at_6();
+        update(&mut state, key(KeyCode::PageUp), NOW_MS);
+        assert_eq!(state.accounts.selected().unwrap().position, 4);
+        assert!(draw(&state, 80, 24)[6].contains("a4@x.co"));
+    }
+
+    #[test]
+    fn a_refresh_that_removes_accounts_clamps_the_list() {
+        // `many(8)`, View::List, account 8 selected (list scrolled); apply `snapshot(many(3))`: the
+        // selection moves to account 3 (as `apply` does) and the next frame shows block 3 whole.
+        let mut state = loaded(many(8));
+        update(&mut state, ch('v'), NOW_MS);
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        state.accounts.apply(snapshot(many(3)));
+        assert_eq!(state.accounts.selected().unwrap().position, 3);
+        let rows = draw(&state, 80, 24);
+        assert!(rows[6].starts_with("▌  3   a3@x.co"), "{}", rows[6]);
+        assert!(rows[9].contains("7d"), "{rows:?}");
+    }
+
+    #[test]
+    fn s_has_no_footer_label_for_the_account_in_use() {
+        // three(): with `work` selected the footer at 80 is
+        // `b best  n next  ⏎ history  P pause auto  v full list  r refresh` then the pinned keys;
+        // with account 1 selected it is `s switch  b best  n next  ⏎ history  P pause auto  v full
+        // list` then the pinned keys (no `r refresh`, S§8). The same in View::List with `v compact`.
+        let mut state = loaded(three());
+        for (view, label) in [("full list", "v full list"), ("compact", "v compact")] {
+            let work = format!("b best  n next  ⏎ history  P pause auto  {label}  r refresh");
+            let one = format!("s switch  b best  n next  ⏎ history  P pause auto  {label}");
+            assert_eq!(footer_80(&state), footer_row(&work, 80), "{view}");
+            update(&mut state, ch('k'), NOW_MS);
+            assert_eq!(footer_80(&state), footer_row(&one, 80), "{view}");
+            update(&mut state, ch('j'), NOW_MS);
+            update(&mut state, ch('v'), NOW_MS);
         }
     }
 }
