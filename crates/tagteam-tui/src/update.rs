@@ -857,8 +857,10 @@ mod tests {
         );
         assert_eq!(state.accounts.shown_ids(), [id(1), id(2)]);
         let drawn = draw(&state, 80, 24);
-        assert_eq!(drawn[2], " ✕ the store is locked");
-        // Under the lead card's two rows and a blank one, the table's head, then row 1.
+        // Under the Now strip (row 2).
+        assert_eq!(drawn[3], " ✕ the store is locked");
+        // The body (from row 4, under the banner) is blank, rule, blank, then the table's head
+        // and row 1.
         let body = body_of(&state, 80, 24, NOW_MS);
         assert!(body[4].contains("a1@x.co"), "{body:?}");
         // The next good read clears it.
@@ -1066,7 +1068,7 @@ mod tests {
             NOW_MS,
         );
         let lines = draw(&state, 80, 24);
-        let shown: String = lines[2..4]
+        let shown: String = lines[3..5]
             .iter()
             .map(|l| l.trim())
             .collect::<Vec<_>>()
@@ -1230,9 +1232,9 @@ mod tests {
         // Redesign §5.6, T2-21: a warn banner as the CLI printed it, on every screen.
         let shown = format!(" ! {WARNING}");
         let mut state = warned(10);
-        assert_eq!(draw(&state, 80, 24)[2], shown);
+        // Under the Now strip.
+        assert_eq!(draw(&state, 80, 24)[3], shown);
         update(&mut state, ch('2'), NOW_MS);
-        // Under the Now strip there.
         assert_eq!(draw(&state, 80, 24)[3], shown, "on Tokens too");
         update(&mut state, key(KeyCode::Esc), NOW_MS);
         assert_eq!(
@@ -1241,7 +1243,7 @@ mod tests {
             "Esc on Tokens goes back a level, and it is at the top"
         );
         update(&mut state, ch('1'), NOW_MS);
-        assert_eq!(draw(&state, 80, 24)[2], shown);
+        assert_eq!(draw(&state, 80, 24)[3], shown);
         update(&mut state, key(KeyCode::Esc), NOW_MS);
         assert!(state.startup.warnings.is_empty());
         assert!(

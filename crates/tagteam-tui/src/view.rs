@@ -28,17 +28,19 @@ pub(crate) struct Areas {
     pub(crate) header: Rect,
     /// The auto line (§5.3), in both modes.
     pub(crate) auto: Rect,
-    /// The Now strip (§5.4), under the auto line on Tokens and History.
+    /// The Now strip (§5.4), under the auto line on every screen.
     pub(crate) now: Option<Rect>,
-    /// The faint rule under the chrome, from `chrome::RULE_FROM` rows (§4.3).
+    /// The faint rule under the chrome, from `chrome::RULE_FROM` rows (§4.3), on Tokens and
+    /// History: the Accounts body draws its own.
     pub(crate) rule: Option<Rect>,
     pub(crate) banner: Option<Rect>,
     pub(crate) body: Rect,
     pub(crate) footer: Rect,
 }
 
-/// The header and the auto line on the first two rows, the Now strip under them on Tokens and
-/// History, the rule under those from `chrome::RULE_FROM` rows, the banner (when there is one) below, the footer on the last rows,
+/// The header and the auto line on the first two rows, the Now strip under them, the rule under
+/// those from `chrome::RULE_FROM` rows on Tokens and History, the banner (when there is one)
+/// below, the footer on the last rows,
 /// and the body between. None of them depends on the daemon's mode, so the body never moves
 /// when it changes (UX-5). The banner, and a toast in the footer, take as many rows as their
 /// words need at the width, `WRAP_ROWS` at most, from the body, which keeps a row at least.
@@ -47,9 +49,8 @@ pub(crate) fn areas(state: &State, area: Rect) -> Areas {
     let height = area.height;
     let header = height.min(1);
     let auto = height.saturating_sub(header).min(1);
-    let strip = matches!(state.screen, Screen::Tokens | Screen::History);
-    let now = u16::from(strip).min(height.saturating_sub(header + auto));
-    let rule = u16::from(height >= chrome::RULE_FROM);
+    let now = 1.min(height.saturating_sub(header + auto));
+    let rule = u16::from(state.screen != Screen::Accounts && height >= chrome::RULE_FROM);
     let chrome = header + auto + now + rule;
     let spare = height.saturating_sub(chrome + 2);
     let banner = rows(chrome::banner_rows(state, area.width).len()).min(spare);
@@ -727,7 +728,7 @@ mod tests {
         );
         assert_eq!(
             areas(&state, Rect::new(0, 0, 80, 24)).body,
-            Rect::new(0, 2, 80, 20),
+            Rect::new(0, 3, 80, 19),
             "the body gives up a row"
         );
     }
@@ -799,7 +800,7 @@ mod tests {
         state.toast(ToastKind::Info, "", NOW_MS);
         let a = areas(&state, Rect::new(0, 0, 80, 24));
         assert_eq!(a.footer.height, 1);
-        assert_eq!(a.body.height, 24 - 2 - 1);
+        assert_eq!(a.body.height, 24 - 3 - 1);
         assert_eq!(
             draw(&state, 80, 24)[23],
             footer_row("", 80),

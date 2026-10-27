@@ -1674,8 +1674,8 @@ mod tests {
             update(&mut state, key(KeyCode::Down), NOW_MS);
         }
         assert!(
-            matches!(state.overlay, Some(Overlay::Doctor { scroll: 23, .. })),
-            "40 rows in a 17-row panel (the body's 21, less its frame): the last page, not the last row on top"
+            matches!(state.overlay, Some(Overlay::Doctor { scroll: 24, .. })),
+            "40 rows in a 16-row panel (the body's 20, less its frame): the last page, not the last row on top"
         );
         assert_eq!(
             update(&mut state, ch('o'), NOW_MS),
@@ -1707,14 +1707,14 @@ mod tests {
         let Some(Overlay::Result { scroll, .. }) = &state.overlay else {
             panic!("{:?}", state.overlay);
         };
-        assert_eq!(*scroll, 15, "32 rows, the last page of 17");
+        assert_eq!(*scroll, 16, "32 rows, the last page of 16");
         let shown = panel_text(&state, 80, 24);
         assert_eq!(
             shown.last().unwrap(),
             "  not collected: the endpoint answered http-429, retry in 5m",
             "the last row, indented as its line is: {shown:?}"
         );
-        assert_eq!(shown[0], "line 16");
+        assert_eq!(shown[0], "line 17");
         update(&mut state, key(KeyCode::Up), NOW_MS);
         let shown = panel_text(&state, 80, 24);
         assert_eq!(
@@ -1725,11 +1725,11 @@ mod tests {
 
     #[test]
     fn a_resize_clamps_a_panels_scroll_and_the_next_key_moves_at_once() {
-        // Twenty-nine 97-column lines, two rows each at 80 columns and one at 120, then a short
-        // one: the last page starts on a line's first row at both widths.
+        // Twenty-nine 97-column lines, two rows each at 80 columns and one at 120, then two short
+        // ones: the last page (16 rows) starts on a line's first row at both widths.
         let text: String = (1..=29)
             .map(|i| format!("{i:02} {}\n", "word ".repeat(19).trim_end()))
-            .chain(["30 end\n".to_owned()])
+            .chain(["30 end\n".to_owned(), "31 end\n".to_owned()])
             .collect();
         let first_row = |state: &State, w: u16| -> String { panel_text(state, w, 24).remove(0) };
         for action in [
@@ -1743,8 +1743,8 @@ mod tests {
             on_done(&mut state, action.clone(), done(1, &text, ""), NOW_MS);
             update(&mut state, key(KeyCode::End), NOW_MS);
             assert!(
-                first_row(&state, 80).starts_with("22 word"),
-                "{action:?}: the last page of 59 rows starts at row 42"
+                first_row(&state, 80).starts_with("23 word"),
+                "{action:?}: the last page of 60 rows starts at row 44"
             );
             update(
                 &mut state,
@@ -1755,12 +1755,12 @@ mod tests {
                 NOW_MS,
             );
             assert!(
-                first_row(&state, 120).starts_with("14 word"),
-                "{action:?}: the last page of 30 rows, not a blank panel"
+                first_row(&state, 120).starts_with("16 word"),
+                "{action:?}: the last page of 31 rows, not a blank panel"
             );
             update(&mut state, key(KeyCode::Up), NOW_MS);
             assert!(
-                first_row(&state, 120).starts_with("13 word"),
+                first_row(&state, 120).starts_with("15 word"),
                 "{action:?}: Up moves from what shows"
             );
         }
@@ -1768,8 +1768,8 @@ mod tests {
 
     #[test]
     fn a_panel_scrolls_no_further_than_its_last_page() {
-        // A 24-row terminal: its body is 21 rows, so 17 rows of text between the panel's frame.
-        for (lines, furthest) in [(5, 0), (17, 0), (18, 1), (45, 28)] {
+        // A 24-row terminal: its body is 20 rows, so 16 rows of text between the panel's frame.
+        for (lines, furthest) in [(5, 0), (16, 0), (17, 1), (45, 29)] {
             for action in [
                 Action::Switch(sel(1)),
                 Action::Doctor {
@@ -1805,7 +1805,7 @@ mod tests {
                 assert!(
                     drawn
                         .iter()
-                        .any(|l| l.contains(&format!("line {}", lines - 16.min(lines - 1)))),
+                        .any(|l| l.contains(&format!("line {}", lines - 15.min(lines - 1)))),
                     "and a full page with it: {drawn:?}"
                 );
             }

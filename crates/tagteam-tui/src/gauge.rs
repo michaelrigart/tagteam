@@ -1,5 +1,5 @@
-//! The bars the Accounts and Tokens screens draw (spec §4.4, T3-17): the lead card's lead bar,
-//! the table's line gauge and the card's sparkline; the Tokens headline's block progress line
+//! The bars the Accounts and Tokens screens draw (spec §4.4, T3-17): the thick bar of the
+//! account in use, the table's line gauge and the card's sparkline; the Tokens headline's block progress line
 //! and its sparkline of cost per day; the Tokens table's share line.
 
 use ratatui::text::Span;
@@ -79,7 +79,7 @@ fn gauge(pct: f64, fill: Role, cells: usize, theme: Theme) -> Vec<Span<'static>>
     spans(drawn, theme)
 }
 
-/// The lead card's bar (§4.4): `▆` in the fill's role on a faint `▁` baseline.
+/// The thick bar of the account in use in its card (§4.4): `▆` in the fill's role on a faint `▁` baseline.
 pub(crate) fn lead_bar(pct: f64, cells: usize, theme: Theme) -> Vec<Span<'static>> {
     let fill = fill_role(pct);
     let whole = filled(pct, cells).round() as usize;

@@ -1,7 +1,6 @@
 //! The selected account's card (redesign §6.4, T3-20, T3-22): its title and facts, a row per
-//! window with a sparkline from the card's history read, its problem and remedy, and its keys.
-//! The lead card (§6.2) reuses its problem rows, `lead_keys`, its title's parts and its label
-//! column.
+//! window (thick bars for the account in use, a sparkline from the card's history read for any
+//! other), its problem and remedy, and its keys.
 
 use ratatui::text::{Line, Span};
 use tagteam_core::{Pace, Sample, Window, WindowKind};
@@ -13,7 +12,7 @@ use super::status::{self, IN_USE_WORDS, THIS_SESSION};
 use super::table::age_now;
 use crate::autoline;
 use crate::chrome::{WIDE, fit_spans};
-use crate::gauge::sparkline;
+use crate::gauge::{lead_bar, sparkline};
 use crate::state::State;
 use crate::theme::{Role, Theme};
 use crate::view::{fit, pad, width_of, wrap_rows};
@@ -29,7 +28,7 @@ const SHORT_SINCE_S: i64 = 86_400;
 /// rate, the title the org, and the card its keys row (§4.5, §6.4, T3-20), and below.
 const SPARK_WIDE: usize = 32;
 const SPARK: usize = 16;
-/// Every row of the card, and of the lead card's bars, starts this far in.
+/// Every row of the card starts this far in.
 pub(super) const INDENT: &str = "    ";
 /// Between a row's parts (§4.3).
 pub(super) const GAP: &str = "  ";
@@ -45,44 +44,31 @@ const LABEL_LEAST: usize = 4;
 /// A title's name keeps this many columns, or its whole width when narrower, before its facts
 /// are cut: T3-15's least for the table's name.
 const NAME_LEAST: usize = 16;
+/// A percentage is bold from here (T3-18).
+const BOLD_FROM: i64 = 70;
+/// A login valid for less than this is warn, and says to log in again (S§3.4, T3-10).
+const SOON_S: i64 = 7 * 86_400;
+const LOG_IN_AGAIN: &str = "log in again before then";
 
 /// An account's windows, as its reading lists them; none without a reading.
 fn windows_of(v: &AccountView) -> &[(Window, Pace)] {
     v.usage.windows.as_deref().unwrap_or_default()
 }
 
-/// Whether `v` is the account in use, whose card leaves to the lead card what it shows: the
-/// reset and projection of the windows it draws (T3-32), and the problem and its remedy (M-9).
-/// The lead card shows focus's account in use, and focus is the selected account's provider.
-pub(crate) fn is_on_lead(v: &AccountView) -> bool {
-    v.active
-}
-
-/// The card's problem rows: none for the account in use, whose lead card shows them (M-9).
-fn own_problem_rows(state: &State, v: &AccountView, width: u16, now_ms: i64) -> Vec<Line<'static>> {
-    if is_on_lead(v) {
-        return vec![];
-    }
-    problem_rows(state, v, width, now_ms)
-}
-
 /// The card's lines at `width`, its windows from `from` on, in at most `rows` (T3-20, T3-22).
 /// When `rows` is less than `min_height`, it returns `min_height` lines all the same: the
 /// title, one window, the problem rows and the keys row are never dropped. When not every
 /// window fits and two rows or more are left for them, the last of those says which show and
-/// how to scroll (`J K: windows 3–9 of 24`, muted). `on_lead` names the windows the lead card
-/// shows for the account in use (T3-32): those rows leave out their reset and projection. It
-/// is empty for any other account. The account in use has no problem rows (M-9).
+/// how to scroll (`J K: windows 3–9 of 24`, muted).
 pub(crate) fn lines(
     state: &State,
     v: &AccountView,
     width: u16,
     rows: usize,
     from: usize,
-    on_lead: &[String],
     now_ms: i64,
 ) -> Vec<Line<'static>> {
-    let problems = own_problem_rows(state, v, width, now_ms);
+    let problems = problem_rows(state, v, width, now_ms);
     let keys = keys_row(v, width, state.theme);
     let n = windows_of(v).len();
     let shown = Shown::of(rows, 1 + problems.len() + keys.len(), n);
@@ -93,7 +79,6 @@ pub(crate) fn lines(
         v,
         width,
         from..from + shown.windows,
-        on_lead,
         now_ms,
     ));
     if shown.hint {
@@ -148,18 +133,7 @@ impl Shown {
     }
 }
 
-/// §6.2's windows for the lead card at `width`, before any fold, by key: the first short and
-/// the first long below 120 columns, every window from 120. The lead card picks its bars from
-/// them (T3-32).
-pub(crate) fn lead_keys(v: &AccountView, width: u16) -> Vec<String> {
-    if width >= WIDE {
-        return windows_of(v).iter().map(|(w, _)| w.key.clone()).collect();
-    }
-    short_and_long(v).map(|(w, _)| w.key.clone()).collect()
-}
-
-/// `v`'s first short and first long window, in that order: the lead card's below 120 columns
-/// and the Now strip's (§5.4, §6.2).
+/// `v`'s first short and first long window, in that order: the Now strip's (§5.4).
 pub(crate) fn short_and_long(v: &AccountView) -> impl Iterator<Item = &(Window, Pace)> {
     let windows = windows_of(v);
     [WindowKind::Short, WindowKind::Long]
@@ -173,10 +147,10 @@ pub(crate) fn height(state: &State, v: &AccountView, width: u16, now_ms: i64) ->
 }
 
 /// The fewest lines the card is drawn in (T3-22): its title, one window row when it has
-/// windows, its problem rows (none for the account in use, M-9) and its keys row.
+/// windows, its problem rows and its keys row.
 pub(crate) fn min_height(state: &State, v: &AccountView, width: u16, now_ms: i64) -> usize {
     1 + usize::from(!windows_of(v).is_empty())
-        + own_problem_rows(state, v, width, now_ms).len()
+        + problem_rows(state, v, width, now_ms).len()
         + usize::from(width >= WIDE)
 }
 
@@ -388,9 +362,21 @@ fn facts_of(state: &State, v: &AccountView, now_ms: i64) -> Vec<(String, Role)> 
         facts.push((words::next_update(at, now_s), Role::Muted));
     }
     if let Some(at_ms) = row.login_expires_at {
-        let passed = at_ms.div_euclid(1000) <= now_s;
-        let role = if passed { Role::Warn } else { Role::Muted };
-        facts.push((words::login_valid(at_ms, now_s), role));
+        // Under `SOON_S` left it is warn and says to log in again (S§3.4); once passed it is
+        // `login expired`, warn, alone.
+        let left = at_ms.div_euclid(1000).saturating_sub(now_s);
+        let login = words::login_valid(at_ms, now_s);
+        facts.push((
+            login,
+            if left < SOON_S {
+                Role::Warn
+            } else {
+                Role::Muted
+            },
+        ));
+        if (1..SOON_S).contains(&left) {
+            facts.push((LOG_IN_AGAIN.to_owned(), Role::Warn));
+        }
     }
     facts
 }
@@ -401,7 +387,6 @@ fn window_rows(
     v: &AccountView,
     width: u16,
     shown: std::ops::Range<usize>,
-    on_lead: &[String],
     now_ms: i64,
 ) -> Vec<Line<'static>> {
     let windows = windows_of(v);
@@ -423,7 +408,7 @@ fn window_rows(
                 samples,
                 label_w,
                 width,
-                on_lead: on_lead.contains(&w.key),
+                thick: v.active,
             };
             row.line(now_ms.div_euclid(1000), state.theme)
         })
@@ -437,13 +422,13 @@ struct Row<'a> {
     samples: &'a [Sample],
     label_w: usize,
     width: u16,
-    /// The lead card shows this window: no reset and no projection (T3-32).
-    on_lead: bool,
+    /// The account in use: thick bars (`lead_bar`), not a sparkline (S§4.1).
+    thick: bool,
 }
 
 impl Row<'_> {
-    /// `    {label}  {spark} {tag}  {pct:>4}[ ▲]  {reset}[ · {projection}]` (T3-20), cut to
-    /// the width. From 120 columns `▲` takes its words when the row still fits.
+    /// `    {label}  {spark or bar} {tag}  {pct:>4}[ ▲]  {reset}[ · {projection}]` (T3-20), cut
+    /// to the width. From 120 columns `▲` takes its words when the row still fits.
     fn line(&self, now_s: i64, theme: Theme) -> Line<'static> {
         let width = usize::from(self.width);
         let (mut spans, mark) = self.spans(now_s, theme);
@@ -467,28 +452,43 @@ impl Row<'_> {
             WindowKind::Long | WindowKind::Scoped | WindowKind::Spend => (CARD_SINCE_S, "7d"),
         };
         let cells = if wide { SPARK_WIDE } else { SPARK };
-        let mut spans = vec![
-            Span::raw(format!("{INDENT}{}{GAP}", pad(&w.label, self.label_w))),
-            sparkline(self.samples, now_s - since, now_s + 1, cells, theme),
+        let mut spans = vec![Span::raw(format!(
+            "{INDENT}{}{GAP}",
+            pad(&w.label, self.label_w)
+        ))];
+        if self.thick {
+            spans.extend(lead_bar(w.pct, cells, theme));
+        } else {
+            spans.push(sparkline(
+                self.samples,
+                now_s - since,
+                now_s + 1,
+                cells,
+                theme,
+            ));
+        }
+        let mut value = value_cell(w, theme);
+        if w.pct.round() as i64 >= BOLD_FROM {
+            value.style = value.style.patch(theme.strong());
+        }
+        spans.extend([
             Span::raw(" "),
             Span::styled(format!("{tag:<3}"), theme.role(Role::Faint)),
             Span::raw(GAP),
-            value_cell(w, theme),
-        ];
+            value,
+        ]);
         let mut mark = None;
         if p.ahead == Some(true) {
             spans.push(Span::raw(" "));
             mark = Some(spans.len());
             spans.push(Span::styled(AHEAD_MARK, theme.role(Role::Warn)));
         }
-        if !self.on_lead {
-            spans.extend(reset_tail(w, p, wide, now_s, theme));
-        }
+        spans.extend(reset_tail(w, p, wide, now_s, theme));
         (spans, mark)
     }
 }
 
-/// How a window's row ends on the card and on the lead card (T3-19, T3-20):
+/// How a window's row ends on the card (T3-19, T3-20):
 /// `  {reset}[ · {projection}]`. The reset is `resets in {span}`, `reset` once passed, or `not
 /// started` for a short or long window without one. The projection shows only with a rate: from
 /// 120 columns with it, below as its clause; warn when the window fills before it resets.
@@ -535,8 +535,7 @@ pub(super) fn reset_tail(
     spans
 }
 
-/// The ahead-of-pace mark on its own, below 120 columns or where its words do not fit, and on
-/// the lead card's bars.
+/// The ahead-of-pace mark on its own, below 120 columns or where its words do not fit.
 pub(super) const AHEAD_MARK: &str = "▲";
 /// A window's value cell, in its severity's role (T3-19, T3-20): its spend (`€12.40 of €50`),
 /// else its percentage right-aligned in four columns.

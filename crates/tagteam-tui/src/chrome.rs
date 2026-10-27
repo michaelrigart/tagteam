@@ -1,6 +1,6 @@
 //! The rows around the body (redesign §5.1): the header (§5.2), the auto line (§5.3), the Now
-//! strip on Tokens and History (§5.4), the faint rule under them from 30 rows (§4.3), the banner
-//! (§5.6), and the footer's keys (§5.5).
+//! strip on every screen (§5.4), the faint rule under them from 30 rows on Tokens and History
+//! (§4.3), the banner (§5.6), and the footer's keys (§5.5).
 
 use ratatui::text::{Line, Span};
 use tagteam_core::WindowKind;
@@ -140,11 +140,11 @@ pub(crate) fn auto_line(state: &State, width: u16, now_ms: i64) -> Line<'static>
     Line::from(spans)
 }
 
-/// §5.4's Now strip for focus's provider (T3-24): on Tokens and History only.
+/// §5.4's Now strip for focus's provider (T3-24), on every screen.
 /// ` ● {pos} {alias, else email}   {label} [{gauge} ]{pct:>4} {span}   …` for its account in
 /// use, its first short and first long window, the gauge from `WIDE` columns; a problem in their
-/// place as `{glyph} {status words} · see Accounts`, in its role; with no account in use
-/// `NO_ACCOUNT_IN_USE`, muted. On the right, one column in, `lead::pick_words`' Now strip form.
+/// place as `{glyph} {status words}`, then ` · see Accounts` off Accounts, in its role; with no
+/// account in use `NO_ACCOUNT_IN_USE` and how to switch to one, muted. On the right, one column in, `lead::pick_words`' Now strip form.
 /// The name gives way first, down to its floor (`card::floored`); then the pick is dropped,
 /// rather than cut the windows or the problem, or the hint with no account in use; and only then
 /// are those cut, from their end. Empty before the first snapshot and with no accounts.
@@ -159,23 +159,27 @@ pub(crate) fn now_strip(state: &State, width: u16, now_ms: i64) -> Line<'static>
     let (least, left): (usize, Box<dyn Fn(usize) -> Vec<Span<'static>>>) = match lead::in_use(state)
     {
         Some((_, v)) => {
-            let (head, name, rest) = in_use_parts(v, width, now_ms, theme);
+            let (head, name, rest) = in_use_parts(v, state.screen, width, now_ms, theme);
             let least = card::floored_least(&head, &name, NOW_GAP, &rest).max(lead::LEFT_LEAST);
             let left =
                 move |room| card::floored(head.clone(), name.clone(), NOW_GAP, rest.clone(), room);
             (least, Box::new(left))
         }
         None => {
+            let how = match state.screen {
+                Screen::Accounts => lead::NO_ACCOUNT_HINT,
+                Screen::Tokens | Screen::History => SWITCH_ON_ACCOUNTS,
+            };
             let hint = vec![
                 Span::raw(" "),
-                Span::styled(NO_ACCOUNT_IN_USE, theme.role(Role::Muted)),
+                Span::styled(format!("{NO_ACCOUNT_IN_USE}{how}"), theme.role(Role::Muted)),
             ];
             let least = spans_width(&hint);
             (least, Box::new(move |room| fit_spans(hint.clone(), room)))
         }
     };
     let width = usize::from(width);
-    let pick = lead::pick_words(state, view, false).unwrap_or_default();
+    let pick = lead::pick_words(state, view).unwrap_or_default();
     let pick_w = spans_width(&pick);
     let room = width.checked_sub(pick_w + lead::PICK_GAP + keys::RIGHT_INSET);
     let Some(room) = room.filter(|&room| pick_w > 0 && room >= least) else {
@@ -188,8 +192,10 @@ pub(crate) fn now_strip(state: &State, width: u16, now_ms: i64) -> Line<'static>
     Line::from(spans)
 }
 
-/// What the Now strip says with no account in use (§5.4).
-const NO_ACCOUNT_IN_USE: &str = "no account in use · s on Accounts switches to one";
+/// What the Now strip says with no account in use (§5.4), and how to switch to one: on
+/// Accounts `lead::NO_ACCOUNT_HINT`, elsewhere `SWITCH_ON_ACCOUNTS`.
+const NO_ACCOUNT_IN_USE: &str = "no account in use · ";
+const SWITCH_ON_ACCOUNTS: &str = "s on Accounts switches to one";
 /// What follows a problem on the Now strip, where its card is.
 const SEE_ACCOUNTS: &str = " · see Accounts";
 /// The Now strip's gauge cells, from `WIDE` columns (§5.4).
@@ -202,7 +208,13 @@ const NOW_GAP: &str = "   ";
 /// windows: they are still what was read, and its status words say nothing of its age.
 type NowParts = (Vec<Span<'static>>, Vec<Span<'static>>, Vec<Span<'static>>);
 
-fn in_use_parts(v: &AccountView, width: u16, now_ms: i64, theme: Theme) -> NowParts {
+fn in_use_parts(
+    v: &AccountView,
+    screen: Screen,
+    width: u16,
+    now_ms: i64,
+    theme: Theme,
+) -> NowParts {
     let head = vec![
         Span::raw(" "),
         Span::styled(table::IN_USE, theme.role(Role::Accent)),
@@ -221,7 +233,10 @@ fn in_use_parts(v: &AccountView, width: u16, now_ms: i64, theme: Theme) -> NowPa
             None => said,
         };
         spans.push(Span::styled(said, theme.role(role)));
-        spans.push(Span::styled(SEE_ACCOUNTS, theme.role(Role::Muted)));
+        // Its card and the table's STATUS are on the same screen on Accounts.
+        if screen != Screen::Accounts {
+            spans.push(Span::styled(SEE_ACCOUNTS, theme.role(Role::Muted)));
+        }
         return (head, name, spans);
     }
     let now_s = now_ms.div_euclid(1000);
@@ -252,7 +267,8 @@ fn in_use_parts(v: &AccountView, width: u16, now_ms: i64, theme: Theme) -> NowPa
     (head, name, spans)
 }
 
-/// `─` across `width`, faint: under the chrome from `RULE_FROM` rows (§4.3).
+/// `─` across `width`, faint: under the chrome from `RULE_FROM` rows on Tokens and History
+/// (§4.3), and around the Accounts table (§5.2).
 pub(crate) fn rule(state: &State, width: u16) -> Line<'static> {
     Line::from(Span::styled(
         "─".repeat(usize::from(width)),
@@ -933,10 +949,10 @@ mod tests {
             "{}",
             lines[0]
         );
-        assert_eq!(areas(&state, Rect::new(0, 0, 80, 24)).body.y, 2);
-        // The body: the lead card's two rows, a blank one, then the table.
+        assert_eq!(areas(&state, Rect::new(0, 0, 80, 24)).body.y, 3);
+        // The body: a blank row, the rule, a blank row (rows 3-5), then the table (row 6).
         assert!(
-            body_of(&state, 80, 24, NOW_MS)[3].contains("ACCOUNT"),
+            draw(&state, 80, 24)[6].contains("ACCOUNT"),
             "the table under it: {lines:?}"
         );
         assert!(draw(&state, 120, 40)[0].ends_with("keychain locked until 15:05   ? keys"));
@@ -1039,7 +1055,7 @@ mod tests {
     fn the_rows_above_the_body_are_the_same_in_both_modes() {
         // UX-5: the body never moves when the daemon comes or goes.
         for ((w, h), body) in [
-            ((80, 24), Rect::new(0, 2, 80, 21)),
+            ((80, 24), Rect::new(0, 3, 80, 20)),
             ((120, 40), Rect::new(0, 3, 120, 36)),
         ] {
             let area = Rect::new(0, 0, w, h);
@@ -1145,12 +1161,9 @@ mod tests {
             "{row}"
         );
         assert!(row.ends_with("   on the best account"), "{row}");
-        // Accounts has its lead card in the strip's place.
-        let lines = draw(&work_in_use(Screen::Accounts), 80, 24);
-        assert!(
-            lines.iter().all(|l| !l.starts_with(" ● 2 work")),
-            "{lines:?}"
-        );
+        // Accounts has the strip too.
+        let row = &draw(&work_in_use(Screen::Accounts), 80, 24)[2];
+        assert_eq!(row, &edged(narrow, BEST_ALEX, 80));
     }
 
     /// `screen` with `work` read and in use, its 7d window ahead of pace.
@@ -1384,12 +1397,12 @@ mod tests {
     }
 
     #[test]
-    fn the_rows_above_the_body_on_tokens_and_history_are_three_and_on_accounts_two() {
+    fn the_rows_above_the_body_are_three_on_every_screen_and_a_rule_follows_on_two() {
         // §5.1, §7.8, UX-5: the Now strip's row never comes or goes with the daemon's mode.
         for (screen, body) in [
             (Screen::Tokens, Rect::new(0, 3, 80, 20)),
             (Screen::History, Rect::new(0, 3, 80, 20)),
-            (Screen::Accounts, Rect::new(0, 2, 80, 21)),
+            (Screen::Accounts, Rect::new(0, 3, 80, 20)),
         ] {
             let area = Rect::new(0, 0, 80, 24);
             let mut state = work_in_use(screen);
@@ -1400,39 +1413,53 @@ mod tests {
             let down = areas(&state, area).body;
             assert_eq!((timer, live, down), (body, body, body), "{screen:?}");
             let now = areas(&state, area).now;
-            let want = (screen != Screen::Accounts).then(|| Rect::new(0, 2, 80, 1));
-            assert_eq!(now, want, "{screen:?}");
+            assert_eq!(now, Some(Rect::new(0, 2, 80, 1)), "{screen:?}");
         }
-        // From 30 rows the rule sits under the strip.
+        // From 30 rows the rule sits under the strip on Tokens and History, and not on Accounts.
         let a = areas(&work_in_use(Screen::History), Rect::new(0, 0, 120, 40));
         assert_eq!(a.rule.map(|r| r.y), Some(3));
         assert_eq!(a.body, Rect::new(0, 4, 120, 35));
+        let a = areas(&work_in_use(Screen::Accounts), Rect::new(0, 0, 120, 40));
+        assert_eq!(a.rule, None);
+        assert_eq!(a.body, Rect::new(0, 3, 120, 36));
     }
 
     #[test]
-    fn from_30_rows_a_faint_rule_sits_under_the_chrome() {
-        for theme in TIERS {
-            let mut state = on_accounts();
-            state.theme = theme;
-            let buf = draw_buffer(&state, 120, 40, NOW_MS);
-            assert_eq!(text_of(&buf)[2], "─".repeat(120));
-            assert_eq!(roles(&buf, theme, 2), canon(theme, &"f".repeat(120)));
+    fn from_30_rows_a_faint_rule_sits_under_the_chrome_on_tokens_and_history() {
+        for screen in [Screen::Tokens, Screen::History] {
+            for theme in TIERS {
+                let mut state = fresh(screen);
+                state.theme = theme;
+                state.accounts.apply(snapshot(many(1)));
+                let buf = draw_buffer(&state, 120, 40, NOW_MS);
+                assert_eq!(text_of(&buf)[3], "─".repeat(120), "{screen:?}");
+                assert_eq!(roles(&buf, theme, 3), canon(theme, &"f".repeat(120)));
+            }
+            let state = fresh(screen);
+            for (h, rule, body) in [(24, None, 3), (29, None, 3), (30, Some(3), 4)] {
+                let a = areas(&state, Rect::new(0, 0, 80, h));
+                assert_eq!(a.rule.map(|r| r.y), rule, "{screen:?} 80x{h}");
+                assert_eq!(a.body.y, body, "{screen:?} 80x{h}");
+            }
         }
+        // Accounts has none at any height: its body's own rule is at row 4.
         let state = on_accounts();
-        for (h, rule, body) in [(24, None, 2), (29, None, 2), (30, Some(2), 3)] {
+        let rows = draw(&state, 120, 40);
+        assert_eq!(rows[3], "");
+        assert_eq!(rows[4], "─".repeat(120));
+        for h in [24, 29, 30, 40] {
             let a = areas(&state, Rect::new(0, 0, 80, h));
-            assert_eq!(a.rule.map(|r| r.y), rule, "80x{h}");
-            assert_eq!(a.body.y, body, "80x{h}");
+            assert_eq!((a.rule, a.body.y), (None, 3), "80x{h}");
         }
     }
 
     #[test]
     fn a_failed_read_is_crit_and_anything_else_warn() {
         // T2-14: `✕` crit for a failed read and a lane's death, `!` warn for the rest, one
-        // column in, under the auto line.
+        // column in, under the Now strip.
         let banner_row = |state: &State, theme: Theme| {
             let buf = draw_buffer(state, 80, 24, NOW_MS);
-            (text_of(&buf)[2].clone(), roles(&buf, theme, 2))
+            (text_of(&buf)[3].clone(), roles(&buf, theme, 3))
         };
         for theme in TIERS {
             for (kind, mark, letter) in [
@@ -1497,9 +1524,9 @@ mod tests {
             state.theme = theme;
             state.raise_banner(BannerKind::Accounts, "the store is locked");
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
-            assert_eq!(text_of(&buf)[2], " ✕ the store is locked");
+            assert_eq!(text_of(&buf)[3], " ✕ the store is locked");
             for x in [1, 3] {
-                let cell = &buf[(x, 2)];
+                let cell = &buf[(x, 3)];
                 assert_eq!(cell.fg, fg, "{theme:?}");
                 assert_eq!(cell.modifier, modifier, "{theme:?}");
             }
@@ -1611,13 +1638,13 @@ mod tests {
     #[test]
     fn a_long_banner_wraps_onto_three_rows_at_most_and_the_body_gives_them_up() {
         // Spec §5.1: 80×24 is enough, so nothing a banner says may be lost at 80 columns. Its
-        // rows sit under the auto line, wrapped under the words.
+        // rows sit under the Now strip, wrapped under the words.
         let mut state = fresh(Screen::Accounts);
         let words = "the store could not be opened because another tagteam holds its lock";
         state.raise_banner(BannerKind::Refusal, format!("{words}; {words}"));
         let lines = draw(&state, 80, 24);
         assert_eq!(
-            lines[2..4],
+            lines[3..5],
             [
                 " ! the store could not be opened because another tagteam holds its lock; the",
                 "   store could not be opened because another tagteam holds its lock",
@@ -1625,17 +1652,17 @@ mod tests {
         );
         assert_eq!(
             areas(&state, Rect::new(0, 0, 80, 24)).body,
-            Rect::new(0, 4, 80, 19),
+            Rect::new(0, 5, 80, 18),
             "two rows, then the body"
         );
         state.raise_banner(BannerKind::Refusal, [words; 5].join("; "));
         let lines = draw(&state, 80, 24);
-        assert!(lines[4].starts_with("   "), "{lines:?}");
-        assert!(lines[4].ends_with('…'), "{lines:?}");
-        assert_eq!(width_of(&lines[4]), 80);
+        assert!(lines[5].starts_with("   "), "{lines:?}");
+        assert!(lines[5].ends_with('…'), "{lines:?}");
+        assert_eq!(width_of(&lines[5]), 80);
         assert_eq!(
             areas(&state, Rect::new(0, 0, 80, 24)).body,
-            Rect::new(0, 5, 80, 18),
+            Rect::new(0, 6, 80, 17),
             "three rows at most"
         );
     }
@@ -1760,9 +1787,15 @@ mod tests {
                         canon(theme, &auto_line(width, false)),
                         "{screen:?} {w}"
                     );
+                    // The Now strip is on row 2 of every screen (no account is in use here).
+                    assert!(
+                        text_of(&buf)[2].starts_with(" no account in use · s "),
+                        "{screen:?} {w}"
+                    );
                     if h >= RULE_FROM {
-                        // Under the Now strip on Tokens and History.
-                        let y = if screen == Screen::Accounts { 2 } else { 3 };
+                        // Under the Now strip on Tokens and History; on Accounts it is the
+                        // body's own, under a blank row.
+                        let y = if screen == Screen::Accounts { 4 } else { 3 };
                         let rule = "f".repeat(width);
                         assert_eq!(roles(&buf, theme, y), canon(theme, &rule), "{screen:?}");
                     }
