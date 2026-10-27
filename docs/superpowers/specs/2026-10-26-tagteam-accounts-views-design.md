@@ -1,0 +1,482 @@
+# tagteam — Accounts in one format, a full list, and pre-tracking token rows
+
+**Status:** Draft
+**Date:** 2026-10-26
+**Scope:** The TUI's Accounts screen and one label on its Tokens screen. Accounts loses the lead
+card, shows every account's details in one format, and gains a full-list view (`v`). Tokens names
+the usage it could not attribute because it predates tracking. The engine exposes the token
+index's epoch with the report. `tagteam list`, `tagteam tokens` and every `--json` output are
+unchanged.
+**Builds on:**
+- **Redesign spec:** [`2026-10-20-tagteam-tui-redesign-design.md`](2026-10-20-tagteam-tui-redesign-design.md)
+  (Implemented), cited as "redesign §n". It stays the authority for what this spec does not
+  change. §9 lists the parts this spec replaces.
+- **Token report spec:** [`2026-10-14-tagteam-token-report-design.md`](2026-10-14-tagteam-token-report-design.md),
+  cited as "TR §n".
+
+Line numbers are as of `eda9605` and will drift.
+
+---
+
+## 1. Purpose
+
+### 1.1 Why
+
+The Accounts screen shows the account in use up to three times: in the lead card, as a table row
+and, when it is selected, in the selected card. The lead card and the selected card draw the same
+windows in two formats (thick bars with reset and projection; sparklines with the reset and
+projection left out for the account in use, M-9). Which details and which keys belong to which
+account is not obvious. Pace marks (`│`, `┿`, `┼`) on the bars read as stray lines.
+
+On Tokens, every day before tagteam started recording which account was in use reads
+`unknown account`. That looks like an error, while it is the expected result for usage from
+before the token index's epoch (TR §7.2).
+
+### 1.2 Goals
+
+1. **One format for an account's details.** Title, facts, then one row per window: bar,
+   percentage, `▲`, reset, rate, projection. The same rows in the selected card and in the full
+   list, for every account, the account in use included.
+2. **The account in use is obvious without repeating it.** The Now strip, which Tokens and
+   History already have, carries it on Accounts too. In the details it has thick bars and
+   `IN USE`; every other account has thin gauges and `not in use`.
+3. **Every account's details on one screen** when wanted: the full list (`v`).
+4. **Aligned.** Every column at a fixed position in its view; window rows line up across the card
+   and across the full list's blocks.
+5. **More air around rules,** and no tick marks on bars.
+6. **Usage from before tracking says so** on Tokens, without changing what the filter selects.
+
+### 1.3 Non-goals
+
+- **Attributing pre-epoch usage to an account** (from Claude Code's `credential_org` transcript
+  lines, an org UUID per session). A separate later spec; it would shrink what §7 labels.
+- **`tagteam list`, `tagteam tokens` and `--json`.** The CLI keeps `unattributed`
+  (`crates/tagteam/src/tokens_cmd.rs:309,550,745`), and the JSON is built field by field
+  (`tokens_cmd.rs:323`), so a new report field does not reach it.
+- **History and Tokens layouts.** Their chrome, Now strip and rule stay as they are.
+- **Sparklines elsewhere.** The Tokens headline and History keep theirs.
+
+### 1.4 Anti-goals
+
+Redesign §1.4 holds. In particular: 80×24 is the first target, and everything works there; no
+meaning carried by colour alone (every state also has a glyph, a word or a shape); the 50 ms p95
+first frame; no real names in the spec, tests, fixtures or images; no second vocabulary — words
+come from the engine's shared words or the TUI's existing ones.
+
+## 2. Decisions
+
+| ID | Question | Decision |
+|---|---|---|
+| AV-1 | What replaces the lead card? | The Now strip (redesign §5.4), on Accounts too |
+| AV-2 | How are an account's details shown? | One format (§4) in the selected card and the full list; no sparklines on Accounts. `⏎` opens History for the account, as today |
+| AV-3 | Which view lists every account in full? | A second view, the full list, toggled by `v`; compact stays the default |
+| AV-4 | How is the account in use told apart? | `●` in the Now strip and the table, `IN USE` on its facts row, thick `▆` bars; other accounts `not in use` and thin `━` gauges |
+| AV-5 | Where is the selection in the full list? | `▌` on every row of the selected block, and bold on its name |
+| AV-6 | Pace marks? | None on any bar or gauge. `▲` stays; where the row has room it ends with the expected percentage in words (§4.3) |
+| AV-7 | Spacing? | A blank row above and below every rule on Accounts |
+| AV-8 | Tokens rows from before the epoch? | `before tracking` where the row's whole span lies before the epoch; `unknown account` everywhere else, the filter included |
+
+AV-1 to AV-7 follow the design agreed in chat on 2026-10-26 (mock v2). AV-8 follows the same
+discussion. §10 lists the calls made while writing this spec.
+
+## 3. Accounts: the compact view (default)
+
+### 3.1 Layout
+
+From the top: the chrome with the Now strip (§3.2), the table between two rules, the selected
+card. Spare rows go to the bottom (VIS-5). At 80×24, with four accounts of three windows each,
+the account in use selected:
+
+```
+ tagteam   1 Accounts   2 Tokens   3 History        ● auto on · at 90%   ? keys
+ ⇄ 11:28  auto switched 1 alex → 2 work · alex's 5h reached 93%           w why
+ ● 2 work   5h  44% 2h25m   7d  82% ▲ 5d04h                 on the best account
+
+────────────────────────────────────────────────────────────────────────────────
+
+    #   ACCOUNT                    5H                7D                 UPDATED
+    1   alex@example.com           ─────────   0%    ━━━━━━━━╸  98% ▲        1m
+▌   2 ● work  sam@corp.example     ━━━╸─────  44%    ━━━━━━━──  82% ▲        2m
+    3   spare  alex@personal.ex…   ─────────   2%    ━━━━━━━━─  90%          1m
+    4   kim@example.org            ━━━━━━━━╸  99%    ━────────  13%          2m
+
+────────────────────────────────────────────────────────────────────────────────
+
+SELECTED  2 work  sam@corp.example
+          IN USE · updated 2m ago · login valid 27 more days
+  5h     ▆▆▆▆▆▆▆▁▁▁▁▁▁▁▁▁  44%    resets in 2h25m · +16.9%/h · lasts
+  7d     ▆▆▆▆▆▆▆▆▆▆▆▆▆▁▁▁  82% ▲  resets in 5d04h · +2.3%/h · full in 7h47m
+  Fable  ▆▆▆▆▁▁▁▁▁▁▁▁▁▁▁▁  28%    resets in 5d04h · +0.9%/h · full in 3d12h
+          ⏎ history   e disable   a alias   x remove
+
+
+
+b best  n next  ⏎ history  P pause auto  v full list  r refresh  ? keys  q quit
+```
+
+Row count: header, auto line, Now strip (3); body rows 4–23 (20); footer (1). The body uses 17:
+blank, rule, blank (3), the table head and four rows (5), blank, rule, blank (3), the card (6).
+
+With account 1 selected, the card and the footer read:
+
+```
+SELECTED  1 alex@example.com
+          not in use · updated 1m ago · login valid 27 more days
+  5h     ────────────────   0%    not started
+  7d     ━━━━━━━━━━━━━━━╸  98% ▲  resets in 1d02h · +0.5%/h · full in 4h00m
+  Fable  ────────────────   0%    resets in 1d02h
+          s switch   ⏎ history   e disable   a alias   x remove
+s switch  b best  n next  ⏎ history  P pause auto  v full list   ? keys  q quit
+```
+
+At 120×40 the table gets STATUS and 14-cell gauges, the Now strip its gauges, the card its org,
+26-cell bars, the long projection and the pace words; the footer the account keys:
+
+```
+ tagteam   1 Accounts   2 Tokens   3 History                                       ● auto on · switches at 90%   ? keys
+ ⇄ 11:28  auto switched 1 alex → 2 work · alex's 5h reached 93%                                                   w why
+ ● 2 work   5h ━━━━──────  44% 2h25m   7d ━━━━━━━━──  82% ▲ 5d04h                                   on the best account
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+    #   ACCOUNT                          5H                     7D                      UPDATED   STATUS
+    1   alex@example.com                 ──────────────   0%    ━━━━━━━━━━━━━╸  98% ▲        1m
+▌   2 ● work  sam@corp.example           ━━━━━━────────  44%    ━━━━━━━━━━━───  82% ▲        2m   in use
+    3   spare  alex@personal.example     ──────────────   2%    ━━━━━━━━━━━━╸─  90%          1m
+    4   kim@example.org                  ━━━━━━━━━━━━━╸  99%    ━╸────────────  13%          2m
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+SELECTED  2 work  sam@corp.example · Example Corp
+          IN USE · updated 2m ago · login valid 27 more days · next update in 1m
+  5h     ▆▆▆▆▆▆▆▆▆▆▆▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁  44%    resets in 2h25m · +16.9%/h · lasts until it resets
+  7d     ▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▁▁▁▁▁  82% ▲  resets in 5d04h · +2.3%/h · full in 7h47m · 26% expected by now
+  Fable  ▆▆▆▆▆▆▆▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁  28%    resets in 5d04h · +0.9%/h · full in 3d12h
+          ⏎ history   e disable   a alias   x remove
+                                   (spare rows)
+b best  n next  ⏎ history  P pause auto  v full list  r refresh  e disable  a alias  x remove            ? keys  q quit
+```
+
+### 3.2 The Now strip on Accounts
+
+Redesign §5.4 unchanged, now on all three screens: `●`, position, name, the short and long
+windows, and on the right the best pick in its Now strip form (`lead::pick_words(…, false)`,
+`best now 3 spare` or `on the best account`). `b` stays in the footer. Two Accounts-only
+differences:
+
+- A problem with the account in use reads `● 2 work   ✕ needs a new login`, without
+  ` · see Accounts` (`chrome.rs` `SEE_ACCOUNTS`): its card or block, and the table's STATUS, are
+  on the same screen.
+- With no account in use, the strip's text stays `no account in use · s on Accounts switches to
+  one`.
+
+On Accounts the chrome draws no rule under the strip at any height; the body's own rule (§5.2)
+takes its place. Tokens and History keep the chrome rule from 30 rows (`view.rs:45-69`).
+
+### 3.3 The table
+
+Redesign §6.3 unchanged, except that gauges carry no pace mark (AV-6). The table does not change
+with `v`: compact shows it, the full list replaces it.
+
+### 3.4 The selected card
+
+- **Title:** the muted capital label `SELECTED`, two spaces, the position, the alias bold and the
+  email muted (or the email bold), the org muted from 120 columns.
+- **Facts row,** under the title from the name's column: today's facts (`card.rs:353` `facts_of`),
+  in its order and roles, joined by ` · `: `IN USE` (accent, now in capitals) for the account in
+  use or `not in use` (muted); the account kind's display name; `in a session`; the run shell's
+  `this session` marker; `disabled`; `updated 2m ago` (warn when the reading is old) or `not
+  checked`; `login valid 27 more days` (warn once passed). Two changes: `next update in 1m` moves
+  to the end and shows from 120 columns only, and a login under 7 days is in warn with `· log in
+  again before then`, as the lead card had it (redesign §6.2). A row too wide is cut at its end.
+- **A row per window,** every window the account has, in §4's format; thick bars for the account
+  in use, thin gauges otherwise.
+- **Problems** under the windows, as redesign §6.4: the sentence, then the remedy, in their role.
+  For the account in use too: no lead card shows them any more (M-9 no longer applies).
+- **Keys row** last, from the name's column: `s switch` (not for the account in use), `⏎ history`,
+  `e disable` (or `e enable`), `a alias`, `x remove`, three spaces apart. At every width while
+  the body has room (§5.4).
+
+## 4. One format for a window
+
+### 4.1 The row
+
+```
+{indent}{label:<L}{bar} {pct:>4} {▲ or space}  {reset}[ · {rate}][ · {projection}][ · {NN}% expected by now]
+```
+
+- `L`: the longest window label of all accounts on the screen, plus two. One `L` per screen, so
+  bars line up across the card and across the full list's blocks.
+- **Bar:** 16 cells below 120 columns, 26 from 120 (`chrome::WIDE`).
+  - The account in use: `lead_bar`, `▆` fill in the severity's role on a faint `▁` baseline.
+  - Any other account: `line_gauge`, `━`/`╸` in the severity's role on a faint `─` track
+    (NO_COLOR: `·`).
+- **`pct`** right-aligned in four columns, bold from 70 % (redesign §6.2); `▲` in warn when
+  ahead of pace, else a space, so the reset starts at the same column on every row.
+- **A spend window** keeps its value as today (`card.rs:543` `value_cell`, `€12.40 of €50`).
+  The value column is then as wide as the widest value on the screen, one width for every row of
+  the card or of the full list, every value right-aligned in it.
+- **Reset, rate, projection** in §11.1's words, as the lead card had them (`words.rs`): `not
+  started`, `resets in 5d04h`, `+2.3%/h`, `full in 7h47m`, `lasts until it resets`. The
+  projection is in warn when the window fills before it resets. Below 120 columns the projection
+  is its last clause (`lasts`, `full in 7h47m`), as redesign §6.2 says for 80 columns.
+
+### 4.2 No pace marks
+
+`line_gauge` and `lead_bar` (`gauge.rs:56`, `:106`) draw no `┿`/`┼`/`│`; `pace_cell`
+(`gauge.rs:33`) goes. This covers the table and the Now strip as well as the details.
+
+### 4.3 Pace in words
+
+A row with `▲` ends with ` · 26% expected by now` when the whole row then fits the width;
+otherwise those words are left out and `▲` alone remains. The words are the parenthesis of the
+engine's `ahead_words` (`words.rs:332`), `Pace.expected_pct` rounded. The builder splits that
+clause into its own function so both read the same text. `▲` keeps its column; it no longer
+expands in place to `▲ faster than an even pace (…)` (today at `card.rs:450`). Help keeps
+`▲  faster than an even pace` (`overlay/help.rs:30`). Windows without pace (5h, C-8) never show
+the words.
+
+## 5. Spacing, alignment and overflow
+
+### 5.1 Alignment
+
+Every column has a fixed position within its view: the table's as redesign §6.3; a window row's
+label, bar, percentage, `▲` and reset as §4.1, the same across every block of the full list.
+Tests assert column positions (§11).
+
+### 5.2 Rules and blank rows
+
+On Accounts, a faint `─` rule across the full width (`chrome::rule`) separates the chrome from the
+table and the table from the card, with a blank row above and below each. In the full list the
+same rule sits under the chrome, and blocks are separated by a faint `┈` rule indented three
+columns and ending three columns in (NO_COLOR: `·`), with a blank row above and below.
+
+### 5.3 Width
+
+At 80 columns everything works (redesign §4.5). When a window row is too wide, in order: the
+pace words go, then the row is cut at its end (today's `fit_spans`). The table shrinks as redesign
+§6.3 says.
+
+### 5.4 Height
+
+When the body is shorter than compact needs, in order:
+
+1. the four blank rows around the two rules, the lower pair first;
+2. the card's keys row (help lists the keys; the footer keeps `s` and `⏎` at every width);
+3. the two rules;
+4. today's split (`accounts.rs:282-330`, T3-22): the table keeps at least `TABLE_LEAST` (4)
+   lines and scrolls with the selection; the card keeps its least and its windows scroll with
+   `J`/`K`.
+
+Problem rows never drop. At 80×24 with four accounts and three windows nothing drops; with seven
+accounts the body is full (20 rows); from eight, step 1 starts.
+
+## 6. Accounts: the full list (`v`)
+
+### 6.1 Layout
+
+Every account as a block: title, facts row, a row per window (§4), problems. Blocks follow table
+order, separated as §5.2. At 80×24 with account 1 selected:
+
+```
+ tagteam   1 Accounts   2 Tokens   3 History        ● auto on · at 90%   ? keys
+ ⇄ 11:28  auto switched 1 alex → 2 work · alex's 5h reached 93%           w why
+ ● 2 work   5h  44% 2h25m   7d  82% ▲ 5d04h                 on the best account
+
+────────────────────────────────────────────────────────────────────────────────
+
+▌  1   alex@example.com
+▌      not in use · updated 1m ago · login valid 27 more days
+▌      5h     ────────────────   0%    not started
+▌      7d     ━━━━━━━━━━━━━━━╸  98% ▲  resets in 1d02h · +0.5%/h · full in 4h00m
+▌      Fable  ────────────────   0%    resets in 1d02h
+
+   ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+
+   2 ● work  sam@corp.example
+       IN USE · updated 2m ago · login valid 27 more days
+       5h     ▆▆▆▆▆▆▆▁▁▁▁▁▁▁▁▁  44%    resets in 2h25m · +16.9%/h · lasts
+       7d     ▆▆▆▆▆▆▆▆▆▆▆▆▆▁▁▁  82% ▲  resets in 5d04h · +2.3%/h · full in 7h47m
+       Fable  ▆▆▆▆▁▁▁▁▁▁▁▁▁▁▁▁  28%    resets in 5d04h · +0.9%/h · full in 3d12h
+
+   ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+
+   3   spare  alex@personal.example
+s switch  b best  n next  ⏎ history  P pause auto  v compact     ? keys  q quit
+```
+
+The body's 20 rows hold two whole blocks; the third starts on the last row, which tells the
+reader the list goes on.
+
+- **Title:** `▌` (selected only), the position, `●` for the account in use, the name (bold when
+  selected), the org muted from 120 columns.
+- **Facts row** as §3.4, from column 7.
+- **Problems** under the windows, as the card's. A disabled account's block is DIM throughout, as
+  its table row (redesign §4.3). An account with no reading shows its status words in place of
+  its windows, as the table does (redesign §6.3).
+- **No keys row:** the footer carries the selected account's keys (`s` (not for the account in
+  use), `⏎`, and from 120 columns `e`, `a`, `x`), as it already does.
+- **Several providers:** a muted provider heading before each provider's blocks, as the table
+  has.
+
+### 6.2 Moving and scrolling
+
+- `j`/`k`/`↑`/`↓` move the selection a block; `Home`/`End` to the first or last.
+- **Scrolling is by block,** as `view.rs:82` `scrolled_windows` does for windows: the scroll
+  state is the first block shown, so the list always starts at a block's title. The blank, rule
+  and blank under the chrome stay pinned. Blocks follow from the first shown while they fit; the
+  next one is drawn cut at the body's end, as in the mock.
+- The first block shown moves as little as needed to keep the selected block whole: down when
+  the selection goes past the last whole block, up when it goes above the first. `v` into the
+  full list scrolls the same way from the top.
+- `PgUp`/`PgDn` move the selection by the number of whole blocks shown, at least one.
+- A block taller than the body shows from its title, and `J`/`K` scroll it.
+- The selection is the account ID (`AccountsState::selected`), so it survives `v` and refreshes;
+  `v` keeps it and scrolls it into view.
+- The view (compact or full list) lasts for the session; tagteam starts in compact.
+
+## 7. Tokens: rows from before tracking
+
+### 7.1 The rule
+
+The report exposes the token index's epoch, the instant this store started recording sightings
+and launches (TR §7.2, `token_epoch.at`). A row's unattributed account reads:
+
+- **`before tracking`** when the row's whole span ends at or before the epoch;
+- **`unknown account`** otherwise: a row whose span contains the epoch, any later row, and every
+  row when the report has no epoch (after a full purge, before the next refresh).
+
+A row's span by period (`view/mod.rs` `PeriodKey`): a day or a month in the query's zone, its end
+the next day's or month's start; a session from `first_ms` to `last_ms`; a block from `start_ms`
+to `end_ms`. Drilled rows follow the same rule for their own span.
+
+Both words are 15 columns, so the ACCOUNT column keeps its width.
+
+### 7.2 Where it applies
+
+Every place a row names its account:
+
+- the table cell (`table.rs:638`, via `account_text` `:252`), including the list of accounts in
+  an ungrouped row;
+- the SELECTED detail line (`table.rs:1268`, via `account_name` `:267`);
+- a breadcrumb drilled from that row (`table.rs:1035`).
+
+The filter is about accounts, not rows, and keeps `unknown account`: its dialog choice
+(`filter.rs:155`, which also uses `account_name`) and the control bar's summary (`table.rs:980`).
+That choice selects every unattributed row, before tracking included. Help says so in one line
+under Tokens: `before tracking  usage from before tagteam recorded which account was in use; the
+filter's unknown account includes it`.
+
+Example, with tracking since 2026-10-23 09:07 local time, grouped by account:
+
+```
+ 2026-10-22  before tracking    5.0K      900  105.9K       —
+ 2026-10-23  unknown account    1.2K      210   20.4K       —
+ 2026-10-24  2 work            48.3K    6,104    1.1M  $12.40
+```
+
+### 7.3 The engine
+
+`TokenReport` (`view/mod.rs`) gains `tracking_since_ms: Option<i64>`: the epoch the report
+already reads (`view/mod.rs:406`, `store.token_epoch()?`), `None` when it has none. Nothing else
+in the engine changes. The report's JSON is unchanged (§1.3).
+
+## 8. Keys
+
+| Where | Key | Does | Footer |
+|---|---|---|---|
+| Accounts | `v` | the full list, or back to compact | `v full list` / `v compact`, at every width |
+
+- In `KEYS` (`keys.rs:105`) the `v` row goes after `P` and before `r`. The footer drops items
+  from the end (`keys.rs:525` `footer_items`), so at 80 columns `r refresh` is left out when `s`
+  shows; help lists it.
+- `s` gets no footer label, and no card keys row entry, when the selected account is the one in
+  use (switching to it does nothing).
+- `J`/`K` scroll the card in compact and a tall block in the full list.
+- The key table's test (`keys.rs:753`) gains `v`'s probe.
+
+Accounts' footer order is now `s switch  b best  n next  ⏎ history  P pause auto  v full list  r
+refresh`, then from 120 columns `e disable  a alias  x remove`.
+
+## 9. Changes to the redesign spec
+
+What each changes; the rest of each section stands.
+
+| Redesign | Change |
+|---|---|
+| M-1 | Accounts keeps no sparklines (AV-2); `Enter` still opens the timeline for the account. The History parts stand |
+| M-4 | The lead card and its bars with pace marks go (AV-1, AV-6). Thick bars mark the account in use in its card and block. The rest of Direction A stands |
+| M-9 | No longer applies: no lead card. The in-use card shows its reset, projection and problems |
+| §1.2 goal 1 | "The account in use leads Accounts … thick bars with pace marks, plus the best pick" → the Now strip carries it on every screen; on Accounts its details have thick bars |
+| §4.3 Sections | On Accounts, a rule with a blank row above and below separates sections (§5.2 here); no chrome rule on Accounts |
+| §4.4 Lead bar, Line gauge | No pace marks; "The pace mark" paragraph goes. `▲` plus words (§4.3 here) |
+| §5.1 row 3 | The Now strip on every screen; "Accounts' lead card plays this role" goes |
+| §5.4 | Title "(Tokens and History)" → every screen; on Accounts no ` · see Accounts` (§3.2 here) |
+| §6.1 | Replaced by §3.1 and §6 here |
+| §6.2 | The lead card goes. Its facts and window format move to the card (§3.4, §4). The best pick stays §12.1's `best_candidate`, shown in the Now strip |
+| §6.3 | Gauges without pace marks |
+| §6.4 | Replaced by §3.4: no sparklines; the reset and projection for every account; the keys row at every width while it fits |
+| §6.5 | `J`/`K` also scroll a tall block in the full list; `v` added |
+| §8 | "an unattributed row as `unknown account`" → §7 here |
+| §10 | `v` added; Accounts' footer order as §8 here |
+
+## 10. Calls made in this spec
+
+These are my choices where the agreed design left a detail open; each can change without
+changing the design.
+
+1. **Pace words** read `26% expected by now`, the engine's existing words, not the mock's
+   `even pace 26%`, so there is one vocabulary (§4.3).
+2. **No chrome rule on Accounts;** its body draws its own rules, so the spacing is the same at
+   every height (§3.2, §5.2).
+3. **Bars:** 16 cells below 120 columns, 26 from 120, one threshold (`WIDE`) like the rest of the
+   card (§4.1).
+4. **The keys row now shows at 80 columns** when it fits, and lists `s` for an account not in use
+   (§3.4).
+5. **`v` sits before `r`** in the footer, so the new key is visible at 80 columns; `r refresh`
+   then drops at 80 when `s` shows (§8).
+6. **Height overflow order** (§5.4), and **width:** pace words go first (§5.3).
+7. **The full list starts with a rule** under the chrome, like compact (§6.1).
+8. **On Accounts the Now strip leaves out ` · see Accounts`** (§3.2).
+9. **The view does not persist** across launches (§6.2).
+10. **Tokens' label is `before tracking`,** in every row-naming place; the filter keeps `unknown
+    account` (§7).
+11. **The full list scrolls by block** with its top rule pinned, and moves as little as needed
+    (§6.2).
+12. **The facts row keeps every fact the card has today;** only `next update` moves to the end,
+    from 120 columns (§3.4).
+13. **A spend window keeps its amount;** the value column widens to the widest value (§4.1).
+
+## 11. Verification
+
+- Renders with `testutil.rs` (`draw_at`, `text_of`, `locate`) at 80×24 and 120×40, both views,
+  every tier in `TIERS` (`testutil.rs:50`): column positions of the table, the card and every
+  block; compact has no lead card and exactly one `SELECTED`; the full list has `▌` on every row
+  of the selected block and on no other; thick bars on the in-use account's rows only; no `┿`,
+  `┼` or `│` in any bar; the 80×24 row counts of §3.1 and §6.1.
+- Tests reversed on purpose: `chrome.rs:1147` (Accounts had no Now strip), `chrome.rs:1352` (the
+  rows above the body: Accounts gains the Now strip and never has the chrome rule), `accounts.rs:1277` and `:3975`
+  (the in-use card left out what the lead card showed, M-9), `gauge.rs:234` and `:257` (pace
+  marks).
+- Tokens: a day, a month, a session and a block wholly before the epoch read `before tracking`;
+  one spanning it, one after it, and every row with no epoch read `unknown account`; the filter's
+  choice and summary read `unknown account`; the detail line and a breadcrumb use the row's
+  words.
+- `v`: toggles, keeps the selection across `v` and a refresh, PgUp/PgDn by whole blocks.
+- The CONTRIBUTING checks: `cargo fmt --all --check`, the three clippy runs, and `cargo test
+  --workspace --locked --no-fail-fast --features tagteam/test-support` (the pty tests need a
+  terminal).
+- A run of the built TUI against a real store, with screenshots of both views at 80×24 and
+  120×40.
+
+## 12. Left to the builder
+
+- How `parts` (`accounts.rs:289`) splits the body without the lead card, and where the full list
+  lives (a new `screens/accounts/list.rs`, say).
+- Whether `lead.rs` keeps its name once only the Now strip and the best pick use it
+  (`lead::pick_words`, `lead::in_use`, `PICK_GAP`, `LEFT_LEAST`).
+- Dropping the selected account's history read that fed the card's sparklines, if nothing else
+  needs it.
+- Where the before-tracking span test lives (an engine helper on `TokenRow`, or the TUI).
+- The help wording's final shape, within §7.2's meaning.
+- CHANGELOG `Unreleased` entries.
