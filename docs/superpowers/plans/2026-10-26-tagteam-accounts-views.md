@@ -1,5 +1,7 @@
 # Accounts in one format, a full list, and pre-tracking token rows: implementation plan
 
+**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/50
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
@@ -18,7 +20,7 @@ through `crates/tagteam-tui/src/testutil.rs`.
 
 **Spec:** `docs/superpowers/specs/2026-10-26-tagteam-accounts-views-design.md` (cited "S§n").
 The redesign spec `docs/superpowers/specs/2026-10-20-tagteam-tui-redesign-design.md` ("redesign
-§n") stays the authority for everything S does not change. Line numbers are as of `25a968c`.
+§n") stays the authority for everything S does not change. Line numbers are as of `eda9605`.
 
 ## Global Constraints
 
@@ -46,7 +48,7 @@ The redesign spec `docs/superpowers/specs/2026-10-20-tagteam-tui-redesign-design
 1. **The full list at the smallest terminal** (80×24 under a full banner and a toast): the
    selected block's title stays visible and nothing panics on the short body. Task 7.
 2. **`v` before the first snapshot, or with no accounts:** the loading or empty state shows as in
-   compact, and `v` back works. Task 6.
+   compact, `v` back works, and the footer shows no `v` hint (VIS-10). Task 6.
 3. **A refresh that removes accounts while the full list is scrolled down:** the first block shown
    clamps so the selection is whole. Task 6.
 4. **A resize from 120×40 to 80×24 in the full list:** the selected block is whole in the first
@@ -143,15 +145,18 @@ Expected: PASS; the `tokens --json` tests unchanged (the JSON is built field by 
   :267, the cell :638-643, the breadcrumb parents :1035, `detail_rows` :1212 and its calls
   :1268-1270, its caller in `below` :1320)
 - Modify: `crates/tagteam-tui/src/screens/tokens/filter.rs:155`
-- Modify: `crates/tagteam-tui/src/overlay/help.rs` (`RATE` :66, `CACHE` :74, their use :141-144)
-- Test: `table.rs` tests (`showing` :1596, `days()`), `filter.rs` tests, `help.rs` tests
+- Modify: `crates/tagteam-tui/src/overlay/help.rs` (`rows` :113, its `keys_of` :124; `RATE`,
+  `CACHE` and the marks' `lead_width` :138-142 stay as they are)
+- Test: `table.rs` tests (`showing` :1596, `showing_after` :1616, `days()`), `filter.rs` tests,
+  `help.rs` tests
 
 **Interfaces:**
 - Consumes: `PeriodKey::before_tracking`, `TokenReport::tracking_since_ms` (Task 1).
 - Produces: `fn account_text(account: &RowAccount, before: bool) -> String`;
   `pub fn account_name(account: &RowAccount, before: bool) -> String`;
   `detail_rows(row, tz, before: bool, now_ms, width, enter, theme)`;
-  `const BEFORE_TRACKING: &str = "before tracking"` in `table.rs`.
+  `pub(crate) const BEFORE_TRACKING: &str = "before tracking"` in `table.rs` (help reads it);
+  in `table.rs`'s tests, `showing_after_with(keys, rows, edit: impl FnOnce(&mut TokenReport))`.
 
 - [ ] **Step 1: Write the failing tests** in `table.rs`'s tests. `days()` has an unattributed
 row on 2026-09-19 (`a_day_report_at_80_columns`, :1721); `YESTERDAY` is 2026-09-20T00:00Z.
@@ -177,8 +182,11 @@ fn a_day_holding_the_epoch_or_no_epoch_reads_unknown_account() {
 
 #[test]
 fn every_period_kind_follows_its_own_span() {
-    // For each kind (day, month, session, block; `showing_after` with the period keys sets the
-    // period), three unattributed rows: one wholly before the epoch E (day 2026-09-19, month
+    // `showing_after` (:1616) cannot set the report's epoch: add `showing_after_with(keys, rows,
+    // edit)`, which edits the report as `showing` does, and make `showing_after` call it with
+    // `|_| {}` so its callers stay as they are.
+    // For each kind (day, month, session, block; `showing_after_with` with the period keys sets
+    // the period and `edit` the epoch), three unattributed rows: one wholly before the epoch E (day 2026-09-19, month
     // 2026-08, session last_ms = E-1, block end_ms = E), one holding E (day 2026-09-20, month
     // 2026-09, session last_ms = E, block end_ms = E+1), one wholly after (day 2026-09-21,
     // month 2026-10, session first_ms = E+1, block start_ms = E+1). With E = YESTERDAY the
@@ -214,8 +222,12 @@ fn the_detail_and_a_breadcrumb_use_their_row_s_words() {
 In `filter.rs`: `the_filter_keeps_unknown_account_for_every_unattributed_row` — the same report
 with `tracking_since_ms = Some(YESTERDAY)`: open the filter (`f`); its account choice reads
 `unknown account`; choose only it; the control bar's summary reads `unknown account`. In
-`help.rs`: on Tokens, help lists `before tracking` and its words name the filter's `unknown
-account`.
+`help.rs`, `help_explains_before_tracking_on_tokens_only`: on Tokens, the Tokens section's last
+entry is led by `before tracking` in muted, and its words name the filter's `unknown account`;
+on Accounts and History no row contains `before tracking`. The marks' lead column keeps its
+width, so `every_mark_s_words_start_in_one_column` (`help.rs:442`, which counts the marks plus
+`RATE` and `CACHE`) and `help_says_from_which_width_the_cache_write_splits`
+(`tokens/table.rs:3240`, which finds `5M 1H  CACHE W 5M and 1H`) pass unchanged.
 
 - [ ] **Step 2: Run to verify they fail** — `cargo test -p tagteam-tui before_tracking`, then
 `cargo test -p tagteam-tui unknown_account`, `cargo test -p tagteam-tui breadcrumb`. FAIL.
@@ -226,9 +238,14 @@ account`.
 breadcrumb for its parent row). `below` computes it for the selected row and passes it to
 `detail_rows`, which uses it for both `row.account` and the `row.accounts` list. `filter.rs:155`
 passes `false`. The filter summary (`filter_text`, `table.rs:976-980`) writes its literal
-`unknown account` and calls neither helper; leave it unchanged. Help gains a third pair beside `RATE` and `CACHE`:
-`("before tracking", "usage from before tagteam recorded which account was in use; the filter's unknown account includes it")`.
-Update every direct caller of `account_text`, `account_name` and `detail_rows` in tests.
+`unknown account` and calls neither helper; leave it unchanged. Help, when `state.screen` is
+Tokens, appends one entry to the Tokens section that `keys_of(Some(Screen::Tokens))` builds:
+`entry(BEFORE_TRACKING, theme.role(Role::Muted), BEFORE_TRACKING_HELP,
+width_of(BEFORE_TRACKING), column)`, with `const BEFORE_TRACKING_HELP: &str = "usage from before
+tagteam recorded which account was in use; the filter's unknown account includes it";`. It is
+not a third pair beside `RATE` and `CACHE`: those share the marks' lead column, which would grow
+from 5 to 15 columns on every screen. Update every direct caller of `account_text`,
+`account_name` and `detail_rows` in tests.
 
 - [ ] **Step 4: Run to verify they pass** — `cargo test -p tagteam-tui`. PASS.
 
@@ -296,26 +313,29 @@ long or scoped.
 **Files:**
 - Modify: `crates/tagteam-tui/src/view.rs` (`areas` :45-84)
 - Modify: `crates/tagteam-tui/src/chrome.rs` (`now_strip` :151, `in_use_parts` :203: no
-  `SEE_ACCOUNTS` on Accounts)
+  `SEE_ACCOUNTS` on Accounts; with no account in use, Accounts reads the lead card's hint, S§3.2)
 - Modify: `crates/tagteam-tui/src/screens/accounts.rs` (module doc; `BLANK`, `LEAD_LEAST`;
   `Parts` :277, `parts` :289, `render` :401-487)
 - Modify: `crates/tagteam-tui/src/screens/accounts/lead.rs` (keep `in_use`, `pick_words`,
-  `PICK_GAP`, `LEFT_LEAST`, `NO_ACCOUNT`'s users if any remain; delete `Lead` (with its
-  `shown`), `lead`, `height`, `no_account` and its `NO_ACCOUNT_HINT` (:37, used only at :160),
-  `with_pick`, `title`, `facts_of`, `bar_rows`,
-  `fold_line`, `BAR_WIDE`, `BAR`, `TITLE_INDENT`, `BOLD_FROM`, `SOON_S`, `LOG_IN_AGAIN` (Task 5
-  defines the last three again in `card.rs`, where they get their caller); the module doc says
-  what is left)
+  `PICK_GAP`, `LEFT_LEAST`, and `NO_ACCOUNT_HINT` (:37, now `pub(crate)`: the strip on Accounts
+  says it); `pick_words` loses its `with_key` parameter and the keyed forms, including the
+  `NoPick::UsageUnknown` arm, since only the strip's form is left (S§3.2); delete `Lead` (with
+  its `shown`), `lead`, `height`, `no_account`, `NO_ACCOUNT`, `with_pick`, `title`, `facts_of`,
+  `bar_rows`, `fold_line`, `BAR_WIDE`, `BAR`, `TITLE_INDENT`; move `BOLD_FROM`, `SOON_S` and
+  `LOG_IN_AGAIN` to `card.rs`, which uses them in this task; the module doc says what is left)
 - Modify: `crates/tagteam-tui/src/screens/accounts/card.rs` (`lead_keys` :154, `is_on_lead`
   :57, `own_problem_rows` :62 and `lines`' `on_lead` parameter go: with no lead card the in-use
   card shows its reset, projection and problems, M-9 no longer applies; the in-use card's bars
   become `gauge::lead_bar`, S§4.1's thick bars, which keeps `lead_bar` a caller once
-  `lead::bar_rows` is gone)
-- Test: `chrome.rs` :1038, :1147, :1352, :1378; `accounts.rs` :1277, :1306, :3739, :3767, :3975,
-  and the lead-card tests :3236-4415
+  `lead::bar_rows` is gone; the card's percentages are bold from `BOLD_FROM`, and `facts_of`'s
+  login fact (:390) takes the `SOON_S` rule, S§3.4, so the three constants have their callers
+  here)
+- Test: `chrome.rs` :1038, :1147, :1352, :1378, :1690; `accounts.rs` :1277, :1306, :3739, :3767,
+  :3975, :4081, :4160, and the lead-card tests :3236-4415
 
 **Interfaces:**
 - Produces: `card::lines(state, v, width, rows, from, now_ms)` (no `on_lead`);
+  `lead::pick_words(state, view) -> Option<Vec<Span<'static>>>` (no `with_key`);
   `struct Parts { top: Rect, table: Rect, under: Rect, card: Rect }`, where `top` and `under` are
   the blank/rule/blank rows (height 3, 2 when its blanks are dropped to one, 1 for the rule
   alone, 0 when dropped).
@@ -374,20 +394,49 @@ fn compact_at_120_by_40_puts_the_columns_where_the_spec_does() {
 
 #[test]
 fn the_in_use_card_draws_thick_bars() {
-    // `mock()` at 80×24: the card's window rows (rows[15..18]) hold only `▆`/`▁` bar cells.
-    // (Thin bars for other accounts come with `window_line`, Task 5.)
+    // `mock()` at 80×24: the card's window rows (rows[15..18]) hold only `▆`/`▁` bar cells
+    // (`lead_bar_of`, :3255, builds the expected run). (Thin bars for other accounts come with
+    // `window_line`, Task 5.)
 }
 
 #[test]
-fn a_short_body_drops_the_blank_rows_then_the_rules() {
+fn a_short_body_scrolls_the_table_and_the_card_before_it_drops_a_separator() {
     // S§5.4's order, on the layout itself: the frame below 80×24 shows only the too-small
     // notice (`view.rs:124-133`), so call `parts(&loaded(mock()), Rect::new(0, 0, 80, h),
-    // NOW_MS)` for every body height h from 20 down to 8. Over decreasing h: `under.height`
-    // goes 3 → 1 before `top.height` leaves 3; `top` goes 3 → 1 before either rule goes
-    // (1 → 0); a height never grows back as h shrinks. At every h, `table.height >=
-    // min(5, TABLE_LEAST)` (TABLE_LEAST counts lines with the header: the header and three
-    // accounts) and `card.height >= card::min_height(..)`. Separately, a frame drawn at 80×23
-    // shows only the too-small notice.
+    // NOW_MS)` for every body height h from 20 down to 6. Over decreasing h: `table.height`
+    // goes 5 → `min(5, TABLE_LEAST)` (TABLE_LEAST counts lines with the header: the header and
+    // three accounts) while `top` and `under` stay 3; then `card.height` goes down to
+    // `card::min_height(..)`; only then does `under.height` go 3 → 1, then `top.height` 3 → 1,
+    // then the rules (1 → 0); a height never grows back as h shrinks. At every h,
+    // `table.height >= min(5, TABLE_LEAST)` and `card.height >= card::min_height(..)` while
+    // the body holds them. Separately, a frame drawn at 80×23 shows only the too-small notice.
+}
+
+#[test]
+fn ten_accounts_at_80_by_24_scroll_the_table_and_keep_both_rules() {
+    // `mock()` extended with `many(10).into_iter().skip(4)` (positions 5–10), at 80×24: blanks at
+    // rows 3, 5 and both rules (4 and the one under the table) with their blank rows stay; the
+    // table shows fewer rows than it has and scrolls with the selection (`End`: account 10's
+    // row is on screen).
+}
+
+#[test]
+fn on_accounts_with_no_account_in_use_the_strip_says_s_switches_to_the_selected_account() {
+    // Ports :3559. `three()` with no account active: on Accounts the strip reads
+    // ` no account in use · s switches to the selected account`, muted; on Tokens it still
+    // reads `… · s on Accounts switches to one`.
+}
+
+#[test]
+fn the_card_s_percentage_is_bold_from_70() {
+    // Ports :4203 to the card (its current layout): 69% not bold, 70% bold, every tier
+    // (`bold_cells`), thick and sparkline rows.
+}
+
+#[test]
+fn a_login_under_seven_days_is_warn_and_says_to_log_in_again() {
+    // Ports :3450 to the card's facts: `login_expires_at` in 3 days: `login valid 3 more days
+    // · log in again before then`, both warn; passed: `login expired`, warn, alone.
 }
 
 #[test]
@@ -408,26 +457,46 @@ Accounts' body now starts at row 3 at 80×24 and 120×40 (no rule on Accounts), 
 unchanged; `:1147` — Accounts has the Now strip; `:1352` — Accounts: header, auto line, Now
 strip, no rule at any height; Tokens and History keep the rule from 30 rows; `:1378`
 (`from_30_rows_a_faint_rule_sits_under_the_chrome`) — runs on Tokens and History, and asserts
-Accounts has no chrome rule at row 3 (its body's own rule is at row 4). Rewrite `:3739` and
-`:3767` for the new stack (strip, blank/rule/blank, table, blank/rule/blank, card). Delete the
-lead-card tests whose subject goes (:3245-3265 helpers, :3265, :3425, :3515, :3559, :3839, :3937,
-:4016, :4203, :4229, :4273, :4289, :4361), with the helpers only they call: `twenty()` (:3809)
-and `m()` (:3834), used only by :3839 and :3937; then check no other test helper is left
-without a caller (clippy runs on all targets). Port to the Now strip on Accounts those whose subject
-stays: the best pick and forecast words (:3338, :3640, :4336) and focus's provider (:3587,
-:3691, :4388). Move `:3450`'s login-expiry subject to Task 5.
+Accounts has no chrome rule at row 3 (its body's own rule is at row 4); `:1690`
+(`every_screen_s_chrome_in_each_tier`) — on Accounts at 120×40 the faint rule it checks is the
+body's, at row 4, and row 2 is the Now strip. Rewrite `:3739` and `:3767` for the new stack
+(strip, blank/rule/blank, table, blank/rule/blank, card). Rewrite `:4081`
+(`the_accounts_screen_s_roles_in_each_tier`, §16's colour-role test): its lead-card half
+becomes the strip's roles on row 2 (`●` accent, the alias bold) and both rules faint (at
+`p.top` and `p.under`); its table half stays; its card half stays until Task 5. In `:4160`
+(`a_title_keeps_its_name_readable_before_its_facts`), drop the lead half and keep the card's.
+
+Delete the lead-card tests whose subject goes (:3265, :3425, :3515, :3839, :3937, :4016, :4273,
+:4289, :4361; `:4229` already went in Task 3), with the helpers only they call: `lead_rows`
+(:3245), `NO_ACCOUNT_IN_USE` (:3260), `twenty()` (:3809) and `m()` (:3834); keep
+`rows_of_part`, `joined` (the ported :3338 uses it) and `lead_bar_of` (the thick-bar test uses
+it); then check no other test helper is left without a caller (clippy runs on all targets).
+Delete `:3715` too: its subject, a long name before the pick, is the strip's, and
+`chrome.rs:1218` covers it. Delete `:3587`
+(`with_several_providers_the_lead_card_names_its_provider`): the strip does not name its
+provider (S§3.2); `:3691`'s port keeps the strip following the selection's provider.
+
+Port to the Now strip on Accounts those whose subject stays: the best pick and forecast words
+(:3338, asserting the strip's form only, now that `pick_words` has no keyed form; :3640;
+:4336), the no-account words (:3559, as the test above) and focus's provider (:3691, :4388).
+Port `:3450` (login expiry) and `:4203` (bold from 70) to the card, as the tests above.
 
 - [ ] **Step 2: Run to verify they fail** — `cargo test -p tagteam-tui compact_at`, then
 `cargo test -p tagteam-tui chrome`. FAIL.
 
 - [ ] **Step 3: Implement.** In `areas`: `strip` is true on every screen; `rule` is
 `state.screen != Screen::Accounts && height >= RULE_FROM`. `in_use_parts` gets the screen and
-skips `SEE_ACCOUNTS` on Accounts. `parts` lays out `top` (blank, rule, blank), the table, `under`
-(blank, rule, blank), the card; it reserves the table's `min(lines, TABLE_LEAST)` and
-`card::min_height` first, then takes back rows in S§5.4's order: `under`'s blanks, `top`'s
-blanks, the two rules. `render` draws `chrome::rule(state, width)` on each rule row. The card
-keeps its current format in this task, except that the account in use gets thick bars
-(`gauge::lead_bar`, same cell count).
+skips `SEE_ACCOUNTS` on Accounts; `now_strip` with no account in use says `NO_ACCOUNT_HINT`'s
+words after `no account in use · ` on Accounts, and `NO_ACCOUNT_IN_USE` elsewhere. `parts` lays
+out `top` (blank, rule, blank), the table, `under` (blank, rule, blank), the card. It reserves
+the table's `min(lines, TABLE_LEAST)` and `card::min_height` first, then gives the rows left, in
+the reverse of S§5.4's order: the two rules, `top`'s blanks, `under`'s blanks (Task 5 puts the
+keys row before the blanks), the card's other windows, then the rest of the table. So on a
+short body the table scrolls first, then the card's windows, and only then do the separators
+go. `render` draws `chrome::rule(state, width)` on each rule row. The card keeps its current
+format in this task, except that the account in use gets thick bars (`gauge::lead_bar`, same
+cell count), every percentage is bold from `BOLD_FROM`, and the login fact takes the `SOON_S`
+rule.
 
 - [ ] **Step 4: Run to verify they pass** — `cargo test -p tagteam-tui`. PASS; clippy clean
 (no field of `Lead` survives).
@@ -439,9 +508,9 @@ keeps its current format in this task, except that the account in use gets thick
 **Files:**
 - Modify: `crates/tagteam-engine/src/words.rs:333` (`ahead_words`)
 - Modify: `crates/tagteam-tui/src/screens/accounts/card.rs` (all of `lines` :75, `title` :238,
-  `facts_of` :353, `window_rows`, `Row` and `reset_tail` :~430-520, `value_cell` :543,
-  `keys_row`, `min_height`, `height`, `furthest`; the sparkline constants, `CARD_DEBOUNCE_MS`,
-  `CARD_SINCE_S`, `SHORT_SINCE_S`)
+  `problem_rows` :186 (an indent parameter), `facts_of` :353, `window_rows`, `Row` and
+  `reset_tail` :~430-520, `value_cell` :543, `keys_row`, `min_height`, `height`, `furthest`; the
+  sparkline constants, `CARD_DEBOUNCE_MS`, `CARD_SINCE_S`, `SHORT_SINCE_S`)
 - Modify: `crates/tagteam-tui/src/gauge.rs` (`sparkline` :127 and its tests :290, and
   sparkline's half of :317, go; its only caller was the card)
 - Modify, the card's history read, all of it: `screens/accounts.rs` (`AccountsState::card`,
@@ -450,10 +519,25 @@ keeps its current format in this task, except that the account in use gets thick
   `Msg::Card`, `ViewsReq::Card` :31 and its arm in `same_as` :90), `update.rs` (`Msg::Card` :68,
   the `schedule_card` call :42, the `on_tick` call if `on_tick` is left empty), `lanes.rs:224`,
   `runtime.rs:455` (the `LoadCard` dispatch), and the `card` generation in `gens`
+- Modify, the read's source, which nothing else calls once `lanes.rs:224` goes (`Source` is a
+  public trait, so the dead-code lint will not flag it): `source.rs` (`Source::history` :73,
+  `EngineSource::history` :145, the test fake's :294), `crates/tagteam/src/tui_cmd.rs:158`
+  (`Refused`'s), and `runtime.rs`'s test sources (:849, :934, :1083, :1128, and `Carded`
+  :993-1030). The engine's own `history` stays: the CLI uses it.
 - Test: `accounts.rs` :1120-1197 helpers (`card_at`, `card_rows`, `card_windows`, `with_card`
   :1153), :1198, :1406, :1441, :1455, :1470-1600 (`card_reads` :1470, :1482, :1535), :1711,
-  :1770, :1788, :1812, :1844, :1877, :1939, :1980, :2007, :2046, :2123, :2188, :2213, :2238;
-  `runtime.rs:1506`; `daemon/mod.rs:943`; `update.rs:756` (`first_card`); `words.rs` tests
+  :1770, :1788, :1812, :1844, :1877, :1939, :1980, :2007, :2046, :2123, :2188, :2213, :2238,
+  the card half of :4081, :4160, and Task 4's ports of :3450 and :4203; `NEEDS_LOGIN_ROWS`
+  (:3419) and its users (problem rows now at the card's indent 2); `runtime.rs:1506`;
+  `daemon/mod.rs:943`; `update.rs:756` (`first_card`); `msg.rs:325`
+  (`views_requests_of_one_kind_coalesce_whatever_they_ask`: its `card` requests go, its
+  `accounts`/`history` ones stay); `crates/tagteam-tui/tests/source.rs` :519
+  (`history_is_the_samples_since_the_range_starts`, goes) and :556
+  (`a_failed_read_carries_the_engines_kind_and_words`: keep its subject, an engine error's kind
+  and words reaching the caller, on a read that stays; first check which one refuses the
+  unknown `gone` (`timeline` with `Scope::Account`, or `collect_due`) and assert that read's
+  kind and words; delete the test only if none does); `testutil.rs` `sample` :406, `history_window`
+  :414 and `history_of` :422 once nothing calls them; `words.rs` tests
 
 **Interfaces:**
 - Produces, in `card.rs`:
@@ -473,8 +557,12 @@ pub(super) fn no_windows_row(v: &AccountView, indent: usize, width: u16, now_s: 
 pub(crate) fn lines(state: &State, v: &AccountView, width: u16, rows: usize, from: usize, keys: bool, now_ms: i64) -> Vec<Line<'static>>;
 ```
 
-  `problem_rows` stays as it is. In `words.rs`: `pub fn expected_words(expected_pct: f64) ->
-  String` (`"26% expected by now"`); `ahead_words` builds its parenthesis from it.
+  and `pub(crate) fn problem_rows(state, v, indent: usize, width, now_ms)`: the sentence from
+  `indent` (2 in the card, 7 in the full list, the window rows' column), its wrapped rows and
+  the remedy placed against `indent` as today's are against `INDENT` (the remedy two further
+  in); today `indent` is fixed at `INDENT`, 4. In `words.rs`:
+  `pub fn expected_words(expected_pct: f64) -> String` (`"26% expected by now"`); `ahead_words`
+  builds its parenthesis from it.
 
 - [ ] **Step 1: Write the failing tests.** In `card.rs`'s tests (`:583`; add
 `use crate::testutil::*;` for `window`, `NOW_S`, `TIERS`):
@@ -499,7 +587,7 @@ fn a_window_row_has_its_parts_at_fixed_columns() {
     assert_eq!(&text[..9], "  7d     ");
     assert_eq!((col(&text, "82%"), col(&text, "▲"), col(&text, "resets in 5d04h")), (27, 31, 34));
     assert!(text.contains("resets in 5d04h · +2.3%/h · full in 7h47m"), "{text}"); // rate kept at 80
-    assert!(!text.contains("expected by now"));                                   // 79 + 22 > 80
+    assert!(!text.contains("expected by now"));                                   // 75 + 22 > 80
     let wide = RowLayout { width: 120, ..at };
     let text = line_text(window_line(&long, &ahead(26.0, 2.3), &wide, true, NOW_S, Theme::new(false)));
     assert_eq!(col(&text, "82%"), 37);                                            // 26 cells
@@ -516,6 +604,13 @@ fn pace_words_show_at_80_when_they_fit_and_never_on_short_or_spend_windows() {
 }
 
 #[test]
+fn a_window_without_a_reset_starts_its_tail_with_its_rate() {
+    // A Scoped window with `resets_at: None` and a rate, at 80: the tail at the reset's column
+    // (34 in `a_window_row_has_its_parts_at_fixed_columns`' layout) reads `+0.9%/h · full in
+    // 3d08h`, with no ` · ` before it; without a rate either, nothing follows the `▲` column.
+}
+
+#[test]
 fn bars_are_thick_for_the_account_in_use_and_thin_otherwise() {
     // thick: the bar's 16 cells are only `▆`/`▁`; thin: only `━`/`╸`/`─` (tier 0 `·`), in
     // every tier. And on screen: `loaded(mock())` at 80×24 with account 1 selected (`k`), the
@@ -524,7 +619,8 @@ fn bars_are_thick_for_the_account_in_use_and_thin_otherwise() {
 
 #[test]
 fn a_percentage_is_bold_from_70() {
-    // Ports accounts.rs:4203: 69% not bold, 70% bold, thick and thin, every tier (`bold_cells`).
+    // Task 4's port of accounts.rs:4203, on `window_line`: 69% not bold, 70% bold, thick and
+    // thin, every tier (`bold_cells`). Task 4's card-level port goes with the old rows.
 }
 
 #[test]
@@ -569,7 +665,8 @@ fn an_account_without_windows_shows_the_table_s_words_or_its_problem() {
     // `unread(UsageStatus::ApiKey, None, None)`: one row from column 2,
     // `api key · has no usage limits to show`, muted; the card is exactly title, facts, that
     // row and the keys row. `unread(ReloginRequired, …)`: the card is exactly title, facts,
-    // `problem_rows`' rows (each once) and the keys row: no no-windows row, no repeat.
+    // `problem_rows`' rows (each once; the sentence's `✕` at column 2, the remedy at 4) and the
+    // keys row: no no-windows row, no repeat.
 }
 
 #[test]
@@ -586,14 +683,9 @@ fn next_update_ends_the_facts_from_120_columns_only() {
 }
 
 #[test]
-fn a_login_under_seven_days_is_warn_and_says_to_log_in_again() {
-    // Ports accounts.rs:3450: `login_expires_at` in 3 days: `login valid 3 more days · log in
-    // again before then`, both warn; passed: `login expired`, warn, alone.
-}
-
-#[test]
 fn a_short_body_drops_the_keys_row_after_the_blank_rows() {
-    // S§5.4 step 2: once both pairs of blanks are gone, the keys row goes before the rules.
+    // S§5.4 step 4: once the table and the card's windows are at their least and both pairs of
+    // blanks are gone, the keys row goes, before the rules.
 }
 ```
 
@@ -603,7 +695,10 @@ In `words.rs`: `expected_words(26.4) == "26% expected by now"`; `ahead_words(Som
 Rewrite, in this task, the existing tests whose assertions this task's behaviour breaks: the
 listed card tests take the new title/facts/keys rows and lose their sparkline and in-place
 `▲ faster…` assertions; `:2123` (`a_window_takes_one_row_whatever_its_words`) keeps its
-oversized-text, spend and overflow assertions at the new columns; the read-scheduling tests
+oversized-text, spend and overflow assertions at the new columns; Task 4's login-expiry port
+(`a_login_under_seven_days_is_warn_and_says_to_log_in_again`) reads the new facts row; `:4081`'s
+card half checks `SELECTED` muted, `IN USE` accent and the thick bar's cells, with no sparkline
+tag; `:4160` goes with `title_spans` (the facts leave the title); the read-scheduling tests
 (:1482, :1535), `runtime.rs:1506`, `daemon/mod.rs:943` and `update.rs`'s `first_card` go with
 the read (a daemon test that only used `first_card` as one expected command among others keeps
 the others).
@@ -617,13 +712,16 @@ the others).
     `gauge::lead_bar` when `thick`, else `gauge::line_gauge`, 16 or 26 cells by `chrome::WIDE`.
     The value is `value_cell`, bold (`theme.strong()` patched on) from 70%. `▲` shows only on
     long and scoped windows with `p.ahead == Some(true)`.
-  - The tail is the reset (as `reset_tail` has it: `resets in …`, `reset`, `not started`),
-    then, only when `p.rate_per_hour` is `Some` (the guard `card.rs:508` has today, since
-    `words.rs:304-305` gives `not enough data yet` without a rate), ` · {rate}%/h ·
-    {projection}`: `projection_clause(…, short = width < WIDE)`, warn when the window fills
-    before it resets. Today's narrow tail drops the rate (`card.rs:508-518`); this one keeps it.
-  - Then ` · {expected_words}` when `▲` shows and `expected_pct` is `Some`, if the whole row fits
-    the width; otherwise the row goes through `fit_spans`. `▲` never expands in place.
+  - The tail is the parts the window has, joined by ` · ` (S§4.1): the reset (as `reset_tail`
+    has it: `resets in …`, `reset`, `not started`; none for a scoped or spend window without
+    `resets_at`); then, only when `p.rate_per_hour` is `Some` (the guard `card.rs:508` has today,
+    since `words.rs:304-305` gives `not enough data yet` without a rate), `{rate}%/h` and
+    `{projection}`: `projection_clause(…, short = width < WIDE)`, warn when the window fills
+    before it resets. A missing reset leaves no separator: the tail then starts with the rate.
+    Today's narrow tail drops the rate (`card.rs:508-518`); this one keeps it.
+  - Then `{expected_words}` as the last part when `▲` shows and `expected_pct` is `Some`, if the
+    whole row fits the width; otherwise the row goes through `fit_spans`. `▲` never expands in
+    place.
   - `row_layout`: `label_width(windows, width) + 2`; `value_w` is 4, or the widest
     `words::spend_text` among the windows.
   - The card (S§3.4):
@@ -632,21 +730,26 @@ the others).
       production caller: delete it, `TITLE_GAP` (:37) and its test `a_title_s_name_keeps_its_
       floor_until_its_facts_are_gone`; keep `floored` and `floored_least`, which chrome uses);
     - `facts_row` at indent 10: `facts_of` with `IN USE` in accent for the account in use,
-      `next update` last and only from `WIDE`, and the soon-to-expire rule: define
-      `const SOON_S: i64 = 7 * 86_400;` and `const LOG_IN_AGAIN: &str = "log in again before
-      then";` here (Task 4 deleted them from `lead.rs`), applied to `login_valid` at `:390`;
+      `next update` last and only from `WIDE`, and the soon-to-expire rule Task 4 moved here
+      (`SOON_S`, `LOG_IN_AGAIN`);
     - window rows at indent 2, `thick: v.active`; with no windows and no problem
       (`words::problem(v)` is `None`), `no_windows_row` (`status::unread_words`, its role)
       instead;
-    - `problem_rows`, once, when there is a problem: after the windows, or in their place;
+    - `problem_rows` at indent 2, once, when there is a problem: after the windows, or in their
+      place;
     - the keys row at indent 10, at every width when `keys`: `s switch` (left out when
       `v.active`), `⏎ history`, `e disable`/`e enable`, `a alias`, `x remove`, `KEYS_GAP` apart.
   - `min_height`: title + facts + one window (or the no-windows row, only when there is no
-    problem) + problem rows. `height` adds the other windows and the keys row. `parts` (Task 4) passes `keys` and adds S§5.4
-    step 2.
-  - Remove the card's history read end to end, as listed under Files, with the test source
-    only that read used: `runtime.rs` `Carded` and `CARD_SAMPLES` (:993-1030), whose one use is
-    the deleted test at :1506.
+    problem) + problem rows. `height` adds the other windows and the keys row. `parts` (Task 4)
+    passes `keys`, and gives the keys row its rows after the rules and before `top`'s blanks
+    (S§5.4 step 4).
+  - The card's value cell takes `BOLD_FROM` through `window_line`; Task 4's card-level bold
+    code goes with the old rows.
+  - Remove the card's history read end to end, as listed under Files: `Source::history` and
+    every implementation of it, with the test source only that read used: `runtime.rs`
+    `Carded` and `CARD_SAMPLES` (:993-1030), whose one use is the deleted test at :1506. Then
+    `rg -n 'fn history\b|\.history\('` over `crates/tagteam-tui` and
+    `crates/tagteam/src/tui_cmd.rs` finds nothing.
 
 - [ ] **Step 4: Run to verify they pass** — `cargo test --workspace --locked --no-fail-fast
 --features tagteam/test-support` and the clippy runs. PASS, no dead code.
@@ -661,7 +764,9 @@ the others).
   `render`, `apply`)
 - Modify: `crates/tagteam-tui/src/keys.rs` (`KEYS` :105: a `v` row between `P` :386 and `r`
   :398; `s`'s label :170-180; the probe test :753 and the footer tests)
-- Test: `list.rs` tests; `keys.rs` tests; `accounts.rs` tests
+- Test: `list.rs` tests; `keys.rs` tests; `accounts.rs` tests; `chrome.rs`
+  `accounts_footer_order_at_80_and_120` (:1651, `ACCOUNTS_80` :1620) and
+  `with_no_accounts_the_footer_hides_the_account_keys` (:1678)
 
 **Interfaces:**
 - Consumes: `card::{RowLayout, row_layout, window_line, facts_row, no_windows_row,
@@ -675,7 +780,15 @@ pub(crate) enum View { #[default] Compact, List }
 // AccountsState gains `view: View` and `list_from: usize` (private), and:
 pub(crate) fn view(&self) -> View;
 // list.rs
-pub(super) struct Block { pub(super) id: AccountId, pub(super) lines: Vec<Line<'static>> }
+/// One scroll unit: `head` (Task 7: the provider heading), the account's own `lines` (title
+/// to its last window or problem row), `tail` (Task 7: the blank row and the one-account
+/// hint). Its height counts all three; `▌` and DIM apply to `lines` only (S§6.1).
+pub(super) struct Block {
+    pub(super) id: AccountId,
+    pub(super) head: Vec<Line<'static>>,
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) tail: Vec<Line<'static>>,
+}
 pub(super) fn blocks(state: &State, width: u16, now_ms: i64) -> Vec<Block>;
 pub(super) fn keep_whole(heights: &[usize], from: usize, at: usize, rows: usize) -> usize;
 pub(super) fn render(state: &State, frame: &mut Frame, body: Rect, now_ms: i64);
@@ -751,7 +864,16 @@ fn the_full_list_at_120_by_40_lines_every_block_up_in_every_tier() {
 fn blocks_without_windows_match_the_compact_card() {
     // An ApiKey account and a ReloginRequired one: the first block is exactly title, facts and
     // `api key · has no usage limits to show` from column 7; the second is exactly title, facts
-    // and the compact card's problem rows (each once), indent aside.
+    // and the compact card's problem rows (each once, the same text), the sentence's `✕` at
+    // column 7 like the window rows and the remedy at 9.
+}
+
+#[test]
+fn a_title_keeps_its_name_at_column_7_whatever_its_position() {
+    // `many(12)` with account 10 in use (so selected), View::List at 80×40: block 10's title
+    // is `▌ 10 ● a10@x.co` (a space between `10` and `●`); `j` to 11, then `Home`: block 1's
+    // title is `▌  1   a1@x.co` and block 10's ` 10 ● a10@x.co`; in every title the name
+    // starts at column 7.
 }
 
 #[test]
@@ -789,7 +911,9 @@ fn v_into_the_list_starts_at_the_top_and_scrolls_the_selection_into_view() {
 #[test]
 fn v_before_the_first_read_or_with_no_accounts_shows_the_same_state() {
     // `fresh(Screen::Accounts)`: `v` then draw: `Loading accounts…` centred; `loaded(vec![])`:
-    // `No accounts yet`; `v` again: compact, same text.
+    // `No accounts yet`; `v` again: compact, same text. In both views and both states the
+    // footer has no `v` hint (VIS-10, S§8): at 80 and 120 it reads `r refresh` before the
+    // pinned keys, as `with_no_accounts_the_footer_hides_the_account_keys` expects.
 }
 
 #[test]
@@ -817,7 +941,12 @@ fn s_has_no_footer_label_for_the_account_in_use() {
 }
 ```
 
-In `keys.rs` the table test gains `v`'s probe (`plain('v')`).
+In `keys.rs` the table test gains `v`'s probe (`plain('v')`). In `chrome.rs`,
+`accounts_footer_order_at_80_and_120` (`many(2)`, nothing in use, so `s` shows): at 80 the
+footer is `s switch  b best  n next  ⏎ history  P pause auto  v full list` (no `r refresh`,
+S§8); at 120 `… P pause auto  v full list  r refresh  e disable  a alias  x remove`. Split
+`ACCOUNTS_80` accordingly. `with_no_accounts_the_footer_hides_the_account_keys` stays as it is
+and passes.
 
 - [ ] **Step 2: Run to verify they fail** — `cargo test -p tagteam-tui keep_whole`, then
 `cargo test -p tagteam-tui full_list`. FAIL.
@@ -825,10 +954,11 @@ In `keys.rs` the table test gains `v`'s probe (`plain('v')`).
 - [ ] **Step 3: Implement.**
   - **The `v` row:** `screen: Some(Screen::Accounts)`, `keys: "v"`,
     `does: "full list, or back to compact"`,
-    `Footer::Show { key: "v", label: |s| Some(if s.accounts.view() == View::List { "compact" } else { "full list" }), from: 0 }`.
+    `Footer::Show { key: "v", label: |s| on_account(s, if s.accounts.view() == View::List { "compact" } else { "full list" }), from: 0 }`,
+    so the hint hides with no account selected, as every Accounts key's (VIS-10, `keys.rs:66`).
     `s`'s label becomes `state.accounts.selected_view().filter(|v| !v.active).map(|_| "switch")`.
-  - **`v` itself:** toggles `view`. On entering the list it sets `list_from = 0` and then
-    `keep_whole`.
+  - **`v` itself:** toggles `view`, with or without accounts. On entering the list it sets
+    `list_from = 0` and then `keep_whole`.
   - **Keys in the list:** `j`/`k`/`↑`/`↓`/`Home`/`End` step the selection as today (one block
     is one account), and `PgUp`/`PgDn` by the number of whole blocks shown, at least one.
     Each key first normalises the stored origin against the current selection and the current
@@ -838,15 +968,16 @@ In `keys.rs` the table test gains `v`'s probe (`plain('v')`).
     stays as it is (`update.rs:22-26`).
   - **Rendering:** `render` and every key recompute `keep_whole` from the stored `list_from`,
     so a resize or refresh is clamped in the next frame.
-  - **A block:**
-    - the title: `▌` when selected, else a space; two spaces; `{position:<2}`; `● ` or two
-      spaces; `name_spans` bold when selected; the org from `WIDE`;
+  - **A block** (its `lines`; `head` and `tail` stay empty until Task 7):
+    - the title: `▌` when selected, else a space; `{position:>3}`; a space; `●` or a space; a
+      space; `name_spans` from column 7, bold when selected; the org from `WIDE` (S§6.1). A
+      position from 10 to 999 keeps the space before `●` and the name at column 7;
     - `facts_row` at indent 7;
     - the window rows through `window_line` at indent 7, `thick: v.active`; with no windows and
       no problem, the no-windows row instead;
-    - `problem_rows`, once, when there is a problem (as the card, Task 5).
-  - **Block styling:** a disabled block is DIM. Every row of the selected block starts with
-    `▌`, in place of its first column.
+    - `problem_rows` at indent 7, once, when there is a problem (as the card, Task 5).
+  - **Block styling:** a disabled block's `lines` are DIM. Every row of the selected block's
+    `lines` starts with `▌`, in place of its first column. Neither touches `head` or `tail`.
   - **Shared layout:** `row_layout` over every window of every account, once per frame.
   - **Separators:** blocks are separated by a blank row, `   ` + `┈` × (width − 6) faint (tier 0:
     `·`), then a blank row.
@@ -877,14 +1008,17 @@ fn a_provider_heading_starts_its_first_block_s_scroll_unit() {
     // up), View::List at 80×40: the row above provider 2's first block title is its muted
     // heading; scrolled so that block is first (select provider 2's last account at 80×24),
     // rows[6] is the heading; scrolled to provider 2's second block, rows[6] is that block's
-    // title.
+    // title. With provider 2's first account selected, its title and every row after it in
+    // the block start with `▌`, and the heading row does not (S§6.1).
 }
 
 #[test]
 fn with_one_account_its_block_is_followed_by_the_add_a_second_hint() {
     // `loaded(vec![one account])`, View::List at 80×24: after the block, a blank row, then
     // ` Add a second account to switch: log in to Claude Code as it, then press A.` muted;
-    // compact still shows it under the table.
+    // compact still shows it under the table. The account is selected: the blank and hint rows
+    // do not start with `▌`. Disabled (`row.disabled = true`), the block's own rows are DIM
+    // and the hint's cells keep the style they have with it enabled, in every tier.
 }
 
 #[test]
@@ -928,9 +1062,11 @@ fn a_resize_keeps_the_selected_block_whole() {
 
 - [ ] **Step 3: Implement.**
   - **Provider headings:** with several providers, the muted ` {display_name}` heading is the
-    first line of each provider's first block.
-  - **The one-account hint:** it is appended, after a blank row, to the sole block of focus's
-    provider (`one_account`).
+    `head` of each provider's first block.
+  - **The one-account hint:** a blank row and the hint are the `tail` of the sole block of
+    focus's provider (`one_account`).
+  - Both count in the block's height and scroll with it, but take neither `▌` nor DIM: Task 6
+    applies those to `lines` only.
   - **Tall blocks:** a selected block taller than the viewport draws its windows through the
     card's `Shown::of(rows, fixed, windows)` with `card_from`, where `fixed` counts every
     non-window row of the block's scroll unit: the provider heading when it leads the block,
@@ -946,8 +1082,10 @@ fn a_resize_keeps_the_selected_block_whole() {
 
 **Files:**
 - Modify: `CHANGELOG.md` (`## [Unreleased]` :8)
-- Modify: `docs/superpowers/specs/2026-10-26-tagteam-accounts-views-design.md`
-  (`**Status:** Draft` → `Implemented`)
+- Modify: `docs/superpowers/specs/2026-10-26-tagteam-accounts-views-design.md` and this plan
+  (`**Status:** In progress — …/pull/50` → `**Status:** Implemented —
+  https://github.com/michaelrigart/tagteam/pull/50`, so the plan is not run again; CONTRIBUTING's
+  design records)
 - Test: `overlay/help.rs` tests
 
 - [ ] **Step 1: Help test** — on Accounts, help lists `v` with `full list, or back to compact`,
@@ -971,4 +1109,4 @@ both views. These are the only images that may be published.
 built TUI against their own store at 80×24 and 120×40, both views, and Tokens across the epoch.
 Record only the outcome (pass, or what was wrong) in the PR; no screenshot, name, email or
 figure from that run goes anywhere public (S§1.4, CONTRIBUTING).
-- [ ] **Step 6: Commit** — `Record the accounts views in the changelog and mark the spec implemented`
+- [ ] **Step 6: Commit** — `Record the accounts views in the changelog and mark their spec and plan implemented`
