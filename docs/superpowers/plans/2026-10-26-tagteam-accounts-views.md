@@ -62,9 +62,9 @@ The redesign spec `docs/superpowers/specs/2026-10-20-tagteam-tui-redesign-design
 
 **Files:**
 - Modify: `crates/tagteam-engine/src/tokens/view/mod.rs` (`TokenReport` :81, `PeriodKey` :117,
-  the report literal :381, the early return :398, the epoch read :406; tests module :471)
+  the report literal :381, the early return :397-400, the epoch read :406; tests module :471)
 - Modify: the other `TokenReport` literals: `crates/tagteam-engine/src/words.rs:1646`,
-  `crates/tagteam/src/tokens_cmd.rs:1008`, `crates/tagteam-tui/src/testutil.rs:556`
+  `crates/tagteam/src/tokens_cmd.rs:1008`, `crates/tagteam-tui/src/testutil.rs:549`
 - Test: `view/mod.rs` tests; `crates/tagteam-engine/tests/tokens_view.rs`
 
 **Interfaces:**
@@ -123,7 +123,7 @@ Expected: compile errors: no method `before_tracking`, no field `tracking_since_
 
 - [ ] **Step 3: Implement.** Add `pub tracking_since_ms: Option<i64>` to `TokenReport`
 (`/// The token index's epoch (TR §7.2), \`None\` when the store has none. Not in the JSON.`).
-Move `let epoch = store.token_epoch()?;` above the early return at :398 and set
+Move `let epoch = store.token_epoch()?;` above the early return at :397-400 and set
 `report.tracking_since_ms = epoch.map(|e| e.at)` there, so both returns carry it. Add
 `PeriodKey::before_tracking` per S§7.1: Day through `day_bounds_ms`, Month through
 `month_bounds_ms`, `end <= epoch`; Session `last_ms < epoch`; Block `end_ms <= epoch`; a `None`
@@ -143,7 +143,7 @@ Expected: PASS; the `tokens --json` tests unchanged (the JSON is built field by 
 **Files:**
 - Modify: `crates/tagteam-tui/src/screens/tokens/table.rs` (`account_text` :252, `account_name`
   :267, the cell :638-643, the breadcrumb parents :1035, `detail_rows` :1212 and its calls
-  :1268-1270, its caller in `below` :1320)
+  :1268-1270, its call in `below` :1325)
 - Modify: `crates/tagteam-tui/src/screens/tokens/filter.rs:155`
 - Modify: `crates/tagteam-tui/src/overlay/help.rs` (`rows` :113, its `keys_of` :124; `RATE`,
   `CACHE` and the marks' `lead_width` :138-142 stay as they are)
@@ -257,7 +257,7 @@ from 5 to 15 columns on every screen. Update every direct caller of `account_tex
 - Modify: `crates/tagteam-tui/src/gauge.rs` (`pace_cell` :33 goes; `line_gauge` :56,
   `progress_line` :66, `gauge` :79, `lead_bar` :106)
 - Modify: callers `screens/accounts/table.rs:442`, `screens/accounts/lead.rs:265-278`,
-  `chrome.rs:233-239` (`in_use_parts`)
+  `chrome.rs:234-239` (`in_use_parts`)
 - Test: `gauge.rs` tests :234, :257, :317; `screens/accounts.rs` tests :780, :4229, :4273;
   `chrome.rs` tests
 
@@ -316,11 +316,11 @@ long or scoped.
 ### Task 4: The lead card goes; the Now strip and the rules come
 
 **Files:**
-- Modify: `crates/tagteam-tui/src/view.rs` (`areas` :45-84)
-- Modify: `crates/tagteam-tui/src/chrome.rs` (`now_strip` :151, `in_use_parts` :203: no
+- Modify: `crates/tagteam-tui/src/view.rs` (`areas` :45-71)
+- Modify: `crates/tagteam-tui/src/chrome.rs` (`now_strip` :151, `in_use_parts` :205: no
   `SEE_ACCOUNTS` on Accounts; with no account in use, Accounts reads the lead card's hint, S§3.2)
 - Modify: `crates/tagteam-tui/src/screens/accounts.rs` (module doc; `BLANK`, `LEAD_LEAST`;
-  `Parts` :277, `parts` :289, `render` :401-487)
+  `Parts` :277, `parts` :289, `render` :401-488)
 - Modify: `crates/tagteam-tui/src/screens/accounts/lead.rs` (keep `in_use`, `pick_words`,
   `PICK_GAP`, `LEFT_LEAST`, and `NO_ACCOUNT_HINT` (:37, now `pub(crate)`: the strip on Accounts
   says it); `pick_words` loses its `with_key` parameter and the keyed forms, including the
@@ -479,14 +479,14 @@ two blank rows. Known: `chrome.rs:910` (`a_state_too_wide_for_the_row_is_cut_and
 `body.y` is 3 on Accounts, and its comment's lead-card rows go); `update.rs:843`
 (`a_failed_read_keeps_the_last_good_data_under_a_banner`: where the banner and the table's
 first row now sit); `accounts.rs:1634`
-(`every_window_is_reachable_by_shift_j_and_k_at_80x24_under_a_full_banner`: under the 3-row
-banner the body loses the strip's row and the card the separators' extra rows, so seven
-windows (`scoped(5)`) no longer fit whole; derive the card's rows from `parts` (about seven:
-the body less six separator rows and the table's four) and give its nothing-hidden half the
-largest `scoped(n)` that fits whole; its 24-window half stays);
-`:2756` (`more_accounts_than_fit_scroll_with_the_selection`) and `:2818`
-(`a_resize_keeps_the_tables_scroll_in_range_and_the_next_key_moves_at_once`): the table's
-visible account rows at 80×28 and 80×24, recounted. Then sweep for the rest: `rg -n "lead
+(`every_window_is_reachable_by_shift_j_and_k_at_80x24_under_a_full_banner`: under its 3-row
+banner Accounts' body is 18 rows at `eda9605` and 17 once the strip joins the chrome (Tokens'
+is 17 today), so the card has 17 − 6 separator rows − 4 table lines = 7: the title and six
+windows. Its nothing-hidden half takes `scoped(4)` (six windows) for `scoped(5)`; its
+24-window half stays); `:2756` (`more_accounts_than_fit_scroll_with_the_selection`) and
+`:2818` (`a_resize_keeps_the_tables_scroll_in_range_and_the_next_key_moves_at_once`), with
+`many(n)`'s three-row card (title, 5h, 7d): the body is 24 rows at 80×28 and 20 at 80×24, so
+the table shows 14 accounts at 80×28 (was 17) and 10 at 80×24. Then sweep for the rest: `rg -n "lead
 card|body_of|body\.y|table_y|rows_of_part|card_rows|card_windows"
 crates/tagteam-tui/src` and check each hit against the new stack.
 
@@ -497,7 +497,7 @@ card assertion with a login under seven days or a percentage from 70%.
 
 Delete the lead-card tests whose subject goes (:3265, :3425, :3515, :3839, :3937, :4016, :4273,
 :4289, :4361; `:4229` already went in Task 3), with the helpers only they call: `lead_rows`
-(:3245), `NO_ACCOUNT_IN_USE` (:3260), `twenty()` (:3809) and `m()` (:3834); keep
+(:3245), `NO_ACCOUNT_IN_USE` (:3259), `twenty()` (:3809) and `m()` (:3834); keep
 `rows_of_part`, `joined` (the ported :3338 uses it) and `lead_bar_of` (the thick-bar test uses
 it); then check no other test helper is left without a caller (clippy runs on all targets).
 Delete `:3715` too: its subject, a long name before the pick, is the strip's, and
@@ -540,10 +540,10 @@ rule.
   `problem_rows` :186 (an indent parameter), `facts_of` :353, `window_rows`, `Row` and
   `reset_tail` :~430-520, `value_cell` :543, `keys_row`, `min_height`, `height`, `furthest`; the
   sparkline constants, `CARD_DEBOUNCE_MS`, `CARD_SINCE_S`, `SHORT_SINCE_S`)
-- Modify: `crates/tagteam-tui/src/gauge.rs` (`sparkline` :127 and its tests :290, and
+- Modify: `crates/tagteam-tui/src/gauge.rs` (`sparkline` :129 and its tests :290, and
   sparkline's half of :317, go; its only caller was the card)
 - Modify, the card's history read, all of it: `screens/accounts.rs` (`AccountsState::card`,
-  `card_for`, `card_due_ms`; `schedule_card` :94; `on_tick` :189; `on_card` :206; the
+  `card_for`, `card_due_ms`; `schedule_card` :94; `on_tick` :188; `on_card` :206; the
   `schedule_card` call in `handle_key`), `state.rs:293` (`load_card`), `msg.rs` (`Cmd::LoadCard`,
   `Msg::Card`, `ViewsReq::Card` :31 and its arm in `same_as` :90), `update.rs` (`Msg::Card` :68,
   the `schedule_card` call :42, the `on_tick` call if `on_tick` is left empty), `lanes.rs:224`,
@@ -557,18 +557,22 @@ rule.
   :1153), :1198, :1406, :1441, :1455, :1470-1600 (`card_reads` :1470, :1482, :1535), :1711,
   :1770, :1788, :1812, :1844, :1877, :1939, :1980, :2007, :2046, :2123, :2188, :2213, :2238,
   the card half of :4081, :4160, and Task 4's ports of :3450 and :4203; the tests Task 4
-  recounted for the new stack that count the card's rows, `:1634`, `:2756` and `:2818`, again
-  for the card's facts and keys rows (S§5.4: the keys row stays while the separators do);
+  recounted for the new stack that count the card's rows, again for the card's facts and keys
+  rows (S§5.4: the keys row stays while the separators do): `:1634`'s 7-row card holds the
+  title, facts, keys and four windows, so its nothing-hidden half takes `scoped(2)`; with
+  `many(n)`'s card now five rows (title, facts, 5h, 7d, keys), `:2756` and `:2818`'s table
+  shows 12 accounts at 80×28 and 8 at 80×24;
   `NEEDS_LOGIN_ROWS`
   (:3419) and its users (problem rows now at the card's indent 2); `runtime.rs:1506`;
   `daemon/mod.rs:943`; `update.rs:756` (`first_card`); `msg.rs:325`
   (`views_requests_of_one_kind_coalesce_whatever_they_ask`: its `card` requests go, its
   `accounts`/`history` ones stay); `crates/tagteam-tui/tests/source.rs` :519
   (`history_is_the_samples_since_the_range_starts`, goes) and :556
-  (`a_failed_read_carries_the_engines_kind_and_words`: keep its subject, an engine error's kind
-  and words reaching the caller, on a read that stays; first check which one refuses the
-  unknown `gone` (`timeline` with `Scope::Account`, or `collect_due`) and assert that read's
-  kind and words; delete the test only if none does); `testutil.rs` `sample` :406, `history_window`
+  (`a_failed_read_carries_the_engines_kind_and_words`: keep its subject on `timeline`, which
+  refuses the unknown account the same way at `eda9605`:
+  `.timeline(&ProviderId::new("claude-code"), &Scope::Account(AccountId::from_string("gone")),
+  0, 70)` errs with kind `no-such-account` and message `no account matches "gone"`;
+  `collect_due` does not refuse it); `testutil.rs` `sample` :406, `history_window`
   :414 and `history_of` :422 once nothing calls them; `words.rs` tests
 
 **Interfaces:**
@@ -794,8 +798,8 @@ the others).
 - Create: `crates/tagteam-tui/src/screens/accounts/list.rs`
 - Modify: `crates/tagteam-tui/src/screens/accounts.rs` (`AccountsState`, `handle_key` :221,
   `render`, `apply`)
-- Modify: `crates/tagteam-tui/src/keys.rs` (`KEYS` :105: a `v` row between `P` :386 and `r`
-  :398; `s`'s label :170-180; the probe test :753 and the footer tests)
+- Modify: `crates/tagteam-tui/src/keys.rs` (`KEYS` :105: a `v` row between `P`'s row :385 and `r`'s
+  :397; `s`'s row :168-179; the probe test :753 and the footer tests)
 - Test: `list.rs` tests; `keys.rs` tests; `accounts.rs` tests; `chrome.rs`
   `accounts_footer_order_at_80_and_120` (:1651, `ACCOUNTS_80` :1620) and
   `with_no_accounts_the_footer_hides_the_account_keys` (:1678)
