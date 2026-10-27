@@ -29,13 +29,6 @@ fn filled(pct: f64, cells: usize) -> f64 {
     pct / 100.0 * cells as f64
 }
 
-/// The cell `expected` falls in, the last one at most (T3-17).
-fn pace_cell(expected: Option<f64>, cells: usize) -> Option<usize> {
-    let expected = expected.filter(|e| !e.is_nan())?;
-    let cell = filled(expected, cells).floor() as usize;
-    cell.min(cells.checked_sub(1)?).into()
-}
-
 /// One span per run of cells in the same role.
 fn spans(cells: Vec<(char, Role)>, theme: Theme) -> Vec<Span<'static>> {
     let mut runs: Vec<(String, Role)> = Vec::new();
@@ -51,21 +44,15 @@ fn spans(cells: Vec<(char, Role)>, theme: Theme) -> Vec<Span<'static>> {
 }
 
 /// The table's and the Now strip's gauge (§4.4): `━` whole cells and a `╸` half cell in the
-/// fill's role on a faint `─` track (tier 0 `·`), the pace mark `┿` inside the whole cells and a
-/// muted `┼` elsewhere.
-pub(crate) fn line_gauge(
-    pct: f64,
-    expected: Option<f64>,
-    cells: usize,
-    theme: Theme,
-) -> Vec<Span<'static>> {
-    gauge(pct, expected, fill_role(pct), cells, theme)
+/// fill's role on a faint `─` track (tier 0 `·`).
+pub(crate) fn line_gauge(pct: f64, cells: usize, theme: Theme) -> Vec<Span<'static>> {
+    gauge(pct, fill_role(pct), cells, theme)
 }
 
 /// The block's progress (T5-13): `━` whole cells and a `╸` half in accent on a faint `─` track
 /// (tier 0 `·`), `cells` wide.
 pub(crate) fn progress_line(pct: f64, cells: usize, theme: Theme) -> Vec<Span<'static>> {
-    gauge(pct, None, Role::Accent, cells, theme)
+    gauge(pct, Role::Accent, cells, theme)
 }
 
 /// Tokens' share line (§4.4, T5-17): `━` whole cells and a `╸` half, at least `╸` above 0.
@@ -77,47 +64,32 @@ pub(crate) fn share_line(pct: f64, cells: usize) -> String {
 }
 
 /// `line_gauge`'s drawing with its fill in `fill`.
-fn gauge(
-    pct: f64,
-    expected: Option<f64>,
-    fill: Role,
-    cells: usize,
-    theme: Theme,
-) -> Vec<Span<'static>> {
+fn gauge(pct: f64, fill: Role, cells: usize, theme: Theme) -> Vec<Span<'static>> {
     let x = filled(pct, cells);
     let whole = x.floor() as usize;
     let half = x - x.floor() >= 0.5;
     let track = if theme.colourless() { '·' } else { '─' };
-    let pace = pace_cell(expected, cells);
     let drawn = (0..cells)
-        .map(|i| match (Some(i) == pace, i < whole) {
-            (true, true) => ('┿', fill),
-            (true, false) => ('┼', Role::Muted),
-            (false, true) => ('━', fill),
-            (false, false) if i == whole && half => ('╸', fill),
+        .map(|i| match (i < whole, i == whole && half) {
+            (true, _) => ('━', fill),
+            (false, true) => ('╸', fill),
             (false, false) => (track, Role::Faint),
         })
         .collect();
     spans(drawn, theme)
 }
 
-/// The lead card's bar (§4.4): `▆` in the fill's role on a faint `▁` baseline, the pace mark `│`
-/// in text inside the fill and muted outside it.
-pub(crate) fn lead_bar(
-    pct: f64,
-    expected: Option<f64>,
-    cells: usize,
-    theme: Theme,
-) -> Vec<Span<'static>> {
+/// The lead card's bar (§4.4): `▆` in the fill's role on a faint `▁` baseline.
+pub(crate) fn lead_bar(pct: f64, cells: usize, theme: Theme) -> Vec<Span<'static>> {
     let fill = fill_role(pct);
     let whole = filled(pct, cells).round() as usize;
-    let pace = pace_cell(expected, cells);
     let drawn = (0..cells)
-        .map(|i| match (Some(i) == pace, i < whole) {
-            (true, true) => ('│', Role::Text),
-            (true, false) => ('│', Role::Muted),
-            (false, true) => ('▆', fill),
-            (false, false) => ('▁', Role::Faint),
+        .map(|i| {
+            if i < whole {
+                ('▆', fill)
+            } else {
+                ('▁', Role::Faint)
+            }
         })
         .collect();
     spans(drawn, theme)
@@ -209,7 +181,7 @@ mod tests {
                 (f64::NAN, track.repeat(9)),
             ];
             for (pct, want) in cases {
-                let (text, _) = drawn(line_gauge(pct, None, 9, theme), theme);
+                let (text, _) = drawn(line_gauge(pct, 9, theme), theme);
                 assert_eq!(text, want, "{pct} in {theme:?}");
             }
             // The fill's cells, the half cell included, then the track's.
@@ -219,7 +191,7 @@ mod tests {
                 (95.0, Role::Crit, 9),
             ] {
                 assert_eq!(fill_role(pct), role, "{pct}");
-                let (_, letters) = drawn(line_gauge(pct, None, 9, theme), theme);
+                let (_, letters) = drawn(line_gauge(pct, 9, theme), theme);
                 let want = format!(
                     "{}{}",
                     letter(role).to_string().repeat(fill),
@@ -231,56 +203,24 @@ mod tests {
     }
 
     #[test]
-    fn a_line_gauge_s_pace_mark_is_inside_or_outside_the_fill() {
+    fn a_line_gauge_draws_no_pace_mark() {
         for theme in TIERS {
             let track = if theme.colourless() { "·" } else { "─" };
-            let (text, letters) = drawn(line_gauge(54.0, Some(62.0), 9, theme), theme);
-            assert_eq!(text, format!("━━━━╸┼{}", track.repeat(3)), "{theme:?}");
-            assert_eq!(letters, canon(theme, "aaaaamfff"), "{theme:?}");
-
-            let (text, letters) = drawn(line_gauge(31.0, Some(24.0), 14, theme), theme);
-            assert_eq!(text, format!("━━━┿{}", track.repeat(10)), "{theme:?}");
-            assert_eq!(letters, canon(theme, "aaaaffffffffff"), "{theme:?}");
-
-            let (text, letters) = drawn(line_gauge(6.0, Some(10.0), 14, theme), theme);
-            assert_eq!(text, format!("╸┼{}", track.repeat(12)), "{theme:?}");
-            assert_eq!(letters, canon(theme, "amffffffffffff"), "{theme:?}");
-
-            // On the half cell the mark takes its place.
-            let (text, letters) = drawn(line_gauge(54.0, Some(50.0), 9, theme), theme);
-            assert_eq!(text, format!("━━━━┼{}", track.repeat(4)), "{theme:?}");
-            assert_eq!(letters, canon(theme, "aaaamffff"), "{theme:?}");
+            let (text, _) = drawn(line_gauge(54.0, 9, theme), theme);
+            assert_eq!(text, format!("━━━━╸{}", track.repeat(4)), "{theme:?}");
+            assert!(!text.contains(['┿', '┼', '│']), "{text}");
         }
     }
 
     #[test]
-    fn a_lead_bar_fills_on_a_baseline_with_its_pace_mark() {
+    fn a_lead_bar_draws_no_pace_mark() {
         for theme in TIERS {
-            let (text, letters) = drawn(lead_bar(53.0, None, 52, theme), theme);
+            let (text, letters) = drawn(lead_bar(53.0, 52, theme), theme);
             assert_eq!(text, format!("{}{}", "▆".repeat(28), "▁".repeat(24)));
+            assert!(!text.contains(['┿', '┼', '│']), "{text}");
             assert_eq!(
                 letters,
                 canon(theme, &format!("{}{}", "a".repeat(28), "f".repeat(24))),
-                "{theme:?}"
-            );
-
-            let (text, letters) = drawn(lead_bar(6.0, Some(10.0), 52, theme), theme);
-            assert_eq!(text, format!("▆▆▆▁▁│{}", "▁".repeat(46)));
-            assert_eq!(
-                letters,
-                canon(theme, &format!("aaaffm{}", "f".repeat(46))),
-                "{theme:?}"
-            );
-
-            let (text, letters) = drawn(lead_bar(53.0, Some(30.0), 52, theme), theme);
-            assert_eq!(text.chars().position(|c| c == '│'), Some(15));
-            assert_eq!(text.chars().count(), 52);
-            assert_eq!(
-                letters,
-                canon(
-                    theme,
-                    &format!("{}t{}{}", "a".repeat(15), "a".repeat(12), "f".repeat(24))
-                ),
                 "{theme:?}"
             );
         }
@@ -322,27 +262,22 @@ mod tests {
         }];
         for theme in TIERS {
             let track = if theme.colourless() { "·" } else { "─" };
-            let line =
-                |pct, expected, cells| drawn(line_gauge(pct, expected, cells, theme), theme).0;
-            let lead = |pct, expected, cells| drawn(lead_bar(pct, expected, cells, theme), theme).0;
+            let line = |pct, cells| drawn(line_gauge(pct, cells, theme), theme).0;
+            let lead = |pct, cells| drawn(lead_bar(pct, cells, theme), theme).0;
             let spark = |from_s, to_s, cells| {
                 drawn(vec![sparkline(&samples, from_s, to_s, cells, theme)], theme).0
             };
             let cases = [
-                (line(54.0, Some(50.0), 0), "", 0),
-                (lead(54.0, Some(50.0), 0), "", 0),
+                (line(54.0, 0), "", 0),
+                (lead(54.0, 0), "", 0),
                 (spark(0, 400, 0), "", 0),
-                (line(54.0, Some(50.0), 1), "┼", 1),
-                (lead(54.0, Some(50.0), 1), "│", 1),
+                (line(54.0, 1), "╸", 1),
+                (lead(54.0, 1), "▆", 1),
                 (spark(0, 400, 1), "▅", 1),
-                (line(-20.0, None, 9), "─────────", 9),
-                (lead(-20.0, None, 9), "▁▁▁▁▁▁▁▁▁", 9),
-                (line(54.0, Some(150.0), 9), "━━━━╸───┼", 9),
-                (lead(54.0, Some(150.0), 9), "▆▆▆▆▆▁▁▁│", 9),
-                (line(54.0, Some(-10.0), 9), "┿━━━╸────", 9),
-                (lead(54.0, Some(-10.0), 9), "│▆▆▆▆▁▁▁▁", 9),
-                (line(54.0, Some(f64::NAN), 9), "━━━━╸────", 9),
-                (lead(54.0, Some(f64::NAN), 9), "▆▆▆▆▆▁▁▁▁", 9),
+                (line(54.0, 9), "━━━━╸────", 9),
+                (lead(54.0, 9), "▆▆▆▆▆▁▁▁▁", 9),
+                (line(-20.0, 9), "─────────", 9),
+                (lead(-20.0, 9), "▁▁▁▁▁▁▁▁▁", 9),
                 (spark(400, 400, 4), "    ", 4),
                 (spark(400, 0, 4), "    ", 4),
             ];

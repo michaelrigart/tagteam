@@ -2,7 +2,7 @@
 //! windows as lead bars, the forecast's best pick, and its problem under them.
 
 use ratatui::text::{Line, Span};
-use tagteam_core::{Pace, Window, WindowKind};
+use tagteam_core::{Pace, Window};
 use tagteam_engine::switch::{BestForecast, NoPick};
 use tagteam_engine::views::{AccountView, ProviderAccounts};
 use tagteam_engine::words;
@@ -262,11 +262,6 @@ fn bar_rows(
     windows
         .into_iter()
         .map(|(w, p)| {
-            // C-8: only long and scoped windows have a pace mark.
-            let expected = match w.kind {
-                WindowKind::Long | WindowKind::Scoped => p.expected_pct,
-                WindowKind::Short | WindowKind::Spend => None,
-            };
             let mut value = card::value_cell(w, theme);
             if w.pct.round() as i64 >= BOLD_FROM {
                 value.style = value.style.patch(theme.strong());
@@ -275,7 +270,7 @@ fn bar_rows(
                 "{INDENT}{}{GAP}",
                 pad(&w.label, label_w)
             ))];
-            spans.extend(lead_bar(w.pct, expected, cells, theme));
+            spans.extend(lead_bar(w.pct, cells, theme));
             spans.push(Span::raw(GAP));
             spans.push(value);
             if p.ahead == Some(true) {

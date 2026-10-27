@@ -435,11 +435,7 @@ fn cell(col: &Column, ws: &[(Window, Pace)], theme: Theme) -> Vec<Span<'static>>
                 }
                 None => {
                     if col.gauge > 0 {
-                        let expected = match col.kind {
-                            WindowKind::Long | WindowKind::Scoped => p.expected_pct,
-                            WindowKind::Short | WindowKind::Spend => None,
-                        };
-                        spans.extend(line_gauge(w.pct, expected, col.gauge, theme));
+                        spans.extend(line_gauge(w.pct, col.gauge, theme));
                         spans.push(Span::raw(" "));
                     }
                     let text = format!("{pct}%");

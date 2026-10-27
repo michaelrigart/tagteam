@@ -232,14 +232,15 @@ fn in_use_parts(v: &AccountView, width: u16, now_ms: i64, theme: Theme) -> NowPa
         spans.push(Span::styled(w.label.clone(), theme.role(Role::Muted)));
         spans.push(Span::raw(" "));
         if width >= WIDE {
-            // C-8: only a long window has a pace mark.
-            let expected = (w.kind == WindowKind::Long)
-                .then_some(p.expected_pct)
-                .flatten();
-            spans.extend(line_gauge(w.pct, expected, NOW_GAUGE, theme));
+            spans.extend(line_gauge(w.pct, NOW_GAUGE, theme));
             spans.push(Span::raw(" "));
         }
         spans.push(card::value_cell(w, theme));
+        // C-8: only a long or scoped window is ahead of pace.
+        if p.ahead == Some(true) && matches!(w.kind, WindowKind::Long | WindowKind::Scoped) {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled("▲", theme.role(Role::Warn)));
+        }
         if let Some(at) = w.resets_at {
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
@@ -1150,6 +1151,40 @@ mod tests {
             lines.iter().all(|l| !l.starts_with(" ● 2 work")),
             "{lines:?}"
         );
+    }
+
+    /// `screen` with `work` read and in use, its 7d window ahead of pace.
+    fn state_on(screen: Screen) -> State {
+        let mut state = fresh(screen);
+        let mut work = account(2, "sam@corp.example", read(60, 53.0, 82.0, true));
+        work.row.alias = Some("work".into());
+        work.active = true;
+        state.accounts.apply(snapshot(vec![work]));
+        state
+    }
+
+    #[test]
+    fn the_now_strip_marks_an_ahead_window_after_its_percentage() {
+        // Tokens and History, `work` in use with 7d ahead: `read(60, 53.0, 82.0, true)`.
+        for screen in [Screen::Tokens, Screen::History] {
+            for w in [80, 120] {
+                let rows = draw(&state_on(screen), w, 30);
+                let strip = &rows[2];
+                assert!(strip.contains(" 82% ▲ "), "{strip}");
+                assert!(!strip.contains('┿') && !strip.contains('┼'), "{strip}");
+            }
+        }
+        for theme in TIERS {
+            for w in [80, 120] {
+                let mut state = state_on(Screen::Tokens);
+                state.theme = theme;
+                let buf = draw_buffer(&state, w, 30, NOW_MS);
+                let (x, y) = locate(&buf, "▲").expect("the mark is drawn");
+                assert_eq!(y, 2);
+                let got = roles(&buf, theme, y).chars().nth(usize::from(x));
+                assert_eq!(got, canon(theme, "w").chars().next(), "{theme:?} {w}");
+            }
+        }
     }
 
     #[test]

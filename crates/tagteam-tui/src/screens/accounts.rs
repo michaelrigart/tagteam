@@ -777,9 +777,8 @@ mod tests {
     }
 
     #[test]
-    fn the_table_draws_the_pace_mark_on_long_windows_only() {
-        // C-8: a long window's pace mark shows in the table; a short window has none, even with
-        // an expected percentage.
+    fn the_table_draws_no_pace_mark() {
+        // The expected shares draw no mark in the table, on a long window or a short one.
         let mut usage = read(60, 30.0, 30.0, false);
         let windows = usage.windows.as_mut().unwrap();
         windows[0].1.expected_pct = Some(10.0);
@@ -793,31 +792,9 @@ mod tests {
             ]);
             state.theme = theme;
             let body = table_of(&state, 120, 40, NOW_MS);
-            let (five, seven) = (col(&body[0], "5H"), col(&body[0], "7D"));
-            let track = if theme.colourless() { "·" } else { "─" };
-            let gauge = |row: &str, at: usize| columns(row, at, at + 14);
-            assert_eq!(gauge(&body[1], five), format!("━━━━{}", track.repeat(10)));
-            assert_eq!(
-                gauge(&body[1], seven),
-                format!("━━━━{}┼{}", track.repeat(3), track.repeat(6))
-            );
-            assert_eq!(
-                gauge(&body[2], seven),
-                format!("━━┿━━━━━{}", track.repeat(6))
-            );
-            // `┿` in the fill's role inside it, `┼` muted outside.
-            let buf = draw_buffer(&state, 120, 40, NOW_MS);
-            let y = table_y(&state, 120, 40);
-            let at = |row: u16, x: usize| roles(&buf, theme, y + row).chars().nth(x);
-            assert_eq!(
-                at(1, seven + 7),
-                canon(theme, "m").chars().next(),
-                "{theme:?}"
-            );
-            assert_eq!(
-                at(2, seven + 2),
-                canon(theme, "a").chars().next(),
-                "{theme:?}"
+            assert!(
+                body.iter().all(|row| !row.contains(['┿', '┼'])),
+                "{theme:?}: {body:?}"
             );
         }
     }
@@ -4223,50 +4200,6 @@ mod tests {
             let (got, want) = role_of(&buf, theme, y + 2, "69%", 't');
             assert_eq!(got, want, "{theme:?}");
         }
-    }
-
-    #[test]
-    fn only_long_and_scoped_lead_bars_have_a_pace_mark() {
-        // C-8: a short window and a spend have no pace mark, whatever their expected share.
-        let mut accounts = three();
-        let windows = accounts[1].usage.windows.as_mut().unwrap();
-        for (w, p) in windows.iter_mut() {
-            w.pct = 40.0;
-            p.expected_pct = Some(50.0);
-        }
-        let pace = Pace {
-            expected_pct: Some(50.0),
-            ..Pace::default()
-        };
-        windows.push((
-            window(
-                "scoped:fable",
-                "Fable",
-                WindowKind::Scoped,
-                40.0,
-                Some(291_630),
-            ),
-            pace,
-        ));
-        let mut spend = window("spend", "spend", WindowKind::Spend, 40.0, Some(1_209_630));
-        spend.detail = Some(r#"{"used": 20, "limit": 50, "currency": "EUR"}"#.parse().unwrap());
-        windows.push((spend, pace));
-        let lead = lead_rows(&loaded(accounts), 120, 40).1;
-        // The label column is 5 wide: the bars are columns 11 to 63; the mark is cell 26.
-        let bar = |row: &str| columns(row, 11, 63);
-        let marked = format!("{}│{}", "▆".repeat(21) + &"▁".repeat(5), "▁".repeat(25));
-        assert_eq!(
-            bar(&lead[1]),
-            "▆".repeat(21) + &"▁".repeat(31),
-            "5h: {lead:?}"
-        );
-        assert_eq!(bar(&lead[2]), marked, "7d: {lead:?}");
-        assert_eq!(bar(&lead[3]), marked, "Fable: {lead:?}");
-        assert_eq!(
-            bar(&lead[4]),
-            "▆".repeat(21) + &"▁".repeat(31),
-            "spend: {lead:?}"
-        );
     }
 
     #[test]
