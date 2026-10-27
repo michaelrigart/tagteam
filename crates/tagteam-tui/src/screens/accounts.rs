@@ -242,15 +242,19 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
     vec![]
 }
 
-/// `J`/`K`: the card's windows move `by` one, stopping once the last one shows, or at the
-/// first.
+/// `J`/`K`: the selected card's, or the full list's selected block's, windows move `by` one,
+/// stopping once the last one shows, or at the first.
 fn scroll_card(state: &mut State, body: Rect, now_ms: i64, by: isize) {
     let Some(v) = state.accounts.selected_view() else {
         return;
     };
-    let parts = parts(state, body, now_ms);
-    let rows = usize::from(parts.card.height);
-    let furthest = card::furthest(state, v, body.width, rows, parts.keys, now_ms);
+    let furthest = if state.accounts.view == View::List {
+        list::furthest(state, body, now_ms)
+    } else {
+        let parts = parts(state, body, now_ms);
+        let rows = usize::from(parts.card.height);
+        card::furthest(state, v, body.width, rows, parts.keys, now_ms)
+    };
     // From what shows: a resize or a new read may have left the stored scroll past the end.
     let st = &mut state.accounts;
     let from = st.card_from.min(furthest) as isize;
@@ -351,6 +355,24 @@ fn one_account(state: &State) -> bool {
     state
         .view_of(&daemon::focus(state))
         .is_some_and(|p| p.accounts.len() == 1)
+}
+
+/// A provider's display name, muted, as the table and the full list head its accounts.
+fn provider_heading(state: &State, name: &str, width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        fit(&format!(" {name}"), usize::from(width)),
+        state.theme.role(Role::Muted),
+    ))
+}
+
+/// The muted hint to add a second account, for focus's provider (§5.7, T3-7).
+fn add_hint(state: &State, width: u16) -> Line<'static> {
+    let display = state.names_of(&daemon::focus(state)).display_name;
+    let hint = format!(" Add a second account to switch: log in to {display} as it, then press A.");
+    Line::from(Span::styled(
+        fit(&hint, usize::from(width)),
+        state.theme.role(Role::Muted),
+    ))
 }
 
 /// How many scrolling table lines fit in `body`: one provider's header is pinned above them.
@@ -454,10 +476,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     let offset = keep_visible(st.offset, at, at, rows, lines.len());
     for line in lines.iter().skip(offset).take(rows) {
         shown.push(match line {
-            TableLine::Provider(name) => Line::from(Span::styled(
-                fit(&format!(" {name}"), width),
-                state.theme.role(Role::Muted),
-            )),
+            TableLine::Provider(name) => provider_heading(state, name, area.width),
             TableLine::Header(i) => tables[*i].header(state.theme),
             TableLine::Account(i, v) => {
                 let mut row = tables[*i].row(v, now_s, state.theme);
@@ -476,15 +495,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     if one_account(state) {
         let room = usize::from(table_area.height).saturating_sub(shown.len());
         if room > 0 {
-            let display = state.names_of(&daemon::focus(state)).display_name;
-            let hint = format!(
-                " Add a second account to switch: log in to {display} as it, then press A."
-            );
-            let hint = fit(&hint, width);
-            shown.push(Line::from(Span::styled(
-                hint,
-                state.theme.role(Role::Muted),
-            )));
+            shown.push(add_hint(state, area.width));
         }
     }
     frame.render_widget(Paragraph::new(shown), table_area);
@@ -2169,7 +2180,7 @@ mod tests {
         let help = draw(&state, 80, 24);
         assert!(
             help.iter()
-                .any(|l| l.contains("J K") && l.contains("scroll the selected card")),
+                .any(|l| l.contains("J K") && l.contains("scroll the selected card or block")),
             "{help:?}"
         );
     }
@@ -4088,5 +4099,180 @@ mod tests {
             update(&mut state, ch('j'), NOW_MS);
             update(&mut state, ch('v'), NOW_MS);
         }
+    }
+
+    /// Two `Claude Code` accounts, then `fake`'s, in the full list.
+    fn two_providers(fake: Vec<AccountView>) -> State {
+        let mut snap = snapshot(many(2));
+        snap.providers.push(fake_agent(fake, LiveLogin::None));
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snap);
+        update(&mut state, ch('v'), NOW_MS);
+        state
+    }
+
+    #[test]
+    fn a_provider_heading_starts_its_first_block_s_scroll_unit() {
+        // Two providers, View::List at 80×40: the row above provider 2's first block title is
+        // its muted heading, and with that block selected only its own rows take `▌`.
+        let fake = (1..=3).map(|p| fake_account(p, &format!("o{p}@x.co")));
+        let mut state = two_providers(fake.collect());
+        resize(&mut state, 80, 40);
+        assert!(state.accounts.select_id(&AccountId::from_string("fake-1")));
+        let rows = draw(&state, 80, 40);
+        let title = row_of(&rows, "o1@x.co");
+        assert_eq!(rows[title - 1], " FakeAgent");
+        for r in &rows[title..title + 4] {
+            assert!(r.starts_with('▌'), "{r}");
+        }
+        assert!(!rows[title - 1].starts_with('▌'));
+        // At 80×24 the selected second block scrolls the list to the heading; the third, to the
+        // second block's title.
+        resize(&mut state, 80, 24);
+        assert!(state.accounts.select_id(&AccountId::from_string("fake-2")));
+        assert_eq!(draw(&state, 80, 24)[6], " FakeAgent");
+        assert!(state.accounts.select_id(&AccountId::from_string("fake-3")));
+        assert!(draw(&state, 80, 24)[6].contains("o2@x.co"));
+    }
+
+    #[test]
+    fn with_one_account_its_block_is_followed_by_the_add_a_second_hint() {
+        let hint = " Add a second account to switch: log in to Claude Code as it, then press A.";
+        let mut state = loaded(many(1));
+        assert!(draw(&state, 80, 24).iter().any(|l| l == hint));
+        update(&mut state, ch('v'), NOW_MS);
+        let rows = draw(&state, 80, 24);
+        assert!(rows[6].starts_with("▌  1   a1@x.co"), "{}", rows[6]);
+        assert_eq!((rows[10].as_str(), rows[11].as_str()), ("", hint));
+        for r in &rows[6..10] {
+            assert!(r.starts_with('▌'), "{r}");
+        }
+        assert!(!rows[11].starts_with('▌'));
+        // Disabled: the block is DIM, the hint keeps the style it has enabled.
+        for theme in TIERS {
+            let mut accounts = many(1);
+            accounts[0].row.disabled = true;
+            let (mut off, mut on) = (loaded(accounts), loaded(many(1)));
+            for state in [&mut off, &mut on] {
+                state.theme = theme;
+                update(state, ch('v'), NOW_MS);
+            }
+            let (off, on) = (
+                draw_buffer(&off, 80, 24, NOW_MS),
+                draw_buffer(&on, 80, 24, NOW_MS),
+            );
+            for x in 0..80 {
+                assert_eq!(off[(x, 11)].style(), on[(x, 11)].style(), "{theme:?} {x}");
+                for y in 6..10 {
+                    let cell = &off[(x, y)];
+                    assert!(
+                        cell.symbol() == " " || cell.modifier.contains(Modifier::DIM),
+                        "{theme:?} {x},{y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_taller_than_the_viewport_shows_alone_and_scrolls_its_windows() {
+        let mut usage = scoped(22);
+        usage.status = UsageStatus::ReloginRequired;
+        let mut quarantined = account(1, "alex@example.com", usage);
+        quarantined.row.quarantine_reason = Some("invalid_grant".into());
+        let mut accounts = many(2);
+        accounts[0] = quarantined;
+        let mut state = loaded(accounts);
+        update(&mut state, ch('v'), NOW_MS);
+        let hint = |rows: &[String]| rows.iter().position(|l| l.contains("J K: windows"));
+        let rows = draw(&state, 80, 24);
+        assert!(rows[6].contains("alex@example.com"), "{}", rows[6]);
+        assert!(rows[7].contains("not in use"), "{}", rows[7]);
+        let at = hint(&rows).unwrap_or_else(|| panic!("{rows:#?}"));
+        assert_eq!(rows[at], format!("▌      J K: windows 1–{} of 24", at - 8));
+        assert!(rows[at + 1].contains("Needs a new login"), "{rows:?}");
+        assert!(rows[22].contains("Log in to"), "{}", rows[22]);
+        let problems = rows[at + 1..23].to_vec();
+        update(&mut state, ch('J'), NOW_MS);
+        let rows = draw(&state, 80, 24);
+        assert_eq!(hint(&rows), Some(at));
+        assert_eq!(rows[at], format!("▌      J K: windows 2–{} of 24", at - 7));
+        assert_eq!(rows[at + 1..23], problems);
+    }
+
+    #[test]
+    fn a_tall_block_counts_its_heading_and_hint_in_its_height() {
+        // After `J` until it stops: the last window and the hint (24 of 24) are the unit's last
+        // rows, nothing clipped.
+        let furthest = |state: &mut State| {
+            for _ in 0..30 {
+                update(state, ch('J'), NOW_MS);
+            }
+            draw(state, 80, 24)
+        };
+        // (a) A second provider's first block, its heading leading it.
+        let mut tall = fake_account(1, "o1@x.co");
+        tall.usage = scoped(22);
+        let mut state = two_providers(vec![tall, fake_account(2, "o2@x.co")]);
+        assert!(state.accounts.select_id(&AccountId::from_string("fake-1")));
+        let rows = draw(&state, 80, 24);
+        assert_eq!(rows[6], " FakeAgent");
+        assert!(rows[7].contains("o1@x.co"), "{}", rows[7]);
+        assert!(rows[22].contains("J K: windows 1–"), "{}", rows[22]);
+        let rows = furthest(&mut state);
+        assert_eq!(rows[6], " FakeAgent");
+        assert!(rows[21].contains("M22"), "{}", rows[21]);
+        assert!(rows[22].ends_with("–24 of 24"), "{}", rows[22]);
+        // (b) The only account: the blank row and the hint follow it.
+        let mut state = loaded(vec![account(1, "alex@example.com", scoped(22))]);
+        update(&mut state, ch('v'), NOW_MS);
+        let rows = draw(&state, 80, 24);
+        assert!(rows[20].contains("J K: windows 1–"), "{}", rows[20]);
+        assert_eq!(rows[21], "");
+        assert!(rows[22].contains("Add a second account"), "{}", rows[22]);
+        let rows = furthest(&mut state);
+        assert!(rows[19].contains("M22"), "{}", rows[19]);
+        assert!(rows[20].ends_with("–24 of 24"), "{}", rows[20]);
+        assert!(rows[22].contains("Add a second account"), "{}", rows[22]);
+    }
+
+    #[test]
+    fn at_80_by_24_under_a_full_banner_and_toast_the_selected_title_shows() {
+        let mut state = loaded(many(8));
+        state.raise_banner(
+            BannerKind::Refusal,
+            ["the store could not be read"; 12].join("; "),
+        );
+        state.toast(
+            crate::state::ToastKind::Info,
+            ["Switched to alex@example.com (position 1)"; 8].join(" "),
+            NOW_MS,
+        );
+        update(&mut state, ch('v'), NOW_MS);
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        let body = body_of(&state, 80, 24, NOW_MS);
+        let b = body.len();
+        assert!((11..18).contains(&(b - 3)), "{b}");
+        assert!(body[3].contains("a7@x.co"), "{body:?}");
+        assert!(body[10].contains("a8@x.co"), "{body:?}");
+        assert!(
+            body[12].contains("5h") && body[13].contains("7d"),
+            "{body:?}"
+        );
+    }
+
+    #[test]
+    fn a_resize_keeps_the_selected_block_whole() {
+        let mut state = loaded(many(8));
+        resize(&mut state, 120, 40);
+        update(&mut state, ch('v'), NOW_MS);
+        for _ in 0..5 {
+            update(&mut state, ch('j'), NOW_MS);
+        }
+        resize(&mut state, 80, 24);
+        let rows = draw(&state, 80, 24);
+        let title = row_of(&rows, "a6@x.co");
+        assert!(title + 3 <= 22, "{rows:?}");
+        assert!(rows[title + 3].contains("7d"), "{rows:?}");
     }
 }

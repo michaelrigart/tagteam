@@ -437,7 +437,7 @@ pub(crate) const KEYS: &[KeyRow] = &[
     KeyRow {
         screen: Some(Screen::Accounts),
         keys: "J K",
-        does: "scroll the selected card",
+        does: "scroll the selected card or block",
         footer: Footer::No,
         #[cfg(test)]
         probes: &[shifted('J'), shifted('K')],

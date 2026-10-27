@@ -10,6 +10,7 @@ use tagteam_engine::views::AccountView;
 use super::card;
 use super::table::IN_USE;
 use crate::chrome::fit_spans;
+use crate::daemon;
 use crate::state::State;
 use crate::theme::Role;
 use crate::view::select;
@@ -25,14 +26,17 @@ const SEP: usize = PINNED as usize;
 /// The rule between blocks stops this far from each side.
 const INSET: usize = 3;
 
-/// One scroll unit: `head` (Task 7: the provider heading), the account's own `lines` (title
-/// to its last window or problem row), `tail` (Task 7: the blank row and the one-account
-/// hint). Its height counts all three; `▌` and DIM apply to `lines` only (S§6.1).
+/// One scroll unit: `head` (the provider heading), the account's own `lines` (title to its last
+/// window or problem row), `tail` (the blank row and the one-account hint). Its height counts
+/// all three; `▌` and DIM apply to `lines` only (S§6.1).
 pub(super) struct Block {
     pub(super) id: AccountId,
     pub(super) head: Vec<Line<'static>>,
     pub(super) lines: Vec<Line<'static>>,
     pub(super) tail: Vec<Line<'static>>,
+    /// How many windows the account has, and how many rows of the unit are not one of them.
+    windows: usize,
+    fixed: usize,
 }
 
 impl Block {
@@ -41,34 +45,64 @@ impl Block {
     }
 }
 
-/// Every account's block at `width`, in table order.
-pub(super) fn blocks(state: &State, width: u16, now_ms: i64) -> Vec<Block> {
+/// Every account's block at `width`, in table order. The selected block, when it is taller than
+/// `rows`, shows the windows from `card_from` that `rows` hold (S§6.1).
+pub(super) fn blocks(state: &State, width: u16, rows: usize, now_ms: i64) -> Vec<Block> {
     let theme = state.theme;
     let now_s = now_ms.div_euclid(1000);
-    let rows = state.accounts.rows();
+    let sections = super::sections(&state.accounts);
     let at = card::row_layout(
-        rows.iter()
-            .flat_map(|v| card::windows_of(v))
+        sections
+            .iter()
+            .flat_map(|p| &p.accounts)
+            .flat_map(card::windows_of)
             .map(|(w, _)| w),
         INDENT,
         width,
     );
-    rows.into_iter()
-        .map(|v| {
+    let hinted = super::one_account(state).then(|| daemon::focus(state));
+    let mut blocks = Vec::new();
+    for provider in &sections {
+        for (i, v) in provider.accounts.iter().enumerate() {
             let chosen = state.accounts.selected.as_ref() == Some(&v.row.id);
-            let mut lines = vec![
+            let head = if sections.len() > 1 && i == 0 {
+                let name = provider.names.display_name;
+                vec![super::provider_heading(state, name, width)]
+            } else {
+                vec![]
+            };
+            let tail = if hinted.as_ref() == Some(&v.row.provider) {
+                vec![Line::default(), super::add_hint(state, width)]
+            } else {
+                vec![]
+            };
+            let mut windows: Vec<Line<'static>> = card::windows_of(v)
+                .iter()
+                .map(|(w, p)| card::window_line(w, p, &at, v.active, now_s, theme))
+                .collect();
+            let rest: Vec<Line<'static>> = card::no_windows_row(v, INDENT, width, now_s, theme)
+                .into_iter()
+                .chain(card::problem_rows(state, v, INDENT, width, now_ms))
+                .collect();
+            let (n, fixed) = (windows.len(), head.len() + 2 + rest.len() + tail.len());
+            if chosen && n > 0 && fixed + n > rows {
+                let shown = card::Shown::of(rows, fixed, n);
+                let from = state.accounts.card_from.min(n - shown.windows);
+                windows.truncate(from + shown.windows);
+                windows.drain(..from);
+                if shown.hint {
+                    let said = (from + 1, from + shown.windows, n);
+                    windows.push(card::windows_hint(INDENT, said, width, theme));
+                }
+            }
+            let top = [
                 title(v, chosen, width, state),
                 card::facts_row(state, v, INDENT, width, now_ms),
             ];
-            lines.extend(
-                card::windows_of(v)
-                    .iter()
-                    .map(|(w, p)| card::window_line(w, p, &at, v.active, now_s, theme)),
-            );
-            lines.extend(card::no_windows_row(v, INDENT, width, now_s, theme));
-            lines.extend(card::problem_rows(state, v, INDENT, width, now_ms));
-            let lines = lines
+            let lines = top
                 .into_iter()
+                .chain(windows)
+                .chain(rest)
                 .enumerate()
                 .map(|(i, line)| {
                     let line = if v.row.disabled {
@@ -83,14 +117,17 @@ pub(super) fn blocks(state: &State, width: u16, now_ms: i64) -> Vec<Block> {
                     }
                 })
                 .collect();
-            Block {
+            blocks.push(Block {
                 id: v.row.id.clone(),
-                head: vec![],
+                head,
                 lines,
-                tail: vec![],
-            }
-        })
-        .collect()
+                tail,
+                windows: n,
+                fixed,
+            });
+        }
+    }
+    blocks
 }
 
 /// The title (S§6.1): the position right-aligned in columns 1-3, `●` for the account in use, the
@@ -155,7 +192,8 @@ struct Geometry {
 }
 
 fn geometry(state: &State, body: Rect, now_ms: i64) -> Geometry {
-    let blocks = blocks(state, body.width, now_ms);
+    let rows = usize::from(body.height.saturating_sub(PINNED));
+    let blocks = blocks(state, body.width, rows, now_ms);
     let heights = blocks
         .iter()
         .enumerate()
@@ -169,8 +207,18 @@ fn geometry(state: &State, body: Rect, now_ms: i64) -> Geometry {
         blocks,
         heights,
         at,
-        rows: usize::from(body.height.saturating_sub(PINNED)),
+        rows,
     }
+}
+
+/// The first window `J` scrolls the selected block to at most, when it is taller than the
+/// viewport: from there on every window shows, the last one included.
+pub(super) fn furthest(state: &State, body: Rect, now_ms: i64) -> usize {
+    let g = geometry(state, body, now_ms);
+    let Some(b) = g.blocks.get(g.at).filter(|b| b.fixed + b.windows > g.rows) else {
+        return 0;
+    };
+    b.windows - card::Shown::of(g.rows, b.fixed, b.windows).windows
 }
 
 /// Moves the first block shown the least that keeps the selected one whole.

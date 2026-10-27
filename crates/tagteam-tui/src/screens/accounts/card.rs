@@ -80,17 +80,8 @@ pub(crate) fn lines(
             .map(|(w, p)| window_line(w, p, &at, v.active, now_s, theme)),
     );
     if shown.hint {
-        let (a, b) = (from + 1, from + shown.windows);
-        lines.push(Line::from(vec![
-            Span::raw(" ".repeat(CARD_INDENT)),
-            Span::styled(
-                fit(
-                    &format!("J K: windows {a}–{b} of {n}"),
-                    usize::from(width).saturating_sub(CARD_INDENT),
-                ),
-                theme.role(Role::Muted),
-            ),
-        ]));
+        let said = (from + 1, from + shown.windows, n);
+        lines.push(windows_hint(CARD_INDENT, said, width, theme));
     }
     lines.extend(none);
     lines.extend(problems);
@@ -116,16 +107,16 @@ pub(super) fn furthest(
 }
 
 /// What the card's window rows show in `rows` lines beside its `fixed` others.
-struct Shown {
+pub(super) struct Shown {
     /// How many windows: one at least when it has any, as T3-22 reserves.
-    windows: usize,
+    pub(super) windows: usize,
     /// Whether the last window row says which windows show instead (`J K: windows a–b of n`):
     /// when not every window fits and two rows or more are left for them.
-    hint: bool,
+    pub(super) hint: bool,
 }
 
 impl Shown {
-    fn of(rows: usize, fixed: usize, windows: usize) -> Shown {
+    pub(super) fn of(rows: usize, fixed: usize, windows: usize) -> Shown {
         let room = rows.saturating_sub(fixed).max(usize::from(windows > 0));
         let hint = windows > room && room >= 2;
         Shown {
@@ -133,6 +124,25 @@ impl Shown {
             hint,
         }
     }
+}
+
+/// The row that says which windows show, `J K: windows a–b of n`, muted, from `indent`.
+pub(super) fn windows_hint(
+    indent: usize,
+    (a, b, n): (usize, usize, usize),
+    width: u16,
+    theme: Theme,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(" ".repeat(indent)),
+        Span::styled(
+            fit(
+                &format!("J K: windows {a}–{b} of {n}"),
+                usize::from(width).saturating_sub(indent),
+            ),
+            theme.role(Role::Muted),
+        ),
+    ])
 }
 
 /// `v`'s first short and first long window, in that order: the Now strip's (§5.4).
