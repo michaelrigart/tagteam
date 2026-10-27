@@ -301,7 +301,8 @@ long or scoped.
   `Parts` :277, `parts` :289, `render` :401-487)
 - Modify: `crates/tagteam-tui/src/screens/accounts/lead.rs` (keep `in_use`, `pick_words`,
   `PICK_GAP`, `LEFT_LEAST`, `NO_ACCOUNT`'s users if any remain; delete `Lead` (with its
-  `shown`), `lead`, `height`, `no_account`, `with_pick`, `title`, `facts_of`, `bar_rows`,
+  `shown`), `lead`, `height`, `no_account` and its `NO_ACCOUNT_HINT` (:37, used only at :160),
+  `with_pick`, `title`, `facts_of`, `bar_rows`,
   `fold_line`, `BAR_WIDE`, `BAR`, `TITLE_INDENT`, `BOLD_FROM`, `SOON_S`, `LOG_IN_AGAIN` (Task 5
   defines the last three again in `card.rs`, where they get their caller); the module doc says
   what is left)
@@ -505,9 +506,11 @@ fn a_window_row_has_its_parts_at_fixed_columns() {
 
 #[test]
 fn pace_words_show_at_80_when_they_fit_and_never_on_short_or_spend_windows() {
-    // A long window with no rate and reset in 0h12m: `  7d     {bar}  82% ▲  resets in 0h12m ·
-    // 26% expected by now` fits 80: the words show. The same pace on a Short (5h) window and on
-    // a Spend window: no `▲`, no words.
+    // A long window with no rate, resetting at NOW_S + 720: the row is exactly
+    // `  7d     {bar}  82% ▲  resets in 12m · 26% expected by now` (no rate, no projection, no
+    // `not enough data yet`) and fits 80: the words show. With a rate, the row has
+    // `· +2.3%/h · full in …`; without, neither part. The same pace on a Short (5h) window and
+    // on a Spend window: no `▲`, no words.
 }
 
 #[test]
@@ -612,16 +615,20 @@ the others).
     `gauge::lead_bar` when `thick`, else `gauge::line_gauge`, 16 or 26 cells by `chrome::WIDE`.
     The value is `value_cell`, bold (`theme.strong()` patched on) from 70%. `▲` shows only on
     long and scoped windows with `p.ahead == Some(true)`.
-  - The tail is the reset (as `reset_tail` has it: `resets in …`, `reset`, `not started`), then
-    ` · {rate}%/h` when there is a rate, then ` · {projection}`:
-    `projection_clause(…, short = width < WIDE)`, warn when the window fills before it resets.
-    Today's narrow tail drops the rate (`card.rs:508-518`); this one keeps it.
+  - The tail is the reset (as `reset_tail` has it: `resets in …`, `reset`, `not started`),
+    then, only when `p.rate_per_hour` is `Some` (the guard `card.rs:508` has today, since
+    `words.rs:304-305` gives `not enough data yet` without a rate), ` · {rate}%/h ·
+    {projection}`: `projection_clause(…, short = width < WIDE)`, warn when the window fills
+    before it resets. Today's narrow tail drops the rate (`card.rs:508-518`); this one keeps it.
   - Then ` · {expected_words}` when `▲` shows and `expected_pct` is `Some`, if the whole row fits
     the width; otherwise the row goes through `fit_spans`. `▲` never expands in place.
   - `row_layout`: `label_width(windows, width) + 2`; `value_w` is 4, or the widest
     `words::spend_text` among the windows.
   - The card (S§3.4):
-    - title `SELECTED` muted, two spaces, `{position} `, `name_spans`;
+    - title `SELECTED` muted, two spaces, `{position} `, `name_spans`, cut to the width with
+      `chrome::fit_spans` (the facts are on their own row now, so `title_spans` loses its last
+      production caller: delete it, `TITLE_GAP` (:37) and its test `a_title_s_name_keeps_its_
+      floor_until_its_facts_are_gone`; keep `floored` and `floored_least`, which chrome uses);
     - `facts_row` at indent 10: `facts_of` with `IN USE` in accent for the account in use,
       `next update` last and only from `WIDE`, and the soon-to-expire rule: define
       `const SOON_S: i64 = 7 * 86_400;` and `const LOG_IN_AGAIN: &str = "log in again before
@@ -635,7 +642,9 @@ the others).
   - `min_height`: title + facts + one window (or the no-windows row, only when there is no
     problem) + problem rows. `height` adds the other windows and the keys row. `parts` (Task 4) passes `keys` and adds S§5.4
     step 2.
-  - Remove the card's history read end to end, as listed under Files.
+  - Remove the card's history read end to end, as listed under Files, with the test source
+    only that read used: `runtime.rs` `Carded` and `CARD_SAMPLES` (:993-1030), whose one use is
+    the deleted test at :1506.
 
 - [ ] **Step 4: Run to verify they pass** — `cargo test --workspace --locked --no-fail-fast
 --features tagteam/test-support` and the clippy runs. PASS, no dead code.
@@ -703,22 +712,28 @@ fn v_toggles_the_full_list_and_keeps_the_selection() {
 #[test]
 fn the_full_list_at_80_by_24_matches_the_spec() {
     // S§6.1's mock: Task 4's `mock()` (three windows each), account 1 selected (`k`), then
-    // `v`; a coloured theme, since `fresh` is tier 0, where the separator is `·`.
-    let mut state = loaded(mock());
-    state.theme = Theme::new(true);
-    update(&mut state, ch('k'), NOW_MS);
-    update(&mut state, ch('v'), NOW_MS);
-    let rows = draw(&state, 80, 24);
-    assert_eq!(rows[3], ""); assert!(rows[4].chars().all(|c| c == '─')); assert_eq!(rows[5], "");
-    assert!(rows[6].starts_with("▌  1   alex@example.com"));
-    for r in &rows[6..11] { assert!(r.starts_with('▌'), "{r}"); }
-    assert!(rows[11..].iter().all(|r| !r.starts_with('▌')));
-    assert_eq!(rows[12], format!("   {}", "┈".repeat(74)));     // ends three columns in
-    assert!(rows[14].starts_with("   2 ● work  sam@corp.example"));
-    assert_eq!(col(&rows[15], "IN USE"), 7);
-    assert!(rows[16].starts_with("       5h     ▆"));             // thick, from column 7
-    assert!(rows[22].starts_with("   3   spare"));                // cut at the body's end
-    assert!(!rows.iter().any(|r| r.contains("x remove") && !r.contains("q quit"))); // no keys row
+    // `v`, in every tier (tier 0, `fresh`'s default, has `·` separators).
+    for theme in TIERS {
+        let mut state = loaded(mock());
+        state.theme = theme;
+        update(&mut state, ch('k'), NOW_MS);
+        update(&mut state, ch('v'), NOW_MS);
+        let rows = draw(&state, 80, 24);
+        let dot = if theme == TIERS[0] { "·" } else { "┈" };
+        assert_eq!(rows[3], ""); assert_eq!(rows[5], "");
+        assert!(rows[4].chars().all(|c| c == rows[4].chars().next().unwrap()));
+        assert!(rows[6].starts_with("▌  1   alex@example.com"));
+        for r in &rows[6..11] { assert!(r.starts_with('▌'), "{r}"); }
+        assert!(rows[11..].iter().all(|r| !r.starts_with('▌')));
+        assert_eq!(rows[12], format!("   {}", dot.repeat(74)));   // ends three columns in
+        assert!(rows[14].starts_with("   2 ● work  sam@corp.example"));
+        assert_eq!(col(&rows[15], "IN USE"), 7);
+        assert!(rows[16].starts_with("       5h     ▆"));           // thick, from column 7
+        assert!(rows[8].starts_with("▌      5h     ") && !rows[8].contains('▆')); // thin
+        assert_eq!(col(&rows[8], "%"), col(&rows[16], "%"));       // one % column
+        assert!(rows[22].starts_with("   3   spare"));              // cut at the body's end
+        assert!(!rows.iter().any(|r| r.contains("x remove") && !r.contains("q quit"))); // no keys row
+    }
 }
 
 #[test]
@@ -750,8 +765,11 @@ fn moving_past_the_last_whole_block_scrolls_one_block() {
 
 #[test]
 fn page_keys_move_by_the_whole_blocks_shown() {
-    // `many(8)` (two whole blocks fit at 80×24): from 1, PgDn selects 3, PgDn 5; PgUp 3; at least
-    // one block when only one fits (80×24 under a full banner).
+    // `many(8)` (4-row blocks; two whole blocks fit in the 17-row viewport at 80×24): from 1,
+    // PgDn selects 3, PgDn 5; PgUp 3. One block shown: eight accounts with four windows each
+    // (`read` plus two scoped windows, as `with_windows(&["M1", "M2"])` builds; 6-row blocks,
+    // two need 6 + 3 + 6 = 15 rows) under a three-row banner (a 14-row viewport): PgDn moves
+    // exactly one account.
 }
 
 #[test]
