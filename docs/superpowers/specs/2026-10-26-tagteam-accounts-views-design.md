@@ -1,6 +1,6 @@
 # tagteam — Accounts in one format, a full list, and pre-tracking token rows
 
-**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/50
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/50
 **Date:** 2026-10-26
 **Scope:** The TUI's Accounts screen and one label on its Tokens screen. Accounts loses the lead
 card, shows every account's details in one format, and gains a full-list view (`v`). Tokens names

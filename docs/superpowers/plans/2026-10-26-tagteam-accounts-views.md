@@ -1,6 +1,6 @@
 # Accounts in one format, a full list, and pre-tracking token rows: implementation plan
 
-**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/50
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/50
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use

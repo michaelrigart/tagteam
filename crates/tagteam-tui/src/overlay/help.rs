@@ -360,6 +360,26 @@ mod tests {
     }
 
     #[test]
+    fn accounts_help_lists_the_full_list_key_and_keeps_the_pace_mark() {
+        let lines = draw(&open(Screen::Accounts), 80, 70);
+        for (keys, does) in [
+            ("v", "full list, or back to compact"),
+            ("s", "switch to the selected account"),
+            ("r", "update usage now"),
+            ("J K", "scroll the selected card or block"),
+            ("▲", "faster than an even pace"),
+        ] {
+            assert!(
+                lines.iter().any(|l| {
+                    let row = inner(l);
+                    row.starts_with(keys) && row.contains(does)
+                }),
+                "{keys} {does}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
     fn help_has_two_columns_from_100_columns_and_scrolls_to_its_end() {
         let state = open(Screen::Accounts);
         let buf = draw_buffer(&state, 120, 40, NOW_MS);

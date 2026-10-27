@@ -7,6 +7,23 @@ with the one before, so any release may contain breaking changes. Each section s
 
 ## [Unreleased]
 
+### Added
+
+- `tagteam tui`'s Accounts screen lists every account in full on `v`; `v` again returns to the
+  compact view.
+
+### Changed
+
+- `tagteam tui`'s Accounts screen shows the account in use in the Now strip, and every account's
+  windows in one format.
+- `tagteam tui`'s bars have no pace marks. `▲` adds the share expected by now, in words, where it
+  fits, and the Now strip shows `▲` on every screen.
+
+### Fixed
+
+- `tagteam tui`'s Tokens screen says `before tracking`, not `unknown account`, for unattributed
+  usage from before tracking started.
+
 ## [20261023.738.0] - 2026-10-23
 
 ### Added
