@@ -329,13 +329,15 @@ pub fn projection_text(hw: &HistoryWindow, now_s: i64) -> String {
     }
 }
 
+/// `62% expected by now`: what an even pace would have used so far.
+pub fn expected_words(expected_pct: f64) -> String {
+    format!("{}% expected by now", expected_pct.round() as i64)
+}
+
 /// `▲ faster than an even pace (62% expected by now)`, or without the parenthesis.
 pub fn ahead_words(expected_pct: Option<f64>) -> String {
     match expected_pct {
-        Some(e) => format!(
-            "▲ faster than an even pace ({}% expected by now)",
-            e.round() as i64
-        ),
+        Some(e) => format!("▲ faster than an even pace ({})", expected_words(e)),
         None => "▲ faster than an even pace".to_owned(),
     }
 }
@@ -1578,6 +1580,7 @@ mod tests {
             "▲ faster than an even pace (62% expected by now)"
         );
         assert_eq!(ahead_words(None), "▲ faster than an even pace");
+        assert_eq!(expected_words(26.4), "26% expected by now");
     }
 
     #[test]

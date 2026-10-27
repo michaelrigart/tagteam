@@ -11,7 +11,7 @@ use tagteam_engine::daemon::daemon_socket_path;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::timeline::{Scope, TimelineView};
 use tagteam_engine::tokens::{IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport};
-use tagteam_engine::views::{HistoryView, ProviderNames};
+use tagteam_engine::views::ProviderNames;
 use tagteam_provider::Cancel;
 use tagteam_tui::source::{
     AccountsSnapshot, CollectSummary, EngineSource, Source, SourceError, SourceFactory,
@@ -155,10 +155,6 @@ impl Source for Refused {
         Err(self.0.clone())
     }
 
-    fn history(&self, _account: &AccountId, _since_s: i64) -> Result<HistoryView, SourceError> {
-        Err(self.0.clone())
-    }
-
     fn timeline(
         &self,
         _provider: &ProviderId,
@@ -253,7 +249,6 @@ mod tests {
             tz: jiff::tz::TimeZone::UTC,
         };
         assert_eq!(source.accounts(None).unwrap_err(), want, "accounts");
-        assert_eq!(source.history(&account, 0).unwrap_err(), want, "history");
         assert_eq!(
             source.timeline(&provider, &Scope::All, 0, 70).unwrap_err(),
             want,

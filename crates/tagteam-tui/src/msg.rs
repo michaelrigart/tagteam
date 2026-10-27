@@ -5,7 +5,6 @@ use tagteam_core::{AccountId, ProviderId};
 use tagteam_daemon::protocol::Status;
 use tagteam_engine::timeline::{Scope, TimelineView};
 use tagteam_engine::tokens::{IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport};
-use tagteam_engine::views::HistoryView;
 
 use crate::host::{Action, ActionOutcome};
 use crate::lanes::Coalesce;
@@ -26,12 +25,6 @@ pub enum ViewsReq {
         scope: Scope,
         since_s: i64,
         columns: usize,
-    },
-    /// The selected account's card: its history since `since_s` (redesign §6.4, T3-21).
-    Card {
-        r#gen: u64,
-        account: AccountId,
-        since_s: i64,
     },
 }
 
@@ -87,7 +80,6 @@ impl Coalesce for ViewsReq {
             (self, other),
             (ViewsReq::Accounts { .. }, ViewsReq::Accounts { .. })
                 | (ViewsReq::Timeline { .. }, ViewsReq::Timeline { .. })
-                | (ViewsReq::Card { .. }, ViewsReq::Card { .. })
         )
     }
 }
@@ -147,12 +139,6 @@ pub enum Msg {
     Timeline {
         r#gen: u64,
         result: Result<TimelineView, SourceError>,
-    },
-    /// The selected account's card's history read, for `account` (T3-21).
-    Card {
-        r#gen: u64,
-        account: AccountId,
-        result: Result<HistoryView, SourceError>,
     },
     Collected {
         r#gen: u64,
@@ -258,12 +244,6 @@ pub enum Cmd {
         since_s: i64,
         columns: usize,
     },
-    /// The selected account's card's history read, on the views lane (redesign §6.4, T3-21).
-    LoadCard {
-        r#gen: u64,
-        account: AccountId,
-        since_s: i64,
-    },
     CollectDue {
         r#gen: u64,
         accounts: Vec<AccountId>,
@@ -332,18 +312,10 @@ mod tests {
             since_s: 0,
             columns: 70,
         };
-        let card = |g, a: &str| ViewsReq::Card {
-            r#gen: g,
-            account: id(a),
-            since_s: 0,
-        };
         assert!(accounts(1).same_as(&accounts(2)));
         assert!(history(1, "a").same_as(&history(2, "b")));
-        assert!(card(1, "a").same_as(&card(2, "b")));
         assert!(!accounts(1).same_as(&history(1, "a")));
         assert!(!history(1, "a").same_as(&accounts(1)));
-        assert!(!card(1, "a").same_as(&history(1, "a")));
-        assert!(!history(1, "a").same_as(&card(1, "a")));
     }
 
     #[test]

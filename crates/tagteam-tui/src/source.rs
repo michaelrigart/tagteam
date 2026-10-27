@@ -15,7 +15,7 @@ use tagteam_engine::timeline::{EventView, Scope, TimelineView};
 use tagteam_engine::tokens::{
     IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport, Wait,
 };
-use tagteam_engine::views::{HistoryView, ProviderAccounts, ShellAccount};
+use tagteam_engine::views::{ProviderAccounts, ShellAccount};
 use tagteam_provider::{Liveness, Read, RunShell, TransientKind};
 
 /// How far back the accounts read looks for each provider's last auto-line event (§5.3,
@@ -70,7 +70,6 @@ pub struct CollectSummary {
 
 pub trait Source {
     fn accounts(&self, provider: Option<&ProviderId>) -> Result<AccountsSnapshot, SourceError>;
-    fn history(&self, account: &AccountId, since_s: i64) -> Result<HistoryView, SourceError>;
     /// History's timeline (redesign §7.7): `provider`'s, for `scope`, since `since_s`, over
     /// `columns`. It only reads.
     fn timeline(
@@ -139,11 +138,6 @@ impl Source for EngineSource {
             config_mtime: Settings::mtime(engine.env()),
             last_auto,
         })
-    }
-
-    /// `history`'s view (core §13.4) of every relevant window since `since_s`.
-    fn history(&self, account: &AccountId, since_s: i64) -> Result<HistoryView, SourceError> {
-        Ok(self.engine.history(account, None, since_s)?)
     }
 
     /// §12.3's `Engine::timeline`.
@@ -288,12 +282,6 @@ mod tests {
         fn accounts(&self, _: Option<&ProviderId>) -> Result<AccountsSnapshot, SourceError> {
             Err(SourceError {
                 kind: "accounts".into(),
-                message: self.0.into(),
-            })
-        }
-        fn history(&self, _: &AccountId, _: i64) -> Result<HistoryView, SourceError> {
-            Err(SourceError {
-                kind: "history".into(),
                 message: self.0.into(),
             })
         }

@@ -217,15 +217,6 @@ impl Lanes {
                     r#gen,
                     result: source.timeline(&focus, &scope, since_s, columns),
                 },
-                ViewsReq::Card {
-                    r#gen,
-                    account,
-                    since_s,
-                } => Msg::Card {
-                    r#gen,
-                    result: source.history(&account, since_s),
-                    account,
-                },
             };
             let _ = out.send(msg);
         });

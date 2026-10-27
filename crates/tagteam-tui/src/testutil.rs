@@ -12,7 +12,7 @@ use ratatui::buffer::{Buffer, Cell, CellWidth};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use tagteam_cc::CLAUDE_CODE;
-use tagteam_core::{AccountId, Pace, ProviderId, Sample, Window, WindowKind};
+use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind};
 use tagteam_daemon::protocol::{
     Status, StatusDaemon, StatusJob, StatusNotifications, StatusProvider, Wire,
 };
@@ -24,8 +24,7 @@ use tagteam_engine::tokens::{
     TokenQuery, TokenReport, TokenRow, TokenTotal,
 };
 use tagteam_engine::views::{
-    AccountView, HistoryView, HistoryWindow, ProviderAccounts, ProviderNames, UsageStatus,
-    UsageView, forecast_of,
+    AccountView, ProviderAccounts, ProviderNames, UsageStatus, UsageView, forecast_of,
 };
 use tagteam_provider::KindTraits;
 
@@ -400,31 +399,6 @@ pub(crate) fn locate(buf: &Buffer, needle: &str) -> Option<(u16, u16)> {
         let at = text.find(needle)?;
         starts.iter().find(|(b, _)| *b == at).map(|(_, x)| (*x, y))
     })
-}
-
-/// A sample of one window taken `ago_s` before `NOW_S`.
-pub(crate) fn sample(ago_s: i64, pct: f64) -> Sample {
-    Sample {
-        fetched_at: NOW_S - ago_s,
-        pct,
-        resets_at: None,
-    }
-}
-
-pub(crate) fn history_window(window: Window, samples: Vec<Sample>, pace: Pace) -> HistoryWindow {
-    HistoryWindow {
-        window,
-        samples,
-        pace,
-    }
-}
-
-pub(crate) fn history_of(account: AccountView, windows: Vec<HistoryWindow>) -> HistoryView {
-    HistoryView {
-        account,
-        windows,
-        unmatched_window: false,
-    }
 }
 
 /// A view over `columns` columns of the 7 days to NOW_S, threshold 90.

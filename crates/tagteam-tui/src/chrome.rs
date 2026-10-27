@@ -21,8 +21,8 @@ use crate::view::{WRAP_ROWS, fit, width_of, wrap, wrap_rows};
 /// From this many rows a faint rule sits under the chrome (§4.5).
 pub(crate) const RULE_FROM: u16 = 30;
 /// From this many columns the long forms take over (§4.5): the header's and the auto line's,
-/// the Now strip's gauges, and the Accounts screen's wide gauges, bars, sparklines, org, `▲`
-/// words and keys row.
+/// the Now strip's gauges, and the Accounts screen's wide gauges and bars, org, next-update fact
+/// and long projection words.
 pub(crate) const WIDE: u16 = 120;
 
 const TABS: [(Screen, &str); 3] = [

@@ -1,9 +1,8 @@
 //! The bars the Accounts and Tokens screens draw (spec §4.4, T3-17): the thick bar of the
-//! account in use, the table's line gauge and the card's sparkline; the Tokens headline's block progress line
-//! and its sparkline of cost per day; the Tokens table's share line.
+//! account in use, the table's line gauge; the Tokens headline's block progress line and its
+//! sparkline of cost per day; the Tokens table's share line.
 
 use ratatui::text::Span;
-use tagteam_core::Sample;
 use tagteam_engine::words::{self, Severity};
 
 use crate::theme::{Role, Theme};
@@ -93,37 +92,6 @@ pub(crate) fn lead_bar(pct: f64, cells: usize, theme: Theme) -> Vec<Span<'static
         })
         .collect();
     spans(drawn, theme)
-}
-
-/// The card's sparkline (§4.4): `cells` equal buckets over `[from_s, to_s)`, each its samples'
-/// peak on `▁…█` in accent; an empty bucket is a space, and a sample outside the range is left
-/// out.
-pub(crate) fn sparkline(
-    samples: &[Sample],
-    from_s: i64,
-    to_s: i64,
-    cells: usize,
-    theme: Theme,
-) -> Span<'static> {
-    let span = (i128::from(to_s) - i128::from(from_s)).max(1);
-    let mut peaks: Vec<Option<f64>> = vec![None; cells];
-    for s in samples {
-        if s.fetched_at < from_s || s.fetched_at >= to_s {
-            continue;
-        }
-        let i = ((i128::from(s.fetched_at) - i128::from(from_s)) * cells as i128 / span) as usize;
-        if let Some(slot) = peaks.get_mut(i) {
-            *slot = Some(slot.map_or(s.pct, |p| p.max(s.pct)));
-        }
-    }
-    let text: String = peaks
-        .into_iter()
-        .map(|peak| match peak {
-            Some(pct) => SPARK[filled(pct, 7).round() as usize],
-            None => ' ',
-        })
-        .collect();
-    Span::styled(text, theme.role(Role::Accent))
 }
 
 /// T5-12's sparkline: each value on `▁…█` against the largest (`▁` when it is 0), a space for
@@ -227,59 +195,20 @@ mod tests {
     }
 
     #[test]
-    fn a_sparkline_shows_each_bucket_s_peak_and_leaves_an_empty_one_blank() {
-        let at = |fetched_at, pct| Sample {
-            fetched_at,
-            pct,
-            resets_at: None,
-        };
-        let samples = [at(10, 0.0), at(110, 50.0), at(120, 100.0), at(390, 20.0)];
-        let outside = [at(-1, 90.0), at(400, 90.0)];
-        let peak_first = [at(110, 100.0), at(120, 50.0)];
-        for theme in TIERS {
-            let (text, letters) = drawn(vec![sparkline(&samples, 0, 400, 4, theme)], theme);
-            assert_eq!(text, "▁█ ▂", "{theme:?}");
-            assert_eq!(letters, canon(theme, "aa a"), "{theme:?}");
-
-            let all: Vec<Sample> = samples.iter().chain(&outside).copied().collect();
-            let (text, _) = drawn(vec![sparkline(&all, 0, 400, 4, theme)], theme);
-            assert_eq!(text, "▁█ ▂", "{theme:?}");
-
-            let (text, _) = drawn(vec![sparkline(&[], 0, 400, 4, theme)], theme);
-            assert_eq!(text, "    ", "{theme:?}");
-
-            let (text, _) = drawn(vec![sparkline(&peak_first, 0, 400, 4, theme)], theme);
-            assert_eq!(text, " █  ", "{theme:?}");
-        }
-    }
-
-    #[test]
     fn the_gauges_draw_edge_inputs_exactly_their_cells_wide() {
-        let samples = [Sample {
-            fetched_at: 10,
-            pct: 60.0,
-            resets_at: None,
-        }];
         for theme in TIERS {
             let track = if theme.colourless() { "·" } else { "─" };
             let line = |pct, cells| drawn(line_gauge(pct, cells, theme), theme).0;
             let lead = |pct, cells| drawn(lead_bar(pct, cells, theme), theme).0;
-            let spark = |from_s, to_s, cells| {
-                drawn(vec![sparkline(&samples, from_s, to_s, cells, theme)], theme).0
-            };
             let cases = [
                 (line(54.0, 0), "", 0),
                 (lead(54.0, 0), "", 0),
-                (spark(0, 400, 0), "", 0),
                 (line(54.0, 1), "╸", 1),
                 (lead(54.0, 1), "▆", 1),
-                (spark(0, 400, 1), "▅", 1),
                 (line(54.0, 9), "━━━━╸────", 9),
                 (lead(54.0, 9), "▆▆▆▆▆▁▁▁▁", 9),
                 (line(-20.0, 9), "─────────", 9),
                 (lead(-20.0, 9), "▁▁▁▁▁▁▁▁▁", 9),
-                (spark(400, 400, 4), "    ", 4),
-                (spark(400, 0, 4), "    ", 4),
             ];
             for (n, (text, want, cells)) in cases.into_iter().enumerate() {
                 assert_eq!(text, want.replace('─', track), "case {n} in {theme:?}");

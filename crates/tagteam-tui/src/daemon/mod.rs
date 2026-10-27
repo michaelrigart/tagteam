@@ -936,16 +936,6 @@ mod tests {
         let mut state = showing(Screen::Accounts, 1);
         update(&mut state, Msg::Live(Live::Up { link: 1 }), NOW_MS);
         tick(&mut state, NOW_MS + 250);
-        // The selected account's card is read 250 ms after the tick that saw its selection.
-        let card = update(&mut state, Msg::Tick, NOW_MS + 500);
-        assert_eq!(
-            card,
-            [Cmd::LoadCard {
-                r#gen: 1,
-                account: id(1),
-                since_s: NOW_S - 7 * 86_400,
-            }]
-        );
         let dropped = update(&mut state, Msg::Tick, NOW_MS + 5_000);
         assert_eq!(dropped, [Cmd::DropLink { link: 1 }]);
         assert_eq!(

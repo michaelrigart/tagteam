@@ -516,21 +516,6 @@ fn a_stale_reading_is_shown_with_its_age_and_not_as_current() {
 }
 
 #[test]
-fn history_is_the_samples_since_the_range_starts() {
-    let home = Home::new();
-    let a = home.add(CLAUDE_CODE, 1, "a@x.co");
-    home.reading(&a, 3 * 86_400, 40.0);
-    home.reading(&a, 3_600, 60.0);
-    let view = home.source().history(&a, NOW_S - 86_400).unwrap();
-    assert_eq!(view.account.row.id, a);
-    assert_eq!(view.windows.len(), 1);
-    let pcts: Vec<f64> = view.windows[0].samples.iter().map(|s| s.pct).collect();
-    assert_eq!(pcts, [60.0], "only the day's sample");
-    let week = home.source().history(&a, NOW_S - 7 * 86_400).unwrap();
-    assert_eq!(week.windows[0].samples.len(), 2);
-}
-
-#[test]
 fn timeline_is_the_engine_s_for_the_scope_and_range() {
     let home = Home::new();
     let a = home.add(CLAUDE_CODE, 1, "a@x.co");
@@ -558,7 +543,12 @@ fn a_failed_read_carries_the_engines_kind_and_words() {
     home.add(CLAUDE_CODE, 1, "a@x.co");
     let e = home
         .source()
-        .history(&AccountId::from_string("gone"), 0)
+        .timeline(
+            &ProviderId::new(CLAUDE_CODE),
+            &Scope::Account(AccountId::from_string("gone")),
+            0,
+            70,
+        )
         .unwrap_err();
     assert_eq!(e.kind, "no-such-account");
     assert_eq!(e.message, "no account matches \"gone\"");
