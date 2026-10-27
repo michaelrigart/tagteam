@@ -411,7 +411,9 @@ strip, no rule at any height; Tokens and History keep the rule from 30 rows; `:1
 Accounts has no chrome rule at row 3 (its body's own rule is at row 4). Rewrite `:3739` and
 `:3767` for the new stack (strip, blank/rule/blank, table, blank/rule/blank, card). Delete the
 lead-card tests whose subject goes (:3245-3265 helpers, :3265, :3425, :3515, :3559, :3839, :3937,
-:4016, :4203, :4229, :4273, :4289, :4361); port to the Now strip on Accounts those whose subject
+:4016, :4203, :4229, :4273, :4289, :4361), with the helpers only they call: `twenty()` (:3809)
+and `m()` (:3834), used only by :3839 and :3937; then check no other test helper is left
+without a caller (clippy runs on all targets). Port to the Now strip on Accounts those whose subject
 stays: the best pick and forecast words (:3338, :3640, :4336) and focus's provider (:3587,
 :3691, :4388). Move `:3450`'s login-expiry subject to Task 5.
 
@@ -687,11 +689,13 @@ pub(super) fn render(state: &State, frame: &mut Frame, body: Rect, now_ms: i64);
 ```rust
 #[test]
 fn keep_whole_moves_as_little_as_needed() {
-    // Heights include the separator rows above every block but the first (3 each).
+    // Heights include the separator rows above every block but the first (3 each); the first
+    // block shown loses its separator, so a block of height h shows in h - 3 rows when first.
     assert_eq!(keep_whole(&[5, 8, 8, 8], 0, 1, 17), 0);
     assert_eq!(keep_whole(&[5, 8, 8, 8], 0, 2, 17), 1);
     assert_eq!(keep_whole(&[5, 8, 8, 8], 2, 0, 17), 0);
-    assert_eq!(keep_whole(&[5, 20, 8], 0, 1, 17), 1);   // taller than the viewport: alone
+    assert_eq!(keep_whole(&[5, 20, 8], 0, 1, 17), 1);   // exactly fits once first (17 rows)
+    assert_eq!(keep_whole(&[5, 21, 8], 0, 1, 17), 1);   // taller than the viewport: alone
     assert_eq!(keep_whole(&[5, 8], 9, 1, 17), 1);       // a stale `from` clamps
 }
 
@@ -752,8 +756,11 @@ fn blocks_without_windows_match_the_compact_card() {
 
 #[test]
 fn a_disabled_block_is_dim_on_every_row() {
-    // `mock()` with account 3 disabled (`row.disabled = true`), View::List at 120×40: every
-    // non-blank cell of block 3's rows carries `Modifier::DIM`; block 1's do not.
+    // `mock()` with account 3 disabled (`row.disabled = true`), View::List at 120×40, in every
+    // tier: every non-blank cell of block 3's rows carries `Modifier::DIM`. Muted carries
+    // DIM in tiers 0 and 1, faint also in tier 0 (`theme.rs:71`, :77-78), so for block 1 (enabled)
+    // assert instead that its cells' styles equal block 1's in the same draw of `mock()` with
+    // no account disabled, and that its title's name cell has no DIM in any tier.
 }
 
 #[test]
