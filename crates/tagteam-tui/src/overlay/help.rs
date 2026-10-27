@@ -12,6 +12,7 @@ use super::panel::{panel, panel_width, scrolled};
 use super::{BoxSpec, KeyOutcome};
 use crate::keys::KEYS;
 use crate::screens::history::{chart, lanes};
+use crate::screens::tokens::table::BEFORE_TRACKING;
 use crate::state::{Screen, State};
 use crate::theme::{Role, Theme};
 use crate::view::{body_at, width_of, wrap};
@@ -77,6 +78,11 @@ const CACHE: (&str, &str) = (
      both",
 );
 
+/// What Tokens' `before tracking` account is, under Tokens' keys: it is a word in the table, not
+/// a mark.
+const BEFORE_TRACKING_HELP: &str = "usage from before tagteam recorded which account was in use; \
+                                    the filter's unknown account includes it";
+
 pub(super) fn key(state: &State, scroll: &mut u16, key: KeyEvent) -> KeyOutcome {
     match key.code {
         KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter => KeyOutcome::Close,
@@ -129,6 +135,15 @@ pub(super) fn rows(state: &State, width: u16) -> Vec<Line<'static>> {
         for row in rows() {
             let accent = theme.role(Role::Accent);
             lines.extend(entry(row.keys, accent, row.does, keys_width, column));
+        }
+        if screen == Some(Screen::Tokens) {
+            lines.extend(entry(
+                BEFORE_TRACKING,
+                theme.role(Role::Muted),
+                BEFORE_TRACKING_HELP,
+                width_of(BEFORE_TRACKING),
+                column,
+            ));
         }
         lines
     };
@@ -225,7 +240,9 @@ mod tests {
 
     use ratatui::text::{Line, Span};
 
-    use super::{KEYS, Role, Screen, State, marks, rows, width_of};
+    use super::{
+        BEFORE_TRACKING, BEFORE_TRACKING_HELP, KEYS, Role, Screen, State, marks, rows, width_of,
+    };
     use crate::overlay::Overlay;
     use crate::testutil::*;
     use crate::update::update;
@@ -573,6 +590,37 @@ mod tests {
                     assert_eq!(said, words, "{lead} {theme:?} {width}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn help_explains_before_tracking_on_tokens_only() {
+        let state = open(Screen::Tokens);
+        let tokens = rows(&state, 80);
+        let (span, said) = entry_led_by(&tokens, BEFORE_TRACKING).unwrap();
+        assert_eq!(span.content.trim(), BEFORE_TRACKING);
+        assert_eq!(span.style, state.theme.role(Role::Muted));
+        assert_eq!(said, BEFORE_TRACKING_HELP);
+        assert!(said.contains("unknown account"));
+        // It is the section's last entry: only its own wrapped words, then a blank row, lie
+        // between it and `Everywhere`.
+        let at = |f: &dyn Fn(&Line<'_>) -> bool| tokens.iter().position(f).unwrap();
+        let led = at(&|l| l.spans.iter().any(|s| s.content.trim() == BEFORE_TRACKING));
+        let everywhere = at(&|l| l.spans.iter().any(|s| s.content == "Everywhere"));
+        assert!(
+            tokens[led + 1..everywhere - 1]
+                .iter()
+                .all(|l| l.spans[1].content.trim().is_empty())
+        );
+        assert!(tokens[everywhere - 1].spans.is_empty());
+        for screen in [Screen::Accounts, Screen::History] {
+            let other = rows(&open(screen), 80);
+            assert!(
+                !other
+                    .iter()
+                    .any(|l| l.spans.iter().any(|s| s.content.contains(BEFORE_TRACKING))),
+                "{screen:?}"
+            );
         }
     }
 

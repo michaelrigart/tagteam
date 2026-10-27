@@ -152,7 +152,7 @@ fn choices(state: &State, report: &TokenReport) -> Vec<Choice> {
     models.dedup();
     let account = |a: RowAccount| Choice {
         on: t.accounts.as_ref().is_none_or(|f| f.contains(&sel(&a))),
-        label: account_name(&a),
+        label: account_name(&a, false),
         kind: Kind::Account(sel(&a)),
     };
     let model = |m: String| Choice {
@@ -423,6 +423,11 @@ mod tests {
 
     /// Tokens, its accounts 1 and 2 read, and the filter dialog open with its inventory.
     fn dialog() -> State {
+        dialog_at(None)
+    }
+
+    /// The same, the index's epoch `epoch`.
+    fn dialog_at(epoch: Option<i64>) -> State {
         let mut state = fresh(Screen::Tokens);
         state.accounts.apply(snapshot(many(2)));
         state.start();
@@ -430,7 +435,9 @@ mod tests {
         let [Cmd::LoadInventory { r#gen, query }] = cmds.as_slice() else {
             panic!("{cmds:?}");
         };
-        let result = Ok(indexed(query.clone()));
+        let mut report = indexed(query.clone());
+        report.tracking_since_ms = epoch;
+        let result = Ok(report);
         update(
             &mut state,
             Msg::Inventory {
@@ -580,6 +587,30 @@ mod tests {
         assert!(
             body[0].contains("   f all accounts · claude-opus-5-5"),
             "the control bar names the one model: {}",
+            body[0]
+        );
+    }
+
+    #[test]
+    fn the_filter_keeps_unknown_account_for_every_unattributed_row() {
+        // The indexed month ends well before this epoch, so the table would call its
+        // unattributed row `before tracking`; the filter's one choice keeps its single name.
+        let epoch = NOW_MS + 30 * 24 * HOUR * 1000;
+        let mut state = dialog_at(Some(epoch));
+        assert_eq!(shown(&state), all(true));
+        // Choose only it: none of the accounts, then the unattributed one.
+        update(&mut state, key(KeyCode::Home), NOW_MS);
+        update(&mut state, ch('a'), NOW_MS);
+        for _ in 0..3 {
+            update(&mut state, ch('j'), NOW_MS);
+        }
+        update(&mut state, ch(' '), NOW_MS);
+        let q = applied(&mut state);
+        assert_eq!(q.accounts, Some(vec![AccountSel::Unattributed]));
+        let body = body_of(&state, 120, 40, NOW_MS);
+        assert!(
+            body[0].contains("   f unknown account · all models"),
+            "the control bar's summary: {}",
             body[0]
         );
     }

@@ -8,7 +8,7 @@ pub mod filter;
 mod headline;
 pub mod index;
 mod models;
-mod table;
+pub(crate) mod table;
 
 use std::cell::OnceCell;
 

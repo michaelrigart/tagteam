@@ -247,9 +247,14 @@ fn period_text(period: &PeriodKey, tz: &TimeZone, now_ms: i64, level: usize) -> 
     }
 }
 
+/// What an unattributed row says when its whole period ends before the token index's epoch: its
+/// usage predates tracking, so no account could have been recorded for it.
+pub(crate) const BEFORE_TRACKING: &str = "before tracking";
+
 /// An account as the table names it (spec §5.3, T5-19): its position and alias, else its label;
-/// `removed account`; `unknown account`.
-fn account_text(account: &RowAccount) -> String {
+/// `removed account`; `unknown account`, or with `before` (its period ends before the index's
+/// epoch) `before tracking`.
+fn account_text(account: &RowAccount, before: bool) -> String {
     match account {
         RowAccount::Account {
             position,
@@ -258,13 +263,14 @@ fn account_text(account: &RowAccount) -> String {
             ..
         } => format!("{position} {}", alias.as_deref().unwrap_or(label)),
         RowAccount::Removed { .. } => "removed account".to_owned(),
+        RowAccount::Unattributed if before => BEFORE_TRACKING.to_owned(),
         RowAccount::Unattributed => "unknown account".to_owned(),
     }
 }
 
 /// An account in full, as the detail and the filter name it (T5-19): `1 work (a@x.co)`,
-/// `removed account 3f2a9c1d`, `unknown account`.
-pub fn account_name(account: &RowAccount) -> String {
+/// `removed account 3f2a9c1d`, `unknown account` (`before tracking` with `before`).
+pub fn account_name(account: &RowAccount, before: bool) -> String {
     match account {
         RowAccount::Account {
             position,
@@ -276,6 +282,7 @@ pub fn account_name(account: &RowAccount) -> String {
             position, label, ..
         } => format!("{position} {label}"),
         RowAccount::Removed { id } => format!("removed account {}", short_id(id.as_str())),
+        RowAccount::Unattributed if before => BEFORE_TRACKING.to_owned(),
         RowAccount::Unattributed => "unknown account".to_owned(),
     }
 }
@@ -634,15 +641,20 @@ impl<'a> Table<'a> {
                 } => project_name(p).to_owned(),
                 _ => words::MISSING.to_owned(),
             },
-            Col::Account => match &row.account {
-                Some(a) => account_text(a),
-                None => row
-                    .accounts
-                    .iter()
-                    .map(account_text)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            },
+            Col::Account => {
+                let before = row
+                    .period
+                    .before_tracking(self.report.tracking_since_ms, &self.report.query.tz);
+                match &row.account {
+                    Some(a) => account_text(a, before),
+                    None => row
+                        .accounts
+                        .iter()
+                        .map(|a| account_text(a, before))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                }
+            }
             Col::Model => match &row.model {
                 Some(m) => self.models.get(m).to_owned(),
                 None => row
@@ -1032,7 +1044,10 @@ fn crumbs(state: &State, width: usize, now_ms: i64) -> Option<Line<'static>> {
                 p => period_text(p, &report.query.tz, now_ms, 0),
             };
             let mut parts = vec![period];
-            parts.extend(row.account.as_ref().map(account_text));
+            let before = row
+                .period
+                .before_tracking(report.tracking_since_ms, &report.query.tz);
+            parts.extend(row.account.as_ref().map(|a| account_text(a, before)));
             parts.extend(row.model.as_deref().map(|m| models.get(m).to_owned()));
             Some(parts.join(" · "))
         })
@@ -1209,9 +1224,12 @@ fn top(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
 /// when `enter` says; then its numbers, muted; then the rest of what it holds: a session's
 /// project's path and its times, whether a block was observed or estimated, every account when
 /// it has none of its own, and every model in full. Laid out by their parts and never cut.
+/// `before` says the row's period ends before the index's epoch, which names its unattributed
+/// usage `before tracking`.
 fn detail_rows(
     row: &TokenRow,
     tz: &TimeZone,
+    before: bool,
     now_ms: i64,
     width: usize,
     enter: Option<&str>,
@@ -1265,9 +1283,13 @@ fn detail_rows(
     };
     let mut identity = vec![first];
     match &row.account {
-        Some(account) => identity.push(account_name(account)),
+        Some(account) => identity.push(account_name(account, before)),
         None if !row.accounts.is_empty() => {
-            let names: Vec<String> = row.accounts.iter().map(account_name).collect();
+            let names: Vec<String> = row
+                .accounts
+                .iter()
+                .map(|a| account_name(a, before))
+                .collect();
             rest.push(names.join(", "));
         }
         None => {}
@@ -1322,9 +1344,13 @@ fn below(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
     };
     if let Some(row) = t.selected_row() {
         lines.push(Line::default());
+        let before = row
+            .period
+            .before_tracking(report.tracking_since_ms, &report.query.tz);
         lines.extend(detail_rows(
             row,
             &report.query.tz,
+            before,
             now_ms,
             width,
             t.drill_to(),
@@ -1615,6 +1641,15 @@ mod tests {
 
     /// The same, after `keys` set the query up: each key's query is answered with `rows`.
     pub(crate) fn showing_after(keys: &str, rows: Vec<TokenRow>) -> State {
+        showing_after_with(keys, rows, |_| {})
+    }
+
+    /// The same, the report `edit`ed as `showing` does.
+    fn showing_after_with(
+        keys: &str,
+        rows: Vec<TokenRow>,
+        edit: impl FnOnce(&mut TokenReport),
+    ) -> State {
         let mut state = fresh(Screen::Tokens);
         state.start();
         let mut last = vec![];
@@ -1624,7 +1659,9 @@ mod tests {
         let [Cmd::LoadReport { r#gen, query }] = last.as_slice() else {
             panic!("{last:?}");
         };
-        let result = Ok(token_report(query.clone(), rows));
+        let mut report = token_report(query.clone(), rows);
+        edit(&mut report);
+        let result = Ok(report);
         update(
             &mut state,
             Msg::TokenReport {
@@ -2519,8 +2556,177 @@ mod tests {
         let below = &lines[total + 1..];
         assert!(reads(below, "removed account 3f2a9c1d"), "{below:?}");
         assert!(!lines.iter().any(|l| l.contains("7e44")), "{lines:?}");
-        assert_eq!(account_name(&gone), "removed account 3f2a9c1d");
-        assert_eq!(account_name(&RowAccount::Unattributed), "unknown account");
+        assert_eq!(account_name(&gone, false), "removed account 3f2a9c1d");
+        assert_eq!(
+            account_name(&RowAccount::Unattributed, false),
+            "unknown account"
+        );
+    }
+
+    #[test]
+    fn an_unattributed_day_wholly_before_the_epoch_reads_before_tracking() {
+        let state = showing(days(), |r| r.tracking_since_ms = Some(YESTERDAY));
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert!(
+            lines.contains(
+                &" 2026-09-19  before tracking    5.0K      900  105.9K       —".to_owned()
+            ),
+            "{lines:?}"
+        );
+        // The attributed rows keep their names.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("▌2026-09-20  1 a1@x.co")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_day_holding_the_epoch_or_no_epoch_reads_unknown_account() {
+        for epoch in [Some(YESTERDAY - 1), None] {
+            let state = showing(days(), |r| r.tracking_since_ms = epoch);
+            let lines = body_of(&state, 80, 24, NOW_MS);
+            assert!(
+                lines.contains(
+                    &" 2026-09-19  unknown account    5.0K      900  105.9K       —".to_owned()
+                ),
+                "{epoch:?}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_period_kind_follows_its_own_span() {
+        // Three unattributed rows per kind: wholly before the epoch E = YESTERDAY, holding it,
+        // wholly after it.
+        let e = YESTERDAY;
+        let unattributed = |period: PeriodKey| {
+            token_row(
+                period,
+                Some(RowAccount::Unattributed),
+                None,
+                counts(1, 2, 3),
+                None,
+            )
+        };
+        let month = |month| PeriodKey::Month { year: 2026, month };
+        let session = |first_ms, last_ms| PeriodKey::Session {
+            session_id: format!("s{first_ms}"),
+            project: None,
+            first_ms,
+            last_ms,
+        };
+        let block = |start_ms, end_ms| PeriodKey::Block {
+            start_ms,
+            end_ms,
+            observed: true,
+            active: None,
+        };
+        let kinds: [(&str, [PeriodKey; 3]); 4] = [
+            ("pppp", [day(2), day(1), day(0)]),
+            ("p", [month(8), month(9), month(10)]),
+            (
+                "pp",
+                [
+                    session(e - HOUR_MS, e - 1),
+                    session(e - HOUR_MS, e),
+                    session(e + 1, e + HOUR_MS),
+                ],
+            ),
+            (
+                "ppp",
+                [
+                    block(e - 5 * HOUR_MS, e),
+                    block(e - 5 * HOUR_MS + 1, e + 1),
+                    block(e + 1, e + 5 * HOUR_MS + 1),
+                ],
+            ),
+        ];
+        for (keys, periods) in kinds {
+            let words_of = |epoch| {
+                let rows = periods.iter().cloned().map(unattributed).collect();
+                let state = showing_after_with(keys, rows, |r| r.tracking_since_ms = epoch);
+                body_of(&state, 80, 24, NOW_MS)[4..7]
+                    .iter()
+                    .map(|l| {
+                        [BEFORE_TRACKING, "unknown account"]
+                            .into_iter()
+                            .find(|w| l.contains(w))
+                            .unwrap_or_else(|| panic!("{keys}: {l}"))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                words_of(Some(e)),
+                [BEFORE_TRACKING, "unknown account", "unknown account"],
+                "{keys}"
+            );
+            assert_eq!(words_of(None), ["unknown account"; 3], "{keys}");
+        }
+    }
+
+    #[test]
+    fn an_attributed_row_before_the_epoch_keeps_its_name() {
+        let state = showing(days(), |r| r.tracking_since_ms = Some(YESTERDAY + DAY_MS));
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("▌2026-09-20  1 a1@x.co")),
+            "{lines:?}"
+        );
+        // Only the unattributed row changes words.
+        assert_eq!(
+            lines.iter().filter(|l| l.contains(BEFORE_TRACKING)).count(),
+            1,
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_ungrouped_row_names_before_tracking_in_its_account_list() {
+        for (accounts, listed) in [
+            (vec![RowAccount::Unattributed], BEFORE_TRACKING),
+            (
+                vec![row_account(1), RowAccount::Unattributed],
+                "1 a1@x.co, before tracking",
+            ),
+        ] {
+            let mut row = token_row(day(2), None, None, counts(1, 2, 3), None);
+            row.accounts = accounts;
+            let state = showing_after_with("ggg", vec![row], |r| {
+                r.tracking_since_ms = Some(YESTERDAY);
+            });
+            let lines = body_of(&state, 80, 24, NOW_MS);
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("▌2026-09-19  ") && l.contains(listed)),
+                "{listed}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_detail_and_a_breadcrumb_use_their_row_s_words() {
+        let mut state = showing(days(), |r| r.tracking_since_ms = Some(YESTERDAY));
+        // Select the 2026-09-19 row (End).
+        update(&mut state, key(KeyCode::End), NOW_MS);
+        let lines = body_of(&state, 80, 24, NOW_MS);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with(" SELECTED  2026-09-19 · before tracking")),
+            "{lines:?}"
+        );
+        // ⏎ into its sessions: the breadcrumb row names `before tracking`.
+        let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
+        answer_with(&mut state, &down, vec![session("3f2a9c1d", row_account(1))]);
+        assert_eq!(
+            body_of(&state, 80, 24, NOW_MS)[1],
+            " › 2026-09-19 · before tracking"
+        );
     }
 
     #[test]
@@ -4080,7 +4286,11 @@ mod tests {
         row.models = (1..=15)
             .map(|n| format!("claude-model-family-{n:02}"))
             .collect();
-        let accounts: Vec<String> = row.accounts.iter().map(account_name).collect();
+        let accounts: Vec<String> = row
+            .accounts
+            .iter()
+            .map(|a| account_name(a, false))
+            .collect();
         let accounts = accounts.join(", ");
         let models = row.models.join(", ");
         assert!(width_of(&accounts) > 3 * 79, "longer than three rows");
