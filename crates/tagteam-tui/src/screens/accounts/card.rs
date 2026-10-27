@@ -421,7 +421,8 @@ pub(super) struct RowLayout {
     pub(super) indent: usize,
     /// `label_width` over every window on the screen, plus two.
     pub(super) label_w: usize,
-    /// 4, or the widest spend value on the screen.
+    /// 4, or the widest spend value on the screen, capped by the room after the label and bar
+    /// so an oversized spend is cut instead of pushing every window's percentage off the row.
     pub(super) value_w: usize,
     pub(super) width: u16,
 }
@@ -433,14 +434,19 @@ pub(super) fn row_layout<'a>(
     width: u16,
 ) -> RowLayout {
     let windows: Vec<&Window> = windows.into_iter().collect();
+    let label_w = label_width(windows.iter().copied(), width) + GAP.len();
+    let cells = if width >= WIDE { BAR_WIDE } else { BAR };
+    // The bar's space, then the value, then a space and the `▲` cell.
+    let room = usize::from(width).saturating_sub(indent + label_w + cells + 3);
     let value_w = windows
         .iter()
         .filter_map(|w| words::spend_text(w))
         .map(|text| width_of(&text))
-        .fold(4, usize::max);
+        .fold(4, usize::max)
+        .min(room.max(4));
     RowLayout {
         indent,
-        label_w: label_width(windows.iter().copied(), width) + GAP.len(),
+        label_w,
         value_w,
         width,
     }

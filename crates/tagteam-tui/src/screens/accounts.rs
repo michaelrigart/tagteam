@@ -2069,6 +2069,14 @@ mod tests {
             assert_eq!(width_of(rows[0]), usize::from(width), "{width}: {card:?}");
             assert!(rows[0].ends_with('…'), "{width}: {card:?}");
             assert!(rows[0].contains('€'), "the spend shows: {width}: {card:?}");
+            // The spend's width does not push the other windows' percentages off their rows.
+            for (label, pct) in [("5h", " 9%"), ("7d", "77%")] {
+                assert!(
+                    card.iter()
+                        .any(|l| l.trim_start().starts_with(label) && l.contains(pct)),
+                    "{label} keeps {pct}: {width}: {card:?}"
+                );
+            }
         }
         // The card reaches it at 80×24 under a 3-row banner, a 3-row toast and a problem.
         state.raise_banner(
