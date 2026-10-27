@@ -373,18 +373,20 @@ fn compact_at_120_by_40_puts_the_columns_where_the_spec_does() {
 
 #[test]
 fn the_in_use_card_draws_thick_bars() {
-    // `mock()` at 80×24: the card's window rows (rows[15..18]) hold only `▆`/`▁` bar cells;
-    // with account 1 selected (`k`), only `━`/`╸`/`─` (tier 0 `·`).
+    // `mock()` at 80×24: the card's window rows (rows[15..18]) hold only `▆`/`▁` bar cells.
+    // (Thin bars for other accounts come with `window_line`, Task 5.)
 }
 
 #[test]
 fn a_short_body_drops_the_blank_rows_then_the_rules() {
-    // S§5.4's order, checked as heights shrink rather than at one height: `mock()` drawn at
-    // 80×h for h from 24 down to 12. At each h, classify the four spacer slots from the rows
-    // (upper blanks, upper rule, lower blanks, lower rule: present or gone). Assert, over
-    // decreasing h: the lower blanks go before the upper blanks, both pairs of blanks before
-    // either rule; once a slot is gone it stays gone; and at every h the card's title row and
-    // the table's header are on screen and the table shows `min(4, TABLE_LEAST)` accounts.
+    // S§5.4's order, on the layout itself: the frame below 80×24 shows only the too-small
+    // notice (`view.rs:124-133`), so call `parts(&loaded(mock()), Rect::new(0, 0, 80, h),
+    // NOW_MS)` for every body height h from 20 down to 8. Over decreasing h: `under.height`
+    // goes 3 → 1 before `top.height` leaves 3; `top` goes 3 → 1 before either rule goes
+    // (1 → 0); a height never grows back as h shrinks. At every h, `table.height >=
+    // min(5, TABLE_LEAST)` (TABLE_LEAST counts lines with the header: the header and three
+    // accounts) and `card.height >= card::min_height(..)`. Separately, a frame drawn at 80×23
+    // shows only the too-small notice.
 }
 
 #[test]
@@ -511,7 +513,8 @@ fn pace_words_show_at_80_when_they_fit_and_never_on_short_or_spend_windows() {
 #[test]
 fn bars_are_thick_for_the_account_in_use_and_thin_otherwise() {
     // thick: the bar's 16 cells are only `▆`/`▁`; thin: only `━`/`╸`/`─` (tier 0 `·`), in
-    // every tier.
+    // every tier. And on screen: `loaded(mock())` at 80×24 with account 1 selected (`k`), the
+    // card's window rows hold only thin bar cells (Task 4 pinned the thick half).
 }
 
 #[test]
@@ -765,6 +768,16 @@ fn v_before_the_first_read_or_with_no_accounts_shows_the_same_state() {
 }
 
 #[test]
+fn after_a_resize_a_key_moves_the_list_from_what_is_on_screen() {
+    // `many(8)` at 120×40, View::List, from account 1 `j` to account 6 (a 33-row viewport:
+    // the stored first block is 2); `Msg::Resize` to 80×24: the frame shows block 5 first
+    // (rows[6]; 17 rows hold blocks 5 and 6, not 4). Then `k`
+    // to account 5: rows[6] is still block 5's title (it was whole, nothing moves). The same
+    // set-up, then `PgUp`: the selection moves by the whole blocks shown, and rows[6] is the
+    // new selection's title or the fewest moves from block 5 that make it whole.
+}
+
+#[test]
 fn a_refresh_that_removes_accounts_clamps_the_list() {
     // `many(8)`, View::List, account 8 selected (list scrolled); apply `snapshot(many(3))`: the
     // selection moves to account 3 (as `apply` does) and the next frame shows block 3 whole.
@@ -793,7 +806,11 @@ In `keys.rs` the table test gains `v`'s probe (`plain('v')`).
     `keep_whole`.
   - **Keys in the list:** `j`/`k`/`↑`/`↓`/`Home`/`End` step the selection as today (one block
     is one account), and `PgUp`/`PgDn` by the number of whole blocks shown, at least one.
-    Afterwards `list_from = keep_whole(…)`.
+    Each key first normalises the stored origin against the current selection and the current
+    viewport (`list_from = keep_whole(heights, list_from, selected, rows)`, so it is the first
+    block on screen now, whatever a resize or refresh left stored), then moves the selection,
+    then sets `list_from = keep_whole(…)` again for the new selection. `Msg::Resize` itself
+    stays as it is (`update.rs:22-26`).
   - **Rendering:** `render` and every key recompute `keep_whole` from the stored `list_from`,
     so a resize or refresh is clamped in the next frame.
   - **A block:**
@@ -854,11 +871,23 @@ fn a_block_taller_than_the_viewport_shows_alone_and_scrolls_its_windows() {
 }
 
 #[test]
+fn a_tall_block_counts_its_heading_and_hint_in_its_height() {
+    // Two cases at 80×24, View::List, the selected block `scoped(22)`: (a) it is a second
+    // provider's first block, so its heading leads it; (b) it is the only account, so the
+    // blank row and the one-account hint follow it. In both, every row of the scroll unit
+    // (heading or hint included) is inside the body, the hint row `J K: windows 1–n of 24`
+    // shows, and `J` until it stops leaves the last window shown with nothing clipped.
+}
+
+#[test]
 fn at_80_by_24_under_a_full_banner_and_toast_the_selected_title_shows() {
-    // As `every_window_is_reachable_by_shift_j_and_k_at_80x24_under_a_full_banner` (:1634) sets
-    // the banner and toast up (a 15-row body, 12 below the pinned three), View::List,
-    // `many(8)` (4-row blocks), from account 1, `End` to account 8: the draw does not panic,
-    // rows[6]'s block is account 7's title (4 + 3 + 4 = 11 rows fit), and block 8 is whole.
+    // The banner and toast `accounts.rs:4026-4034` raise (12 repeats of the banner text, 8 of
+    // the toast), over `many(8)` (4-row blocks, 7 with the separator above), View::List, from
+    // account 1, `End` to account 8. Read the body with `body_of(&state, 80, 24, NOW_MS)`
+    // (16 rows there today; derive it, `let b = body.len()`), so the viewport is `b - 3`
+    // rows. Assert: the draw does not panic; with `b - 3` in 11..18 (two blocks fit, three do
+    // not), body[3] is account 7's title, and account 8's title and both its window rows are
+    // inside the body.
 }
 
 #[test]
@@ -878,9 +907,11 @@ fn a_resize_keeps_the_selected_block_whole() {
   - **The one-account hint:** it is appended, after a blank row, to the sole block of focus's
     provider (`one_account`).
   - **Tall blocks:** a selected block taller than the viewport draws its windows through the
-    card's `Shown::of(rows, fixed, windows)` with `card_from` (fixed: title, facts and the
-    problem rows). `J`/`K` call `scroll_card` with the rows the active
-    view gives the selected account.
+    card's `Shown::of(rows, fixed, windows)` with `card_from`, where `fixed` counts every
+    non-window row of the block's scroll unit: the provider heading when it leads the block,
+    title, facts, the problem rows, and the blank row plus hint when the one-account hint
+    follows it (S§6.1 counts both in the block's height). `J`/`K` call `scroll_card` with that
+    same budget, so their limit matches what is drawn.
 
 - [ ] **Step 4: Run to verify they pass** — `cargo test -p tagteam-tui`. PASS.
 
