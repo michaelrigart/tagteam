@@ -348,6 +348,10 @@ reader the list goes on.
   scroll unit and counts in its height, so a list scrolled to that block starts with the heading.
   A list scrolled to a later block of the same provider starts with that block's title, without
   the heading. With one provider there is no heading.
+- **One account:** when focus's provider has one account (`accounts.rs:337-342` `one_account`),
+  today's muted hint (`accounts.rs:462-474`, redesign §5.7) is the row after that account's
+  block, after one blank row. Both rows belong to the block's scroll unit and count in its
+  height. Compact keeps the hint under the table, as today.
 
 ### 6.2 Moving and scrolling
 
@@ -457,6 +461,7 @@ What each changes; the rest of each section stands.
 | §4.4 Lead bar, Line gauge | No pace marks; "The pace mark" paragraph goes. `▲` plus words (§4.3 here) |
 | §5.1 row 3 | The Now strip on every screen; "Accounts' lead card plays this role" goes |
 | §5.4 | Title "(Tokens and History)" → every screen; its gauges without pace mark and `▲` after an ahead window's percentage, on every screen; on Accounts no ` · see Accounts` (§3.2 here) |
+| §5.7 row 3 | "under the table" holds for compact; in the full list the hint follows the account's block (§6.1 here) |
 | §6.1 | Replaced by §3.1 and §6 here |
 | §6.2 | The lead card goes. Its facts and window format move to the card (§3.4, §4). The best pick stays §12.1's `best_candidate`, shown in the Now strip |
 | §6.3 | Gauges without pace marks |
