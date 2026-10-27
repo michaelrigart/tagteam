@@ -1,6 +1,6 @@
 # tagteam — Accounts in one format, a full list, and pre-tracking token rows
 
-**Status:** Draft
+**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/50
 **Date:** 2026-10-26
 **Scope:** The TUI's Accounts screen and one label on its Tokens screen. Accounts loses the lead
 card, shows every account's details in one format, and gains a full-list view (`v`). Tokens names
@@ -79,7 +79,7 @@ come from the engine's shared words or the TUI's existing ones.
 | AV-2 | How are an account's details shown? | One format (§4) in the selected card and the full list; no sparklines on Accounts. `⏎` opens History for the account, as today |
 | AV-3 | Which view lists every account in full? | A second view, the full list, toggled by `v`; compact stays the default |
 | AV-4 | How is the account in use told apart? | `●` in the Now strip and the table, `IN USE` on its facts row, thick `▆` bars; other accounts `not in use` and thin `━` gauges |
-| AV-5 | Where is the selection in the full list? | `▌` on every row of the selected block, and bold on its name |
+| AV-5 | Where is the selection in the full list? | `▌` on every row of the selected account's block, and bold on its name |
 | AV-6 | Pace marks? | None on any bar or gauge. `▲` stays; where the row has room it ends with the expected percentage in words (§4.3) |
 | AV-7 | Spacing? | A blank row above and below every rule on Accounts |
 | AV-8 | Tokens rows from before the epoch? | `before tracking` where the row's whole span lies before the epoch; `unknown account` everywhere else, the filter included |
@@ -168,21 +168,29 @@ b best  n next  ⏎ history  P pause auto  v full list  r refresh  e disable  a 
 ### 3.2 The Now strip on Accounts
 
 Redesign §5.4, now on all three screens, with the one change below: `●`, position, name, the short and long
-windows, and on the right the best pick in its Now strip form (`lead::pick_words(…, false)`,
-`best now 3 spare` or `on the best account`). `b` stays in the footer.
+windows, and on the right the best pick in its Now strip form (`lead::pick_words`,
+`best now 3 spare` or `on the best account`). `b` stays in the footer. The lead card's keyed
+forms go with it (`best now  3 spare   b switch`, and `b checks usage first, then picks` before
+any usage is read), so `pick_words` keeps only the strip's form; the footer and help still name
+`b`.
+
+With several providers the strip follows focus's provider, the selected account's, and does not
+name it, as on Tokens and History; the table's provider headings name it. The lead card's
+`in use · Claude Code` goes with the card.
 
 One change on every screen: the strip's gauges (from 120 columns) lose their pace mark (§4.2),
 and `▲` in warn follows a window's percentage, after one space, when that window is ahead of pace
 (`Pace.ahead`), at every width: `7d  82% ▲ 5d04h`. Today the strip passes the expected pace to
 the gauge and draws no `▲` (`chrome.rs:228-249`).
 
-Two Accounts-only differences:
+Two Accounts-only differences, both because the strip's reader is already on Accounts:
 
 - A problem with the account in use reads `● 2 work   ✕ needs a new login`, without
   ` · see Accounts` (`chrome.rs` `SEE_ACCOUNTS`): its card or block, and the table's STATUS, are
   on the same screen.
-- With no account in use, the strip's text stays `no account in use · s on Accounts switches to
-  one`.
+- With no account in use, the strip reads `no account in use · s switches to the selected
+  account`, the lead card's hint (`lead.rs:37` `NO_ACCOUNT_HINT`). Tokens and History keep `no
+  account in use · s on Accounts switches to one`.
 
 On Accounts the chrome draws no rule under the strip at any height; the body's own rule (§5.2)
 takes its place. Tokens and History keep the chrome rule from 30 rows (`view.rs:45-69`).
@@ -215,8 +223,9 @@ full list replaces it.
   columns (`status.rs:124-136` `unread_words`, redesign §6.3), in their role:
   `api key · has no usage limits to show`. Today's card shows nothing there (`card.rs:49-52`).
   This rule is the full list's too (§6.1).
-- **Problems** under the windows, as redesign §6.4: the sentence, then the remedy, in their role.
-  For the account in use too: no lead card shows them any more (M-9 no longer applies).
+- **Problems** under the windows, as redesign §6.4: the sentence from the window rows' column
+  (2 in the card), then the remedy two columns further in, in their role. For the account in use
+  too: no lead card shows them any more (M-9 no longer applies).
 - **Keys row** last, from column 10: `s switch` (not shown for the account in use, §8), `⏎ history`,
   `e disable` (or `e enable`), `a alias`, `x remove`, three spaces apart. At every width while
   the body has room (§5.4).
@@ -226,8 +235,12 @@ full list replaces it.
 ### 4.1 The row
 
 ```
-{indent}{label:<L}{bar} {pct:>4} {▲ or space}  {reset}[ · {rate}][ · {projection}][ · {NN}% expected by now]
+{indent}{label:<L}{bar} {pct:>4} {▲ or space}  {tail}
 ```
+
+The tail is the parts the window has, in this order, joined by ` · `: the reset, the rate, the
+projection, `{NN}% expected by now`. A part the window lacks leaves no separator: a scoped or
+spend window without a reset starts its tail with the rate, at the reset's column.
 
 - `L`: today's label column (`card.rs:340-349` `label_width`: the widest label, at least
   `LABEL_LEAST`, at most a quarter of the width; a longer label is cut to it), taken over every
@@ -256,7 +269,7 @@ full list replaces it.
 
 A row with `▲` ends with ` · 26% expected by now` when the whole row then fits the width;
 otherwise those words are left out and `▲` alone remains. The words are the parenthesis of the
-engine's `ahead_words` (`words.rs:332`), `Pace.expected_pct` rounded. The builder splits that
+engine's `ahead_words` (`words.rs:333`), `Pace.expected_pct` rounded. The builder splits that
 clause into its own function so both read the same text. `▲` keeps its column; it no longer
 expands in place to `▲ faster than an even pace (…)` (today at `card.rs:450`). Help keeps
 `▲  faster than an even pace` (`overlay/help.rs:30`). Windows without pace (5h, C-8) never show
@@ -285,18 +298,20 @@ pace words go, then the row is cut at its end (today's `fit_spans`). The table s
 
 ### 5.4 Height
 
-When the body is shorter than compact needs, in order:
+The table and the card scroll before any separator goes. When the body is shorter than compact
+needs, rows go in this order:
 
-1. the four blank rows around the two rules, the lower pair first;
-2. the card's keys row (help lists the keys; the footer keeps `s` and `⏎` at every width);
-3. the two rules;
-4. today's split (`accounts.rs:282-330`, T3-22): the table reserves `min(its lines,
-   TABLE_LEAST)` lines (`TABLE_LEAST` is 4, `accounts.rs:36`; the reservation at
-   `accounts.rs:301-302`) and scrolls with the
-   selection; the card keeps its least and its windows scroll with `J`/`K`.
+1. the table's rows beyond `min(its lines, TABLE_LEAST)` (`TABLE_LEAST` is 4, `accounts.rs:36`):
+   it scrolls with the selection, as today (`accounts.rs:282-330`, T3-22);
+2. the card's windows beyond its least (title, facts, one window, problems): they scroll with
+   `J`/`K`, as today;
+3. the four blank rows around the two rules, the lower pair first;
+4. the card's keys row (help lists the keys; the footer keeps `s` and `⏎` at every width);
+5. the two rules.
 
-Problem rows never drop. At 80×24 with four accounts and three windows nothing drops; with seven
-accounts the body is full (20 rows); from eight, step 1 starts.
+What is left, the table's and the card's least, is reserved first, as today. Problem rows never
+drop. At 80×24 with four accounts and three windows nothing drops; with seven accounts the body
+is full (20 rows); from eight, the table scrolls and the separators stay.
 
 ## 6. Accounts: the full list (`v`)
 
@@ -335,12 +350,14 @@ s switch  b best  n next  ⏎ history  P pause auto  v compact     ? keys  q qui
 The body's 20 rows hold two whole blocks; the third starts on the last row, which tells the
 reader the list goes on.
 
-- **Title:** `▌` (selected only), the position, `●` for the account in use, the name (bold when
-  selected), the org muted from 120 columns.
+- **Title:** `▌` in column 0 (selected only, else a space), the position right-aligned in
+  columns 1–3, a space, `●` for the account in use (else a space), a space, the name from column
+  7 (bold when selected), the org muted from 120 columns. Positions 10 to 999 keep the gap before
+  `●` and the name at column 7.
 - **Facts row** as §3.4, from column 7.
-- **Problems** under the windows, as the card's. A disabled account's block is DIM throughout, as
-  its table row (redesign §4.3). An account with no windows follows §3.4's rule, its row from
-  column 7.
+- **Problems** under the windows, as the card's, the sentence from column 7 and the remedy from
+  column 9. A disabled account's block is DIM throughout, as its table row (redesign §4.3). An
+  account with no windows follows §3.4's rule, its row from column 7.
 - **No keys row:** the footer carries the selected account's keys (`s` (not for the account in
   use), `⏎`, and from 120 columns `e`, `a`, `x`), as it already does.
 - **Several providers:** a muted provider heading before each provider's blocks, as the table
@@ -352,6 +369,8 @@ reader the list goes on.
   today's muted hint (`accounts.rs:462-474`, redesign §5.7) is the row after that account's
   block, after one blank row. Both rows belong to the block's scroll unit and count in its
   height. Compact keeps the hint under the table, as today.
+- **The heading and the hint are not the account's rows:** they scroll with its block, but take
+  no `▌` when it is selected and no DIM when it is disabled; both stay muted.
 
 ### 6.2 Moving and scrolling
 
@@ -408,9 +427,10 @@ Every place a row names its account:
 
 The filter is about accounts, not rows, and keeps `unknown account`: its dialog choice
 (`filter.rs:155`, which also uses `account_name`) and the control bar's summary (`table.rs:980`).
-That choice selects every unattributed row, before tracking included. Help says so in one line
-under Tokens: `before tracking  usage from before tagteam recorded which account was in use; the
-filter's unknown account includes it`.
+That choice selects every unattributed row, before tracking included. Help says so in one entry
+at the end of its Tokens section, shown only on Tokens: `before tracking  usage from before
+tagteam recorded which account was in use; the filter's unknown account includes it`. The entry
+has its own lead column; the Marks lead column (`overlay/help.rs:138-142`) keeps its width.
 
 Example, with tracking since 2026-10-23 09:07 local time, grouped by account:
 
@@ -431,8 +451,11 @@ split of §4.3. The report's JSON is unchanged (§1.3).
 
 | Where | Key | Does | Footer |
 |---|---|---|---|
-| Accounts | `v` | the full list, or back to compact | `v full list` / `v compact`, at every width |
+| Accounts | `v` | the full list, or back to compact | `v full list` / `v compact`, at every width, while an account is selected |
 
+- `v`'s hint hides with no account selected (before the first snapshot, or with no accounts), as
+  every Accounts key's does (VIS-10, `keys.rs:66` `on_account`). The key still toggles: the
+  loading and empty states read the same in both views.
 - In `KEYS` (`keys.rs:105`) the `v` row goes after `P` and before `r`. The footer drops items
   from the end (`keys.rs:525` `footer_items`), so at 80 columns `r refresh` is left out when `s`
   shows; help lists it.
@@ -463,7 +486,7 @@ What each changes; the rest of each section stands.
 | §5.4 | Title "(Tokens and History)" → every screen; its gauges without pace mark and `▲` after an ahead window's percentage, on every screen; on Accounts no ` · see Accounts` (§3.2 here) |
 | §5.7 row 3 | "under the table" holds for compact; in the full list the hint follows the account's block (§6.1 here) |
 | §6.1 | Replaced by §3.1 and §6 here |
-| §6.2 | The lead card goes. Its facts and window format move to the card (§3.4, §4). The best pick stays §12.1's `best_candidate`, shown in the Now strip |
+| §6.2 | The lead card goes. Its facts and window format move to the card (§3.4, §4). The best pick stays §12.1's `best_candidate`, shown in the Now strip. Its keyed pick forms and, with several providers, its provider name go (§3.2 here) |
 | §6.3 | Gauges without pace marks |
 | §6.4 | Replaced by §3.4: no sparklines; the reset and projection for every account; the keys row at every width while it fits |
 | §6.5 | `J`/`K` also scroll a tall block in the full list; `v` added |
@@ -485,7 +508,8 @@ changing the design.
    (§3.4).
 5. **`v` sits before `r`** in the footer, so the new key is visible at 80 columns; `r refresh`
    then drops at 80 when `s` shows (§8).
-6. **Height overflow order** (§5.4), and **width:** pace words go first (§5.3).
+6. **Height overflow order** (§5.4): the table, then the card's windows, scroll before any blank
+   row or rule goes; **width:** pace words go first (§5.3).
 7. **The full list starts with a rule** under the chrome, like compact (§6.1).
 8. **On Accounts the Now strip leaves out ` · see Accounts`** (§3.2).
 9. **The view does not persist** across launches (§6.2).
@@ -505,13 +529,23 @@ changing the design.
 18. **The mocks' numbers follow the engine:** `▲` only where the reading is 15 points or more
     ahead of the even pace (`tagteam-core/src/pace.rs:17`), and each projection follows from
     its rate.
+19. **With several providers the Now strip does not name its provider** (§3.2): the table's
+    headings do, and the strip reads the same on every screen.
+20. **On Accounts, the strip with no account in use keeps the lead card's hint,** `s switches to
+    the selected account` (§3.2).
+21. **The keyed pick forms go with the lead card** (§3.2); `b` stays in the footer and help.
+22. **A full-list block's position is right-aligned in three columns** (§6.1), so the name
+    stays at column 7 up to 999 accounts.
+23. **The provider heading and the one-account hint take no `▌` or DIM** (§6.1): they are not
+    the account's rows.
 
 ## 11. Verification
 
 - Renders with `testutil.rs` (`draw_at`, `text_of`, `locate`) at 80×24 and 120×40, both views,
   every tier in `TIERS` (`testutil.rs:50`): column positions of the table, the card and every
   block; compact has no lead card and exactly one `SELECTED`; the full list has `▌` on every row
-  of the selected block and on no other; thick bars on the in-use account's rows only; no `┿`,
+  of the selected account's block and on no other row, its provider heading and the one-account
+  hint included; thick bars on the in-use account's rows only; no `┿`,
   `┼` or `│` in any bar; the 80×24 row counts of §3.1 and §6.1.
 - Tests reversed on purpose: `chrome.rs:1147` (Accounts had no Now strip), `chrome.rs:1352` (the
   rows above the body: Accounts gains the Now strip and never has the chrome rule), `accounts.rs:1277` and `:3975`
