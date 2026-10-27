@@ -90,6 +90,8 @@ pub struct TokenReport {
     pub prices_as_of: &'static str,
     /// Models whose price config changed, by name (spec §8.2).
     pub price_overrides: Vec<String>,
+    /// The token index's epoch (TR §7.2), `None` when the store has none. Not in the JSON.
+    pub tracking_since_ms: Option<i64>,
 }
 
 /// One row: a period, split as the query's grouping says (spec §10.1).
@@ -137,6 +139,24 @@ pub enum PeriodKey {
         observed: bool,
         active: Option<ActiveBlock>,
     },
+}
+
+impl PeriodKey {
+    /// Whether this period's whole span lies before `epoch_ms`, the token index's epoch: its
+    /// unattributed rows then predate tracking rather than lost their account. A day or month
+    /// spans its calendar interval in `tz`, the end exclusive; a session `first_ms..=last_ms`,
+    /// both response times; a block `start_ms..end_ms`. No epoch is never before it.
+    pub fn before_tracking(&self, epoch_ms: Option<i64>, tz: &TimeZone) -> bool {
+        let Some(epoch) = epoch_ms else {
+            return false;
+        };
+        match self {
+            PeriodKey::Day { date } => day_bounds_ms(*date, tz).1 <= epoch,
+            PeriodKey::Month { year, month } => month_bounds_ms(*year, *month, tz).1 <= epoch,
+            PeriodKey::Session { last_ms, .. } => *last_ms < epoch,
+            PeriodKey::Block { end_ms, .. } => *end_ms <= epoch,
+        }
+    }
 }
 
 /// The active block's progress and projection (spec §9).
@@ -387,12 +407,15 @@ impl Engine {
             unpriced_models: Vec::new(),
             prices_as_of: table.as_of,
             price_overrides,
+            tracking_since_ms: None,
         };
         let Some(store) = self.existing_store()? else {
             return Ok(report);
         };
         // Read before the usage, so whatever lands after it moves `changed_at_ms` again.
         report.index = index_state(&store, &q.provider)?;
+        let epoch = store.token_epoch()?;
+        report.tracking_since_ms = epoch.map(|e| e.at);
         // `Some` of an empty list matches nothing (spec §10.1).
         if q.accounts.as_ref().is_some_and(Vec::is_empty)
             || q.models.as_ref().is_some_and(Vec::is_empty)
@@ -401,9 +424,8 @@ impl Engine {
         }
         // The usage, the pending files, then the stored launches, as the doc says. Each store
         // read is a statement of its own: a transaction opened before the files are read would
-        // fix the launches' snapshot there. A test stops after each read. The epoch bounds the
-        // starts the pending files' names give.
-        let epoch = store.token_epoch()?;
+        // fix the launches' snapshot there. A test stops after each read. The epoch read above
+        // bounds the starts the pending files' names give.
         let usage = group::usage(q, &store)?;
         hooks::point(self, "report-usage-read")?;
         // Launches `run` kept in a pending file count as stored ones, read only.
@@ -469,6 +491,7 @@ fn index_state(store: &Store, provider: &ProviderId) -> Result<IndexState, Store
 
 #[cfg(test)]
 mod tests {
+    use jiff::civil::date;
     use tagteam_core::time::{format_iso8601, parse_iso8601_ms};
 
     use super::*;
@@ -529,5 +552,51 @@ mod tests {
             since(TokenPeriod::Month, "2026-03-29T12:00:00Z", &brussels),
             "2025-03-31T22:00:00Z"
         );
+    }
+
+    #[test]
+    fn a_period_is_before_tracking_only_when_its_whole_span_ends_by_the_epoch() {
+        let tz = TimeZone::get("Europe/Brussels").unwrap();
+        let (start_23, _) = day_bounds_ms(date(2026, 10, 23), &tz);
+        let epoch = start_23 + 9 * 3_600_000; // 09:00 on the 23rd
+        let day = |d| PeriodKey::Day { date: d };
+        assert!(day(date(2026, 10, 22)).before_tracking(Some(epoch), &tz));
+        assert!(!day(date(2026, 10, 23)).before_tracking(Some(epoch), &tz));
+        assert!(!day(date(2026, 10, 22)).before_tracking(None, &tz));
+        let month = |m| PeriodKey::Month {
+            year: 2026,
+            month: m,
+        };
+        assert!(month(9).before_tracking(Some(epoch), &tz));
+        assert!(!month(10).before_tracking(Some(epoch), &tz));
+        let session = |last_ms| PeriodKey::Session {
+            session_id: "s".into(),
+            project: None,
+            first_ms: start_23,
+            last_ms,
+        };
+        assert!(session(epoch - 1).before_tracking(Some(epoch), &tz));
+        assert!(!session(epoch).before_tracking(Some(epoch), &tz)); // a response at the epoch
+        let block = |end_ms| PeriodKey::Block {
+            start_ms: end_ms - 5 * 3_600_000,
+            end_ms,
+            observed: true,
+            active: None,
+        };
+        assert!(block(epoch).before_tracking(Some(epoch), &tz));
+        assert!(!block(epoch + 1).before_tracking(Some(epoch), &tz));
+    }
+
+    #[test]
+    fn a_dst_day_before_the_epoch_ends_at_its_zone_s_midnight() {
+        // 2026-10-25 is 25 hours long in Europe/Brussels.
+        let tz = TimeZone::get("Europe/Brussels").unwrap();
+        let (start, end) = day_bounds_ms(date(2026, 10, 25), &tz);
+        assert_eq!(end - start, 25 * 3_600_000);
+        let d = PeriodKey::Day {
+            date: date(2026, 10, 25),
+        };
+        assert!(d.before_tracking(Some(end), &tz));
+        assert!(!d.before_tracking(Some(end - 1), &tz));
     }
 }

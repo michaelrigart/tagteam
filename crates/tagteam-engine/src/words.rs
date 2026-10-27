@@ -1662,6 +1662,7 @@ mod tests {
             unpriced_models: vec![],
             prices_as_of: "2026-10-01",
             price_overrides: vec![],
+            tracking_since_ms: None,
         }
     }
 

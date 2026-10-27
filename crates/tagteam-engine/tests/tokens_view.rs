@@ -1645,3 +1645,24 @@ fn a_fast_response_of_a_model_without_a_fast_card_is_unpriced() {
     assert_eq!((r.rows[0].cost, r.rows[1].cost), (None, Some(priced)));
     assert_eq!(r.unpriced_models, ["model-a"]);
 }
+
+#[test]
+fn the_report_carries_the_epoch_it_read() {
+    let v = View::new();
+    let epoch = v.store.token_epoch().unwrap().unwrap().at;
+    let q = v.query(TokenPeriod::Day, TokenGrouping::None);
+    assert_eq!(v.report(&q).tracking_since_ms, Some(epoch));
+    // The early return for a filter that matches nothing carries it too.
+    let none = TokenQuery {
+        accounts: Some(vec![]),
+        ..q.clone()
+    };
+    assert_eq!(v.report(&none).tracking_since_ms, Some(epoch));
+    // A store without the row (a full purge, before the next refresh) has none.
+    rusqlite::Connection::open(v.fx.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .execute("DELETE FROM token_epoch", [])
+        .unwrap();
+    assert_eq!(v.report(&q).tracking_since_ms, None);
+    assert_eq!(v.report(&none).tracking_since_ms, None);
+}
