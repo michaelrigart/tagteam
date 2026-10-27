@@ -305,7 +305,8 @@ needs, rows go in this order:
    it scrolls with the selection, as today (`accounts.rs:282-330`, T3-22);
 2. the card's windows beyond its least (title, facts, one window, problems): they scroll with
    `J`/`K`, as today;
-3. the four blank rows around the two rules, the lower pair first;
+3. the four blank rows around the two rules: the lower pair first, and in each pair the
+   blank under the rule before the one above it;
 4. the card's keys row (help lists the keys; the footer keeps `s` and `⏎` at every width);
 5. the two rules.
 

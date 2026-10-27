@@ -280,18 +280,18 @@ row contains `┿` or `┼`, in every tier. Delete `accounts.rs:4229` (it only
 pinned the mark); keep `:4273`'s `▲` in warn assertion as it is (the lead card still draws `▲`
 until Task 4). In `chrome.rs`'s tests, define `fn state_on(screen: Screen) -> State`: `fresh(screen)`
 then `state.accounts.apply(snapshot(…))` (as `accounts.rs:521` `loaded` does), the snapshot
-holding `account(2, "sam@corp.example", read(60, 53.0, 6.0, true))` with alias `work`, in use.
+holding `account(2, "sam@corp.example", read(60, 53.0, 82.0, true))` with alias `work`, in use.
 Then:
 
 ```rust
 #[test]
 fn the_now_strip_marks_an_ahead_window_after_its_percentage() {
-    // Tokens and History, `work` in use with 7d ahead: `read(60, 53.0, 6.0, true)`.
+    // Tokens and History, `work` in use with 7d ahead: `read(60, 53.0, 82.0, true)`.
     for screen in [Screen::Tokens, Screen::History] {
         for w in [80, 120] {
             let rows = draw(&state_on(screen), w, 30);
             let strip = &rows[2];
-            assert!(strip.contains("  6% ▲ "), "{strip}");
+            assert!(strip.contains(" 82% ▲ "), "{strip}");
             assert!(!strip.contains('┿') && !strip.contains('┼'), "{strip}");
         }
     }
@@ -343,13 +343,16 @@ long or scoped.
 - Produces: `card::lines(state, v, width, rows, from, now_ms)` (no `on_lead`);
   `lead::pick_words(state, view) -> Option<Vec<Span<'static>>>` (no `with_key`);
   `struct Parts { top: Rect, table: Rect, under: Rect, card: Rect }`, where `top` and `under` are
-  the blank/rule/blank rows (height 3, 2 when its blanks are dropped to one, 1 for the rule
-  alone, 0 when dropped).
+  the blank/rule/blank rows (height 3; 2 once the blank under its rule is dropped, the rule
+  then last; 1 for the rule alone; 0 when dropped).
 
 - [ ] **Step 1: Write the failing tests.**
 
 ```rust
-/// S§3.1's mock: four accounts, every reading fresh (60 s, so no `!` status column), each with
+/// S§3.1's mock in shape: its accounts, names, windows and rows, so columns and row indices
+/// match it; not its figures (`read` gives other resets and no rate, `▲`, age or login), so no
+/// test built on it asserts a percentage, reset or fact from the mock.
+/// Four accounts, every reading fresh (60 s, so no `!` status column), each with
 /// 5h, 7d and a scoped `Fable` window; `work` (2) in use and selected. Tasks 5-7 reuse it.
 fn mock() -> Vec<AccountView> {
     let with_fable = |five, seven| {
@@ -412,7 +415,8 @@ fn a_short_body_scrolls_the_table_and_the_card_before_it_drops_a_separator() {
     // NOW_MS)` for every body height h from 20 down to 6. Over decreasing h: `table.height`
     // goes 5 → `min(5, TABLE_LEAST)` (TABLE_LEAST counts lines with the header: the header and
     // three accounts) while `top` and `under` stay 3; then `card.height` goes down to
-    // `card::min_height(..)`; only then does `under.height` go 3 → 1, then `top.height` 3 → 1,
+    // `card::min_height(..)`; only then does `under.height` go 3 → 2 → 1, then `top.height` 3 → 2 → 1
+    // (S§5.4: in each pair the blank under the rule goes first, so at 2 the rule is last),
     // then the rules (1 → 0); a height never grows back as h shrinks. At every h,
     // `table.height >= min(5, TABLE_LEAST)` and `card.height >= card::min_height(..)` while
     // the body holds them. Separately, a frame drawn at 80×23 shows only the too-small notice.
@@ -632,8 +636,9 @@ fn a_window_row_has_its_parts_at_fixed_columns() {
 
 #[test]
 fn pace_words_show_at_80_when_they_fit_and_never_on_short_or_spend_windows() {
-    // A long window with no rate, resetting at NOW_S + 720: the row is exactly
-    // `  7d     {bar}  82% ▲  resets in 12m · 26% expected by now` (no rate, no projection, no
+    // A long window with no rate, resetting at NOW_S + 446_400 (5d04h, so 26% expected): the
+    // row is exactly `  7d     {bar}  82% ▲  resets in 5d04h · 26% expected by now` (71
+    // columns; no rate, no projection, no
     // `not enough data yet`) and fits 80: the words show. With a rate, the row has
     // `· +2.3%/h · full in …`; without, neither part. The same pace on a Short (5h) window and
     // on a Spend window: no `▲`, no words.
@@ -908,7 +913,8 @@ fn blocks_without_windows_match_the_compact_card() {
 fn a_title_keeps_its_name_at_column_7_whatever_its_position() {
     // `many(12)` with account 10 in use (so selected), View::List at 80×40: block 10's title
     // is `▌ 10 ● a10@x.co` (a space between `10` and `●`); `j` to 11, then `Home`: block 1's
-    // title is `▌  1   a1@x.co` and block 10's ` 10 ● a10@x.co`; in every title the name
+    // title is `▌  1   a1@x.co` and block 10's `  10 ● a10@x.co` (column 0 blank, `10` in columns
+    // 2-3); in every title the name
     // starts at column 7.
 }
 
