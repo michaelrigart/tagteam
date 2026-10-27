@@ -220,7 +220,7 @@ full list replaces it.
 - **No windows** (no reading, or a reading with an empty list): an account with a problem shows
   its problem rows in the windows' place. One without (an API key, an unsupported provider, an
   empty list) shows one row from column 2 with the words the table puts across its window
-  columns (`status.rs:124-136` `unread_words`, redesign §6.3), in their role:
+  columns (`status.rs:124-138` `unread_words`, redesign §6.3), in their role:
   `api key · has no usage limits to show`. Today's card shows nothing there (`card.rs:49-52`).
   This rule is the full list's too (§6.1).
 - **Problems** under the windows, as redesign §6.4: the sentence from the window rows' column
@@ -365,7 +365,7 @@ reader the list goes on.
   scroll unit and counts in its height, so a list scrolled to that block starts with the heading.
   A list scrolled to a later block of the same provider starts with that block's title, without
   the heading. With one provider there is no heading.
-- **One account:** when focus's provider has one account (`accounts.rs:337-342` `one_account`),
+- **One account:** when focus's provider has one account (`accounts.rs:339-344` `one_account`),
   today's muted hint (`accounts.rs:462-474`, redesign §5.7) is the row after that account's
   block, after one blank row. Both rows belong to the block's scroll unit and count in its
   height. Compact keeps the hint under the table, as today.
@@ -462,7 +462,7 @@ split of §4.3. The report's JSON is unchanged (§1.3).
 - `s` gets no footer label, and no card keys row entry, when the selected account is the one in
   use. Only the hint is hidden: the key still works and keeps today's path, since switching to the
   account in use can be a real self-switch that installs replacement credentials when the live
-  ones diverge (`tagteam-engine/src/switch/plan.rs:147-165`, `actions.rs:179-191`). Help keeps
+  ones diverge (`tagteam-engine/src/switch/plan.rs:147-165`, `crates/tagteam-tui/src/actions.rs:179-191`). Help keeps
   listing `s`.
 - `J`/`K` scroll the card in compact and a tall block in the full list.
 - The key table's test (`keys.rs:753`) gains `v`'s probe.
@@ -472,7 +472,8 @@ refresh`, then from 120 columns `e disable  a alias  x remove`.
 
 ## 9. Changes to the redesign spec
 
-What each changes; the rest of each section stands.
+What each changes; the rest of each section stands. Each of these passages in the redesign spec
+carries an `*(Amended by the accounts-views spec §n.)*` note pointing here.
 
 | Redesign | Change |
 |---|---|

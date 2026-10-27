@@ -54,7 +54,7 @@ internal (`relogin required`, `pts/h (regression)`, `no-qualifying-candidate`).
 1. **The three questions are answered at a glance, on every screen.** A header names auto's
    state and threshold. An auto line gives auto's last action in plain words. The account in use
    leads Accounts as the one bold element on screen: thick bars with pace marks, plus the best
-   pick with its key. On the other screens a one-row Now strip carries it.
+   pick with its key. On the other screens a one-row Now strip carries it. *(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §3.2.)*
 2. **One timeline explains auto.** History becomes a time-based screen: usage charts with auto's
    events (switches, pauses, failed switches, logins that need you) on the same time axis, a
    swimlane per account showing who carried the load, an event list synced to the range, and a
@@ -105,15 +105,15 @@ internal (`relogin required`, `pts/h (regression)`, `no-qualifying-candidate`).
 
 | # | Question | Decision |
 |---|---|---|
-| M-1 | History or an Activity screen? | **Both, on one time-based screen**: charts carry auto's events as markers, an event list sits below synced to the range, a time cursor shows the values at a moment, events come from the store. A "Now" strip on every screen carries auto's last action, with a key to jump to it. Accounts keeps compact sparklines, and `Enter` opens the timeline filtered to the account. Fall back to four tabs only if 80×24 doesn't work. It works (§7.8), so there is no fallback |
+| M-1 | History or an Activity screen? | **Both, on one time-based screen**: charts carry auto's events as markers, an event list sits below synced to the range, a time cursor shows the values at a moment, events come from the store. A "Now" strip on every screen carries auto's last action, with a key to jump to it. Accounts keeps compact sparklines, and `Enter` opens the timeline filtered to the account. Fall back to four tabs only if 80×24 doesn't work. It works (§7.8), so there is no fallback. *(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §9: Accounts keeps no sparklines.)* |
 | M-2 | Colour | **ANSI-16 stays the default, plus an optional truecolor tier** (selection tint, dialog surface) when detected. TUI §5.1 is amended |
 | M-3 | Wording | **One plain vocabulary, in the shared engine words**, so `list` reads the same. TUI §5.2's "same words as `list`" is amended to mean words, not columns. Human output only; `--json` is unchanged |
-| M-4 | Visual direction | **Direction A** of `visual.md`: quiet and borderless; `▌` and bold for the selection; a loud status column; the active account's bars with pace marks as the single bold element; "best now: N · b switch"; dialogs with a dimmed backdrop and a rounded frame |
+| M-4 | Visual direction | **Direction A** of `visual.md`: quiet and borderless; `▌` and bold for the selection; a loud status column; the active account's bars with pace marks as the single bold element; "best now: N · b switch"; dialogs with a dimmed backdrop and a rounded frame. *(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §9: no lead card, no pace marks.)* |
 | M-5 | Store pauses and failed switches as events, outside the TUI's files? | "Do what is best": **yes**, after refactor R4 (§12.4) |
 | M-6 | (2026-10-21, T2 review) A late DA1 reply cut short is held whole by crossterm 0.29, Ctrl-C included. Fix it or accept it? | **Accept, and amend §4.2**: a known residual. No crossterm upgrade, no byte pre-reader |
 | M-7 | (2026-10-21, T2 review) Before T4, should timer mode say `no switches in the last 30 days` without reading the store? | **Show nothing until T4**: rank 4's place stays empty in timer mode (§5.3) |
 | M-8 | (2026-10-21, T3 review) A daemon's or auto's scheduled polls skip disabled accounts, so a disabled account's reading goes stale while they collect, and a stored failure stays. Should STATUS say `! old reading` (or `! rate-limited`, …) or `○ disabled`? | **Disabled wins, over every `!`**: STATUS says `○ disabled` unless the account has a `✕` problem (new login, expired, no login). A stale reading, rate-limited, retrying, keychain and budget all give way. UPDATED keeps a stale age in warn (§6.3) |
-| M-9 | (2026-10-21, T3 review) When the selected account is the one in use and has a problem, the lead card and the card both show its sentence and remedy. Keep both? | **Drop duplicate rows**: the in-use card leaves out its problem rows too, as the lead card already shows them, and its minimum height shrinks to match. Any other selected account keeps its problem rows (§6.4) |
+| M-9 | (2026-10-21, T3 review) When the selected account is the one in use and has a problem, the lead card and the card both show its sentence and remedy. Keep both? | **Drop duplicate rows**: the in-use card leaves out its problem rows too, as the lead card already shows them, and its minimum height shrinks to match. Any other selected account keeps its problem rows (§6.4). *(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §9: no longer applies.)* |
 
 **Inherited rulings:**
 - **D-2** (refactor §2): keep driving the CLI through argv, and fix its two string couplings with
@@ -290,7 +290,7 @@ a `Modifier`.
   (identity | windows | meta).
 - **Sections** are separated by a blank row and, where they need a name, a muted capital label
   (`SELECTED`). A faint rule goes under the chrome when the terminal is at least 30 rows tall, and
-  above TOTAL.
+  above TOTAL. *(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §5.2: Accounts' own rules.)*
 - **Borders** only for what floats: dialogs and panels (§9.1). Screens are borderless.
 
 ### 4.4 Components
@@ -301,8 +301,8 @@ not used.
 
 | Component | Drawing |
 |---|---|
-| Lead bar (the bold element) | `▆` fill in the severity's role on a faint `▁` baseline; pace mark `│` (text inside the fill, muted outside); about 2 % per cell at 52 cells |
-| Line gauge (tables, Now strip) | `━` fill and a `╸` half cell in the severity's role on a faint `─` track; pace mark `┿` inside the fill, `┼` outside; NO_COLOR track `·` |
+| Lead bar (the bold element) | `▆` fill in the severity's role on a faint `▁` baseline; pace mark `│` (text inside the fill, muted outside); about 2 % per cell at 52 cells. *(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §4.2.)* |
+| Line gauge (tables, Now strip) | `━` fill and a `╸` half cell in the severity's role on a faint `─` track; pace mark `┿` inside the fill, `┼` outside; NO_COLOR track `·`. *(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §4.2.)* |
 | Share line (Tokens) | `━`/`╸` in accent, no track, relative to the largest row |
 | Chart (History) | `▁▂▃▄▅▆▇█` stacked over N rows, one bucket per column, each column in its own value's severity; a faint `┈` (NO_COLOR `·`) at the threshold; an empty bucket stays blank |
 | Sparkline (cards, Tokens headline) | `▁…█` in accent, one row |
@@ -311,7 +311,7 @@ not used.
 | Markers | `●` in use · `▶` in a session · `○` disabled · `▲` faster than an even pace · `✕` needs you · `!` tagteam retries · `✓` done · `≥` at least · `~` estimated · `›` breadcrumb · `·` separator · `⏎` Enter · `⇄` switch · `‖` pause · `⠋⠙⠹…` spinner |
 
 **The pace mark** sits where `Pace.expected_pct` says usage should be by now. A fill past it
-means "faster than the window allows". Only long and scoped windows have one (C-8).
+means "faster than the window allows". Only long and scoped windows have one (C-8). *(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §4.2, §4.3: no pace marks.)*
 
 ### 4.5 Width and height
 
@@ -332,7 +332,7 @@ means "faster than the window allows". Only long and scoped windows have one (C-
 From the top:
 1. **Header** (§5.2), one row.
 2. **Auto line** (§5.3), one row, in both modes.
-3. **Now strip** (§5.4), one row, on Tokens and History. Accounts' lead card plays this role.
+3. **Now strip** (§5.4), one row, on Tokens and History. Accounts' lead card plays this role. *(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §3.2: on every screen; no rule on Accounts.)*
 4. **Rule**, faint, when the terminal has at least 30 rows.
 5. **Banner** (§5.6), 0–3 rows.
 6. **Body.**
@@ -408,6 +408,8 @@ One row: a glyph, a time, auto's last action in plain words, and on the right `w
 
 ### 5.4 Now strip (Tokens and History)
 
+*(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §3.2: on every screen, its gauges without pace marks, `▲` after an ahead window's percentage.)*
+
 ```
  ● 2 work   5h ━━━━━─────  53% 2h20m   7d ━┼────────   6% 5d16h                best now 3 spare
 ```
@@ -458,7 +460,7 @@ A centred block: a title, one sentence, the key to press (VIS-10, UX-15).
 |---|---|---|
 | Loading (after TUI §6.1's 100 ms) | `Loading accounts…` | none |
 | No accounts | `No accounts yet` | `Log in with <launch command>, then press A to add that login.` |
-| One account | (Accounts shows it normally; the header says `needs 2 usable accounts`) | under the table: `Add a second account to switch: log in to <display name> as it, then press A.` |
+| One account | (Accounts shows it normally; the header says `needs 2 usable accounts`) | under the table: `Add a second account to switch: log in to <display name> as it, then press A.` *(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §6.1: after the account's block in the full list.)* |
 | Tokens, nothing indexed | `No token usage yet` | `tagteam reads <display name>'s transcripts; they appear here as you use it.` |
 | History, nothing in range | `Nothing in the last 7 days` | `[ ] picks a longer range.` |
 | A failed Tokens read | the last report stays, DIM, with `! couldn't read the token index (<error>) · r retries` above it | |
@@ -485,8 +487,11 @@ A centred block: a title, one sentence, the key to press (VIS-10, UX-15).
 
 From the top: the lead card (§6.2), a blank row, the table (§6.3), a blank row, the selected
 account's card (§6.4). Content anchors to the top; spare rows go to the bottom (VIS-5).
+*(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §3.1, §5, §6.)*
 
 ### 6.2 Lead card and the best pick
+
+*(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §3.2, §3.4, §4: the lead card goes.)*
 
 - **The account in use**, from `AccountView.active`: `●`, position, alias bold and email muted
   (or the email bold), the org muted from 120 columns, then its facts muted (`in use · login valid
@@ -515,6 +520,8 @@ account's card (§6.4). Content anchors to the top; spare rows go to the bottom 
   CLI's real outcome.
 
 ### 6.3 Table
+
+*(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §3.3: gauges without pace marks.)*
 
 - **Columns,** by priority when the width runs short (VIS-4): selection marker; position; marker
   (`●` in use, `▶` in a session, `○` disabled); name; 5H; 7D; UPDATED; STATUS (from 100 columns);
@@ -553,6 +560,8 @@ account's card (§6.4). Content anchors to the top; spare rows go to the bottom 
 
 ### 6.4 Selected card
 
+*(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §3.4, §4: one format, no sparklines.)*
+
 - **The title:** position, alias bold and email muted, the org from 120 columns, then the facts
   muted (`not in use · updated 14m ago · next update in 2m`, `· login valid 27 more days`).
 - **A row per window** (all of them): the label, a sparkline (32 cells from 120 columns, 16 at
@@ -578,7 +587,7 @@ account's card (§6.4). Content anchors to the top; spare rows go to the bottom 
   ID, as today.
 - **`⏎`** opens History scoped to the selected account (§7.2), and the History scope and the
   Accounts selection stay in sync both ways (UX-11).
-- **`J`/`K`** scroll the selected card when it doesn't fit.
+- **`J`/`K`** scroll the selected card when it doesn't fit. *(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §6, §8: and a tall block; `v` added.)*
 - **`g`/`G` are dropped**; `Home`/`End` stay (UX-7).
 
 ## 7. History: the timeline
@@ -727,7 +736,7 @@ Behaviour stays TUI §5.3's and §6.4's; the screen changes:
   - Estimated blocks marked `~` before their start time, in place of the `observed`/`inferred`
     column; help explains it.
   - A removed account as `removed account` and an unattributed row as `unknown account`; IDs in
-    breadcrumbs and details as their first 8 characters (VIS-15).
+    breadcrumbs and details as their first 8 characters (VIS-15). *(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §7: `before tracking` for a row wholly before the token index's epoch.)*
 - **Labelled sections:** `SELECTED` with the selected row's detail and `⏎ its sessions`, then the
   notes, each led by its mark (`≥ at least: 3 subagent responses are still being counted`, `$ what
   this would cost on the API at list prices of 2026-10-01; not your bill`). `tagteam tokens` prints
@@ -846,7 +855,7 @@ re-read of the views.
 | History | `J` `K` | scroll charts (one account at 80×24) | — |
 
 Accounts' footer order: `s switch  b best  n next  ⏎ history  P pause auto  r refresh`, then from
-120 columns `e disable  a alias  x remove`.
+120 columns `e disable  a alias  x remove`. *(Amended by the [accounts-views spec](2026-10-26-tagteam-accounts-views-design.md) §8: `v` added.)*
 
 ## 11. Words
 
