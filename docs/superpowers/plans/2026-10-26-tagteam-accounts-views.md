@@ -268,8 +268,13 @@ from 5 to 15 columns on every screen. Update every direct caller of `account_tex
 - [ ] **Step 1: Write the failing tests.** Rewrite `gauge.rs:234` as
 `a_line_gauge_draws_no_pace_mark` and `:257` as `a_lead_bar_draws_no_pace_mark`: for every tier
 in `TIERS`, `line_gauge(54.0, 9, theme)` draws `━━━━╸────` (tier 0 track `·`) and
-`lead_bar(53.0, 52, theme)` 28 `▆` then 24 `▁`, neither containing `┿`, `┼` or `│`. `:317`
-drops its `expected` argument. Rewrite `accounts.rs:780` as `the_table_draws_no_pace_mark`:
+`lead_bar(53.0, 52, theme)` 28 `▆` then 24 `▁`, neither containing `┿`, `┼` or `│`. In `:317`
+(`the_gauges_draw_edge_inputs_exactly_their_cells_wide`) every case drops its `expected`
+argument and the cases that drew a mark take the unmarked drawing (`gauge` :79 and `lead_bar`
+:106: the line fills `floor` cells plus `╸` from half a cell, the lead bar `round` cells): one
+cell at 54% is `╸` (line) and `▆` (lead); nine cells at 54% are `━━━━╸────` and
+`▆▆▆▆▆▁▁▁▁` for each of the former `Some(150.0)`, `Some(-10.0)` and `Some(f64::NAN)` cases,
+which become duplicates: keep one pair. The calls at `:212` and `:222` drop their `None`. Rewrite `accounts.rs:780` as `the_table_draws_no_pace_mark`:
 keep its fixture, whose `expected_pct` values (10, 50, 20) draw marks today, and assert no table
 row contains `┿` or `┼`, in every tier. Delete `accounts.rs:4229` (it only
 pinned the mark); keep `:4273`'s `▲` in warn assertion as it is (the lead card still draws `▲`
@@ -330,8 +335,9 @@ long or scoped.
   `lead::bar_rows` is gone; the card's percentages are bold from `BOLD_FROM`, and `facts_of`'s
   login fact (:390) takes the `SOON_S` rule, S§3.4, so the three constants have their callers
   here)
-- Test: `chrome.rs` :1038, :1147, :1352, :1378, :1690; `accounts.rs` :1277, :1306, :3739, :3767,
-  :3975, :4081, :4160, and the lead-card tests :3236-4415
+- Test: `chrome.rs` :910, :1038, :1147, :1352, :1378, :1690; `accounts.rs` :1277, :1306, :1634,
+  :1711, :1788, :2756, :2818, :3739, :3767, :3975, :4081, :4160, and the lead-card tests
+  :3236-4415; `update.rs:843`
 
 **Interfaces:**
 - Produces: `card::lines(state, v, width, rows, from, now_ms)` (no `on_lead`);
@@ -466,6 +472,29 @@ becomes the strip's roles on row 2 (`●` accent, the alias bold) and both rules
 `p.top` and `p.under`); its table half stays; its card half stays until Task 5. In `:4160`
 (`a_title_keeps_its_name_readable_before_its_facts`), drop the lead half and keep the card's.
 
+The new stack moves rows on Accounts, so every test that places a row from the old split
+changes here, its arithmetic redone in its comment: the body now starts under the Now strip
+(row 3), opens with blank/rule/blank, and has six separator rows where it had the lead card and
+two blank rows. Known: `chrome.rs:910` (`a_state_too_wide_for_the_row_is_cut_and_keys_stay`:
+`body.y` is 3 on Accounts, and its comment's lead-card rows go); `update.rs:843`
+(`a_failed_read_keeps_the_last_good_data_under_a_banner`: where the banner and the table's
+first row now sit); `accounts.rs:1634`
+(`every_window_is_reachable_by_shift_j_and_k_at_80x24_under_a_full_banner`: under the 3-row
+banner the body loses the strip's row and the card the separators' extra rows, so seven
+windows (`scoped(5)`) no longer fit whole; derive the card's rows from `parts` (about seven:
+the body less six separator rows and the table's four) and give its nothing-hidden half the
+largest `scoped(n)` that fits whole; its 24-window half stays);
+`:2756` (`more_accounts_than_fit_scroll_with_the_selection`) and `:2818`
+(`a_resize_keeps_the_tables_scroll_in_range_and_the_next_key_moves_at_once`): the table's
+visible account rows at 80×28 and 80×24, recounted. Then sweep for the rest: `rg -n "lead
+card|body_of|body\.y|table_y|rows_of_part|card_rows|card_windows"
+crates/tagteam-tui/src` and check each hit against the new stack.
+
+The card's facts take the `SOON_S` rule in this task, so `:1711`
+(`the_card_shows_the_selected_account`) and `:1788` (its next-update test), whose logins have
+6 and 5 days left, now end `· log in again before then`, warn; update them here, and any other
+card assertion with a login under seven days or a percentage from 70%.
+
 Delete the lead-card tests whose subject goes (:3265, :3425, :3515, :3839, :3937, :4016, :4273,
 :4289, :4361; `:4229` already went in Task 3), with the helpers only they call: `lead_rows`
 (:3245), `NO_ACCOUNT_IN_USE` (:3260), `twenty()` (:3809) and `m()` (:3834); keep
@@ -527,7 +556,10 @@ rule.
 - Test: `accounts.rs` :1120-1197 helpers (`card_at`, `card_rows`, `card_windows`, `with_card`
   :1153), :1198, :1406, :1441, :1455, :1470-1600 (`card_reads` :1470, :1482, :1535), :1711,
   :1770, :1788, :1812, :1844, :1877, :1939, :1980, :2007, :2046, :2123, :2188, :2213, :2238,
-  the card half of :4081, :4160, and Task 4's ports of :3450 and :4203; `NEEDS_LOGIN_ROWS`
+  the card half of :4081, :4160, and Task 4's ports of :3450 and :4203; the tests Task 4
+  recounted for the new stack that count the card's rows, `:1634`, `:2756` and `:2818`, again
+  for the card's facts and keys rows (S§5.4: the keys row stays while the separators do);
+  `NEEDS_LOGIN_ROWS`
   (:3419) and its users (problem rows now at the card's indent 2); `runtime.rs:1506`;
   `daemon/mod.rs:943`; `update.rs:756` (`first_card`); `msg.rs:325`
   (`views_requests_of_one_kind_coalesce_whatever_they_ask`: its `card` requests go, its

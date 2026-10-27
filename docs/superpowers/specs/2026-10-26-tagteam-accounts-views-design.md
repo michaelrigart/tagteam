@@ -568,8 +568,11 @@ changing the design.
 - The CONTRIBUTING checks: `cargo fmt --all --check`, the three clippy runs, and `cargo test
   --workspace --locked --no-fail-fast --features tagteam/test-support` (the pty tests need a
   terminal).
-- A run of the built TUI against a real store, with screenshots of both views at 80×24 and
-  120×40.
+- Screenshots of both views at 80×24 and 120×40 from a test store (`tagteam-fake` and a scratch
+  directory, as CONTRIBUTING requires); these are the only images that may be published (§1.4).
+- A private run of the built TUI against a real store, both views at 80×24 and 120×40 and Tokens
+  across the epoch. Only its outcome is recorded; no screenshot, name or figure from it is
+  published.
 
 ## 12. Left to the builder
 
