@@ -18,6 +18,9 @@ with the one before, so any release may contain breaking changes. Each section s
   windows in one format.
 - `tagteam tui`'s bars have no pace marks. `▲` adds the share expected by now, in words, where it
   fits, and the Now strip shows `▲` on every screen.
+- Auto's `no switch needed` line, in `tagteam tui`, `tagteam auto` and `tagteam daemon`, names
+  every window of the account in use and marks the one that counts:
+  `(5h 9% · 7d 53%◂, switches at 90%)`.
 
 ### Fixed
 

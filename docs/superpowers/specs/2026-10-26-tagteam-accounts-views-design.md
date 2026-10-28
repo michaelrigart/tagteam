@@ -82,10 +82,12 @@ come from the engine's shared words or the TUI's existing ones.
 | AV-5 | Where is the selection in the full list? | `▌` on every row of the selected account's block, and bold on its name |
 | AV-6 | Pace marks? | None on any bar or gauge. `▲` stays; where the row has room it ends with the expected percentage in words (§4.3) |
 | AV-7 | Spacing? | A blank row above and below every rule on Accounts |
-| AV-8 | Tokens rows from before the epoch? | `before tracking` where the row's whole span lies before the epoch; `unknown account` everywhere else, the filter included |
+| AV-8 | Tokens rows from before the epoch? | `before tracking` where every response in the row lies before the epoch; `unknown account` everywhere else, the filter included |
+| AV-9 | Which window does auto's no-switch sentence count? | Every window of the account in use, in `tagteam list`'s form, `◂` after the one that counts (§4.4) |
 
 AV-1 to AV-7 follow the design agreed in chat on 2026-10-26 (mock v2). AV-8 follows the same
-discussion. §10 lists the calls made while writing this spec.
+discussion; its rule and AV-9 were settled on 2026-10-28 after the real-store run. §10 lists the
+calls made while writing this spec.
 
 ## 3. Accounts: the compact view (default)
 
@@ -275,6 +277,27 @@ expands in place to `▲ faster than an even pace (…)` (today at `card.rs:450`
 `▲  faster than an even pace` (`overlay/help.rs:30`). Windows without pace (5h, C-8) never show
 the words.
 
+### 4.4 Auto's no-switch sentence names its windows
+
+Auto counts the highest of the account in use's relevant windows, and its `below-threshold`
+sentence showed only that percentage: `no switch needed (53%, switches at 90%)`. When the 5h
+window reset, the number fell from 72% to 51% with nothing saying the 7d window was now the one
+counted. The sentence now names every window of the account in use, in `tagteam list`'s form and
+the poll's order, with `◂` after the one that counts:
+
+```
+no switch needed (5h 9% · 7d 53%◂, switches at 90%)
+```
+
+- Spend windows are left out; a scoped window is named by its model (`Fable 0%`).
+- The window that counts is the first within 0.05 points of the account's usage (100 less its
+  headroom), as the daemon's binding window already is (`protocol.rs` `PollPayload::binding`).
+- With no window that near, or no windows in the poll, the sentence reads as before: the bare
+  percentage in `tagteam auto` and `tagteam daemon`, and none on the TUI's auto line, which shows
+  only a binding window's usage (redesign T3-29).
+- The same words show on the TUI's auto line and in `tagteam auto` and `tagteam daemon`'s tick
+  lines (`words::windows_said`, `words::no_switch`). No JSON changes.
+
 ## 5. Spacing, alignment and overflow
 
 ### 5.1 Alignment
@@ -399,21 +422,20 @@ reader the list goes on.
 The report exposes the token index's epoch, the instant this store started recording sightings
 and launches (TR §7.2, `token_epoch.at`). A row's unattributed account reads:
 
-- **`before tracking`** when the row's whole span lies before the epoch;
-- **`unknown account`** otherwise: a row whose span reaches the epoch or later, and every row when
+- **`before tracking`** when every response in the row lies before the epoch;
+- **`unknown account`** otherwise: a row with a response at the epoch or later, and every row when
   the report has no epoch (after a full purge, before the next refresh).
 
-"Wholly before" by period (`view/mod.rs` `PeriodKey`):
+The rule reads the row's latest response time (`TokenRow::last_ms`, the row's own `Acc.last_ms`
+in `group.rs`): before tracking when `last_ms < epoch`, for every period alike. The day the epoch
+falls in is therefore `before tracking` when its responses all came before the epoch, as on a
+store whose first day of tracking began in the afternoon. A response exactly at the epoch makes
+the row `unknown account`. Drilled rows follow the same rule for their own responses. Only
+unattributed rows change: an attributed pre-epoch row keeps its account's name (§1.1).
 
-| Period | Its span | Before tracking when |
-|---|---|---|
-| Day, Month | the calendar day or month in `report.query.tz`; the end is the next one's start, exclusive (calendar helpers: `tagteam-core/src/tokens/bucket.rs:40-54`) | `end <= epoch` |
-| Session | `first_ms` to `last_ms`, both response times, inclusive (`group.rs:650-651`, `:709-713`) | `last_ms < epoch` |
-| Block | `start_ms` to `end_ms`, the end exclusive | `end_ms <= epoch` |
-
-A session with a response exactly at the epoch is therefore `unknown account`. Drilled rows follow
-the same rule for their own span. Only unattributed rows change: an attributed pre-epoch row keeps
-its account's name (§1.1).
+Amended 2026-10-28 after the real-store run: the first rule judged a row by its period's end, so
+the epoch's own day read `unknown account` although every one of its responses predated the
+epoch.
 
 Both words are 15 columns, so the ACCOUNT column keeps its width.
 
@@ -433,7 +455,8 @@ at the end of its Tokens section, shown only on Tokens: `before tracking  usage 
 tagteam recorded which account was in use; the filter's unknown account includes it`. The entry
 has its own lead column; the Marks lead column (`overlay/help.rs:138-142`) keeps its width.
 
-Example, with tracking since 2026-10-23 09:07 local time, grouped by account:
+Example, with tracking since 2026-10-23 09:07 local time, grouped by account, and unattributed
+responses on the 23rd after 09:07:
 
 ```
  2026-10-22  before tracking    5.0K      900  105.9K       —
@@ -444,9 +467,10 @@ Example, with tracking since 2026-10-23 09:07 local time, grouped by account:
 ### 7.3 The engine
 
 `TokenReport` (`view/mod.rs`) gains `tracking_since_ms: Option<i64>`: the epoch the report
-already reads (`view/mod.rs:406`, `store.token_epoch()?`), `None` when it has none. No other
-token-report or attribution behaviour changes; the only other engine change is the shared-words
-split of §4.3. The report's JSON is unchanged (§1.3).
+already reads (`view/mod.rs:406`, `store.token_epoch()?`), `None` when it has none. `TokenRow`
+gains `last_ms`, the time of its latest response (§7.1). No other token-report or attribution
+behaviour changes; the only other engine changes are the shared-words split of §4.3 and the
+no-switch sentence of §4.4. The report's JSON is unchanged (§1.3).
 
 ## 8. Keys
 
@@ -561,9 +585,9 @@ changing the design.
   dispatches the switch.
 - An API-key account and one needing a login, selected in compact and shown in the full list:
   the same replacement row or problem rows in both views (§3.4).
-- Tokens: a day, a month, a session and a block wholly before the epoch read `before tracking`;
-  one spanning it, one after it, every row with no epoch, and a session with a response exactly
-  at the epoch read `unknown account`; an attributed pre-epoch row keeps its account's name; the filter's
+- Tokens: a row whose responses all predate the epoch reads `before tracking`, the epoch's own
+  day included; a row with a response at the epoch or later, and every row with no epoch, read
+  `unknown account`; an attributed pre-epoch row keeps its account's name; the filter's
   choice and summary read `unknown account`; the detail line and a breadcrumb use the row's
   words.
 - `v`: toggles, keeps the selection across `v` and a refresh, PgUp/PgDn by whole blocks.

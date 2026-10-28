@@ -753,6 +753,7 @@ impl Tables<'_> {
             responses: acc.responses,
             unfinalized: acc.unfinalized,
             cost,
+            last_ms: acc.last_ms,
         }
     }
 }

@@ -161,6 +161,7 @@ fn outcome(o: &StatusOutcome) -> Option<Noted> {
             reason: NoSwitchReason::parse(reason)?,
             detail: String::new(),
             used_pct: None,
+            windows: None,
             frees_at_ms: None,
         },
         Some(OutcomeKind::Error) => NotedWhat::Error(reason.to_owned()),
@@ -183,12 +184,14 @@ fn decided(
             reason,
             detail,
             used_pct,
+            windows,
             frees_at_ms,
         } => {
             let frees_at = frees_at_ms.map(|ms| when(ms, now_ms, state.tokens.tz()));
             let facts = NoSwitchFacts {
                 detail,
                 used_pct: *used_pct,
+                windows: windows.as_deref(),
                 threshold: state
                     .view_of(provider)
                     .map_or(DEFAULT_THRESHOLD, |v| v.threshold),
@@ -401,7 +404,7 @@ mod tests {
         update(&mut state, no_switch("below-threshold", ""), NOW_MS);
         assert_eq!(
             line(&state, 80),
-            hinted("   14:13  no switch needed (77%, switches at 90%)", 80)
+            hinted("   14:13  no switch needed (5h 77%◂, switches at 90%)", 80)
         );
     }
 

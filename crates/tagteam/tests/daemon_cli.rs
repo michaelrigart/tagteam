@@ -146,7 +146,7 @@ fn human_output_has_auto_s_tick_lines_and_the_daemon_s_own() {
     staying(d.path());
     let mut running = Running::spawn(daemon(d.path(), &[]));
     running.wait_for(Duration::from_secs(20), "its first tick", |out| {
-        out.contains("no switch needed (60%, switches at 90%)")
+        out.contains("no switch needed (5h 10% · 7d 60%◂, switches at 90%)")
     });
     let pid = running.child.id();
     running.signal(libc::SIGTERM);
@@ -160,7 +160,9 @@ fn human_output_has_auto_s_tick_lines_and_the_daemon_s_own() {
     );
     assert!(lines.contains(&"mode auto".to_owned()), "{lines:?}");
     assert!(
-        lines.contains(&"#2 b@x.co  60%  no switch needed (60%, switches at 90%)".to_owned()),
+        lines.contains(
+            &"#2 b@x.co  60%  no switch needed (5h 10% · 7d 60%◂, switches at 90%)".to_owned()
+        ),
         "{lines:?}"
     );
     assert_eq!(lines.last().unwrap(), "stopped");

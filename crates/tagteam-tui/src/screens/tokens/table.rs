@@ -642,9 +642,7 @@ impl<'a> Table<'a> {
                 _ => words::MISSING.to_owned(),
             },
             Col::Account => {
-                let before = row
-                    .period
-                    .before_tracking(self.report.tracking_since_ms, &self.report.query.tz);
+                let before = row.before_tracking(self.report.tracking_since_ms);
                 match &row.account {
                     Some(a) => account_text(a, before),
                     None => row
@@ -1044,9 +1042,7 @@ fn crumbs(state: &State, width: usize, now_ms: i64) -> Option<Line<'static>> {
                 p => period_text(p, &report.query.tz, now_ms, 0),
             };
             let mut parts = vec![period];
-            let before = row
-                .period
-                .before_tracking(report.tracking_since_ms, &report.query.tz);
+            let before = row.before_tracking(report.tracking_since_ms);
             parts.extend(row.account.as_ref().map(|a| account_text(a, before)));
             parts.extend(row.model.as_deref().map(|m| models.get(m).to_owned()));
             Some(parts.join(" · "))
@@ -1344,9 +1340,7 @@ fn below(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
     };
     if let Some(row) = t.selected_row() {
         lines.push(Line::default());
-        let before = row
-            .period
-            .before_tracking(report.tracking_since_ms, &report.query.tz);
+        let before = row.before_tracking(report.tracking_since_ms);
         lines.extend(detail_rows(
             row,
             &report.query.tz,

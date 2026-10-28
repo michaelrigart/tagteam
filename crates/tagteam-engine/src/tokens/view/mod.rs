@@ -112,6 +112,17 @@ pub struct TokenRow {
     /// Responses whose output is a lower bound (spec §2.3).
     pub unfinalized: u64,
     pub cost: Option<Cost>,
+    /// The time of the row's latest response. Not in the JSON.
+    pub last_ms: i64,
+}
+
+impl TokenRow {
+    /// Whether every response in the row predates `epoch_ms`, the token index's epoch: its
+    /// unattributed usage then predates tracking rather than lost its account. A day the epoch
+    /// falls in is before it when the day's responses all are. No epoch is never before it.
+    pub fn before_tracking(&self, epoch_ms: Option<i64>) -> bool {
+        epoch_ms.is_some_and(|epoch| self.last_ms < epoch)
+    }
 }
 
 /// A row's period (spec §10).
@@ -139,24 +150,6 @@ pub enum PeriodKey {
         observed: bool,
         active: Option<ActiveBlock>,
     },
-}
-
-impl PeriodKey {
-    /// Whether this period's whole span lies before `epoch_ms`, the token index's epoch: its
-    /// unattributed rows then predate tracking rather than lost their account. A day or month
-    /// spans its calendar interval in `tz`, the end exclusive; a session `first_ms..=last_ms`,
-    /// both response times; a block `start_ms..end_ms`. No epoch is never before it.
-    pub fn before_tracking(&self, epoch_ms: Option<i64>, tz: &TimeZone) -> bool {
-        let Some(epoch) = epoch_ms else {
-            return false;
-        };
-        match self {
-            PeriodKey::Day { date } => day_bounds_ms(*date, tz).1 <= epoch,
-            PeriodKey::Month { year, month } => month_bounds_ms(*year, *month, tz).1 <= epoch,
-            PeriodKey::Session { last_ms, .. } => *last_ms < epoch,
-            PeriodKey::Block { end_ms, .. } => *end_ms <= epoch,
-        }
-    }
 }
 
 /// The active block's progress and projection (spec §9).
@@ -555,48 +548,32 @@ mod tests {
     }
 
     #[test]
-    fn a_period_is_before_tracking_only_when_its_whole_span_ends_by_the_epoch() {
+    fn a_row_is_before_tracking_only_when_its_latest_response_is() {
         let tz = TimeZone::get("Europe/Brussels").unwrap();
         let (start_23, _) = day_bounds_ms(date(2026, 10, 23), &tz);
-        let epoch = start_23 + 9 * 3_600_000; // 09:00 on the 23rd
-        let day = |d| PeriodKey::Day { date: d };
-        assert!(day(date(2026, 10, 22)).before_tracking(Some(epoch), &tz));
-        assert!(!day(date(2026, 10, 23)).before_tracking(Some(epoch), &tz));
-        assert!(!day(date(2026, 10, 22)).before_tracking(None, &tz));
-        let month = |m| PeriodKey::Month {
-            year: 2026,
-            month: m,
+        let epoch = start_23 + 11 * 3_600_000; // 11:00 on the 23rd
+        let period = PeriodKey::Day {
+            date: date(2026, 10, 23),
         };
-        assert!(month(9).before_tracking(Some(epoch), &tz));
-        assert!(!month(10).before_tracking(Some(epoch), &tz));
-        let session = |last_ms| PeriodKey::Session {
-            session_id: "s".into(),
-            project: None,
-            first_ms: start_23,
+        let row = |last_ms| TokenRow {
+            key: RowKey::new(&period, None, None),
+            period: period.clone(),
+            account: None,
+            model: None,
+            accounts: vec![],
+            models: vec![],
+            counts: TokenCounts::default(),
+            responses: 1,
+            unfinalized: 0,
+            cost: None,
             last_ms,
         };
-        assert!(session(epoch - 1).before_tracking(Some(epoch), &tz));
-        assert!(!session(epoch).before_tracking(Some(epoch), &tz)); // a response at the epoch
-        let block = |end_ms| PeriodKey::Block {
-            start_ms: end_ms - 5 * 3_600_000,
-            end_ms,
-            observed: true,
-            active: None,
-        };
-        assert!(block(epoch).before_tracking(Some(epoch), &tz));
-        assert!(!block(epoch + 1).before_tracking(Some(epoch), &tz));
-    }
-
-    #[test]
-    fn a_dst_day_before_the_epoch_ends_at_its_zone_s_midnight() {
-        // 2026-10-25 is 25 hours long in Europe/Brussels.
-        let tz = TimeZone::get("Europe/Brussels").unwrap();
-        let (start, end) = day_bounds_ms(date(2026, 10, 25), &tz);
-        assert_eq!(end - start, 25 * 3_600_000);
-        let d = PeriodKey::Day {
-            date: date(2026, 10, 25),
-        };
-        assert!(d.before_tracking(Some(end), &tz));
-        assert!(!d.before_tracking(Some(end - 1), &tz));
+        // The epoch's own day, its responses all from the morning before it.
+        assert!(row(epoch - 1).before_tracking(Some(epoch)));
+        assert!(
+            !row(epoch).before_tracking(Some(epoch)),
+            "a response at the epoch"
+        );
+        assert!(!row(epoch - 1).before_tracking(None), "no epoch");
     }
 }

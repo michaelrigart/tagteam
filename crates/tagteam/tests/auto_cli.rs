@@ -129,7 +129,7 @@ fn once_exits_0_switched_1_error_2_no_action_and_3_blocked() {
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
     assert_eq!(
         untimed(&out.stdout),
-        ["#2 b@x.co  60%  no switch needed (60%, switches at 90%)"]
+        ["#2 b@x.co  60%  no switch needed (5h 10% · 7d 60%◂, switches at 90%)"]
     );
     assert_eq!(text(&out.stderr), "");
 
@@ -459,7 +459,7 @@ fn bad_flag_values_are_usage_errors() {
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
     assert_eq!(
         untimed(&out.stdout),
-        ["#2 b@x.co  60%  no switch needed (60%, switches at 99.9%)"]
+        ["#2 b@x.co  60%  no switch needed (5h 10% · 7d 60%◂, switches at 99.9%)"]
     );
 }
 

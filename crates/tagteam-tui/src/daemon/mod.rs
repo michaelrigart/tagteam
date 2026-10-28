@@ -54,6 +54,8 @@ pub(crate) enum NotedWhat {
         reason: NoSwitchReason,
         detail: String,
         used_pct: Option<f64>,
+        /// That poll's windows of the account in use, the one that counts marked.
+        windows: Option<String>,
         frees_at_ms: Option<i64>,
     },
     /// An `error`'s message.
@@ -351,6 +353,7 @@ fn note(state: &mut State, event: &Event, now_ms: i64) {
             reason,
             detail: no_switch.detail,
             used_pct: d.polls.get(provider).and_then(used_pct),
+            windows: d.polls.get(provider).and_then(windows),
             frees_at_ms: None,
         }
     } else if let Some(message) = event.error() {
@@ -370,6 +373,15 @@ fn note(state: &mut State, event: &Event, now_ms: i64) {
 fn used_pct(poll: &PollPayload) -> Option<f64> {
     let active = poll.active.as_ref()?.number;
     poll.binding(active).map(|b| b.used_pct as f64)
+}
+
+/// The windows of the account in use at `poll`, as `tagteam list` names them, the one at its
+/// usage marked (`words::windows_said`). None when its usage or windows are unknown.
+fn windows(poll: &PollPayload) -> Option<String> {
+    let active = poll.active.as_ref()?.number;
+    let used = 100.0 - (*poll.headroom_pct.get(&active)?)?;
+    let windows = poll.windows_pct.get(&active)?;
+    tagteam_engine::words::windows_said(windows.iter().map(|(k, pct)| (k.as_str(), *pct)), used)
 }
 
 /// What an event asks for is read `REREAD_MS` from the first event that asks, once for every
@@ -899,7 +911,7 @@ mod tests {
         update(&mut state, below(), NOW_MS);
         assert_eq!(
             draw(&state, 80, 24)[1],
-            hinted("   14:13  no switch needed (77%, switches at 90%)"),
+            hinted("   14:13  no switch needed (5h 40% · 7d 77%◂, switches at 90%)"),
             "the binding window's usage"
         );
     }

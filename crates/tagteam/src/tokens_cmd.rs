@@ -1089,6 +1089,7 @@ mod tests {
             responses: 1,
             unfinalized: 0,
             cost: None,
+            last_ms: 1_790_000_060_000,
         };
         let mut report = report_with(IndexState::default());
         report.query.period = TokenPeriod::Session;

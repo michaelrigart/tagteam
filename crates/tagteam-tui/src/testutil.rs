@@ -12,6 +12,7 @@ use ratatui::buffer::{Buffer, Cell, CellWidth};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use tagteam_cc::CLAUDE_CODE;
+use tagteam_core::tokens::{day_bounds_ms, month_bounds_ms};
 use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind};
 use tagteam_daemon::protocol::{
     Status, StatusDaemon, StatusJob, StatusNotifications, StatusProvider, Wire,
@@ -459,7 +460,8 @@ pub(crate) fn counts(input: u64, output: u64, cache_read: u64) -> TokenCounts {
 }
 
 /// A row of `period`, grouped by `account` and `model` when they are given, of one response
-/// counting `counts`, costing `cost` nano-dollars (or nothing), keyed as the report keys it.
+/// counting `counts`, costing `cost` nano-dollars (or nothing), keyed as the report keys it, at
+/// the latest its period allows.
 pub(crate) fn token_row(
     period: PeriodKey,
     account: Option<RowAccount>,
@@ -467,6 +469,13 @@ pub(crate) fn token_row(
     counts: TokenCounts,
     cost: Option<u64>,
 ) -> TokenRow {
+    // In UTC, as `token_query`'s.
+    let last_ms = match &period {
+        PeriodKey::Day { date } => day_bounds_ms(*date, &TimeZone::UTC).1 - 1,
+        PeriodKey::Month { year, month } => month_bounds_ms(*year, *month, &TimeZone::UTC).1 - 1,
+        PeriodKey::Session { last_ms, .. } => *last_ms,
+        PeriodKey::Block { end_ms, .. } => end_ms - 1,
+    };
     TokenRow {
         key: RowKey::new(&period, account.as_ref(), model),
         accounts: account.iter().cloned().collect(),
@@ -481,6 +490,7 @@ pub(crate) fn token_row(
             usd_nanos,
             partial: false,
         }),
+        last_ms,
     }
 }
 

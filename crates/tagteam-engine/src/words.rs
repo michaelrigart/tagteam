@@ -511,6 +511,8 @@ pub struct NoSwitchFacts<'a> {
     pub detail: &'a str,
     /// The account in use's usage at the tick, for `below-threshold`: 100 less its headroom.
     pub used_pct: Option<f64>,
+    /// Its windows as `windows_said` gives them, for `below-threshold`; they replace `used_pct`.
+    pub windows: Option<&'a str>,
     pub threshold: f64,
     /// `all-exhausted`: when the first account frees up, in the caller's clock form (`16:40`).
     pub frees_at: Option<&'a str>,
@@ -526,14 +528,43 @@ pub fn threshold(pct: f64) -> String {
     }
 }
 
+/// The mark after the window that counts in `windows_said`.
+pub const COUNTING: &str = "◂";
+
+/// An account's windows as the no-switch sentence names them, in `tagteam list`'s form and the
+/// order given: `5h 9% · 7d 53%◂`. Each window by its key (`scoped:` dropped), spend left out,
+/// `COUNTING` after the first one within 0.05 points of `used` (100 less the headroom). `None`
+/// when no window is that near, so the sentence reads as it did without it.
+pub fn windows_said<'a>(
+    windows: impl IntoIterator<Item = (&'a str, f64)>,
+    used: f64,
+) -> Option<String> {
+    let mut counted = false;
+    let parts: Vec<String> = windows
+        .into_iter()
+        .filter(|(key, _)| *key != "spend")
+        .map(|(key, pct)| {
+            let label = key.strip_prefix("scoped:").unwrap_or(key);
+            let counts = !counted && (pct - used).abs() < 0.05;
+            counted |= counts;
+            let mark = if counts { COUNTING } else { "" };
+            format!("{label} {}%{mark}", pct.round() as i64)
+        })
+        .collect();
+    counted.then(|| parts.join(" · "))
+}
+
 /// Auto's decision in plain words (spec §11.3), for the auto line and `tagteam auto`.
 pub fn no_switch(reason: NoSwitchReason, facts: &NoSwitchFacts<'_>) -> String {
     let t = threshold(facts.threshold);
     let display = facts.display_name;
     match reason {
-        NoSwitchReason::BelowThreshold => match facts.used_pct {
-            Some(u) => format!("no switch needed ({}%, switches at {t})", u.round() as i64),
-            None => format!("no switch needed (switches at {t})"),
+        NoSwitchReason::BelowThreshold => match (facts.windows, facts.used_pct) {
+            (Some(w), _) => format!("no switch needed ({w}, switches at {t})"),
+            (None, Some(u)) => {
+                format!("no switch needed ({}%, switches at {t})", u.round() as i64)
+            }
+            (None, None) => format!("no switch needed (switches at {t})"),
         },
         NoSwitchReason::Cooldown if facts.detail.is_empty() => {
             "waiting after the last switch".into()
@@ -678,6 +709,7 @@ fn event_words(e: &EventView, frees_at: Option<&str>) -> String {
             let facts = NoSwitchFacts {
                 detail: "",
                 used_pct: None,
+                windows: None,
                 threshold: 0.0,
                 frees_at,
                 display_name: "",
@@ -1731,6 +1763,7 @@ mod tests {
         NoSwitchFacts {
             detail,
             used_pct: Some(77.0),
+            windows: None,
             threshold: 90.0,
             frees_at: Some("16:40"),
             display_name: "Claude Code",
@@ -1803,6 +1836,7 @@ mod tests {
         let bare = NoSwitchFacts {
             detail: "",
             used_pct: None,
+            windows: None,
             threshold: 90.0,
             frees_at: None,
             display_name: "Claude Code",
@@ -1835,6 +1869,28 @@ mod tests {
             no_switch(NoSwitchReason::BelowThreshold, &tie),
             "no switch needed (77%, switches at 90%)"
         );
+    }
+
+    #[test]
+    fn the_sentence_names_every_window_and_marks_the_one_that_counts() {
+        let windows = [
+            ("5h", 9.0),
+            ("7d", 53.0),
+            ("scoped:Fable", 0.0),
+            ("spend", 80.0),
+        ];
+        let said = windows_said(windows, 53.0).unwrap();
+        assert_eq!(said, "5h 9% · 7d 53%◂ · Fable 0%");
+        let named = NoSwitchFacts {
+            windows: Some(&said),
+            ..facts("")
+        };
+        assert_eq!(
+            no_switch(NoSwitchReason::BelowThreshold, &named),
+            "no switch needed (5h 9% · 7d 53%◂ · Fable 0%, switches at 90%)"
+        );
+        // No window near the usage: no windows to name.
+        assert_eq!(windows_said(windows, 60.0), None);
     }
 
     #[test]

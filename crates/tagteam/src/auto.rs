@@ -88,6 +88,8 @@ struct Polled {
     email: String,
     /// The highest relevant percentage (100 − headroom); `None` when unknown.
     used: Option<f64>,
+    /// Its windows, the one at `used` marked (`words::windows_said`).
+    windows: Option<String>,
     /// The switch threshold, percent: what the poll decided by.
     threshold: f64,
 }
@@ -204,13 +206,22 @@ impl EventSink for HumanSink<'_> {
                 active: Some((position, email)),
                 headroom_pct,
                 threshold,
+                windows_pct,
                 ..
             } => {
-                let used = headroom_pct.get(position).copied().flatten();
+                let used = headroom_pct
+                    .get(position)
+                    .copied()
+                    .flatten()
+                    .map(|h| 100.0 - h);
+                let windows = used.zip(windows_pct.get(position)).and_then(|(used, w)| {
+                    words::windows_said(w.iter().map(|(k, pct)| (k.as_str(), *pct)), used)
+                });
                 let polled = Polled {
                     position: *position,
                     email: email.clone(),
-                    used: used.map(|h| 100.0 - h),
+                    used,
+                    windows,
                     threshold: *threshold,
                 };
                 self.polled.borrow_mut().insert(provider.clone(), polled);
@@ -250,15 +261,18 @@ impl EventSink for HumanSink<'_> {
                     // `all-exhausted` has its line at the event that follows, with its time.
                     Some(NoSwitchReason::AllExhausted) => {}
                     Some(parsed) => {
-                        let (used_pct, threshold) = self
+                        let (used_pct, windows, threshold) = self
                             .polled
                             .borrow()
                             .get(provider)
-                            .map_or((None, DEFAULT_THRESHOLD), |p| (p.used, p.threshold));
+                            .map_or((None, None, DEFAULT_THRESHOLD), |p| {
+                                (p.used, p.windows.clone(), p.threshold)
+                            });
                         let display_name = (self.names)(provider);
                         let facts = NoSwitchFacts {
                             detail,
                             used_pct,
+                            windows: windows.as_deref(),
                             threshold,
                             frees_at: None,
                             display_name: &display_name,
@@ -285,6 +299,7 @@ impl EventSink for HumanSink<'_> {
                 let facts = NoSwitchFacts {
                     detail: "",
                     used_pct: None,
+                    windows: None,
                     threshold: DEFAULT_THRESHOLD,
                     frees_at: frees_at.as_deref(),
                     display_name: &display_name,
