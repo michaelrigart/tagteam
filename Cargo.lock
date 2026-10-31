@@ -3162,7 +3162,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam"
-version = "20261023.738.0"
+version = "20261031.2215.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -3189,7 +3189,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam-cc"
-version = "20261023.738.0"
+version = "20261031.2215.0"
 dependencies = [
  "fastrand",
  "hex",
@@ -3208,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam-core"
-version = "20261023.738.0"
+version = "20261031.2215.0"
 dependencies = [
  "hex",
  "jiff",
@@ -3220,7 +3220,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam-daemon"
-version = "20261023.738.0"
+version = "20261031.2215.0"
 dependencies = [
  "fastrand",
  "libc",
@@ -3241,7 +3241,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam-engine"
-version = "20261023.738.0"
+version = "20261031.2215.0"
 dependencies = [
  "age",
  "fastrand",
@@ -3266,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam-fake"
-version = "20261023.738.0"
+version = "20261031.2215.0"
 dependencies = [
  "serde_json",
  "tagteam-core",
@@ -3276,7 +3276,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam-provider"
-version = "20261023.738.0"
+version = "20261031.2215.0"
 dependencies = [
  "fastrand",
  "hex",
@@ -3291,7 +3291,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam-tui"
-version = "20261023.738.0"
+version = "20261031.2215.0"
 dependencies = [
  "crossterm",
  "jiff",
@@ -4102,7 +4102,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "20261023.738.0"
+version = "20261031.2215.0"
 dependencies = [
  "clap",
  "hex",
