@@ -64,7 +64,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Blocking HTTP over rustls with the OS trust store (§4.4); no async runtime. Held to one
 # minor: tagteam-engine wraps its transport, and `ureq::unversioned` breaks only in minors.
-ureq = { version = "~3.4", default-features = false, features = ["rustls", "platform-verifier"] }
+ureq = { version = "~3.5", default-features = false, features = ["rustls", "platform-verifier"] }
 # NFC for Appendix A.2's Keychain names and §12.2's profile spelling. Claude Code names its items
 # with its JavaScript runtime's NFC, and new Unicode tables can change NFC for code points they
 # assign, so the tables move only on purpose: pinned exactly at Unicode 17 (0.1.26 has 18).
