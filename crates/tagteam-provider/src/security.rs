@@ -162,7 +162,7 @@ pub fn decode_output(mut out: Vec<u8>) -> Vec<u8> {
 /// could just as well be a printable secret that happens to look like hex.
 fn looks_like_hex(bytes: &[u8]) -> bool {
     !bytes.is_empty()
-        && bytes.len() % 2 == 0
+        && bytes.len().is_multiple_of(2)
         && bytes
             .iter()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
@@ -189,7 +189,7 @@ fn confirm_password(stderr: &[u8], raw: &[u8]) -> Option<Vec<u8>> {
             .chars()
             .take_while(char::is_ascii_hexdigit)
             .collect();
-        if digits.is_empty() || digits.len() % 2 != 0 {
+        if digits.is_empty() || !digits.len().is_multiple_of(2) {
             return None;
         }
         let bytes = hex::decode(&digits).ok()?;
@@ -245,10 +245,10 @@ impl SecurityCli {
     }
 
     fn run(&self, mut args: Vec<String>, stdin: Option<&[u8]>) -> RunResult {
-        if let Some(f) = &self.keychain_file {
-            if stdin.is_none() {
-                args.push(f.to_string_lossy().into_owned());
-            }
+        if let Some(f) = &self.keychain_file
+            && stdin.is_none()
+        {
+            args.push(f.to_string_lossy().into_owned());
         }
         // H4: the token of this thread's scope, if any. A write's scope has none.
         let scope = cancel::scoped();

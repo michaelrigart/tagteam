@@ -305,10 +305,10 @@ impl Engine {
             let Read::Present(bytes) = &entry.bytes else {
                 continue;
             };
-            if let Some(from) = &from {
-                if self.capture_rotated_outgoing(&mut cx, store, rec, from, bytes)? {
-                    continue;
-                }
+            if let Some(from) = &from
+                && self.capture_rotated_outgoing(&mut cx, store, rec, from, bytes)?
+            {
+                continue;
             }
             // Every entry cleared here sits on the other auth axis, and §9.6 never takes the
             // live identity as evidence of whose it is: attributed to no one (§6.3).

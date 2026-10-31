@@ -286,14 +286,14 @@ fn wait_polling<T>(
         let (mut check_logged, mut write_logged) = (false, false);
         let mut reported = None;
         while !stop.load(Ordering::Relaxed) {
-            if let Err(e) = engine.observe_launch(id, profile, pid, seen) {
-                if !check_logged {
-                    tracing::warn!(
-                        kind = e.kind(),
-                        "could not read the session's record for the token report"
-                    );
-                    check_logged = true;
-                }
+            if let Err(e) = engine.observe_launch(id, profile, pid, seen)
+                && !check_logged
+            {
+                tracing::warn!(
+                    kind = e.kind(),
+                    "could not read the session's record for the token report"
+                );
+                check_logged = true;
             }
             report_confirmed(seen, &mut reported);
             if Instant::now() >= next {
@@ -332,14 +332,14 @@ fn wait_polling<T>(
                         );
                     }
                 }
-                if let Err(e) = engine.poll_launch(id, seen) {
-                    if !write_logged {
-                        tracing::warn!(
-                            kind = e.kind(),
-                            "could not record the session for the token report"
-                        );
-                        write_logged = true;
-                    }
+                if let Err(e) = engine.poll_launch(id, seen)
+                    && !write_logged
+                {
+                    tracing::warn!(
+                        kind = e.kind(),
+                        "could not record the session for the token report"
+                    );
+                    write_logged = true;
                 }
                 next = Instant::now() + RECORD_POLL;
             }

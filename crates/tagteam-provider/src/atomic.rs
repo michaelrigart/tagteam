@@ -150,10 +150,10 @@ fn write_atomic_mode_with<E: From<io::Error>>(
 /// is `F_FULLFSYNC`, which devfs refuses with `ENOTSUP`): that stays silent. Any other failure,
 /// an `EIO` say, is logged at WARN with its cause and the file's `role`, never a path (§14.2).
 pub fn sync_parent(dir: &Path, role: &str) {
-    if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
-        if let Some(line) = parent_sync_warning(role, &e) {
-            tracing::warn!("{line}");
-        }
+    if let Err(e) = File::open(dir).and_then(|d| d.sync_all())
+        && let Some(line) = parent_sync_warning(role, &e)
+    {
+        tracing::warn!("{line}");
     }
 }
 

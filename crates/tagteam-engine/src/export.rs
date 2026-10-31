@@ -238,10 +238,10 @@ impl Engine {
         };
         for id in providers {
             let p = self.provider(id)?;
-            if let Read::Present(live) = p.live_identity(&self.env) {
-                if let Some(row) = store.find_by_identity_key(id, p.identity_key(&live).as_str())? {
-                    out.insert(id.to_string(), row.position);
-                }
+            if let Read::Present(live) = p.live_identity(&self.env)
+                && let Some(row) = store.find_by_identity_key(id, p.identity_key(&live).as_str())?
+            {
+                out.insert(id.to_string(), row.position);
             }
         }
         Ok(out)

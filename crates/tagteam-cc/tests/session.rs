@@ -624,7 +624,7 @@ fn deleting_a_profile_credential_holds_the_storage_write_lock_at_the_profile_s_a
     let gone = f.env.home.join("moved-from/sessions/0192");
     let spelling = gone.to_str().unwrap();
     let lock = dir.join(".storage-write");
-    let probe = LockProbeKeychain::over(&f.kc, &[lock.clone()]);
+    let probe = LockProbeKeychain::over(&f.kc, std::slice::from_ref(&lock));
     let cc = ClaudeCode::with_store(
         LiveStore::new(probe.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO),
     );

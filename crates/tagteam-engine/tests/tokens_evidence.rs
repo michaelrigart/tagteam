@@ -390,7 +390,7 @@ fn a_launch_is_open_before_the_spawn_and_attached_after() {
         pid: None,
         recorded_at: NOW,
     };
-    assert_eq!(launches(&fx), [open.clone()]);
+    assert_eq!(launches(&fx), std::slice::from_ref(&open));
 
     fx.clock.advance_ms(50);
     fx.engine.attach_launch_pid(&id, 4242).unwrap();
@@ -425,7 +425,7 @@ fn a_planned_launch_is_recorded_late_with_its_own_start_and_recording_is_idempot
         pid: None,
         recorded_at: NOW + 7_000,
     };
-    assert_eq!(launches(&fx), [open.clone()]);
+    assert_eq!(launches(&fx), std::slice::from_ref(&open));
 
     fx.clock.advance_ms(1_000);
     fx.engine.attach_launch_pid(&id, 4242).unwrap();
@@ -438,7 +438,7 @@ fn a_planned_launch_is_recorded_late_with_its_own_start_and_recording_is_idempot
     fx.engine.record_launch(&id).unwrap();
     assert_eq!(
         launches(&fx),
-        [attached.clone()],
+        std::slice::from_ref(&attached),
         "a second record is a no-op"
     );
 

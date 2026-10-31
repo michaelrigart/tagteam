@@ -220,10 +220,10 @@ impl Timeline {
         };
         match switches.first() {
             Some(&(first_at, from, _)) => {
-                if let Some(from) = from {
-                    if let Some(start) = added(from).filter(|start| *start < first_at) {
-                        segment(from, start, first_at);
-                    }
+                if let Some(from) = from
+                    && let Some(start) = added(from).filter(|start| *start < first_at)
+                {
+                    segment(from, start, first_at);
                 }
                 for (i, &(at, _, to)) in switches.iter().enumerate() {
                     let end = switches.get(i + 1).map_or(i64::MAX, |next| next.0);
@@ -238,10 +238,10 @@ impl Timeline {
                     .filter(|c| c.at_ms <= epoch_ms)
                     .min_by_key(|c| c.at_ms)
                     .and_then(|c| c.account.as_ref());
-                if let Some(account) = seeded {
-                    if let Some(start) = added(account) {
-                        segment(account, start, i64::MAX);
-                    }
+                if let Some(account) = seeded
+                    && let Some(start) = added(account)
+                {
+                    segment(account, start, i64::MAX);
                 }
             }
         }
@@ -368,7 +368,7 @@ mod tests {
     fn one_home_places_two_homes_conflict() {
         let a = seen(profile("a"), 10, 20);
         assert_eq!(
-            place(&[a.clone()], &none(), &complete(), 15),
+            place(std::slice::from_ref(&a), &none(), &complete(), 15),
             Placement::Home(profile("a"))
         );
         // Two executions in the same home still name one home.

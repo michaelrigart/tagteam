@@ -45,7 +45,7 @@ fn a_quarantine_the_vault_has_moved_past_is_released_and_recorded_with_its_sourc
         fx.engine_as(EventSource::Auto)
             .release_unbound_quarantines(&fx.provider())
             .unwrap(),
-        [a.clone()]
+        std::slice::from_ref(&a)
     );
     assert_eq!(quarantine_of(&fx, &a), (None, None));
     let events = fx.engine.store().unwrap().events().unwrap();
@@ -118,7 +118,7 @@ fn the_live_account_s_quarantine_holds_while_the_live_credential_is_its_generati
         fx.engine
             .release_unbound_quarantines(&fx.provider())
             .unwrap(),
-        [b.clone()]
+        std::slice::from_ref(&b)
     );
     assert_eq!(quarantine_of(&fx, &b), (None, None));
 }

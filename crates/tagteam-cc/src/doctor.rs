@@ -345,10 +345,10 @@ fn former_items(env: &Env) -> Vec<String> {
         names.extend(kinds.map(|k| keychain_service(&default, k)));
     }
     let link = Path::new(dir);
-    if fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink()) {
-        if let Ok(target) = fs::canonicalize(link) {
-            names.extend(kinds.map(|k| keychain_service(&named_from(env, &target), k)));
-        }
+    if fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink())
+        && let Ok(target) = fs::canonicalize(link)
+    {
+        names.extend(kinds.map(|k| keychain_service(&named_from(env, &target), k)));
     }
     let current: Vec<String> = kinds.map(|k| keychain_service(env, k)).to_vec();
     names.retain(|n| !current.contains(n));

@@ -309,13 +309,13 @@ impl Engine {
         let unlisted = match plan.provider {
             // §6.3: as `remove` would, before anything is deleted.
             Some(_) => {
-                if let Some(row) = rows.first() {
-                    if let Err(e) = self.rescue_paths_for(&row.id) {
-                        return Err(EngineError::RescueUnlistable {
-                            path: e.path,
-                            detail: e.detail,
-                        });
-                    }
+                if let Some(row) = rows.first()
+                    && let Err(e) = self.rescue_paths_for(&row.id)
+                {
+                    return Err(EngineError::RescueUnlistable {
+                        path: e.path,
+                        detail: e.detail,
+                    });
                 }
                 UnlistedRescues::Refuse
             }
@@ -628,12 +628,11 @@ impl Engine {
         profile: &Path,
         providers: &[ProviderId],
     ) -> Vec<Arc<dyn Provider>> {
-        if let Read::Present(marker) = ProfileMarker::read(profile) {
-            if let Ok(p) = self.provider(&marker.provider) {
-                if p.capabilities().sessions {
-                    return vec![p];
-                }
-            }
+        if let Read::Present(marker) = ProfileMarker::read(profile)
+            && let Ok(p) = self.provider(&marker.provider)
+            && p.capabilities().sessions
+        {
+            return vec![p];
         }
         let mut judges: Vec<Arc<dyn Provider>> = Vec::new();
         for id in providers {
@@ -681,10 +680,10 @@ impl Engine {
     /// this build does not register, no share list is known, so every registered provider's
     /// must-share entries are checked, and a real one refuses (`refuse_real_copies`).
     fn refuse_orphan_split(&self, profile: &Path) -> Result<(), EngineError> {
-        if let Read::Present(marker) = ProfileMarker::read(profile) {
-            if let Ok(p) = self.provider(&marker.provider) {
-                return self.refuse_split_at(p.as_ref(), profile, |_| true);
-            }
+        if let Read::Present(marker) = ProfileMarker::read(profile)
+            && let Ok(p) = self.provider(&marker.provider)
+        {
+            return self.refuse_split_at(p.as_ref(), profile, |_| true);
         }
         self.refuse_real_copies(profile)
     }

@@ -176,10 +176,10 @@ impl Replies {
     }
 
     fn end_osc(&mut self) {
-        if !self.overlong {
-            if let Some(background) = background_of(&self.body) {
-                self.background = Some(background);
-            }
+        if !self.overlong
+            && let Some(background) = background_of(&self.body)
+        {
+            self.background = Some(background);
         }
         self.state = State::Ground;
     }

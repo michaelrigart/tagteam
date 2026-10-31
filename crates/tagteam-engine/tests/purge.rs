@@ -600,7 +600,7 @@ fn an_orphaned_profile_in_use_refuses() {
     // An unreadable marker counts as affected even by a `--provider` purge.
     fs::write(gone.join(".tagteam-profile.json"), "not a marker").unwrap();
     let narrowed = fx.engine.purge_plan(Some(&fx.provider())).unwrap();
-    assert_eq!(narrowed.orphan_profiles, [gone.clone()]);
+    assert_eq!(narrowed.orphan_profiles, std::slice::from_ref(&gone));
     let _session = fx.hold_reservation(&gone);
     assert_eq!(
         fx.engine.purge(&narrowed).unwrap_err().kind(),
@@ -965,7 +965,7 @@ fn a_full_purge_deletes_an_account_of_a_provider_this_build_does_not_register() 
         "listed with its provider's ID"
     );
     assert_eq!(plan.accounts[1].provider, ghost);
-    assert_eq!(plan.orphan_profiles, [stray.clone()]);
+    assert_eq!(plan.orphan_profiles, std::slice::from_ref(&stray));
 
     let report = fx.engine.purge(&plan).unwrap();
 
@@ -1044,7 +1044,7 @@ fn an_orphan_whose_marker_cannot_be_read_refuses_when_it_holds_real_history() {
     fs::create_dir_all(&projects).unwrap();
     fs::write(broken.join(".tagteam-profile.json"), "not a marker").unwrap();
     let narrowed = fx.engine.purge_plan(Some(&fx.provider())).unwrap();
-    assert_eq!(narrowed.orphan_profiles, [broken.clone()]);
+    assert_eq!(narrowed.orphan_profiles, std::slice::from_ref(&broken));
     for plan in [full_plan(&fx), narrowed] {
         let err = fx.engine.purge(&plan).unwrap_err();
         assert!(
@@ -1387,7 +1387,7 @@ fn a_copy_of_an_account_s_profile_never_deletes_the_account_s_item() {
     let copy = fx.env.data_dir().join("sessions/copy");
     copy_dir(&original, &copy);
     let plan = full_plan(&fx);
-    assert_eq!(plan.orphan_profiles, [copy.clone()]);
+    assert_eq!(plan.orphan_profiles, std::slice::from_ref(&copy));
     fx.kc.set_fail_delete(SERVICE, true);
     let report = fx.engine.purge(&plan).unwrap();
     fx.kc.set_fail_delete(SERVICE, false);
@@ -1425,7 +1425,7 @@ fn a_stored_profile_that_cannot_be_resolved_leaves_every_orphan_as_it_is() {
     fs::create_dir_all(profile.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&profile, &profile).unwrap();
     let plan = ffx.engine.purge_plan(Some(&fx.provider())).unwrap();
-    assert_eq!(plan.orphan_profiles, [gone.clone()]);
+    assert_eq!(plan.orphan_profiles, std::slice::from_ref(&gone));
     let report = ffx.engine.purge(&plan).unwrap();
     assert!(gone.exists(), "the orphan is left as it is");
     assert!(
@@ -1464,7 +1464,7 @@ fn an_orphan_naming_the_live_config_dir_never_deletes_the_live_login() {
     assert_eq!(fs::canonicalize(&link).unwrap(), live_dir);
 
     let plan = full_plan(&fx);
-    assert_eq!(plan.orphan_profiles, [link.clone()]);
+    assert_eq!(plan.orphan_profiles, std::slice::from_ref(&link));
     let report = fx.engine.purge(&plan).unwrap();
 
     assert_eq!(
@@ -1622,7 +1622,7 @@ fn a_link_to_an_account_s_profile_never_deletes_the_account_s_item() {
     let link = fx.env.data_dir().join("sessions/x");
     std::os::unix::fs::symlink(&original, &link).unwrap();
     let plan = full_plan(&fx);
-    assert_eq!(plan.orphan_profiles, [link.clone()]);
+    assert_eq!(plan.orphan_profiles, std::slice::from_ref(&link));
     fx.kc.set_fail_delete(SERVICE, true);
     let report = fx.engine.purge(&plan).unwrap();
     fx.kc.set_fail_delete(SERVICE, false);
@@ -1658,7 +1658,7 @@ fn an_orphan_named_by_the_secure_storage_override_never_deletes_the_live_login()
     let live_item = fx.live_item(tagteam_cc::ItemKind::OAuth);
     fx.kc.put(&live_item.0, &live_item.1, b"the live login");
     let plan = full_plan(&fx);
-    assert_eq!(plan.orphan_profiles, [orphan.clone()]);
+    assert_eq!(plan.orphan_profiles, std::slice::from_ref(&orphan));
     // R-premerge-preflight-live: the whole purge refuses, before anything is deleted.
     let message = fx.engine.purge(&plan).unwrap_err().to_string();
     assert_eq!(
@@ -1687,7 +1687,7 @@ fn a_link_with_no_marker_is_removed_and_names_no_keychain_item_by_the_path_it_le
     let items = fx.kc.items();
 
     let plan = full_plan(&fx);
-    assert_eq!(plan.orphan_profiles, [link.clone()]);
+    assert_eq!(plan.orphan_profiles, std::slice::from_ref(&link));
     let report = fx.engine.purge(&plan).unwrap();
 
     assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
@@ -1724,7 +1724,7 @@ fn a_link_to_a_directory_holding_a_readable_marker_names_no_item_by_that_marker(
     let items = fx.kc.items();
 
     let plan = full_plan(&fx);
-    assert_eq!(plan.orphan_profiles, [link.clone()]);
+    assert_eq!(plan.orphan_profiles, std::slice::from_ref(&link));
     let report = fx.engine.purge(&plan).unwrap();
 
     assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");

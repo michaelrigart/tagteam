@@ -1324,7 +1324,7 @@ fn row_keys_are_stable_across_refreshes() {
     let v = View::new();
     v.sight("s-1", "acct-a", T0, T0 + D);
     let stale = v.usage("s-1", T0 + H, "model-a", 1, 2);
-    v.index(&[stale.clone()]);
+    v.index(std::slice::from_ref(&stale));
     let queries = [
         v.query(TokenPeriod::Day, TokenGrouping::AccountModel),
         v.query(TokenPeriod::Month, TokenGrouping::AccountModel),

@@ -998,7 +998,6 @@ pub fn storage_write_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
 
     use super::*;

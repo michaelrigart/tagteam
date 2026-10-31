@@ -194,10 +194,9 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
         .provider_flag
         .as_ref()
         .filter(|_| !matches!(command, Command::Purge { .. }))
+        && let Err(e) = app.engine.provider(p)
     {
-        if let Err(e) = app.engine.provider(p) {
-            return Ended::Code(app.io.fail(json, e.kind(), &e.to_string()));
-        }
+        return Ended::Code(app.io.fail(json, e.kind(), &e.to_string()));
     }
     let result = match command {
         // §12.5: `run` has an end of its own. It checks the Keychain's lock itself, once it

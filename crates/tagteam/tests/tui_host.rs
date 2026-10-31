@@ -86,10 +86,10 @@ impl Dialogs {
 
 impl Ask for Dialogs {
     fn confirm(&mut self, question: &str, default_yes: bool) -> bool {
-        if let Some(shutdown) = &self.shutdown {
-            if shutdown.requested().is_some() {
-                return false;
-            }
+        if let Some(shutdown) = &self.shutdown
+            && shutdown.requested().is_some()
+        {
+            return false;
         }
         self.asked.push((question.to_owned(), default_yes));
         if self.quit_while_open {

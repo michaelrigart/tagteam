@@ -23,11 +23,11 @@ impl Engine {
                 Ok(store.find_by_position(provider, p)?.into_iter().collect())
             }
             Some(AccountRefInput::Text(t)) => {
-                if let Ok(alias) = normalize_alias(&t) {
-                    if let Some(row) = store.find_by_alias(&alias)? {
-                        let wrong_provider = provider.is_some_and(|p| p != &row.provider);
-                        return Ok(if wrong_provider { vec![] } else { vec![row] });
-                    }
+                if let Ok(alias) = normalize_alias(&t)
+                    && let Some(row) = store.find_by_alias(&alias)?
+                {
+                    let wrong_provider = provider.is_some_and(|p| p != &row.provider);
+                    return Ok(if wrong_provider { vec![] } else { vec![row] });
                 }
                 Ok(store.find_by_email(&t, provider)?)
             }

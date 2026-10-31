@@ -1714,7 +1714,7 @@ fn every_tick_ends_at_one_boundary_whatever_it_came_to() {
     fx.engine.cancel().request(libc::SIGTERM);
     let e = engine.tick(&sink).unwrap_err();
     assert_eq!(e.signal(), Some(libc::SIGTERM));
-    assert_eq!(sink.take(), [done.clone()]);
+    assert_eq!(sink.take(), std::slice::from_ref(&done));
 }
 
 /// §14.1: a signal at a collection cancellation point ends the tick with the interruption. The

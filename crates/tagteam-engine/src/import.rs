@@ -184,10 +184,10 @@ impl Engine {
                 if !logins.insert((record.provider.clone(), key.clone())) {
                     return Err(refused(n, "it is the same login as an earlier account"));
                 }
-                if let Some(a) = &alias {
-                    if !aliases.insert(a.clone()) {
-                        return Err(refused(n, "its alias is an earlier account's"));
-                    }
+                if let Some(a) = &alias
+                    && !aliases.insert(a.clone())
+                {
+                    return Err(refused(n, "its alias is an earlier account's"));
                 }
                 Ok(Valid {
                     record,

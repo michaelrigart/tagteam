@@ -478,10 +478,10 @@ fn a_budgeted_refresh_resumes_where_it_stopped() {
         assert!(now > seen, "call {calls} made no progress");
         seen = now;
         for (path, len) in &paths {
-            if let Some(f) = stored.iter().find(|f| f.path == path.to_string_lossy()) {
-                if f.offset < *len {
-                    assert_eq!(f.size, -1, "{} is read part-way", f.path);
-                }
+            if let Some(f) = stored.iter().find(|f| f.path == path.to_string_lossy())
+                && f.offset < *len
+            {
+                assert_eq!(f.size, -1, "{} is read part-way", f.path);
             }
         }
         assert_eq!(store.token_state(&p).unwrap().unwrap().refreshed_at, None);

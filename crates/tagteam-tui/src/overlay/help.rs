@@ -490,7 +490,7 @@ mod tests {
                 .unwrap();
             let starts: Vec<(String, usize)> = rows[marks_at + 1..]
                 .iter()
-                .map(|l| text(l))
+                .map(text)
                 .filter(|t| t.len() == 4 && !t[1].trim().is_empty())
                 .map(|t| (t[1].trim().to_owned(), width_of(&t[..3].concat())))
                 .collect();

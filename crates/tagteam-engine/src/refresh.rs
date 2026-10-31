@@ -266,15 +266,15 @@ impl<'e> Received<'e> {
     fn landed(&mut self) {
         self.armed = false;
         self.log_failed_write_ahead();
-        if let Some(path) = self.ahead.take() {
-            if let Err(e) = self.engine.delete_rescue(&path) {
-                tracing::warn!(
-                    position = self.row.position,
-                    account = %self.row.id,
-                    kind = e.kind(),
-                    "a rescue written ahead could not be deleted after the vault took its token"
-                );
-            }
+        if let Some(path) = self.ahead.take()
+            && let Err(e) = self.engine.delete_rescue(&path)
+        {
+            tracing::warn!(
+                position = self.row.position,
+                account = %self.row.id,
+                kind = e.kind(),
+                "a rescue written ahead could not be deleted after the vault took its token"
+            );
         }
         self.release_warnings();
     }

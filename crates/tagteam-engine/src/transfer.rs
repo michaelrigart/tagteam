@@ -574,10 +574,10 @@ fn decrypt(
             Key::SshEncrypted(_) => None,
         })
         .collect();
-    if !ready.is_empty() {
-        if let Attempt::Plaintext(p) = attempt(input, &ready, false)? {
-            return Ok(p);
-        }
+    if !ready.is_empty()
+        && let Attempt::Plaintext(p) = attempt(input, &ready, false)?
+    {
+        return Ok(p);
     }
     // An encrypted SSH key can only open an ssh-ed25519 stanza: without one, its passphrase is
     // not worth asking for. A header that cannot be read leaves the question to the key.

@@ -86,7 +86,7 @@ impl Redactor {
                 self.known.push((form.to_owned(), placeholder.clone()));
             }
         }
-        self.known.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        self.known.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
     }
 
     /// `text` for a child's raw output.

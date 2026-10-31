@@ -613,10 +613,10 @@ impl Engine {
                     p.login_expires_at(&bytes),
                 )?;
                 self.unquarantine(out, CREDENTIALS_REPLACED)?;
-                if backfill_uuid {
-                    if let Some(uuid) = resolved.and_then(|i| i.account_uuid.as_deref()) {
-                        store.backfill_account_uuid(&out.id, uuid)?;
-                    }
+                if backfill_uuid
+                    && let Some(uuid) = resolved.and_then(|i| i.account_uuid.as_deref())
+                {
+                    store.backfill_account_uuid(&out.id, uuid)?;
                 }
                 if class == OutgoingClass::Unresolved {
                     tracing::warn!(

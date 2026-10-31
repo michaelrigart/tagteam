@@ -665,7 +665,7 @@ mod tests {
             "{}: `default_provider` names other, which this build does not have; using claude-code",
             settings::config_path(&env).display()
         );
-        assert_eq!(chosen.warnings, [warning.clone()]);
+        assert_eq!(chosen.warnings, std::slice::from_ref(&warning));
         // An explicit provider, as `--provider` names one, warns all the same.
         let chosen = command_settings(
             &env,

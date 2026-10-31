@@ -999,14 +999,16 @@ impl Engine {
             label: None,
             account_uuid: None,
         };
-        if let Some(c) = store.live_identity_cache(&stamp.provider)? {
-            if c.path == stamp.path && c.mtime_ns == stamp.mtime_ns && c.size == stamp.size {
-                return Ok(c.identity_key.map(|key| CachedLogin {
-                    key,
-                    label: c.label.unwrap_or_default(),
-                    account_uuid: c.account_uuid,
-                }));
-            }
+        if let Some(c) = store.live_identity_cache(&stamp.provider)?
+            && c.path == stamp.path
+            && c.mtime_ns == stamp.mtime_ns
+            && c.size == stamp.size
+        {
+            return Ok(c.identity_key.map(|key| CachedLogin {
+                key,
+                label: c.label.unwrap_or_default(),
+                account_uuid: c.account_uuid,
+            }));
         }
         // An unreadable or garbled file is not cached: the next run parses it again.
         let Some(login) = parse() else {
