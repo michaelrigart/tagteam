@@ -1,0 +1,12 @@
+# Each of these starts crossterm's event reader: a second poll on the terminal, which loses a key
+# typed with a resize. The TUI reads the terminal itself (docs/superpowers/specs/
+# 2026-10-31-tagteam-tui-input-reader-design.md §3.3).
+disallowed-methods = [
+    { path = "crossterm::event::poll", reason = "starts crossterm's event reader (input reader spec §3.3)" },
+    { path = "crossterm::event::read", reason = "starts crossterm's event reader (input reader spec §3.3)" },
+    { path = "crossterm::cursor::position", reason = "starts crossterm's event reader (input reader spec §3.3)" },
+    { path = "crossterm::terminal::supports_keyboard_enhancement", reason = "starts crossterm's event reader (input reader spec §3.3)" },
+    { path = "ratatui::Terminal::clear", reason = "asks crossterm for the cursor position (input reader spec §3.3)" },
+    { path = "ratatui::Terminal::get_cursor_position", reason = "asks crossterm for the cursor position (input reader spec §3.3)" },
+    { path = "ratatui::backend::Backend::get_cursor_position", reason = "asks crossterm for the cursor position (input reader spec §3.3)" },
+]
