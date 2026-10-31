@@ -300,16 +300,17 @@ no switch needed (5h 9% · 7d 53%◂, switches at 90%)
   position's counting window (`counting_window`), computed where `windows_pct` is. It is in no
   JSON; the daemon's wire and every `--json` line are unchanged.
 - The TUI hears the poll over the wire, which carries no key, so it works the key out with the
-  same rule from its own view and the poll together. The view gives what does not change between
-  readings: the account's windows' keys, kinds and labels, and their order (the stored reading's,
-  which the tie-break follows). The poll gives their percentages, because the view is always
-  older than the tick: a `poll` only schedules the view's re-read 250 ms later, and its
-  `no-switch` is heard before that. `binding_window` runs over the view's windows, in the view's
-  order, at the poll's percentages, under that provider's `models`.
+  same rule from its own view and the poll together. The view gives the account's windows' keys,
+  kinds and labels, and their order (the stored reading's, which the tie-break follows; the
+  provider lists its windows in a stable order). The poll gives their percentages, because the
+  view is always older than the tick: a `poll` only schedules the view's re-read 250 ms later, and
+  its `no-switch` is heard before that. `binding_window` runs over the view's windows, in the
+  view's order, at the poll's percentages, under that provider's `models`.
 - It marks nothing when the view lacks the account or its reading, when its keys for the account
-  are not the poll's, or when the window it counts is not at the account's usage in the poll: the
-  poll's percentage for it must be within the binding tolerance (`BINDING_TOLERANCE`, 0.05 points,
-  shared with the parser) of 100 less the account's `headroomPct`. That last check catches a
+  are not the poll's, when the poll gives the account no `headroomPct`, or when the window it
+  counts is not at the account's usage in the poll: the poll's percentage for it must equal 100
+  less the account's `headroomPct`, which the engine takes from the same reading without rounding,
+  so to within float error (`1e-9`), not the parser's binding tolerance. That last check catches a
   `models` the view and the daemon do not share, as when the setting has just changed and the view
   has not caught up. A view that is only older, with the same keys at other percentages, still
   marks; nothing marked reads as the next point says.
