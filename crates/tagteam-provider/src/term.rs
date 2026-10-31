@@ -74,6 +74,88 @@ pub fn read_byte(fd: RawFd) -> ByteRead {
     }
 }
 
+/// How many bytes `fd` holds unread (`ioctl` `FIONREAD`): what a read of it takes without
+/// waiting.
+pub fn bytes_waiting(fd: RawFd) -> io::Result<usize> {
+    let mut n: libc::c_int = 0;
+    // SAFETY: `n` is one valid, writable `c_int` for the duration of the call, which is what
+    // FIONREAD fills in.
+    let rc = unsafe { libc::ioctl(fd, libc::FIONREAD as _, &mut n) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(usize::try_from(n).unwrap_or(0))
+}
+
+/// Reads up to `buf.len()` bytes from `fd` with exactly one `read(2)`. It never retries: a
+/// signal ends it with `ErrorKind::Interrupted`, which the caller sees and decides on.
+pub fn read_some(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `buf` is valid and writable for `buf.len()` bytes for the duration of the call.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    usize::try_from(n).map_err(|_| io::Error::last_os_error())
+}
+
+/// A pseudo-terminal for tests, as `(master, slave)`, both close-on-exec. The slave is raw
+/// (`cfmakeraw`): no line buffering, no echo, no signals. The master is non-blocking, on its own
+/// open file description, so a test's write to it never blocks: a full terminal is `WouldBlock`.
+#[cfg(any(test, feature = "test-doubles"))]
+pub fn open_raw_pty() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: `master` and `slave` are valid, writable `c_int`s that `openpty` fills in; the
+    // name, termios and winsize pointers are null, which it allows.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `openpty` succeeded, so both descriptors are open and owned by nobody else.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    for fd in [&master, &slave] {
+        // SAFETY: fcntl on a descriptor this function owns takes integers only.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: `termios` is a zeroed struct that `tcgetattr` fills in and `cfmakeraw` and
+    // `tcsetattr` then read and write; the slave is open.
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave.as_raw_fd(), &mut termios) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        libc::cfmakeraw(&mut termios);
+        if libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &termios) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let flags = status_flags(master.as_raw_fd())?;
+    // SAFETY: fcntl on a descriptor this function owns takes integers only.
+    if unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((master, slave))
+}
+
+/// The file status flags of `fd` (`fcntl` `F_GETFL`), for tests that check `O_NONBLOCK`.
+#[cfg(any(test, feature = "test-doubles"))]
+pub fn status_flags(fd: RawFd) -> io::Result<i32> {
+    // SAFETY: F_GETFL takes no argument and touches no memory.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags)
+}
+
 /// This process's group id.
 pub fn own_process_group() -> i32 {
     // SAFETY: getpgrp has no arguments and cannot fail.
@@ -193,8 +275,9 @@ pub fn stop_self() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::io::Write as _;
-    use std::os::fd::AsRawFd as _;
+    use std::os::fd::{AsRawFd as _, OwnedFd};
     use std::os::unix::net::UnixStream;
 
     use super::*;
@@ -231,6 +314,91 @@ mod tests {
             u32::try_from(own_process_group()).ok()
         );
         assert_eq!(process_group_of(u32::MAX), None);
+    }
+
+    fn wait_for_slave(slave: &OwnedFd) {
+        assert_eq!(wait_readable(slave.as_raw_fd(), 1000), Readiness::Ready);
+    }
+
+    #[test]
+    fn bytes_waiting_counts_what_the_terminal_holds() {
+        let (master, slave) = open_raw_pty().unwrap();
+        let mut master = File::from(master);
+        master.write_all(b"abc").unwrap();
+        wait_for_slave(&slave);
+        let fd = slave.as_raw_fd();
+        assert_eq!(bytes_waiting(fd).unwrap(), 3);
+        let mut buf = [0u8; 8];
+        assert_eq!(read_some(fd, &mut buf).unwrap(), 3);
+        assert_eq!(bytes_waiting(fd).unwrap(), 0);
+    }
+
+    #[test]
+    fn read_some_takes_at_most_its_buffer_and_leaves_the_rest() {
+        let (master, slave) = open_raw_pty().unwrap();
+        let mut master = File::from(master);
+        master.write_all(b"abcde").unwrap();
+        wait_for_slave(&slave);
+        let fd = slave.as_raw_fd();
+        let mut buf = [0u8; 3];
+        assert_eq!(read_some(fd, &mut buf).unwrap(), 3);
+        assert_eq!(&buf, b"abc");
+        assert_eq!(bytes_waiting(fd).unwrap(), 2);
+    }
+
+    #[test]
+    fn the_raw_pty_passes_bytes_unbuffered_and_unechoed() {
+        let (master, slave) = open_raw_pty().unwrap();
+        let mut master_file = File::from(master);
+        master_file.write_all(b"q").unwrap();
+        wait_for_slave(&slave);
+        let mut buf = [0u8; 4];
+        assert_eq!(read_some(slave.as_raw_fd(), &mut buf).unwrap(), 1);
+        assert_eq!(buf[0], b'q');
+        assert_eq!(
+            wait_readable(master_file.as_raw_fd(), 100),
+            Readiness::TimedOut,
+            "nothing is echoed back"
+        );
+        assert_eq!(
+            status_flags(slave.as_raw_fd()).unwrap() & libc::O_NONBLOCK,
+            0
+        );
+        assert_ne!(
+            status_flags(master_file.as_raw_fd()).unwrap() & libc::O_NONBLOCK,
+            0
+        );
+    }
+
+    #[test]
+    fn a_full_pty_refuses_a_write_instead_of_blocking() {
+        let (master, _slave) = open_raw_pty().unwrap();
+        let mut master = File::from(master);
+        let start = std::time::Instant::now();
+        let mut written = 0usize;
+        let err = loop {
+            match master.write(&[b'x'; 256]) {
+                Ok(n) => written += n,
+                Err(e) => break e,
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        };
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(written > 0);
+    }
+
+    #[test]
+    fn a_hung_up_pty_reads_as_the_end_or_eio() {
+        let (master, slave) = open_raw_pty().unwrap();
+        drop(master);
+        let start = std::time::Instant::now();
+        let mut buf = [0u8; 4];
+        match read_some(slave.as_raw_fd(), &mut buf) {
+            Ok(0) => {}
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EIO)),
+            Ok(n) => panic!("read {n} bytes from a hung-up pty"),
+        }
+        assert!(start.elapsed() < std::time::Duration::from_millis(50));
     }
 }
 
