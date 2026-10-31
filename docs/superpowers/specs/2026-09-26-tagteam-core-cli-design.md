@@ -2341,7 +2341,8 @@ renames CC's config file or Keychain item (Appendix A.1, A.7):
 - `ANTHROPIC_PROFILE`, `ANTHROPIC_CONFIG_DIR`, `ANTHROPIC_FEDERATION_RULE_ID`,
   `ANTHROPIC_IDENTITY_TOKEN`, `ANTHROPIC_IDENTITY_TOKEN_FILE`;
 - `CLAUDE_CODE_SESSION_ACCESS_TOKEN`, `CLAUDE_CODE_GATEWAY_TOKEN`,
-  `CLAUDE_CODE_HOST_CREDS_FILE`, `CLAUDE_CODE_HOST_AUTH_ENV_VAR`;
+  `CLAUDE_CODE_HOST_CREDS_FILE`, `CLAUDE_CODE_HOST_AUTH_ENV_VAR`,
+  `CLAUDE_CODE_SESSIONS_OAUTH_TOKEN`;
 - `CLAUDE_CODE_CUSTOM_OAUTH_URL`, `USE_LOCAL_OAUTH`, `USE_STAGING_OAUTH`;
 - `CLAUDE_SECURESTORAGE_CONFIG_DIR`.
 
@@ -2352,7 +2353,7 @@ workload-identity profile file, is caught by validation as `overridden` (§12.3)
 **What is scrubbed.** A name is scrubbed when it supplies a credential or points at one, and
 validation cannot see it: `claude auth status` reports no change when it is set (Appendix A.7),
 so a session could use a login other than the account's own without `overridden` ever firing.
-That is why the four names in the fourth bullet are on the list.
+That is why the names in the fourth bullet are on the list.
 
 **What is not.** Two kinds of name stay in the session environment:
 - Names that only route traffic, which people set on purpose: `ANTHROPIC_BASE_URL`,
@@ -3765,6 +3766,10 @@ caches account- and org-scoped data (`groveConfigCache`, `modelAccessCache`,
   `ANTHROPIC_FOUNDRY_API_KEY`, `ANTHROPIC_AWS_API_KEY`, `ANTHROPIC_BASE_URL` and
   `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`. The controls behave as §12.3 expects:
   `CLAUDE_CODE_OAUTH_TOKEN` gives `oauth_token` and `ANTHROPIC_API_KEY` gives `api_key`.
+  *2.1.316* adds `CLAUDE_CODE_SESSIONS_OAUTH_TOKEN`, the token for CC's cloud-sessions API, which
+  CC's own subprocess scrub lists beside `CLAUDE_CODE_OAUTH_TOKEN`. `auth status` reports no
+  change for it, alone or with `CLAUDE_CODE_SDK_HAS_SESSIONS_OAUTH_REFRESH`, and the controls
+  behave as before.
 - **The config lock's retries** (*2.1.292*): CC retries the config lock on a backoff of 200, 400,
   800, 1600, 3200 and 4000 ms (about 10.2 s in all); during its first 30 s, until its interactive
   UI is up, it stops retrying after 1.5 s. Then it writes the global config without the lock,
