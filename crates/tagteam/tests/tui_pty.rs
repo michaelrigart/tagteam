@@ -256,8 +256,8 @@ fn three_shows_history_and_one_the_accounts_again() {
 
 #[test]
 fn a_burst_of_keys_in_one_write_is_handled_whole() {
-    // crossterm reads both keys at once and hands them out one by one: the second waits in
-    // its queue, where no wait on the terminal sees it.
+    // The input thread reads both keys at once and hands them out one by one: the second waits
+    // in the decoder, where no wait on the terminal sees it.
     let home = Home::new();
     let mut tui = home.tui(&["tui"]);
     tui.wait_for(LONG, "the accounts table", accounts);
@@ -270,8 +270,8 @@ fn a_burst_of_keys_in_one_write_is_handled_whole() {
 }
 
 /// Types `replies` and then `q` in one write, as a late answer to a foreground program's query
-/// arrives just ahead of a key: the TUI quits within 2 s. crossterm keeps the replies to
-/// itself, and the key waits in its queue behind them.
+/// arrives just ahead of a key: the TUI quits within 2 s. The input thread drops the replies, and
+/// the key comes out behind them.
 fn quits_behind(replies: &[u8]) {
     let home = Home::new();
     let mut tui = home.tui(&["tui"]);
@@ -289,8 +289,8 @@ fn a_key_behind_a_terminal_reply_is_handled() {
 
 #[test]
 fn a_key_behind_several_terminal_replies_is_handled() {
-    // Each kind crossterm keeps: a cursor position, the keyboard enhancement flags and the
-    // primary device attributes, and a second cursor position.
+    // Each kind the input thread drops: a cursor position, the keyboard enhancement flags and
+    // the primary device attributes, and a second cursor position.
     quits_behind(b"\x1b[1;1R\x1b[?1u\x1b[?62;22c\x1b[1;1R");
 }
 

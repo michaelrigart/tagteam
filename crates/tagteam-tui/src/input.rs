@@ -176,10 +176,10 @@ impl Wait {
     }
 }
 
-/// The process's terminal: fd 0 through `Wait`, read and decoded by the thread itself. Each
+/// A terminal's fd, fd 0 in the TUI, through `Wait`, read and decoded by the thread itself. Each
 /// `next` is one bounded step (TUI input reader spec §3.2): a read of at most `TTY_BUFFER_SIZE`
-/// bytes, taken only once `FIONREAD` says the terminal holds some, so it cannot block and fd 0
-/// is never made non-blocking. The bytes go through crossterm 0.29.0's decoder, vendored in
+/// bytes and no more than `FIONREAD` says the terminal holds, so it cannot block and the fd is
+/// never made non-blocking. The bytes go through crossterm 0.29.0's decoder, vendored in
 /// `decode`. The size comes from `crossterm::terminal::size()`.
 pub(crate) struct Terminal {
     wait: Wait,
@@ -235,13 +235,14 @@ impl Events for Terminal {
         if self.wait.closed()? {
             return Ok(Next::Closed);
         }
-        match bytes_waiting(self.fd) {
+        let waiting = match bytes_waiting(self.fd) {
             Ok(0) => return Ok(Next::Empty),
-            Ok(_) => {}
+            Ok(waiting) => waiting,
             Err(e) if hung_up(&e) => return Ok(Next::Closed),
             Err(e) => return Err(e),
-        }
-        let read = match read_some(self.fd, &mut self.buffer[..]) {
+        };
+        // Only what is there: a read of more could block, whatever the terminal's VMIN.
+        let read = match read_some(self.fd, &mut self.buffer[..waiting.min(TTY_BUFFER_SIZE)]) {
             Ok(0) => return Ok(Next::Closed),
             Ok(read) => read,
             Err(e) if hung_up(&e) => return Ok(Next::Closed),
@@ -463,7 +464,8 @@ fn read(
         filter,
         told: false,
     };
-    // The decoder may hold events from before.
+    // The terminal may already hold bytes (the decoder holds nothing yet), and no wait would
+    // report them.
     let mut more = true;
     loop {
         {
@@ -1520,6 +1522,23 @@ mod tests {
         assert!(matches!(terminal.next().unwrap(), Next::Empty));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_step_that_yields_no_event_reads_once() {
+        let _alone = alone();
+        let (master, slave) = pty();
+        let mut terminal = terminal_on(&slave);
+        let replies = b"\x1b[?62;22c".repeat(300);
+        assert_eq!(replies.len(), 2700);
+        assert!(write_whole(&master, &replies, &AtomicBool::new(false)));
+        landed(&slave, 2700);
+        assert!(matches!(terminal.next().unwrap(), Next::Pending));
+        assert_eq!(
+            bytes_waiting(slave.as_raw_fd()).unwrap(),
+            2700 - TTY_BUFFER_SIZE
+        );
+    }
+
     #[test]
     fn more_than_a_read_s_worth_comes_out_whole_and_in_order() {
         let _alone = alone();
@@ -1614,14 +1633,32 @@ mod tests {
         drop(input);
     }
 
-    /// Answers to a DA1 query, whole, until `stop` is set, and then `last` if there is one.
-    /// `stop` ends the stream only between two answers, never inside one.
+    /// Sets `stop` and `abort` when dropped, so a test that fails never leaves its writer
+    /// spinning.
+    struct Halt(Arc<AtomicBool>, Arc<AtomicBool>);
+
+    impl Drop for Halt {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+            self.1.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Answers to a DA1 query inside an unfinished bracketed paste, until `stop` is set, and then
+    /// `last` if there is one. The paste's start is written once into the empty pty, so it lands
+    /// whole; the decoder holds every byte after it until the paste's end, whatever `more` says.
+    /// A write the full pty cuts could otherwise end a short read on a lone ESC, which decodes to
+    /// the Esc key and, after it, to keys. `stop` ends the stream only between two answers.
     fn stream_replies(
         master: &Arc<File>,
+        slave: &OwnedFd,
         stop: &Arc<AtomicBool>,
         abort: &Arc<AtomicBool>,
         last: Option<&'static [u8]>,
     ) -> thread::JoinHandle<()> {
+        const PASTE: &[u8] = b"\x1b[200~";
+        assert!(write_whole(master, PASTE, abort));
+        landed(slave, PASTE.len());
         let (master, stop, abort) = (Arc::clone(master), Arc::clone(stop), Arc::clone(abort));
         thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
@@ -1646,7 +1683,8 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
-        let writer = stream_replies(&master, &stop, &abort, Some(b"q"));
+        let writer = stream_replies(&master, &slave, &stop, &abort, Some(b"\x1b[201~q"));
+        let _halt = Halt(Arc::clone(&stop), Arc::clone(&abort));
         let (tx, rx) = mpsc::channel();
         let input = Input::spawn_with(tx, terminal_on(&slave), None).unwrap();
         thread::sleep(Duration::from_millis(100));
@@ -1674,7 +1712,8 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
-        let writer = stream_replies(&master, &stop, &abort, None);
+        let writer = stream_replies(&master, &slave, &stop, &abort, None);
+        let _halt = Halt(Arc::clone(&stop), Arc::clone(&abort));
         let (tx, _rx) = mpsc::channel();
         let input = Input::spawn_with(tx, terminal_on(&slave), None).unwrap();
         thread::sleep(Duration::from_millis(100));
@@ -1704,17 +1743,11 @@ mod tests {
         let before = status_flags(slave.as_raw_fd()).unwrap();
         write_whole(&master, b"jk", &AtomicBool::new(false));
         landed(&slave, 2);
-        for _ in 0..10 {
-            if matches!(terminal.next().unwrap(), Next::Empty) {
-                break;
-            }
-        }
+        let empty = (0..10).any(|_| matches!(terminal.next().unwrap(), Next::Empty));
+        assert!(empty, "the keys were read and the terminal was empty");
         drop(master);
-        for _ in 0..10 {
-            if matches!(terminal.next().unwrap(), Next::Closed) {
-                break;
-            }
-        }
+        let closed = (0..10).any(|_| matches!(terminal.next().unwrap(), Next::Closed));
+        assert!(closed, "the hang-up was seen");
         let after = status_flags(slave.as_raw_fd()).unwrap();
         assert_eq!(before, after);
         assert_eq!(after & libc::O_NONBLOCK, 0);
