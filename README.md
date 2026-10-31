@@ -76,7 +76,7 @@ Available once the first release is published:
 cargo install tagteam --locked
 ```
 
-You need Rust 1.88 or newer (the minimum supported version, `rust-version` in `Cargo.toml`)
+You need Rust 1.89 or newer (the minimum supported version, `rust-version` in `Cargo.toml`)
 and a C compiler, because tagteam bundles SQLite. Only `tagteam` is meant to be installed; the
 `tagteam-*` crates it depends on are internals with no stable API.
 

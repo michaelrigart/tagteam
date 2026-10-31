@@ -98,7 +98,7 @@ impl CountingFence {
     }
 
     fn check(&self) -> Result<(), ProviderError> {
-        #[allow(deprecated)] // its replacement, `try_update`, needs Rust 1.95; the MSRV is 1.88
+        #[allow(deprecated)] // its replacement, `try_update`, needs Rust 1.95; the MSRV is 1.89
         let passed = self
             .remaining
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))

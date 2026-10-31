@@ -27,6 +27,7 @@ with the one before, so any release may contain breaking changes. Each section s
   token, from the session's environment, so it cannot give a session a credential of another
   account. Claude Code 2.1.316 reads it. `tagteam run` warns when the variable was set, and
   `tagteam doctor` reports it.
+- Building tagteam needs Rust 1.89 or newer; it was 1.88.
 
 ### Removed
 

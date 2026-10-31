@@ -145,6 +145,19 @@ mod tests {
         );
     }
 
+    /// NFC follows the Unicode tables: U+1AEF, unassigned in Unicode 17, has combining class 220
+    /// in Unicode 18 and so sorts before U+0301. New tables would rename an item Claude Code named
+    /// with older ones, so `unicode-normalization` is pinned (Cargo.toml).
+    #[test]
+    fn names_use_the_pinned_unicode_tables() {
+        let mut e = env();
+        crate::env::set_config_dir(&mut e, Some("/tmp/x\u{301}\u{1aef}".into()));
+        assert_eq!(
+            keychain_service(&e, ItemKind::OAuth),
+            "Claude Code-credentials-4a00d355"
+        );
+    }
+
     #[test]
     fn a_defined_secure_storage_dir_decides_alone() {
         let mut e = env();
