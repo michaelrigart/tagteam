@@ -1,6 +1,6 @@
 # tagteam — The TUI reads its own keys
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/54
 **Date:** 2026-10-31
 **Scope:** The TUI's input thread (`crates/tagteam-tui/src/input.rs`) and a new vendored decoder
 module. It stops calling crossterm's event reader and reads the terminal itself, so a key typed as
