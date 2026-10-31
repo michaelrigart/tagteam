@@ -407,7 +407,6 @@ fn read_answer(fd: RawFd, token: &Cancel) -> Answer {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::net::UnixStream;
 

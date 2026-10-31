@@ -1317,7 +1317,7 @@ fn an_account_quarantined_while_it_is_collected_is_reported() {
             (a.clone(), failed("refresh-failed"))
         ]
     );
-    assert_eq!(report.quarantined, [a.clone()]);
+    assert_eq!(report.quarantined, std::slice::from_ref(&a));
     assert_eq!(quarantine_of(&fx, &a).0.as_deref(), Some("invalid_grant"));
 
     let report = fx.collect(&[&a]);

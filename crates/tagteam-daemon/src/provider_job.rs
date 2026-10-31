@@ -1241,13 +1241,13 @@ mod tests {
         fx.settings("[daemon]\nautoswitch = false\n", 1);
         job.settings_changed(&mut cx);
         let paused = (EventKind::AutoswitchPaused, EventSource::Daemon, None);
-        assert_eq!(pauses(&fx, &cc()), [paused.clone()]);
+        assert_eq!(pauses(&fx, &cc()), std::slice::from_ref(&paused));
         fx.settings(
             "[daemon]\nautoswitch = false\n\n[autoswitch]\nthreshold = 80\n",
             2,
         );
         job.settings_changed(&mut cx);
-        assert_eq!(pauses(&fx, &cc()), [paused.clone()]);
+        assert_eq!(pauses(&fx, &cc()), std::slice::from_ref(&paused));
         fx.settings("[daemon]\nautoswitch = true\n", 3);
         job.settings_changed(&mut cx);
         assert_eq!(
@@ -1283,13 +1283,13 @@ mod tests {
             EventSource::Daemon,
             at_start.clone(),
         );
-        assert_eq!(pauses(&fx, &cc()), [paused.clone()]);
+        assert_eq!(pauses(&fx, &cc()), std::slice::from_ref(&paused));
         job.run(&mut cx);
         let mut again = ProviderJob::new(&fx.engine, cc(), job_ctx(&board));
         again.run(&mut cx);
         assert_eq!(
             pauses(&fx, &cc()),
-            [paused.clone()],
+            std::slice::from_ref(&paused),
             "the store already says so"
         );
 

@@ -98,6 +98,7 @@ impl CountingFence {
     }
 
     fn check(&self) -> Result<(), ProviderError> {
+        #[allow(deprecated)] // its replacement, `try_update`, needs Rust 1.95; the MSRV is 1.88
         let passed = self
             .remaining
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
@@ -2483,10 +2484,10 @@ impl Flaky {
 impl Keychain for Flaky {
     fn find(&self, _s: &str, _a: &str) -> Read<Vec<u8>> {
         let n = self.finds.fetch_add(1, Ordering::SeqCst);
-        if n == 0 {
-            if let Some(t) = &self.token {
-                t.request(15);
-            }
+        if n == 0
+            && let Some(t) = &self.token
+        {
+            t.request(15);
         }
         if n < self.fails {
             Read::Unreadable(ReadError::new(

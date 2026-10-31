@@ -518,10 +518,10 @@ mod wake_tests {
             let mut runs = self.runs.borrow_mut();
             runs.push((self.name, self.clock.now_ms().div_euclid(1000) - T0));
             let mine = runs.iter().filter(|(n, _)| *n == self.name).count();
-            if let Some((wake, on, prefix)) = &self.wake {
-                if mine == *on {
-                    wake.wake(prefix);
-                }
+            if let Some((wake, on, prefix)) = &self.wake
+                && mine == *on
+            {
+                wake.wake(prefix);
             }
             Ran::After(self.period_ms)
         }

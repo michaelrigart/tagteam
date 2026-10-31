@@ -262,10 +262,10 @@ pub fn row_notes(v: &AccountView, this: bool, now_s: i64) -> Vec<String> {
     if !has_windows || u.status != UsageStatus::Ok {
         notes.push(usage_words(u, now_s));
     }
-    if let Some(kind) = v.kind.display {
-        if !notes.iter().any(|n| n == kind) {
-            notes.push(kind.to_owned());
-        }
+    if let Some(kind) = v.kind.display
+        && !notes.iter().any(|n| n == kind)
+    {
+        notes.push(kind.to_owned());
     }
     if v.row.disabled {
         notes.push("disabled".into());
@@ -1307,7 +1307,7 @@ mod tests {
             unread(UsageStatus::Unavailable, None, None),
         );
         assert_eq!(
-            window_columns(&[unread_only.clone()]),
+            window_columns(std::slice::from_ref(&unread_only)),
             vec![],
             "no reading, no columns"
         );

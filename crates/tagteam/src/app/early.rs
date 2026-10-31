@@ -133,11 +133,11 @@ pub(super) fn run_shell_init(
         io.fail(true, KIND_USAGE, SHELL_INIT_UNDER_JSON);
         return EXIT_USAGE;
     }
-    if let Some(id) = provider {
-        if registry.get(&ProviderId::new(id)).is_none() {
-            let e = EngineError::UnknownProvider(id.to_owned());
-            return io.fail(false, e.kind(), &e.to_string());
-        }
+    if let Some(id) = provider
+        && registry.get(&ProviderId::new(id)).is_none()
+    {
+        let e = EngineError::UnknownProvider(id.to_owned());
+        return io.fail(false, e.kind(), &e.to_string());
     }
     let wrapped: Vec<Wrapped> = registry
         .all()

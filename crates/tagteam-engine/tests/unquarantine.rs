@@ -186,7 +186,7 @@ fn the_tick_s_release_of_a_landed_replacement_records_account_replaced_once() {
         fx.engine_as(EventSource::Auto)
             .release_unbound_quarantines(&fx.provider())
             .unwrap(),
-        [a.clone()]
+        std::slice::from_ref(&a)
     );
     drop(fx.engine.lock_account(&a).unwrap());
     let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();

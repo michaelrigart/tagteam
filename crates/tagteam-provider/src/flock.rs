@@ -315,12 +315,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("42.lock");
         let held = FlockGuard::try_lock(&p).unwrap().unwrap();
-        match holders_of(&p) {
-            Some(pids) => {
-                assert!(cfg!(target_os = "linux"));
-                assert!(pids.contains(&std::process::id()), "{pids:?}");
-            }
-            None => assert!(!cfg!(target_os = "linux")),
+        let holders = holders_of(&p);
+        assert_eq!(holders.is_some(), cfg!(target_os = "linux"), "{holders:?}");
+        if let Some(pids) = holders {
+            assert!(pids.contains(&std::process::id()), "{pids:?}");
         }
         drop(held);
     }

@@ -719,10 +719,10 @@ pub fn decide(s: &Snapshot, st: &AutoState, cfg: &AutoConfig, phase: Phase) -> D
         Ok(t) => t,
         Err(stop) => return stop,
     };
-    if !t.trigger.must_move() {
-        if let Some(left) = cooldown_left(st, cfg, s.now) {
-            return no_switch(NoSwitchReason::Cooldown, span(left), t.unhealthy_ticks);
-        }
+    if !t.trigger.must_move()
+        && let Some(left) = cooldown_left(st, cfg, s.now)
+    {
+        return no_switch(NoSwitchReason::Cooldown, span(left), t.unhealthy_ticks);
     }
     let candidates: Vec<&AccountSnapshot> = s
         .accounts

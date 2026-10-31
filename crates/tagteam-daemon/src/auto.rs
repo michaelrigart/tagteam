@@ -139,10 +139,10 @@ pub fn run_loop(
     }
     // §4.5: from the settings, or with no `--provider`, such a provider's engine runs `best`
     // with a `config-warning` instead.
-    if let (Some(p), Some(AutoStrategy::ConsumeFirst)) = (&run.provider, run.flags.strategy) {
-        if engine.provider(p)?.primary_long_window().is_none() {
-            return Err(AutoError::NoLongWindow(p.clone()));
-        }
+    if let (Some(p), Some(AutoStrategy::ConsumeFirst)) = (&run.provider, run.flags.strategy)
+        && engine.provider(p)?.primary_long_window().is_none()
+    {
+        return Err(AutoError::NoLongWindow(p.clone()));
     }
     // Before the settings are read, so a write landing meanwhile still counts as a change.
     let mtime = Settings::mtime(engine.env());

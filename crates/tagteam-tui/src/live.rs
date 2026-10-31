@@ -154,10 +154,10 @@ impl LiveQueue {
     /// connects again with backoff. The UI calls it for a link that no longer works. A link the
     /// thread has since replaced is gone already, and its successor is left alone.
     pub fn end_link(&self, link: u64) {
-        if let Some((held, closer)) = &self.lock().link {
-            if *held == link {
-                closer.close();
-            }
+        if let Some((held, closer)) = &self.lock().link
+            && *held == link
+        {
+            closer.close();
         }
     }
 
@@ -188,10 +188,10 @@ struct OnPanic<F: FnOnce()>(Option<F>);
 
 impl<F: FnOnce()> Drop for OnPanic<F> {
     fn drop(&mut self) {
-        if thread::panicking() {
-            if let Some(f) = self.0.take() {
-                f();
-            }
+        if thread::panicking()
+            && let Some(f) = self.0.take()
+        {
+            f();
         }
     }
 }

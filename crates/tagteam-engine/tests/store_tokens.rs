@@ -224,7 +224,7 @@ fn a_batch_creates_state_and_moves_changed_at_only_on_change() {
             pruned_at: None,
         })
     );
-    assert_eq!(s.token_files(&cc()).unwrap(), [f.clone()]);
+    assert_eq!(s.token_files(&cc()).unwrap(), std::slice::from_ref(&f));
     assert!(s.token_files(&fake()).unwrap().is_empty());
 
     let changed = |s: &Store| s.token_state(&cc()).unwrap().unwrap().changed_at;
@@ -1282,7 +1282,7 @@ fn launches_open_attach_close() {
         pid: None,
         recorded_at: T,
     };
-    assert_eq!(s.launches(&cc()).unwrap(), [open.clone()]);
+    assert_eq!(s.launches(&cc()).unwrap(), std::slice::from_ref(&open));
     s.attach_launch_pid(&cc(), "acct-a", T, 4242, T + 1)
         .unwrap();
     let spawned = LaunchRow {
@@ -1290,19 +1290,19 @@ fn launches_open_attach_close() {
         recorded_at: T + 1,
         ..open
     };
-    assert_eq!(s.launches(&cc()).unwrap(), [spawned.clone()]);
+    assert_eq!(s.launches(&cc()).unwrap(), std::slice::from_ref(&spawned));
     s.close_launch(&cc(), "acct-a", T, T + 50, T + 51).unwrap();
     let closed = LaunchRow {
         ended_at: Some(T + 50),
         recorded_at: T + 51,
         ..spawned
     };
-    assert_eq!(s.launches(&cc()).unwrap(), [closed.clone()]);
+    assert_eq!(s.launches(&cc()).unwrap(), std::slice::from_ref(&closed));
     s.close_launch(&cc(), "acct-a", T, T + 90, T + 91).unwrap();
     s.open_launch(&cc(), "acct-a", T, T + 99).unwrap();
     assert_eq!(
         s.launches(&cc()).unwrap(),
-        [closed.clone()],
+        std::slice::from_ref(&closed),
         "an ended launch keeps its end, and a recorded one its row"
     );
     s.open_launch(&cc(), "acct-b", T - 5, T).unwrap();

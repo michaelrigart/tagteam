@@ -363,15 +363,15 @@ impl Engine {
                     drop(locks);
                     drop(accounts);
                     // §9.1 (amended): with CC's locks released, `oauthAccount` is read again.
-                    if let Some(to) = &outcome.to {
-                        if let Ok(identity) = p.parse_identity(&to.identity_json) {
-                            outcome.warnings.extend(self.reverify_identity(
-                                p,
-                                &guard,
-                                &req.provider,
-                                &identity,
-                            ));
-                        }
+                    if let Some(to) = &outcome.to
+                        && let Ok(identity) = p.parse_identity(&to.identity_json)
+                    {
+                        outcome.warnings.extend(self.reverify_identity(
+                            p,
+                            &guard,
+                            &req.provider,
+                            &identity,
+                        ));
                     }
                     // The re-plan needs no lock and never fetches (§8.3).
                     self.replan_polls(p, store, &outcome);

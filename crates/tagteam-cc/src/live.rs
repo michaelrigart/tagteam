@@ -1172,17 +1172,17 @@ impl LiveStore {
             .collect();
 
         // 1. `global_config` first: CC's identity and managed-key axis live here.
-        if !file_matches(&paths.global_config, &snap.global_config) {
-            if let Err(e) = restore_file(&paths.global_config, &snap.global_config, fence, false) {
-                if matches!(e, ProviderError::Lock(_)) {
-                    let mut never_attempted = vec![global_config_name];
-                    never_attempted.extend(item_names.iter().cloned());
-                    never_attempted.push(credentials_file_name);
-                    log_lock_abort(&failed, &never_attempted);
-                    return Err(e);
-                }
-                failed.push(global_config_name);
+        if !file_matches(&paths.global_config, &snap.global_config)
+            && let Err(e) = restore_file(&paths.global_config, &snap.global_config, fence, false)
+        {
+            if matches!(e, ProviderError::Lock(_)) {
+                let mut never_attempted = vec![global_config_name];
+                never_attempted.extend(item_names.iter().cloned());
+                never_attempted.push(credentials_file_name);
+                log_lock_abort(&failed, &never_attempted);
+                return Err(e);
             }
+            failed.push(global_config_name);
         }
 
         // 2. The Keychain items: managed-key, then OAuth; 3. the credentials file last, so a

@@ -570,15 +570,15 @@ impl Engine {
         // The vault's `.prev`: an earlier pass reached the vault but not the live store. A
         // rescue of the vault's generation was settled by the landed rule above, deleted or
         // skipped.
-        if let (Some(v), Some(pr)) = (&vault, &prev) {
-            if is_live(pr) {
-                return Ok(Reconciled {
-                    current: v.clone(),
-                    publish: true,
-                    changed: true,
-                    retire: vec![],
-                });
-            }
+        if let (Some(v), Some(pr)) = (&vault, &prev)
+            && is_live(pr)
+        {
+            return Ok(Reconciled {
+                current: v.clone(),
+                publish: true,
+                changed: true,
+                retire: vec![],
+            });
         }
 
         // A rescue's generation: published, but its vault write failed.
@@ -657,10 +657,10 @@ impl Engine {
         cx.held.hold(p, secret);
         cx.hold_vault(self, &row.id);
         for entry in &doomed {
-            if let Read::Present(bytes) = &entry.bytes {
-                if let Err(e) = cx.save_unheld(self, bytes) {
-                    return not_published(e);
-                }
+            if let Read::Present(bytes) = &entry.bytes
+                && let Err(e) = cx.save_unheld(self, bytes)
+            {
+                return not_published(e);
             }
         }
         let login = StoredLogin {

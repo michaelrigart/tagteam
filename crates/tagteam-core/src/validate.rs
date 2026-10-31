@@ -65,10 +65,10 @@ pub fn parse_account_ref(s: &str) -> Option<AccountRefInput> {
     if s.is_empty() {
         return None;
     }
-    if s.bytes().all(|b| b.is_ascii_digit()) {
-        if let Ok(p) = s.parse::<u32>() {
-            return Some(AccountRefInput::Position(p));
-        }
+    if s.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(p) = s.parse::<u32>()
+    {
+        return Some(AccountRefInput::Position(p));
     }
     Some(AccountRefInput::Text(s.to_owned()))
 }

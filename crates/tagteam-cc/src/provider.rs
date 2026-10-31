@@ -896,10 +896,10 @@ impl Provider for ClaudeCode {
             &self.endpoints.profile,
             &self.endpoints.usage,
         ] {
-            if let Some(host) = doctor::origin(url) {
-                if !hosts.contains(&host) {
-                    hosts.push(host);
-                }
+            if let Some(host) = doctor::origin(url)
+                && !hosts.contains(&host)
+            {
+                hosts.push(host);
             }
         }
         hosts

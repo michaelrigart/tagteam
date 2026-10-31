@@ -583,7 +583,11 @@ fn a_purge_logs_each_entry_it_deleted_by_its_id() {
     fx.login("stranger@x.co", "rt-s");
     fx.switch_to(&a, true).unwrap();
     let id = fx.engine.displaced().unwrap().entries[0].id.clone();
-    let (_, logs) = capture_logs(|| fx.engine.purge_displaced(&[id.clone()]).unwrap());
+    let (_, logs) = capture_logs(|| {
+        fx.engine
+            .purge_displaced(std::slice::from_ref(&id))
+            .unwrap()
+    });
     let line = one(&logs, "deleted a displaced credential");
     assert_eq!(field(line, "displaced"), Some(id.as_str()), "{line}");
     assert!(logs.iter().all(|l| !l.contains("stranger")), "{logs:#?}");

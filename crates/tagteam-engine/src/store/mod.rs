@@ -631,17 +631,17 @@ fn displaced_from_row(r: &Row<'_>) -> rusqlite::Result<DisplacedRow> {
 
 /// Maps UNIQUE violations to named errors.
 fn classify(e: rusqlite::Error, position: u32, alias: Option<&str>) -> StoreError {
-    if let rusqlite::Error::SqliteFailure(f, Some(msg)) = &e {
-        if f.code == ErrorCode::ConstraintViolation {
-            if msg.contains("accounts.alias") {
-                return StoreError::AliasTaken(alias.unwrap_or_default().to_owned());
-            }
-            if msg.contains("accounts.position") {
-                return StoreError::PositionTaken(position);
-            }
-            if msg.contains("accounts.identity_key") {
-                return StoreError::IdentityTaken;
-            }
+    if let rusqlite::Error::SqliteFailure(f, Some(msg)) = &e
+        && f.code == ErrorCode::ConstraintViolation
+    {
+        if msg.contains("accounts.alias") {
+            return StoreError::AliasTaken(alias.unwrap_or_default().to_owned());
+        }
+        if msg.contains("accounts.position") {
+            return StoreError::PositionTaken(position);
+        }
+        if msg.contains("accounts.identity_key") {
+            return StoreError::IdentityTaken;
         }
     }
     StoreError::Sqlite(e)

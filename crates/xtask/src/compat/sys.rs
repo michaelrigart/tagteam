@@ -471,10 +471,10 @@ fn wait_interactive_as(
     // A leader ended by a terminal Ctrl-C (or SIGTERM, SIGHUP) is the run's cancellation: the
     // token records it, as the harness's own handler would, before any cleanup, so every caller
     // sees `requested()` whatever the cleanup then does.
-    if let Ok(Some(status)) = &outcome {
-        if let Some(n) = terminating_signal(*status) {
-            token.request(n);
-        }
+    if let Ok(Some(status)) = &outcome
+        && let Some(n) = terminating_signal(*status)
+    {
+        token.request(n);
     }
     // Everything current is known before anything is signalled: the group's end below reaps the
     // leader, and a descendant that left the group (`setsid`) is then re-parented out of sight.
@@ -878,13 +878,13 @@ impl Proc {
 
 impl Drop for Proc {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            if !end_group(&mut child) {
-                SURVIVORS
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push((std::mem::take(&mut self.what), child));
-            }
+        if let Some(mut child) = self.child.take()
+            && !end_group(&mut child)
+        {
+            SURVIVORS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((std::mem::take(&mut self.what), child));
         }
     }
 }

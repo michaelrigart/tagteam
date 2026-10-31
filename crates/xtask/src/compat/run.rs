@@ -603,11 +603,11 @@ fn run_checks(ctx: &mut Ctx, selected: &[usize], report: &mut Report) -> Result<
         if here.is_empty() {
             continue;
         }
-        if phase == Phase::Live {
-            if let Err(e) = enter_live(ctx, report) {
-                report.fail(e.0);
-                break;
-            }
+        if phase == Phase::Live
+            && let Err(e) = enter_live(ctx, report)
+        {
+            report.fail(e.0);
+            break;
         }
         for i in here {
             if cancel().requested().is_some() {
@@ -668,12 +668,12 @@ fn enter_live(ctx: &mut Ctx, report: &mut Report) -> Result<(), HarnessError> {
     report
         .setup
         .push(note("the lineage once live", lineage.clone()));
-    if let Some(rotated) = ahead {
-        if lineage["live"] != json!(rotated) {
-            return Err(harness(
-                "the activation did not take the profile's rotation into the vault; the live phase is not entered",
-            ));
-        }
+    if let Some(rotated) = ahead
+        && lineage["live"] != json!(rotated)
+    {
+        return Err(harness(
+            "the activation did not take the profile's rotation into the vault; the live phase is not entered",
+        ));
     }
     ctx.live_active = true;
     Ok(())

@@ -386,7 +386,7 @@ fn list_and_status_inside_a_run_shell_see_the_default_home() {
         .filter(|v| v.active)
         .map(|v| v.row.id.clone())
         .collect();
-    assert_eq!(active, [b.clone()]);
+    assert_eq!(active, std::slice::from_ref(&b));
     let StatusView::Managed { account, .. } = engine.status(&fx.provider()).unwrap() else {
         panic!("the default home's live login is managed")
     };

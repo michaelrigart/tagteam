@@ -20,10 +20,10 @@ use crate::render::{RESET, severity_code};
 /// ends at its next cancellation point and never inside a critical span. Any other write error
 /// is ignored, as is every write without a token.
 pub(crate) fn written(result: io::Result<()>, cancel: &Option<Cancel>) {
-    if let (Err(e), Some(cancel)) = (result, cancel) {
-        if e.kind() == io::ErrorKind::BrokenPipe {
-            cancel.request(libc::SIGPIPE);
-        }
+    if let (Err(e), Some(cancel)) = (result, cancel)
+        && e.kind() == io::ErrorKind::BrokenPipe
+    {
+        cancel.request(libc::SIGPIPE);
     }
 }
 

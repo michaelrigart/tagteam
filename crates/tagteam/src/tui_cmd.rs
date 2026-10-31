@@ -62,10 +62,10 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
     for w in &warnings {
         let _ = writeln!(err, "warning: {w}");
     }
-    if let Some(p) = &provider {
-        if let Err(e) = probe.provider(p) {
-            return app::fail_to(&mut out, &mut err, false, e.kind(), &e.to_string());
-        }
+    if let Some(p) = &provider
+        && let Err(e) = probe.provider(p)
+    {
+        return app::fail_to(&mut out, &mut err, false, e.kind(), &e.to_string());
     }
     // The terminal check above stands in for `stdout_terminal`: the TUI draws on stdout.
     let color = app::ColorEnv {

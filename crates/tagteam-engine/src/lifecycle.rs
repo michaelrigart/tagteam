@@ -132,12 +132,12 @@ pub(crate) fn check_identity_conflict(
     let Some(row) = row else {
         return Ok(());
     };
-    if let (Some(old), Some(new)) = (row.account_uuid.as_deref(), claimed_uuid) {
-        if old != new {
-            return Err(EngineError::IdentityConflict {
-                label: label.to_owned(),
-            });
-        }
+    if let (Some(old), Some(new)) = (row.account_uuid.as_deref(), claimed_uuid)
+        && old != new
+    {
+        return Err(EngineError::IdentityConflict {
+            label: label.to_owned(),
+        });
     }
     Ok(())
 }
@@ -647,15 +647,15 @@ impl Engine {
                 });
             }
         }
-        if let Some(a) = alias {
-            if let Some(owner) = store.find_by_alias(a)? {
-                let freed = [existing.as_ref(), occupant.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .any(|r| r.id == owner.id);
-                if !freed {
-                    return Err(alias_taken(StoreError::AliasTaken(a.to_owned())));
-                }
+        if let Some(a) = alias
+            && let Some(owner) = store.find_by_alias(a)?
+        {
+            let freed = [existing.as_ref(), occupant.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|r| r.id == owner.id);
+            if !freed {
+                return Err(alias_taken(StoreError::AliasTaken(a.to_owned())));
             }
         }
         let id = match &existing {
@@ -1006,13 +1006,13 @@ impl Engine {
         if let Some(occupant) = &prep.occupant {
             self.refuse_destroying(p.as_ref(), occupant)?;
         }
-        if let Some(existing) = &current {
-            if existing.kind != kind {
-                return Err(EngineError::InvalidInput(format!(
-                    "{} is already stored as a {} account",
-                    identity.label, existing.kind
-                )));
-            }
+        if let Some(existing) = &current
+            && existing.kind != kind
+        {
+            return Err(EngineError::InvalidInput(format!(
+                "{} is already stored as a {} account",
+                identity.label, existing.kind
+            )));
         }
         // §12.5: whether the live identity names this account, read now that its lock is
         // held: a file read, with no Keychain. One that cannot be read leaves the evidence

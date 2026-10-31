@@ -8,7 +8,7 @@ By contributing, you agree that your contribution is licensed under the [MIT lic
 
 ## Toolchain
 
-- **Rust.** `rust-toolchain.toml` pins Rust 1.88.0 with `rustfmt` and `clippy`. With
+- **Rust.** `rust-toolchain.toml` pins Rust 1.99.1 with `rustfmt` and `clippy`. With
   [rustup](https://rustup.rs) installed, cargo picks it up on first use inside the checkout. The
   workspace declares a minimum supported Rust version of 1.88 (edition 2024), which ratatui 0.30
   requires.
@@ -81,7 +81,7 @@ cargo test -p tagteam-engine --features real_keychain --test run_real_keychain -
 - **`real_keychain` tests need an unsandboxed terminal** on macOS, because they run
   `/usr/bin/security` and create a keychain file.
 - **Linux tests run in Docker.** To reproduce the Linux CI run from a Mac, run the tests in a
-  `rust:1.88` container. They must run as a non-root user (root defeats the permission-based
+  `rust:1.99.1` container. They must run as a non-root user (root defeats the permission-based
   fault injection in the engine tests), as a user with a passwd entry, and with `HOME` outside
   `/tmp`. Pass `--init` too: the process-group tests in `xtask` need PID 1 to reap the orphans
   they leave, and without an init process they find them still there as zombies:
@@ -89,7 +89,7 @@ cargo test -p tagteam-engine --features real_keychain --test run_real_keychain -
   ```sh
   docker run --rm --init -v "$PWD":/src:ro \
     -v tagteam-target:/target -v tagteam-registry:/usr/local/cargo/registry \
-    -e CARGO_TARGET_DIR=/target -e RUSTUP_TOOLCHAIN=1.88.0 -w /src rust:1.88 \
+    -e CARGO_TARGET_DIR=/target -e RUSTUP_TOOLCHAIN=1.99.1 -w /src rust:1.99.1 \
     bash -c 'useradd -m -u 1000 tester && chown -R tester /target /usr/local/cargo &&
       setpriv --reuid=1000 --regid=1000 --clear-groups \
         env HOME=/home/tester USER=tester \

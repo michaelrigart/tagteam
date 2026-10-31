@@ -83,7 +83,7 @@ and a C compiler, because tagteam bundles SQLite. Only `tagteam` is meant to be 
 ### From source
 
 Build the current `main` instead of a release. You need [rustup](https://rustup.rs) and a C
-compiler (tagteam bundles SQLite). The repository's `rust-toolchain.toml` pins Rust 1.88.0, which
+compiler (tagteam bundles SQLite). The repository's `rust-toolchain.toml` pins Rust 1.99.1, which
 rustup installs on first use.
 
 ```sh

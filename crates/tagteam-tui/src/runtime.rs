@@ -381,10 +381,10 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
     /// Begins the shutdown for a signal in the token: SIGTERM, SIGHUP, or a SIGINT sent to the
     /// process (in raw mode Ctrl-C is a key). True once a shutdown has begun, for any reason.
     fn shutting_down(&mut self) -> bool {
-        if self.ending.is_none() {
-            if let Some(signal) = self.signal.requested() {
-                self.begin_shutdown(128 + signal, signal, None);
-            }
+        if self.ending.is_none()
+            && let Some(signal) = self.signal.requested()
+        {
+            self.begin_shutdown(128 + signal, signal, None);
         }
         self.ending.is_some()
     }

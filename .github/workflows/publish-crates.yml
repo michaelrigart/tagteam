@@ -70,8 +70,8 @@ jobs:
                 exit 1
                 ;;
             esac
-            # cargo 1.88 waits at most 60 s for the index and then only warns, so wait here,
-            # up to 5 minutes, before the next crate needs this one.
+            # cargo's own wait for the index times out with only a warning (after 60 s in cargo
+            # 1.88), so wait here, up to 5 minutes, before the next crate needs this one.
             deadline=$((SECONDS + 300))
             until in_index "$crate" "$VERSION"; do
               if (( SECONDS >= deadline )); then
