@@ -174,7 +174,7 @@ git commit -m "Test that a key typed with a resize is read at once"
 - Produces:
   - `pub fn bytes_waiting(fd: RawFd) -> io::Result<usize>` — `ioctl(fd, FIONREAD)`; `Err(last_os_error)` on failure.
   - `pub fn read_some(fd: RawFd, buf: &mut [u8]) -> io::Result<usize>` — exactly one `read(2)` of up to `buf.len()`; `Err(last_os_error)` on failure, `EINTR` included (no retry).
-  - `#[cfg(any(test, feature = "test-doubles"))] pub fn open_raw_pty() -> io::Result<(OwnedFd, OwnedFd)>` — `(master, slave)` from `openpty`, both `FD_CLOEXEC`, the slave in raw mode (`cfmakeraw`, `tcsetattr(TCSANOW)`): no line buffering, no echo, no signals.
+  - `#[cfg(any(test, feature = "test-doubles"))] pub fn open_raw_pty() -> io::Result<(OwnedFd, OwnedFd)>` — `(master, slave)` from `openpty`, both `FD_CLOEXEC`, the slave in raw mode (`cfmakeraw`, `tcsetattr(TCSANOW)`): no line buffering, no echo, no signals. The master is `O_NONBLOCK` (its own open file description; the slave's flags are untouched), so a test's write to it never blocks: a full terminal is `WouldBlock`.
   - `#[cfg(any(test, feature = "test-doubles"))] pub fn status_flags(fd: RawFd) -> io::Result<i32>` — `fcntl(fd, F_GETFL)`.
 
 - [ ] **Step 1: Write the failing tests** (in `term.rs`'s tests; bytes written to a pty master reach
@@ -182,7 +182,8 @@ git commit -m "Test that a key typed with a resize is read at once"
 
   - `bytes_waiting_counts_what_the_terminal_holds`: write `b"abc"` to the master → `bytes_waiting(slave) == 3`; read them all with `read_some` → `bytes_waiting(slave) == 0`.
   - `read_some_takes_at_most_its_buffer_and_leaves_the_rest`: write `b"abcde"`; `read_some(slave, &mut [0; 3]) == 3` and the bytes are `abc`; `bytes_waiting(slave) == 2`.
-  - `the_raw_pty_passes_bytes_unbuffered_and_unechoed`: write `b"q"` (no newline) → `read_some` gives `q`; `wait_readable(master, 100) == Readiness::TimedOut` (nothing echoed); `status_flags(slave) & libc::O_NONBLOCK == 0`.
+  - `the_raw_pty_passes_bytes_unbuffered_and_unechoed`: write `b"q"` (no newline) → `read_some` gives `q`; `wait_readable(master, 100) == Readiness::TimedOut` (nothing echoed); `status_flags(slave) & libc::O_NONBLOCK == 0` and `status_flags(master) & libc::O_NONBLOCK != 0`.
+  - `a_full_pty_refuses_a_write_instead_of_blocking`: write to the master in 256-byte chunks until one fails; it fails with `WouldBlock` within 1 s, having written more than 0 bytes.
   - `a_hung_up_pty_reads_as_the_end_or_eio`: drop the master; `read_some(slave, ..)` is `Ok(0)` or an error with `raw_os_error() == Some(libc::EIO)` (macOS and Linux differ), and returns within 50 ms.
 
 - [ ] **Step 2: Run them to see them fail**
@@ -277,15 +278,20 @@ git commit -m "Vendor crossterm 0.29.0's key decoder, with its tests and its lic
   - `Terminal::on(fd: RawFd, size: fn() -> io::Result<(u16, u16)>) -> io::Result<Terminal>`; `Terminal::stdin()` is `on(libc::STDIN_FILENO, crossterm::terminal::size)`.
   - `Terminal`'s fields: `wait: Wait`, `fd: RawFd`, `decoder: Parser`, `buffer: Box<[u8; TTY_BUFFER_SIZE]>`, `size: fn() -> io::Result<(u16, u16)>`.
 
-- [ ] **Step 1: Write the failing tests** in `input.rs`'s tests. Each pty test holds `alone()` and builds `Terminal::on(slave.as_raw_fd(), || Ok((100, 30)))` on `open_raw_pty()`; it writes to the master through `std::fs::File::from(master)`, and waits with `tagteam_provider::term::wait_readable(slave, 1000)` where it needs the bytes to have landed (`term` in `input.rs` is the TUI's own module). Each test drops its `Input` before its pty.
+- [ ] **Step 1: Write the failing tests** in `input.rs`'s tests. Each pty test holds `alone()` and builds `Terminal::on(slave.as_raw_fd(), || Ok((100, 30)))` on `open_raw_pty()` (`tagteam_provider::term`: `term` in `input.rs` is the TUI's own module). It writes to the non-blocking master through `std::fs::File::from(master)`. Each test drops its `Input` before its pty. Two test helpers:
+  - `landed(slave, n)`: polls `bytes_waiting(slave)` every 1 ms until it is `n`, panicking after 1 s (bytes reach a Linux slave asynchronously).
+  - `write_until(master, bytes, stop: &AtomicBool)`: writes all of `bytes`, retrying `WouldBlock` every 1 ms; returns `false` without finishing once `stop` is set. No write ever blocks, so every writer thread can be joined.
 
-  - `a_resize_and_a_key_pending_together_both_arrive` (G1): `raise(SIGWINCH)` after `Terminal::on`, write `q`, wait for it to land, then `Input::spawn_with(tx, terminal, None)`: within 2 s both `Msg::Resize { width: 100, height: 30 }` and `Msg::Key('q')` arrive (either order), then nothing for 200 ms.
-  - `a_key_split_across_two_reads_is_one_key`: write `\x1b[`, sleep 100 ms, assert nothing came, write `A`: one `Msg::Key(Up)` within 2 s, nothing else.
-  - `an_esc_alone_at_the_end_of_a_short_read_is_esc_at_once`: write `\x1b`: `Msg::Key(Esc)` within 2 s.
-  - `replies_in_one_read_are_dropped_and_the_key_behind_them_comes_out`: one write of `\x1b[?62;22c\x1b[1;1R\x1b[?1u` + `q`: only `Msg::Key('q')`, then nothing for 200 ms.
-  - `more_than_a_read_s_worth_comes_out_whole_and_in_order`: a writer thread writes 3000 bytes cycling `a..=z` (so more than 1024 wait at once on Linux): 3000 `Msg::Key`s, in that order, within 5 s.
-  - `a_pause_and_a_stop_are_acknowledged_while_replies_stream_in`: a writer thread writes DA1 answers while `bytes_waiting(slave) < 512` (so a write never blocks) until told to stop. After 100 ms, `pause()` is `true` and returns within `ACK`; nothing arrives for 200 ms; stop and join the writer, write `q`, assert nothing for 200 ms (the paused thread reads nothing), `resume()`: `Msg::Key('q')` within 2 s and no other message before it. Then, on a fresh pty and stream, `drop(input)` returns within `ACK` (acknowledged), and the writer is stopped and joined.
-  - `a_hang_up_ends_in_closed_without_blocking`: on a `Terminal` called directly (no thread), write `abc`, wait for it, drop the master; within 10 `next()` calls one returns `Closed`, each call within 50 ms, and two more calls return `Closed` again.
+  Tests of the step's read boundaries call `Terminal::next()` directly, with no thread, so each boundary is the test's own:
+  - `a_key_split_across_two_reads_is_one_key`: write `\x1b[`, `landed(2)`, `next()` is `Pending`; write `A`, `landed(1)`, `next()` is `Event(Key(Up))`; `next()` is `Empty`.
+  - `an_esc_alone_at_the_end_of_a_short_read_is_esc_at_once`: write `\x1b`, `landed(1)`: `next()` is `Event(Key(Esc))`.
+  - `replies_in_one_read_are_dropped_and_the_key_behind_them_comes_out`: write `\x1b[?62;22c\x1b[1;1R\x1b[?1u` + `q` at once, `landed(len)`: `next()` is `Event(Key('q'))`, then `Empty`.
+  - `more_than_a_read_s_worth_comes_out_whole_and_in_order`: 3000 bytes cycling `a..=z`. Write as many as the master takes (stop at `WouldBlock`) and `landed(written)`. On Linux (`cfg(target_os = "linux")`) assert `written == 3000`, and that the first `next()` returns `a` with `bytes_waiting == 3000 - 1024` after it: one read takes 1024 and leaves the rest. macOS holds about 1 KiB in a pty, so there the assertion is only `written > 0`. Then call `next()`, and on `Empty` write the rest the master takes and `landed` it, until 3000 `Key` events have come: all of them, in order, and no `Empty` while `bytes_waiting > 0`.
+  - `a_hang_up_ends_in_closed_without_blocking`: write `abc`, `landed(3)`, drop the master; within 10 `next()` calls one returns `Closed`, each call within 50 ms, and two more calls return `Closed` again.
+
+  Tests of the thread:
+  - `a_resize_and_a_key_pending_together_both_arrive` (G1): `raise(SIGWINCH)` after `Terminal::on`, write `q`, `landed(1)`, then `Input::spawn_with(tx, terminal, None)`: within 2 s both `Msg::Resize { width: 100, height: 30 }` and `Msg::Key('q')` arrive (either order), then nothing for 200 ms.
+  - `a_pause_and_a_stop_are_acknowledged_while_replies_stream_in`: a writer thread `write_until`s DA1 answers in a loop until `stop`, then (pause case only) `write_until`s `q` with a fresh, unset flag. Spawn the input; after 100 ms `pause()` is `true` (acknowledged within `ACK`). Set `stop`; nothing arrives for 200 ms (the paused thread reads nothing, `q` included). `resume()`: `Msg::Key('q')` within 2 s and no other message before it; then join the writer. Stop case, on a fresh pty and stream: after 100 ms, `drop(input)` returns within `ACK` (acknowledged); set `stop` and join the writer.
   - `with_nothing_pending_next_is_empty_at_once`: `next()` on a fresh `Terminal` returns `Empty` within 50 ms.
   - `the_terminal_s_file_status_flags_never_change`: `status_flags(slave)` before; write `jk`, call `next()` until `Empty`; drop the master, call `next()` until `Closed`; the flags after are the same and have no `O_NONBLOCK`.
   - `a_pending_step_reads_on_without_waiting` (`Script`): queue `[Next::Pending, Next::Pending, Next::Event(Key('q'))]` before spawning; receive `q`, sleep 100 ms: `(nexts, waits) == (4, 1)` (three, then `Empty`, then one wait). Treating `Pending` as `Empty` gives three waits.
