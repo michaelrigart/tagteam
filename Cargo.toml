@@ -53,10 +53,11 @@ serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision
 sha2 = "0.11"
 # §14.1, Decision 2: SIGINT, SIGTERM and SIGHUP only set the cancel token; `flag` needs no
 # feature.
-signal-hook = { version = "0.3", default-features = false }
+signal-hook = { version = "0.4", default-features = false }
 # SIGWINCH as a mio source, for the TUI input thread's wait (TUI redesign spec §14, PERF-R-9).
-# crossterm registers its own the same way.
-signal-hook-mio = { version = "0.2.5", features = ["support-v1_0"] }
+# crossterm registers its own the same way, through signal-hook 0.3 and signal-hook-mio 0.2: both
+# versions are built, and their handlers chain through the one signal-hook-registry.
+signal-hook-mio = { version = "0.3", features = ["support-v1_0"] }
 thiserror = "2"
 # config.toml (§6.4): read in M2b, written in M5; preserves comments and formatting.
 toml_edit = "0.22"

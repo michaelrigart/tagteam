@@ -624,8 +624,8 @@ dependencies = [
  "mio",
  "parking_lot",
  "rustix",
- "signal-hook",
- "signal-hook-mio",
+ "signal-hook 0.3.18",
+ "signal-hook-mio 0.2.5",
  "winapi",
 ]
 
@@ -2964,6 +2964,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signal-hook"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49f7447afd772ca79ad17ae0a3972a6b0df0cb4b80990fd82707593e9e012a74"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
 name = "signal-hook-mio"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2971,7 +2981,18 @@ checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
 dependencies = [
  "libc",
  "mio",
- "signal-hook",
+ "signal-hook 0.3.18",
+]
+
+[[package]]
+name = "signal-hook-mio"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3c965b71730d01c671d7a7f6b2c4f5729acc8fba1acb65a36576f9181076dfa"
+dependencies = [
+ "libc",
+ "mio",
+ "signal-hook 0.4.6",
 ]
 
 [[package]]
@@ -3152,7 +3173,7 @@ dependencies = [
  "predicates",
  "rusqlite",
  "serde_json",
- "signal-hook",
+ "signal-hook 0.4.6",
  "tagteam-cc",
  "tagteam-core",
  "tagteam-daemon",
@@ -3278,8 +3299,8 @@ dependencies = [
  "mio",
  "ratatui",
  "serde_json",
- "signal-hook",
- "signal-hook-mio",
+ "signal-hook 0.4.6",
+ "signal-hook-mio 0.3.0",
  "tagteam-cc",
  "tagteam-core",
  "tagteam-daemon",
@@ -3312,7 +3333,7 @@ dependencies = [
  "bitflags 2.13.2",
  "parking_lot",
  "rustix",
- "signal-hook",
+ "signal-hook 0.3.18",
  "windows-sys 0.61.2",
 ]
 
@@ -3369,7 +3390,7 @@ dependencies = [
  "pest_derive",
  "phf",
  "sha2 0.10.9",
- "signal-hook",
+ "signal-hook 0.3.18",
  "siphasher",
  "terminfo",
  "termios",
@@ -4075,7 +4096,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "sha2 0.11.1",
- "signal-hook",
+ "signal-hook 0.4.6",
  "tagteam-cc",
  "tagteam-provider",
 ]
