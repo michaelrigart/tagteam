@@ -464,8 +464,7 @@ fn read(
         filter,
         told: false,
     };
-    // The terminal may already hold bytes (the decoder holds nothing yet), and no wait would
-    // report them.
+    // Bytes may already wait in the terminal: one step looks before the first wait, at no cost.
     let mut more = true;
     loop {
         {
