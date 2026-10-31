@@ -112,16 +112,20 @@ pub struct TokenRow {
     /// Responses whose output is a lower bound (spec §2.3).
     pub unfinalized: u64,
     pub cost: Option<Cost>,
-    /// The time of the row's latest response. Not in the JSON.
-    pub last_ms: i64,
+    /// The time of the row's latest unattributed response, `None` when it has none. Not in
+    /// the JSON.
+    pub unattributed_last_ms: Option<i64>,
 }
 
 impl TokenRow {
-    /// Whether every response in the row predates `epoch_ms`, the token index's epoch: its
-    /// unattributed usage then predates tracking rather than lost its account. A day the epoch
-    /// falls in is before it when the day's responses all are. No epoch is never before it.
+    /// Whether every unattributed response in the row predates `epoch_ms`, the token index's
+    /// epoch: that usage then predates tracking rather than lost its account. A day the epoch
+    /// falls in is before it when the day's unattributed responses all are, whatever the
+    /// attributed ones after it. No epoch, or no unattributed response, is never before it.
     pub fn before_tracking(&self, epoch_ms: Option<i64>) -> bool {
-        epoch_ms.is_some_and(|epoch| self.last_ms < epoch)
+        epoch_ms
+            .zip(self.unattributed_last_ms)
+            .is_some_and(|(epoch, last)| last < epoch)
     }
 }
 
@@ -548,14 +552,14 @@ mod tests {
     }
 
     #[test]
-    fn a_row_is_before_tracking_only_when_its_latest_response_is() {
+    fn a_row_is_before_tracking_only_when_its_latest_unattributed_response_is() {
         let tz = TimeZone::get("Europe/Brussels").unwrap();
         let (start_23, _) = day_bounds_ms(date(2026, 10, 23), &tz);
         let epoch = start_23 + 11 * 3_600_000; // 11:00 on the 23rd
         let period = PeriodKey::Day {
             date: date(2026, 10, 23),
         };
-        let row = |last_ms| TokenRow {
+        let row = |unattributed_last_ms| TokenRow {
             key: RowKey::new(&period, None, None),
             period: period.clone(),
             account: None,
@@ -566,14 +570,18 @@ mod tests {
             responses: 1,
             unfinalized: 0,
             cost: None,
-            last_ms,
+            unattributed_last_ms,
         };
-        // The epoch's own day, its responses all from the morning before it.
-        assert!(row(epoch - 1).before_tracking(Some(epoch)));
+        // The epoch's own day, its unattributed responses all from the morning before it.
+        assert!(row(Some(epoch - 1)).before_tracking(Some(epoch)));
         assert!(
-            !row(epoch).before_tracking(Some(epoch)),
+            !row(Some(epoch)).before_tracking(Some(epoch)),
             "a response at the epoch"
         );
-        assert!(!row(epoch - 1).before_tracking(None), "no epoch");
+        assert!(!row(Some(epoch - 1)).before_tracking(None), "no epoch");
+        assert!(
+            !row(None).before_tracking(Some(epoch)),
+            "no unattributed response"
+        );
     }
 }

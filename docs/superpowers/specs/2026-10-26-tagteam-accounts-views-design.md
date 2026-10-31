@@ -82,7 +82,7 @@ come from the engine's shared words or the TUI's existing ones.
 | AV-5 | Where is the selection in the full list? | `▌` on every row of the selected account's block, and bold on its name |
 | AV-6 | Pace marks? | None on any bar or gauge. `▲` stays; where the row has room it ends with the expected percentage in words (§4.3) |
 | AV-7 | Spacing? | A blank row above and below every rule on Accounts |
-| AV-8 | Tokens rows from before the epoch? | `before tracking` where every response in the row lies before the epoch; `unknown account` everywhere else, the filter included |
+| AV-8 | Tokens rows from before the epoch? | `before tracking` where every unattributed response in the row lies before the epoch; `unknown account` everywhere else, the filter included |
 | AV-9 | Which window does auto's no-switch sentence count? | Every window of the account in use, in `tagteam list`'s form, `◂` after the one that counts (§4.4) |
 
 AV-1 to AV-7 follow the design agreed in chat on 2026-10-26 (mock v2). AV-8 follows the same
@@ -422,20 +422,24 @@ reader the list goes on.
 The report exposes the token index's epoch, the instant this store started recording sightings
 and launches (TR §7.2, `token_epoch.at`). A row's unattributed account reads:
 
-- **`before tracking`** when every response in the row lies before the epoch;
-- **`unknown account`** otherwise: a row with a response at the epoch or later, and every row when
-  the report has no epoch (after a full purge, before the next refresh).
+- **`before tracking`** when every unattributed response in the row lies before the epoch;
+- **`unknown account`** otherwise: a row with an unattributed response at the epoch or later, and
+  every row when the report has no epoch (after a full purge, before the next refresh).
 
-The rule reads the row's latest response time (`TokenRow::last_ms`, the row's own `Acc.last_ms`
-in `group.rs`): before tracking when `last_ms < epoch`, for every period alike. The day the epoch
-falls in is therefore `before tracking` when its responses all came before the epoch, as on a
-store whose first day of tracking began in the afternoon. A response exactly at the epoch makes
-the row `unknown account`. Drilled rows follow the same rule for their own responses. Only
-unattributed rows change: an attributed pre-epoch row keeps its account's name (§1.1).
+The rule reads the time of the row's latest unattributed response
+(`TokenRow::unattributed_last_ms`, the row's own `Acc.unattributed_last_ms` in `group.rs`, `None`
+when the row has none): before tracking when `unattributed_last_ms < epoch`, for every period
+alike. The day the epoch falls in is therefore `before tracking` when its unattributed responses
+all came before the epoch, as on a store whose first day of tracking began in the afternoon. An
+unattributed response exactly at the epoch makes the row `unknown account`. Drilled rows follow
+the same rule for their own responses. Only unattributed rows change: an attributed pre-epoch
+row keeps its account's name (§1.1).
 
 Amended 2026-10-28 after the real-store run: the first rule judged a row by its period's end, so
 the epoch's own day read `unknown account` although every one of its responses predated the
-epoch.
+epoch. On 2026-10-31 the rule was narrowed to the row's unattributed responses, because a Model-
+or None-grouped row mixes accounts and its attributed responses after the epoch decided the
+label of the unattributed entry beside them.
 
 Both words are 15 columns, so the ACCOUNT column keeps its width.
 
@@ -468,9 +472,10 @@ responses on the 23rd after 09:07:
 
 `TokenReport` (`view/mod.rs`) gains `tracking_since_ms: Option<i64>`: the epoch the report
 already reads (`view/mod.rs:406`, `store.token_epoch()?`), `None` when it has none. `TokenRow`
-gains `last_ms`, the time of its latest response (§7.1). No other token-report or attribution
-behaviour changes; the only other engine changes are the shared-words split of §4.3 and the
-no-switch sentence of §4.4. The report's JSON is unchanged (§1.3).
+gains `unattributed_last_ms`, the time of its latest unattributed response, `None` when it has
+none (§7.1). No other token-report or attribution behaviour changes; the only other engine
+changes are the shared-words split of §4.3 and the no-switch sentence of §4.4. The report's JSON
+is unchanged (§1.3).
 
 ## 8. Keys
 
@@ -585,9 +590,10 @@ changing the design.
   dispatches the switch.
 - An API-key account and one needing a login, selected in compact and shown in the full list:
   the same replacement row or problem rows in both views (§3.4).
-- Tokens: a row whose responses all predate the epoch reads `before tracking`, the epoch's own
-  day included; a row with a response at the epoch or later, and every row with no epoch, read
-  `unknown account`; an attributed pre-epoch row keeps its account's name; the filter's
+- Tokens: a row whose unattributed responses all predate the epoch reads `before tracking`, the
+  epoch's own day included and a Model- or None-grouped row beside attributed responses after
+  it; a row with an unattributed response at the epoch or later, and every row with no epoch,
+  read `unknown account`; an attributed pre-epoch row keeps its account's name; the filter's
   choice and summary read `unknown account`; the detail line and a breadcrumb use the row's
   words.
 - `v`: toggles, keeps the selection across `v` and a refresh, PgUp/PgDn by whole blocks.

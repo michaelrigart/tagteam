@@ -461,7 +461,8 @@ pub(crate) fn counts(input: u64, output: u64, cache_read: u64) -> TokenCounts {
 
 /// A row of `period`, grouped by `account` and `model` when they are given, of one response
 /// counting `counts`, costing `cost` nano-dollars (or nothing), keyed as the report keys it, at
-/// the latest its period allows.
+/// the latest its period allows. An unattributed row's response is unattributed; a row of another
+/// account has none, and an ungrouped row says which it holds in its `accounts`.
 pub(crate) fn token_row(
     period: PeriodKey,
     account: Option<RowAccount>,
@@ -476,6 +477,7 @@ pub(crate) fn token_row(
         PeriodKey::Session { last_ms, .. } => *last_ms,
         PeriodKey::Block { end_ms, .. } => end_ms - 1,
     };
+    let unattributed_last_ms = (account == Some(RowAccount::Unattributed)).then_some(last_ms);
     TokenRow {
         key: RowKey::new(&period, account.as_ref(), model),
         accounts: account.iter().cloned().collect(),
@@ -490,7 +492,7 @@ pub(crate) fn token_row(
             usd_nanos,
             partial: false,
         }),
-        last_ms,
+        unattributed_last_ms,
     }
 }
 

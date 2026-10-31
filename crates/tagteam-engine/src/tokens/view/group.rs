@@ -152,6 +152,7 @@ pub(super) fn group(
         if cost.is_none() {
             t.models.unpriced[r.model] = true;
         }
+        let unattributed = r.slot == t.slots.unattributed;
         let key = GroupKey {
             period,
             slot: grouping.by_account().then_some(r.slot),
@@ -160,8 +161,8 @@ pub(super) fn group(
         groups
             .entry(key)
             .or_insert_with(Acc::new)
-            .add(row, cost, r.slot, r.model);
-        total.add(row, cost, r.slot, r.model);
+            .add(row, cost, r.slot, r.model, unattributed);
+        total.add(row, cost, r.slot, r.model, unattributed);
         let basis = &mut by_basis[basis_index(r.basis)];
         *basis = basis.saturating_add(row.counts.total());
         let session = &mut t.sessions.list[r.session];
@@ -620,6 +621,8 @@ struct Acc {
     unpriced: u64,
     first_ms: i64,
     last_ms: i64,
+    /// The latest response that `add` was told is unattributed.
+    unattributed_last_ms: Option<i64>,
     slots: Vec<usize>,
     models: Vec<usize>,
 }
@@ -634,12 +637,20 @@ impl Acc {
             unpriced: 0,
             first_ms: i64::MAX,
             last_ms: i64::MIN,
+            unattributed_last_ms: None,
             slots: Vec::new(),
             models: Vec::new(),
         }
     }
 
-    fn add(&mut self, row: &ReportResponse, cost: Option<u64>, slot: usize, model: usize) {
+    fn add(
+        &mut self,
+        row: &ReportResponse,
+        cost: Option<u64>,
+        slot: usize,
+        model: usize,
+        unattributed: bool,
+    ) {
         self.counts.add(&row.counts);
         self.responses += 1;
         self.unfinalized += u64::from(!row.finalized);
@@ -649,6 +660,9 @@ impl Acc {
         }
         self.first_ms = self.first_ms.min(row.at_ms);
         self.last_ms = self.last_ms.max(row.at_ms);
+        if unattributed {
+            self.unattributed_last_ms = self.unattributed_last_ms.max(Some(row.at_ms));
+        }
         if !self.slots.contains(&slot) {
             self.slots.push(slot);
         }
@@ -753,7 +767,7 @@ impl Tables<'_> {
             responses: acc.responses,
             unfinalized: acc.unfinalized,
             cost,
-            last_ms: acc.last_ms,
+            unattributed_last_ms: acc.unattributed_last_ms,
         }
     }
 }

@@ -2591,9 +2591,9 @@ mod tests {
     }
 
     #[test]
-    fn every_period_kind_follows_its_own_span() {
-        // Three unattributed rows per kind: wholly before the epoch E = YESTERDAY, holding it,
-        // wholly after it.
+    fn every_period_kind_judges_its_unattributed_responses_against_the_epoch() {
+        // Three unattributed rows per kind, whose unattributed responses end at the period's end:
+        // wholly before the epoch E = YESTERDAY, holding it, wholly after it.
         let e = YESTERDAY;
         let unattributed = |period: PeriodKey| {
             token_row(
@@ -2657,6 +2657,13 @@ mod tests {
                 "{keys}"
             );
             assert_eq!(words_of(None), ["unknown account"; 3], "{keys}");
+            // The epoch's own period, its unattributed responses all before the epoch (the rest
+            // of its responses after it are another account's): before tracking.
+            let mut holding = unattributed(periods[1].clone());
+            holding.unattributed_last_ms = Some(e - 1);
+            let state = showing_after_with(keys, vec![holding], |r| r.tracking_since_ms = Some(e));
+            let lines = body_of(&state, 80, 24, NOW_MS);
+            assert!(lines[4].contains(BEFORE_TRACKING), "{keys}: {lines:?}");
         }
     }
 
@@ -2680,15 +2687,38 @@ mod tests {
 
     #[test]
     fn an_ungrouped_row_names_before_tracking_in_its_account_list() {
-        for (accounts, listed) in [
-            (vec![RowAccount::Unattributed], BEFORE_TRACKING),
+        // The epoch is YESTERDAY. A row's unattributed entry is judged by its unattributed
+        // responses alone: an attributed account's, after the epoch, beside them changes nothing.
+        for (day_ago, accounts, unattributed_last_ms, listed) in [
             (
+                2,
+                vec![RowAccount::Unattributed],
+                YESTERDAY - 1,
+                BEFORE_TRACKING,
+            ),
+            (
+                2,
                 vec![row_account(1), RowAccount::Unattributed],
+                YESTERDAY - 1,
                 "1 a1@x.co, before tracking",
             ),
+            // The epoch's own day: account 1 answered after the epoch, the rest before it.
+            (
+                1,
+                vec![row_account(1), RowAccount::Unattributed],
+                YESTERDAY - 1,
+                "1 a1@x.co, before tracking",
+            ),
+            (
+                1,
+                vec![row_account(1), RowAccount::Unattributed],
+                YESTERDAY,
+                "1 a1@x.co, unknown account",
+            ),
         ] {
-            let mut row = token_row(day(2), None, None, counts(1, 2, 3), None);
+            let mut row = token_row(day(day_ago), None, None, counts(1, 2, 3), None);
             row.accounts = accounts;
+            row.unattributed_last_ms = Some(unattributed_last_ms);
             let state = showing_after_with("ggg", vec![row], |r| {
                 r.tracking_since_ms = Some(YESTERDAY);
             });
@@ -2696,7 +2726,7 @@ mod tests {
             assert!(
                 lines
                     .iter()
-                    .any(|l| l.starts_with("▌2026-09-19  ") && l.contains(listed)),
+                    .any(|l| l.starts_with("▌2026-09-") && l.contains(listed)),
                 "{listed}: {lines:?}"
             );
         }

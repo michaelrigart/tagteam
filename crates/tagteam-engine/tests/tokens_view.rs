@@ -91,9 +91,15 @@ struct View {
 
 impl View {
     fn new() -> Self {
+        Self::with_epoch(T0 + 40 * D)
+    }
+
+    /// A store whose epoch is `epoch_ms`, which every response a test indexes predates unless
+    /// it says otherwise.
+    fn with_epoch(epoch_ms: i64) -> Self {
         let fx = Fx::new();
         // Before the store opens: its migration dates the epoch with this clock.
-        fx.clock.set(T0 + 40 * D);
+        fx.clock.set(epoch_ms);
         let engine = fx.engine_with_settings(settings());
         let store = engine.store().unwrap();
         let a = add(&store, &cc(), "acct-a", "a@x.co", 1);
@@ -102,11 +108,7 @@ impl View {
             .token_epoch()
             .unwrap()
             .expect("step 3 records the epoch");
-        assert_eq!(
-            epoch.at,
-            T0 + 40 * D,
-            "the responses these tests index must predate the store's epoch"
-        );
+        assert_eq!(epoch.at, epoch_ms);
         assert!(
             epoch.seeded,
             "an unsighted default-home response before the epoch is placed only on a seeded epoch"
@@ -1665,4 +1667,86 @@ fn the_report_carries_the_epoch_it_read() {
         .unwrap();
     assert_eq!(v.report(&q).tracking_since_ms, None);
     assert_eq!(v.report(&none).tracking_since_ms, None);
+}
+
+/// The epoch of the before-tracking tests: nine hours into 2026-10-11, so that day holds
+/// responses on both sides of it.
+const EPOCH: i64 = T0 + 40 * D + 9 * H;
+
+/// A store whose epoch falls mid-day, with b's profile possibly running (so an unsighted
+/// response stays unattributed) and `s-a` sighted in a from the epoch.
+fn tracking_began_mid_day() -> View {
+    let v = View::with_epoch(EPOCH);
+    v.sight("s-a", "acct-a", EPOCH, EPOCH + D);
+    v.sight("s-m", "acct-a", EPOCH, EPOCH + D);
+    v.store
+        .open_launch(&cc(), v.b.as_str(), T0 - D, v.engine.now_ms())
+        .unwrap();
+    v
+}
+
+/// Each row holding unattributed usage, in every period and grouping: its key, how many
+/// accounts it holds and whether it is before tracking.
+fn unattributed_rows(v: &View) -> Vec<(String, usize, bool)> {
+    let mut found = Vec::new();
+    for period in [TokenPeriod::Day, TokenPeriod::Month, TokenPeriod::Session] {
+        for grouping in [
+            TokenGrouping::Account,
+            TokenGrouping::Model,
+            TokenGrouping::None,
+        ] {
+            let r = v.report(&v.query(period, grouping));
+            for row in &r.rows {
+                if row.accounts.contains(&RowAccount::Unattributed) {
+                    let before = row.before_tracking(r.tracking_since_ms);
+                    found.push((row.key.as_str().to_owned(), row.accounts.len(), before));
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn unattributed_usage_before_the_epoch_is_before_tracking_in_a_row_mixing_accounts() {
+    let v = tracking_began_mid_day();
+    v.index(&[
+        v.usage("s-u", EPOCH - 8 * H, "model-a", 1, 0),
+        v.usage("s-u", EPOCH - H, "model-a", 2, 0),
+        v.usage("s-a", EPOCH + H, "model-a", 4, 0),
+        v.usage("s-a", EPOCH + 8 * H, "model-a", 8, 0),
+        // A session that spans the epoch: unsighted before it, in a after.
+        v.usage("s-m", EPOCH - 2 * H, "model-a", 16, 0),
+        v.usage("s-m", EPOCH + 2 * H, "model-a", 32, 0),
+    ]);
+    let found = unattributed_rows(&v);
+    // The Model- and None-grouped day, month and s-m rows hold both accounts.
+    let mixed: Vec<_> = found
+        .iter()
+        .filter(|(_, accounts, _)| *accounts > 1)
+        .collect();
+    assert_eq!(mixed.len(), 6, "{found:?}");
+    assert!(
+        mixed.iter().any(|(key, ..)| key == "session:s-m"),
+        "{found:?}"
+    );
+    assert!(found.iter().all(|(_, _, before)| *before), "{found:?}");
+}
+
+#[test]
+fn an_unattributed_response_at_or_after_the_epoch_is_not_before_tracking() {
+    for at in [EPOCH, EPOCH + H] {
+        let v = tracking_began_mid_day();
+        v.index(&[
+            v.usage("s-u", EPOCH - H, "model-a", 1, 0),
+            v.usage("s-u", at, "model-a", 2, 0),
+            v.usage("s-a", EPOCH + 2 * H, "model-a", 4, 0),
+        ]);
+        let found = unattributed_rows(&v);
+        assert!(!found.is_empty(), "at {at}");
+        assert!(
+            found.iter().all(|(_, _, before)| !before),
+            "at {at}: {found:?}"
+        );
+    }
 }
