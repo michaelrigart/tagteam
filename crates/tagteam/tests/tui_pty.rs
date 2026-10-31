@@ -315,6 +315,36 @@ fn a_resize_while_idle_redraws_at_the_new_size() {
 }
 
 #[test]
+fn a_key_typed_with_a_resize_is_read() {
+    // A key typed as the terminal is resized must not wait for the next key (input reader
+    // spec §1). Each round resizes and types at once, without waiting for the redraw.
+    let home = Home::new();
+    let mut tui = home.tui(&["tui"]);
+    tui.wait_for(LONG, "the account in use selected", |s| {
+        accounts(s) && s.contains("SELECTED  2 ")
+    });
+    let sizes = [(100, 30), (90, 28), (110, 32), (96, 26)];
+    for round in 0..40 {
+        let (cols, rows) = sizes[round % sizes.len()];
+        let (key, want) = if round % 2 == 0 {
+            (b"k", "SELECTED  1 ")
+        } else {
+            (b"j", "SELECTED  2 ")
+        };
+        tui.resize(cols, rows);
+        tui.type_keys(key);
+        tui.wait_for(
+            Duration::from_secs(2),
+            &format!("round {round}: {want}"),
+            |s| s.contains(want),
+        );
+    }
+    tui.type_keys(b"q");
+    let f = tui.finish(LONG);
+    assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+}
+
+#[test]
 fn two_shows_the_token_report_and_one_the_accounts_again() {
     // Spec §5.3, §6.4: the index is refreshed after the first frame, and the report read from
     // it on the report lane.
