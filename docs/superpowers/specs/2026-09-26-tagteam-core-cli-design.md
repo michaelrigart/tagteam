@@ -3420,10 +3420,16 @@ is a workspace crate (`publish = false`) reached through a cargo alias. It drive
   with a `NOTICE` crediting claude-swap (MIT, © Onur Cetinkol), whose behaviour and constants
   are derived.
 - **Toolchain.** `rust-toolchain.toml` pins the stable Rust current at implementation time
-  (edition 2024, MSRV ≥ 1.85). mise respects that file.
+  (edition 2024), and moves to a newer stable only on purpose. mise respects that file.
+  - The MSRV is `rust-version` in `Cargo.toml`, at least 1.85. The dependencies set it, not the
+    pin: 1.88 since ratatui 0.30.
 - **CI** (GitHub Actions) on `macos-26` (Apple silicon) and `ubuntu-latest`: `cargo fmt --check`,
-  `clippy -D warnings`, and `cargo test` (plus the `real_keychain` tests on macOS). GitHub has no
-  macOS 27 image, so `macos-26`, its newest, stands in for the supported macOS 27.
+  `clippy -D warnings`, and `cargo test` (plus `tagteam-provider`'s `real_keychain` test on
+  macOS). GitHub has no macOS 27 image, so `macos-26`, its newest, stands in for the supported
+  macOS 27. Because those run on the pin, an `msrv` job on both runners runs `cargo check`
+  with the MSRV toolchain: the shipped shape (libraries and binaries, no features), then
+  every target without features and with `tagteam/test-support`, and on macOS the targets of
+  `tagteam-provider` and `tagteam-engine` with their `real_keychain` features.
 - **Release.** `cargo-dist` builds `aarch64-apple-darwin`, `x86_64-unknown-linux-musl`, and
   `aarch64-unknown-linux-musl`, one archive per target. The supported platforms are macOS 27 on
   Apple silicon and Linux on x86-64 and aarch64; there is no Intel Mac build. The macOS build
