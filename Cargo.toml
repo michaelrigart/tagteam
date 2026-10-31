@@ -44,7 +44,8 @@ jiff = { version = "=0.2.38", default-features = false, features = ["std", "tz-s
 libc = "0.2"
 # The TUI's input thread blocks on the terminal, SIGWINCH and a waker, with no wake-up while idle
 # (TUI redesign spec §14, PERF-R-9): `Poll` and `Waker`, and `SourceFd` for the terminal's fd.
-# crossterm waits with the same mio, so nothing new is built.
+# crossterm's `events` feature builds the same mio, though tagteam never creates its reader, so
+# nothing new is built.
 mio = { version = "1.2", features = ["os-poll", "os-ext"] }
 ratatui = "=0.30.2"
 rusqlite = { version = "0.41", features = ["bundled"] }
@@ -55,8 +56,8 @@ sha2 = "0.11"
 # feature.
 signal-hook = { version = "0.4", default-features = false }
 # SIGWINCH as a mio source, for the TUI input thread's wait (TUI redesign spec §14, PERF-R-9).
-# crossterm registers its own the same way, through signal-hook 0.3 and signal-hook-mio 0.2: both
-# versions are built, and their handlers chain through the one signal-hook-registry.
+# crossterm's `events` feature builds signal-hook 0.3 and signal-hook-mio 0.2 too, though tagteam
+# never creates crossterm's reader, so crossterm registers no SIGWINCH of its own.
 signal-hook-mio = { version = "0.3", features = ["support-v1_0"] }
 thiserror = "2"
 # config.toml (§6.4): read in M2b, written in M5; preserves comments and formatting.

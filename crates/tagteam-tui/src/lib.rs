@@ -8,7 +8,6 @@ mod ask;
 mod autoline;
 mod chrome;
 pub(crate) mod daemon;
-#[allow(dead_code)]
 mod decode;
 mod detect;
 mod gauge;
