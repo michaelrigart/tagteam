@@ -3766,7 +3766,7 @@ caches account- and org-scoped data (`groveConfigCache`, `modelAccessCache`,
   `ANTHROPIC_FOUNDRY_API_KEY`, `ANTHROPIC_AWS_API_KEY`, `ANTHROPIC_BASE_URL` and
   `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`. The controls behave as §12.3 expects:
   `CLAUDE_CODE_OAUTH_TOKEN` gives `oauth_token` and `ANTHROPIC_API_KEY` gives `api_key`.
-  *2.1.316* adds `CLAUDE_CODE_SESSIONS_OAUTH_TOKEN`, the token for CC's cloud-sessions API, which
+  *2.1.316* reads `CLAUDE_CODE_SESSIONS_OAUTH_TOKEN`, the token for CC's cloud-sessions API, which
   CC's own subprocess scrub lists beside `CLAUDE_CODE_OAUTH_TOKEN`. `auth status` reports no
   change for it, alone or with `CLAUDE_CODE_SDK_HAS_SESSIONS_OAUTH_REFRESH`, and the controls
   behave as before.

@@ -22,9 +22,9 @@ with the one before, so any release may contain breaking changes. Each section s
   every window of the account in use and marks the one that counts:
   `(5h 9% · 7d 53%◂, switches at 90%)`.
 - `tagteam run` now also removes `CLAUDE_CODE_SESSIONS_OAUTH_TOKEN`, Claude Code's cloud-sessions
-  token (new in 2.1.316), from the session's environment, so it cannot give a session a
-  credential of another account. It warns when the variable was set, and `tagteam doctor` reports
-  it.
+  token, from the session's environment, so it cannot give a session a credential of another
+  account. Claude Code 2.1.316 reads it. `tagteam run` warns when the variable was set, and
+  `tagteam doctor` reports it.
 
 ### Removed
 
