@@ -48,6 +48,39 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test -p tagteam-provider --locked --features real_keychain --test real_keychain
 
+  # rust-toolchain.toml pins a newer Rust than the workspace's rust-version, so check that the
+  # minimum supported version still builds every target.
+  msrv:
+    if: github.event_name != 'schedule'
+    name: msrv (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain rust-version names
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$msrv" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check (shipped shape)
+        run: cargo check --workspace --locked
+      - name: Check (no features)
+        run: cargo check --workspace --all-targets --locked
+      - name: Check (test-support)
+        run: cargo check --workspace --all-targets --locked --features tagteam/test-support
+      - name: Check (real keychain)
+        if: runner.os == 'macOS'
+        run: >-
+          cargo check -p tagteam-provider -p tagteam-engine --all-targets --locked
+          --features tagteam-provider/real_keychain,tagteam-engine/real_keychain
+
   # No Swatinem/rust-cache here: a poisoned cache must not be able to make this job pass
   deny:
     name: deny (advisories)
