@@ -210,9 +210,11 @@ fn decided(
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
+    use tagteam_core::{Pace, WindowKind};
     use tagteam_daemon::protocol::{Event, Wire};
     use tagteam_engine::EventSource;
     use tagteam_engine::timeline::EventView;
+    use tagteam_engine::views::UsageView;
 
     use super::*;
     use crate::live::Live;
@@ -399,6 +401,16 @@ mod tests {
             letters(&mut state),
             hinted_letters(&format!("   mmmmm  {}", all(text, 't')), 80)
         );
+        // The view holds the poll's one window for account 1, so the mark can be placed.
+        let mut accounts = many(3);
+        accounts[0].usage = UsageView {
+            windows: Some(vec![(
+                window("5h", "5h", WindowKind::Short, 77.0, Some(9_630)),
+                Pace::default(),
+            )]),
+            ..read(60, 0.0, 0.0, false)
+        };
+        state.accounts.apply(snapshot(accounts));
         let poll = json!({"active": {"number": 1}, "headroomPct": {"1": 23}, "windowsPct": {"1": {"5h": 77.0}}});
         update(&mut state, auto("poll", poll), NOW_MS);
         update(&mut state, no_switch("below-threshold", ""), NOW_MS);

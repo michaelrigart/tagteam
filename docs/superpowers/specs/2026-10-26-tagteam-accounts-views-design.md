@@ -299,21 +299,27 @@ no switch needed (5h 9% · 7d 53%◂, switches at 90%)
 - `tagteam auto` and `tagteam daemon` get the key from the engine: `AutoEvent::Poll` carries each
   position's counting window (`counting_window`), computed where `windows_pct` is. It is in no
   JSON; the daemon's wire and every `--json` line are unchanged.
-- The TUI hears the poll over the wire, which carries no key, so it works the key out with the
-  same rule from its own view and the poll together. The view gives the account's windows' keys,
-  kinds and labels, and their order (the stored reading's, which the tie-break follows; the
-  provider lists its windows in a stable order). The poll gives their percentages, because the
-  view is always older than the tick: a `poll` only schedules the view's re-read 250 ms later, and
-  its `no-switch` is heard before that. `binding_window` runs over the view's windows, in the
-  view's order, at the poll's percentages, under that provider's `models`.
+- The TUI hears the poll over the wire, which carries no key, so it works the key out from its own
+  view and the poll together. The view gives the account's windows' keys, kinds and labels, and
+  their order (the stored reading's, which the tie-break follows; the provider lists its windows
+  in a stable order). The poll gives their percentages, because the view is always older than the
+  tick: a `poll` only schedules the view's re-read 250 ms later, and its `no-switch` is heard
+  before that.
+- The TUI does not use its own `models`, because the view's setting can lag the daemon's, as when
+  `autoswitch.models` has just changed and one has reloaded and the other has not. The usage the
+  poll gives the account (100 less its `headroomPct`, which the engine takes from the same reading
+  without rounding) is some counted window's. The candidates are the account's windows in the
+  view's order, spend left out, whose percentage in the poll equals that usage to within float
+  error (`1e-9`), not the parser's binding tolerance. The first candidate is marked when no
+  `models` setting could change which window the daemon counted: when it is the only candidate
+  (spend never counts, so the daemon's window is that one), or when it is a 5h or 7d window (they
+  always count, and a tie goes to the earlier window).
 - It marks nothing when the view lacks the account or its reading, when its keys for the account
-  are not the poll's, when the poll gives the account no `headroomPct`, or when the window it
-  counts is not at the account's usage in the poll: the poll's percentage for it must equal 100
-  less the account's `headroomPct`, which the engine takes from the same reading without rounding,
-  so to within float error (`1e-9`), not the parser's binding tolerance. That last check catches a
-  `models` the view and the daemon do not share, as when the setting has just changed and the view
-  has not caught up. A view that is only older, with the same keys at other percentages, still
-  marks; nothing marked reads as the next point says.
+  are not the poll's, when the poll gives the account no `headroomPct`, when no window is at the
+  usage, or when several are and the first is scoped: `Fable` and `Opus` tied at 53% with `Fable`
+  first is counted as `Opus` under `models = ["Opus"]` and as `Fable` under `["all"]`, and the TUI
+  cannot tell which the daemon holds. A view that is only older, with the same keys at other
+  percentages, still marks; nothing marked reads as the next point says.
 - With no window that counts, a key the sentence does not list, or no windows in the poll, the
   sentence reads as before: the bare percentage in `tagteam auto` and `tagteam daemon`, and none
   on the TUI's auto line, which shows only a binding window's usage (redesign T3-29).
@@ -624,10 +630,13 @@ changing the design.
   `Opus` tied, `Opus` carries the mark in `words::windows_said`, in a `tagteam auto` tick line and
   on the TUI's auto line; no counting key, or one the sentence does not list, marks nothing; the
   TUI marks from the poll's percentages over its view's keys, also when the view is older than
-  the poll, and marks nothing when its view lacks the account, its reading, or the poll's keys,
-  or when the window counted is not at the usage the poll's headroom gives (`models` drift); the
-  engine's poll names the counting key under `models`, and the wire and `--json` lines are the
-  same bytes with and without it.
+  the poll, and without its own `models`: the first window at the poll's usage (spend left out)
+  when it is the only one, even where the view's `models` disagrees, or a 5h or 7d window, also
+  in a tie with a later window; it marks nothing when several scoped windows tie at the usage
+  with a scoped one first, under any `models` the view holds, or when its view lacks the account,
+  its reading, or the poll's keys, or no window is at the usage; the engine's poll names the
+  counting key under `models`, and the wire and `--json` lines are the same bytes with and
+  without it.
 - The CONTRIBUTING checks: `cargo fmt --all --check`, the three clippy runs, and `cargo test
   --workspace --locked --no-fail-fast --features tagteam/test-support` (the pty tests need a
   terminal).
