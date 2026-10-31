@@ -389,6 +389,9 @@ mod tests {
 
     #[test]
     fn a_hung_up_pty_reads_as_the_end_or_eio() {
+        // A child forked by another test could hold a copy of the master, so dropping it would
+        // not hang the slave up.
+        let _fork = crate::fork_guard();
         let (master, slave) = open_raw_pty().unwrap();
         drop(master);
         let start = std::time::Instant::now();
