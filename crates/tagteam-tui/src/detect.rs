@@ -1,5 +1,5 @@
 //! Asking the terminal its background (redesign spec §4.2): OSC 11, then DA1 as a sentinel, read
-//! byte by byte from the terminal before the input thread's first crossterm read. Detection
+//! byte by byte from the terminal before the input thread's first read. Detection
 //! owns every byte it reads: what is not part of a reply is dropped, never replayed.
 
 use std::os::fd::RawFd;
