@@ -11,4 +11,5 @@ unmaintained = "workspace"
 yanked = "warn"
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "age's `ssh` feature pulls in `rsa`, whose RSA decryption has a timing side channel. tagteam refuses RSA identity files and `ssh-rsa` recipients (`parse_identity_file` and `parse_recipient` in crates/tagteam-engine/src/transfer.rs), so it never decrypts with an RSA key." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 reaches tagteam only through age's P-256 code, which serves the `p256tag` and `age1tagpq` recipients. tagteam builds only X25519 and ssh-ed25519 recipients (`parse_recipient` in crates/tagteam-engine/src/transfer.rs), and without age's `plugin` feature an identity file yields only X25519 identities, so no P-256 arithmetic runs. The fix is crypto-bigint 0.7.6, which age 0.12 (via p256 0.13) cannot use." },
 ]
