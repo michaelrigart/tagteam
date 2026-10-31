@@ -293,9 +293,11 @@ no switch needed (5h 9% · 7d 53%◂, switches at 90%)
 - The window that counts is the one auto counts: core's `rank::binding_window` over the
   account's windows under `autoswitch.models`, the relevant window with the highest percentage
   (ties to the earlier one; spend, and scoped windows `autoswitch.models` does not name, are not
-  relevant, §8.2 of the auto-switch spec). It is chosen by its key, never by its percentage, so a
-  tied or unrelated window at the same value is not marked: with `models = ["Opus"]` and `Fable`
-  and `Opus` both at 53%, `Opus 53%◂` is marked and `Fable 53%` is not.
+  relevant, §8.2 of the auto-switch spec). `words::windows_said` takes it by its key, never by its
+  percentage, so a tied or unrelated window at the same value is not marked: with
+  `models = ["Opus"]` and `Fable` and `Opus` both at 53%, `Opus 53%◂` is marked and `Fable 53%` is
+  not. The TUI has no key from the engine and follows its own rule, below; on that tie it marks
+  nothing.
 - `tagteam auto` and `tagteam daemon` get the key from the engine: `AutoEvent::Poll` carries each
   position's counting window (`counting_window`), computed where `windows_pct` is. It is in no
   JSON; the daemon's wire and every `--json` line are unchanged.
@@ -313,7 +315,10 @@ no switch needed (5h 9% · 7d 53%◂, switches at 90%)
   error (`1e-9`), not the parser's binding tolerance. The first candidate is marked when no
   `models` setting could change which window the daemon counted: when it is the only candidate
   (spend never counts, so the daemon's window is that one), or when it is a 5h or 7d window (they
-  always count, and a tie goes to the earlier window).
+  always count, and a tie goes to the earlier window) whose polled percentage is at least every
+  other candidate's. That comparison is on the exact polled readings, with no tolerance: the
+  tolerance only matches a window against the usage, so a 5h at `53.0` is not marked when the
+  daemon counted an Opus at `53.0000000001`.
 - It marks nothing when the view lacks the account or its reading, when its keys for the account
   are not the poll's, when the poll gives the account no `headroomPct`, when no window is at the
   usage, or when several are and the first is scoped: `Fable` and `Opus` tied at 53% with `Fable`
@@ -323,8 +328,8 @@ no switch needed (5h 9% · 7d 53%◂, switches at 90%)
 - With no window that counts, a key the sentence does not list, or no windows in the poll, the
   sentence reads as before: the bare percentage in `tagteam auto` and `tagteam daemon`, and none
   on the TUI's auto line, which shows only a binding window's usage (redesign T3-29).
-- The same words show on the TUI's auto line and in `tagteam auto` and `tagteam daemon`'s tick
-  lines (`words::windows_said`, `words::no_switch`). No JSON changes.
+- The same words show in `tagteam auto` and `tagteam daemon`'s tick lines and, when the TUI's rule
+  finds the window, on its auto line (`words::windows_said`, `words::no_switch`). No JSON changes.
 
 ## 5. Spacing, alignment and overflow
 
@@ -627,16 +632,17 @@ changing the design.
   words.
 - `v`: toggles, keeps the selection across `v` and a refresh, PgUp/PgDn by whole blocks.
 - Auto's no-switch sentence marks the window auto counts: with `models = ["Opus"]` and `Fable` and
-  `Opus` tied, `Opus` carries the mark in `words::windows_said`, in a `tagteam auto` tick line and
-  on the TUI's auto line; no counting key, or one the sentence does not list, marks nothing; the
-  TUI marks from the poll's percentages over its view's keys, also when the view is older than
-  the poll, and without its own `models`: the first window at the poll's usage (spend left out)
-  when it is the only one, even where the view's `models` disagrees, or a 5h or 7d window, also
-  in a tie with a later window; it marks nothing when several scoped windows tie at the usage
-  with a scoped one first, under any `models` the view holds, or when its view lacks the account,
-  its reading, or the poll's keys, or no window is at the usage; the engine's poll names the
-  counting key under `models`, and the wire and `--json` lines are the same bytes with and
-  without it.
+  `Opus` tied, `Opus` carries the mark in `words::windows_said` and in a `tagteam auto` tick line,
+  which get the key from the engine; the TUI marks nothing on that tie; no counting key, or one the
+  sentence does not list, marks nothing; the TUI marks from the poll's percentages over its view's
+  keys, also when the view is older than the poll, and without its own `models`: the first window at
+  the poll's usage (spend left out) when it is the only one, even where the view's `models`
+  disagrees, or a 5h or 7d window at least as high in the poll as every other candidate, also in a
+  tie with a later window; it marks nothing when several windows are at the usage and the first is
+  scoped, under any `models` the view holds, or a 5h or 7d window is below a later candidate in the
+  poll, or when its view lacks the account, its reading, or the poll's keys, or no window is at the
+  usage; the engine's poll names the counting key under `models`, and the wire and `--json` lines
+  are the same bytes with and without it.
 - The CONTRIBUTING checks: `cargo fmt --all --check`, the three clippy runs, and `cargo test
   --workspace --locked --no-fail-fast --features tagteam/test-support` (the pty tests need a
   terminal).
