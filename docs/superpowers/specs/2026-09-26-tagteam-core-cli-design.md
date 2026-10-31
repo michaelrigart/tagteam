@@ -3418,14 +3418,16 @@ is a workspace crate (`publish = false`) reached through a cargo alias. It drive
   are derived.
 - **Toolchain.** `rust-toolchain.toml` pins the stable Rust current at implementation time
   (edition 2024, MSRV ≥ 1.85). mise respects that file.
-- **CI** (GitHub Actions) on `macos-latest` and `ubuntu-latest`: `cargo fmt --check`,
-  `clippy -D warnings`, and `cargo test` (plus the `real_keychain` tests on macOS).
-- **Release.** `cargo-dist` builds `aarch64-apple-darwin`, `x86_64-apple-darwin`,
-  `x86_64-unknown-linux-musl`, and `aarch64-unknown-linux-musl`, one archive per target.
-  cargo-dist 0.33 cannot merge the two macOS builds into a universal binary; the Homebrew
-  formula picks the architecture. It publishes GitHub Releases and the Homebrew tap
+- **CI** (GitHub Actions) on `macos-26` (Apple silicon) and `ubuntu-latest`: `cargo fmt --check`,
+  `clippy -D warnings`, and `cargo test` (plus the `real_keychain` tests on macOS). GitHub has no
+  macOS 27 image, so `macos-26`, its newest, stands in for the supported macOS 27.
+- **Release.** `cargo-dist` builds `aarch64-apple-darwin`, `x86_64-unknown-linux-musl`, and
+  `aarch64-unknown-linux-musl`, one archive per target. The supported platforms are macOS 27 on
+  Apple silicon and Linux on x86-64 and aarch64; there is no Intel Mac build. The macOS build
+  runs on the `macos-26` runner, set through `[dist.github-custom-runners]`, because GitHub has
+  no macOS 27 image. It publishes GitHub Releases and the Homebrew tap
   `michaelrigart/homebrew-tap` (formula `tagteam`). Archives carry `LICENSE` and `NOTICE`.
-  - Every pull request builds all four targets without publishing.
+  - Every pull request builds all three targets without publishing.
   - A smoke job gates publishing. On each musl target the binary must be statically linked,
     run on Alpine, and round-trip the bundled SQLite store. An ignored live test, built for the
     same target, proves the TLS platform verifier accepts a real chain and rejects an untrusted

@@ -22,6 +22,11 @@ with the one before, so any release may contain breaking changes. Each section s
   every window of the account in use and marks the one that counts:
   `(5h 9% · 7d 53%◂, switches at 90%)`.
 
+### Removed
+
+- Release builds for Intel Macs (`x86_64-apple-darwin`). tagteam supports macOS 27 on Apple
+  silicon, and Linux on x86-64 and aarch64.
+
 ### Fixed
 
 - `tagteam tui`'s Tokens screen says `before tracking`, not `unknown account`, for unattributed
