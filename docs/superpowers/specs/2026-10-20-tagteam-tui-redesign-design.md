@@ -245,10 +245,10 @@ a `Modifier`.
   2 is known before the first draw. After detection, the tier does not change.
 - **The answers never reach the keys.** The answer bytes (`ESC ] 11 ; rgb:…` contains `r`, `g`
   and `b`, and `b` switches accounts) must never be read as keys:
-  - The input thread starts its first crossterm read only after detection has finished.
+  - The input thread starts its first crossterm read only after detection has finished. *(Amended by the [input reader spec](2026-10-31-tagteam-tui-input-reader-design.md) §3: the first read is the thread's own, not crossterm's; the rule does not change.)*
   - **Detection owns every byte it reads.** Bytes that are not part of a reply, a key typed in the
     few milliseconds before the DA1 answer, are dropped, never replayed: dropping a key can
-    change nothing, while a replay would need a second key decoder beside crossterm's.
+    change nothing, while a replay would need a second key decoder beside crossterm's. *(Amended by the [input reader spec](2026-10-31-tagteam-tui-input-reader-design.md) §3: the decoder is crossterm's, vendored in tagteam; the rule does not change.)*
   - **A reply detection didn't finish** must not become keys either: one it stopped partway
     through (the 2 s deadline), or one that begins after it gave up (a terminal silent for over a
     second, then answering). Detection hands its parse state to the input thread. The input
@@ -1163,7 +1163,7 @@ From refactor §10, each re-verified at `683b266`:
 
 | Item | Today | Change |
 |---|---|---|
-| PERF-R-9 | the input thread polls crossterm every 50 ms (`input.rs:16, 147`), about 20 wake-ups a second idle; pause and drop wait up to a slice | the thread waits on the terminal, a wake pipe (pause, resume, stop) and a SIGWINCH pipe with `poll(2)`, and reads crossterm events without blocking once one is ready. No idle wake-ups; pause acknowledged within 50 ms. `input.rs`'s bounds (`:313, 411, 422, 446`) stay or tighten |
+| PERF-R-9 | the input thread polls crossterm every 50 ms (`input.rs:16, 147`), about 20 wake-ups a second idle; pause and drop wait up to a slice | the thread waits on the terminal, a wake pipe (pause, resume, stop) and a SIGWINCH pipe with `poll(2)`, and reads crossterm events without blocking once one is ready. No idle wake-ups; pause acknowledged within 50 ms. `input.rs`'s bounds (`:313, 411, 422, 446`) stay or tighten *(Amended by the [input reader spec](2026-10-31-tagteam-tui-input-reader-design.md) §3: once woken, the thread reads the terminal and decodes it itself, instead of reading crossterm events.)* |
 | PERF-R-10a | `liveness` re-parses the live login per view (`views.rs:509`); an unmanaged login twice | read once per `accounts` call, keeping `Read<T>`'s states and the stored-active fallback (§12.2) |
 | PERF-R-10b | Tokens lays out every row each frame (`table.rs:1154-1205`) | cache `(items, starts)` on `TokensState`, keyed by report generation, width and the second; `render`, `follow` and `page` share it; built in `on_report` and on resize |
 | PERF-D-2 (TUI half) | every `changed_at` rise re-queries (`tokens/index.rs:193-233, 270-300`) | C-13: the live throttle `LIVE_REQUERY_MS` goes from 5 s to 30 s, except while the TUI's own refresh runs and after `r` |

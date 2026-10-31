@@ -15,7 +15,9 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use mio::unix::SourceFd;
 use mio::{Interest, Poll, Token};
 use signal_hook_mio::v1_0::Signals;
+use tagteam_provider::term::{bytes_waiting, read_some};
 
+use crate::decode::{InternalEvent, Parser, TTY_BUFFER_SIZE};
 use crate::detect::{self, Control as Typed};
 use crate::msg::Msg;
 use crate::replies::ReplyFilter;
@@ -42,9 +44,12 @@ pub(crate) enum Ready {
     Closed,
 }
 
-/// What the terminal holds now.
+/// What one step of reading the terminal came to.
 pub(crate) enum Next {
     Event(Event),
+    /// The step read bytes that decoded to no event, or a signal cut its read short: the
+    /// terminal may hold more.
+    Pending,
     Empty,
     Closed,
 }
@@ -55,8 +60,10 @@ pub(crate) trait Events: Send + 'static {
     /// waker was called or a signal interrupted the wait (`Woken`), or the terminal hung up
     /// (`Closed`).
     fn wait(&mut self) -> io::Result<Ready>;
-    /// An event crossterm has read and parsed, without blocking, and `Empty` once it holds
-    /// none. `Closed` once the terminal has hung up, and then crossterm is not called.
+    /// One bounded step, never blocking: at most one read of the terminal and at most one
+    /// event. `Pending` when the step produced no event and the terminal may hold more, and
+    /// `Empty` only once nothing waits in the terminal and the decoder holds no event. `Closed`
+    /// once the terminal has hung up, and then nothing is read.
     fn next(&mut self) -> io::Result<Next>;
     /// The terminal's size now, for a resize.
     fn size(&mut self) -> io::Result<(u16, u16)>;
@@ -81,7 +88,7 @@ pub(crate) struct Wait {
 
 impl Wait {
     /// Waits on `fd`, on SIGWINCH and on the waker. The SIGWINCH registration is this one's
-    /// own, made before crossterm's: a resize wakes the wait whatever crossterm has seen.
+    /// own: a resize wakes the wait whatever the thread has read.
     pub(crate) fn on(fd: RawFd) -> io::Result<Wait> {
         let poll = Poll::new()?;
         let registry = poll.registry();
@@ -169,54 +176,51 @@ impl Wait {
     }
 }
 
-/// How many replies to a terminal's queries one drain looks past: a key with up to 32 replies
-/// in all ahead of it, however they arrived, is drained at once. A key behind more waits for
-/// the next byte, a resize or a wake, as it did before the drain looked past any. One read
-/// could hold 256 (1024 bytes, `TTY_BUFFER_SIZE` in crossterm 0.29.0, over the 4 of
-/// `ESC [ ? c`), but each look past one costs two zero-timeout kevents once crossterm holds
-/// nothing: a drain's end took about 8 ms in a release build at 256, and about 1 ms at 32.
-const REPLIES: usize = 32;
-
-/// `Terminal::next` over crossterm's calls, `closed` before each one.
-///
-/// crossterm's zero-timeout `poll` hands out one parsed event a call. When that event is a
-/// reply it keeps to itself (a cursor position, the keyboard enhancement flags, the primary
-/// device attributes), it says no, though keys may wait behind it. Each no before a key it
-/// holds takes one reply ahead of that key, so `REPLIES + 1` noes in a row say it holds no key
-/// with up to `REPLIES` replies in all ahead of it. Bytes a read takes within those noes came
-/// after the wait last looked: `Wait::closed` keeps their arrival, or the wait has yet to see
-/// it, and the next wait drains again.
-fn next_of(
-    mut closed: impl FnMut() -> io::Result<bool>,
-    mut poll: impl FnMut() -> io::Result<bool>,
-    read: impl FnOnce() -> io::Result<Event>,
-) -> io::Result<Next> {
-    for _ in 0..=REPLIES {
-        // crossterm's read loops forever on a terminal that has hung up.
-        if closed()? {
-            return Ok(Next::Closed);
-        }
-        if poll()? {
-            return read().map(Next::Event);
-        }
-    }
-    Ok(Next::Empty)
-}
-
-/// The process's terminal: fd 0 through `Wait`. Its events come through crossterm
-/// (`event::poll(Duration::ZERO)` and `read`), and only after `Wait::closed` has said no. Its
-/// size comes from `crossterm::terminal::size()`.
+/// The process's terminal: fd 0 through `Wait`, read and decoded by the thread itself. Each
+/// `next` is one bounded step (TUI input reader spec §3.2): a read of at most `TTY_BUFFER_SIZE`
+/// bytes, taken only once `FIONREAD` says the terminal holds some, so it cannot block and fd 0
+/// is never made non-blocking. The bytes go through crossterm 0.29.0's decoder, vendored in
+/// `decode`. The size comes from `crossterm::terminal::size()`.
 pub(crate) struct Terminal {
     wait: Wait,
+    fd: RawFd,
+    decoder: Parser,
+    buffer: Box<[u8; TTY_BUFFER_SIZE]>,
+    size: fn() -> io::Result<(u16, u16)>,
 }
 
 impl Terminal {
-    /// fd 0: `tagteam tui` runs only with stdin a terminal, and crossterm reads that one.
-    fn stdin() -> io::Result<Terminal> {
+    /// Reads `fd`, and asks `size` for the terminal's size after a resize.
+    pub(crate) fn on(fd: RawFd, size: fn() -> io::Result<(u16, u16)>) -> io::Result<Terminal> {
         Ok(Terminal {
-            wait: Wait::on(libc::STDIN_FILENO)?,
+            wait: Wait::on(fd)?,
+            fd,
+            decoder: Parser::default(),
+            buffer: Box::new([0; TTY_BUFFER_SIZE]),
+            size,
         })
     }
+
+    /// fd 0: `tagteam tui` runs only with stdin a terminal.
+    fn stdin() -> io::Result<Terminal> {
+        Terminal::on(libc::STDIN_FILENO, crossterm::terminal::size)
+    }
+
+    /// The first event the decoder holds. The replies to queries it holds are dropped: nothing
+    /// in tagteam asks for one.
+    fn take(&mut self) -> Option<Event> {
+        self.decoder.find_map(|item| match item {
+            InternalEvent::Event(event) => Some(event),
+            InternalEvent::CursorPosition(..)
+            | InternalEvent::KeyboardEnhancementFlags(_)
+            | InternalEvent::PrimaryDeviceAttributes => None,
+        })
+    }
+}
+
+/// A terminal that has hung up reports `EIO` on its slave side.
+fn hung_up(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EIO)
 }
 
 impl Events for Terminal {
@@ -225,16 +229,34 @@ impl Events for Terminal {
     }
 
     fn next(&mut self) -> io::Result<Next> {
-        let wait = &mut self.wait;
-        next_of(
-            || wait.closed(),
-            || crossterm::event::poll(Duration::ZERO),
-            crossterm::event::read,
-        )
+        if let Some(event) = self.take() {
+            return Ok(Next::Event(event));
+        }
+        if self.wait.closed()? {
+            return Ok(Next::Closed);
+        }
+        match bytes_waiting(self.fd) {
+            Ok(0) => return Ok(Next::Empty),
+            Ok(_) => {}
+            Err(e) if hung_up(&e) => return Ok(Next::Closed),
+            Err(e) => return Err(e),
+        }
+        let read = match read_some(self.fd, &mut self.buffer[..]) {
+            Ok(0) => return Ok(Next::Closed),
+            Ok(read) => read,
+            Err(e) if hung_up(&e) => return Ok(Next::Closed),
+            Err(e) if e.kind() == ErrorKind::Interrupted => return Ok(Next::Pending),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(Next::Empty),
+            Err(e) => return Err(e),
+        };
+        // crossterm's rule for whether more input follows: a read that filled the buffer.
+        self.decoder
+            .advance(&self.buffer[..read], read == TTY_BUFFER_SIZE);
+        Ok(self.take().map_or(Next::Pending, Next::Event))
     }
 
     fn size(&mut self) -> io::Result<(u16, u16)> {
-        crossterm::terminal::size()
+        (self.size)()
     }
 
     fn waker(&self) -> Arc<dyn Fn() + Send + Sync> {
@@ -251,8 +273,8 @@ pub(crate) trait Pause {
     fn pause(&self) -> bool;
     fn resume(&self);
     /// The terminal has hung up and is gone: the thread is asked to stop, and nothing waits for
-    /// it. crossterm's reader loops on a closed terminal and never looks at the control, so an
-    /// acknowledgment would only be waited for in vain, at full speed.
+    /// it: a terminal that is gone has no next owner for a late read to take keys from, and an
+    /// acknowledgment is not worth waiting for.
     fn hang_up(&self);
 }
 
@@ -351,9 +373,9 @@ impl Input {
     }
 }
 
-/// Asks the terminal its background, reads what it says before the first crossterm read, and
+/// Asks the terminal its background, reads what it says before the thread's first read, and
 /// sends it as `Detected` (§4.2). A Ctrl-C or Ctrl-Z that ended the reading is sent after it, as
-/// the key crossterm would have read. The filter for the keys that follow is calm when no query
+/// the key the decoder would have made. The filter for the keys that follow is calm when no query
 /// was asked or its DA1 answer was read, and otherwise wary, from where the parser stood however
 /// the reading ended (a quiet second, the limit, a stop or pause, Ctrl-C or Ctrl-Z): detection is
 /// not started again. `None` once the UI thread is gone.
@@ -441,7 +463,7 @@ fn read(
         filter,
         told: false,
     };
-    // crossterm may hold events from before.
+    // The decoder may hold events from before.
     let mut more = true;
     loop {
         {
@@ -456,7 +478,7 @@ fn read(
                             .changed
                             .wait(mode)
                             .unwrap_or_else(PoisonError::into_inner);
-                        // A pause can come between two events crossterm holds.
+                        // A pause can come between two events the decoder holds.
                         more = true;
                     }
                     Mode::StopAsked | Mode::HungUp | Mode::Stopped => {
@@ -473,13 +495,15 @@ fn read(
     }
 }
 
-/// One call into the terminal, so the mode is looked at between any two: the next event
-/// crossterm holds while there may be `more`, else a wait. False once the thread is to stop:
+/// One call into the terminal, so the mode is looked at between any two: one `next` step while
+/// there may be `more`, else a wait. False once the thread is to stop:
 /// the terminal has hung up, or the UI thread is gone and nothing reads these any more.
 fn step(events: &mut impl Events, tx: &Sender<Msg>, more: &mut bool, keys: &mut Keys) -> bool {
     if *more {
         return match events.next() {
             Ok(Next::Event(event)) => keys.send(event, tx),
+            // Bytes read and no event yet: the terminal may hold more, and `more` stays set.
+            Ok(Next::Pending) => true,
             Ok(Next::Empty) => {
                 *more = false;
                 keys.drained(tx)
@@ -498,8 +522,7 @@ fn step(events: &mut impl Events, tx: &Sender<Msg>, more: &mut bool, keys: &mut 
             *more = true;
             true
         }
-        // The size is read after the thread's own SIGWINCH, so crossterm's `Resize` is not
-        // waited for (R-8).
+        // The size is read after the thread's own SIGWINCH (R-8).
         Ok(Ready::Resized) => {
             *more = true;
             events
@@ -517,7 +540,7 @@ fn step(events: &mut impl Events, tx: &Sender<Msg>, more: &mut bool, keys: &mut 
 }
 
 /// The events the TUI acts on: key presses (and repeats). Resizes come from the thread's own
-/// SIGWINCH, and crossterm's `Resize` is dropped (R-8).
+/// SIGWINCH, and a `Resize` event is dropped (R-8).
 fn message(event: Event) -> Option<Msg> {
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => Some(Msg::Key(key)),
@@ -566,13 +589,15 @@ impl Drop for Input {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fs::File;
     use std::io::Write;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tagteam_provider::term::{open_raw_pty, status_flags};
 
     use super::*;
 
@@ -781,7 +806,8 @@ mod tests {
             Event::Key(release),
             Event::FocusGained,
             Event::Key(key('q')),
-            // crossterm's own, which the SIGWINCH below makes too: dropped (R-8).
+            // Not one the decoder makes, but dropped all the same: the SIGWINCH below makes the
+            // resize (R-8).
             Event::Resize(80, 24),
         ] {
             script.push(event);
@@ -867,7 +893,7 @@ mod tests {
         assert!(!script.reading.load(Ordering::SeqCst));
     }
 
-    /// A thread held up before its call, as a closed terminal holds crossterm's reader.
+    /// A thread held up before its call, as a call into the terminal that does not return.
     fn stuck_input() -> (Input, Gate) {
         let gate = Gate::default();
         let (tx, _rx) = mpsc::channel();
@@ -1076,8 +1102,8 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_is_sent_from_the_outer_signal_even_before_crossterm_has_it() {
-        // The thread's own SIGWINCH woke it, and crossterm has no `Resize` to read yet.
+    fn a_resize_is_sent_from_the_thread_s_own_signal() {
+        // The thread's own SIGWINCH woke it: no event from the terminal is needed.
         let script = Script::default();
         let (tx, rx) = mpsc::channel();
         let _input = Input::spawn_with(tx, script.clone(), None).unwrap();
@@ -1389,53 +1415,333 @@ mod tests {
         drop(theirs);
     }
 
-    /// `next_of` over a crossterm that holds `replies` it keeps to itself and then `q`, or
-    /// nothing after them: what it returns, and how many `closed`s and `poll`s it made.
-    fn next_behind(replies: usize, then_q: bool, closes_at: Option<usize>) -> (Next, usize, usize) {
-        let (mut closeds, mut polls) = (0, 0);
-        let next = next_of(
-            || {
-                closeds += 1;
-                Ok(closes_at == Some(closeds))
-            },
-            || {
-                polls += 1;
-                Ok(then_q && polls > replies)
-            },
-            || Ok(Event::Key(key('q'))),
-        )
-        .unwrap();
-        (next, closeds, polls)
+    /// The in-process pty the reader tests use: the non-blocking master as a file, and the raw
+    /// slave `Terminal::on` reads.
+    fn pty() -> (File, OwnedFd) {
+        let (master, slave) = open_raw_pty().unwrap();
+        (File::from(master), slave)
+    }
+
+    fn terminal_on(slave: &OwnedFd) -> Terminal {
+        Terminal::on(slave.as_raw_fd(), || Ok((100, 30))).unwrap()
+    }
+
+    /// Returns once the slave holds `n` bytes unread: bytes reach a Linux slave asynchronously.
+    fn landed(slave: &OwnedFd, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while bytes_waiting(slave.as_raw_fd()).unwrap() != n {
+            assert!(Instant::now() < deadline, "{n} bytes never landed");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Writes all of `bytes` to the master, keeping its offset across partial writes and trying
+    /// a full master again every millisecond. False only once `abort` is set, for the clean-up of
+    /// a test after which no key is expected. No write blocks, so every writer can be joined.
+    fn write_whole(mut master: &File, bytes: &[u8], abort: &AtomicBool) -> bool {
+        let mut done = 0;
+        while done < bytes.len() {
+            match master.write(&bytes[done..]) {
+                Ok(n) => done += n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    if abort.load(Ordering::SeqCst) {
+                        return false;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => panic!("the master write failed: {e}"),
+            }
+        }
+        true
+    }
+
+    /// Writes as much of `bytes` as the master takes, and how much that was.
+    fn write_what_fits(mut master: &File, bytes: &[u8]) -> usize {
+        let mut done = 0;
+        while done < bytes.len() {
+            match master.write(&bytes[done..]) {
+                Ok(n) => done += n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => panic!("the master write failed: {e}"),
+            }
+        }
+        done
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_key(next: &Next, c: char) -> bool {
+        matches!(next, Next::Event(Event::Key(k)) if k.code == KeyCode::Char(c))
     }
 
     #[test]
-    fn a_key_behind_the_replies_crossterm_keeps_is_read() {
-        // Up to as many as a drain looks past.
-        for replies in [0, 1, 2, REPLIES] {
-            let (next, closeds, polls) = next_behind(replies, true, None);
-            assert!(
-                matches!(next, Next::Event(Event::Key(k)) if k.code == KeyCode::Char('q')),
-                "behind {replies} replies"
-            );
+    fn a_key_split_across_two_reads_is_one_key() {
+        let _alone = alone();
+        let (master, slave) = pty();
+        let mut terminal = terminal_on(&slave);
+        write_whole(&master, b"\x1b[", &AtomicBool::new(false));
+        landed(&slave, 2);
+        assert!(matches!(terminal.next().unwrap(), Next::Pending));
+        write_whole(&master, b"A", &AtomicBool::new(false));
+        landed(&slave, 1);
+        assert!(matches!(
+            terminal.next().unwrap(),
+            Next::Event(Event::Key(k)) if k.code == KeyCode::Up
+        ));
+        assert!(matches!(terminal.next().unwrap(), Next::Empty));
+    }
+
+    #[test]
+    fn an_esc_alone_at_the_end_of_a_short_read_is_esc_at_once() {
+        let _alone = alone();
+        let (master, slave) = pty();
+        let mut terminal = terminal_on(&slave);
+        write_whole(&master, b"\x1b", &AtomicBool::new(false));
+        landed(&slave, 1);
+        assert!(matches!(
+            terminal.next().unwrap(),
+            Next::Event(Event::Key(k)) if k.code == KeyCode::Esc
+        ));
+    }
+
+    #[test]
+    fn replies_in_one_read_are_dropped_and_the_key_behind_them_comes_out() {
+        let _alone = alone();
+        let (master, slave) = pty();
+        let mut terminal = terminal_on(&slave);
+        let bytes = b"\x1b[?62;22c\x1b[1;1R\x1b[?1uq";
+        write_whole(&master, bytes, &AtomicBool::new(false));
+        landed(&slave, bytes.len());
+        assert!(matches!(
+            terminal.next().unwrap(),
+            Next::Event(Event::Key(k)) if k.code == KeyCode::Char('q')
+        ));
+        assert!(matches!(terminal.next().unwrap(), Next::Empty));
+    }
+
+    #[test]
+    fn more_than_a_read_s_worth_comes_out_whole_and_in_order() {
+        let _alone = alone();
+        const TOTAL: usize = 3000;
+        let (master, slave) = pty();
+        let mut terminal = terminal_on(&slave);
+        let bytes: Vec<u8> = (0..TOTAL).map(|i| b'a' + (i % 26) as u8).collect();
+        let mut sent = write_what_fits(&master, &bytes);
+        assert!(sent > 0);
+        landed(&slave, sent);
+        let mut keys = Vec::new();
+        // Linux holds the lot, and one read takes 1024 of it. macOS holds about 1 KiB, so the
+        // rest is written as the terminal empties.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(sent, TOTAL);
+            assert!(is_key(&terminal.next().unwrap(), 'a'));
             assert_eq!(
-                (closeds, polls),
-                (replies + 1, replies + 1),
-                "a hang-up check each"
+                bytes_waiting(slave.as_raw_fd()).unwrap(),
+                TOTAL - TTY_BUFFER_SIZE
             );
+            keys.push(KeyCode::Char('a'));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while keys.len() < TOTAL {
+            assert!(Instant::now() < deadline, "only {} keys came", keys.len());
+            match terminal.next().unwrap() {
+                Next::Event(Event::Key(k)) => keys.push(k.code),
+                Next::Pending => {}
+                Next::Empty => {
+                    assert_eq!(bytes_waiting(slave.as_raw_fd()).unwrap(), 0);
+                    let more = write_what_fits(&master, &bytes[sent..]);
+                    sent += more;
+                    landed(&slave, more);
+                }
+                _ => panic!("a key, a pending step or an empty terminal"),
+            }
+        }
+        let expected: Vec<KeyCode> = bytes.iter().map(|b| KeyCode::Char(*b as char)).collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn a_hang_up_ends_in_closed_without_blocking() {
+        let _alone = alone();
+        let (master, slave) = pty();
+        let mut terminal = terminal_on(&slave);
+        write_whole(&master, b"abc", &AtomicBool::new(false));
+        landed(&slave, 3);
+        drop(master);
+        let mut closed = false;
+        for _ in 0..10 {
+            let started = Instant::now();
+            let next = terminal.next().unwrap();
+            assert!(started.elapsed() < Duration::from_millis(50));
+            if matches!(next, Next::Closed) {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "no Closed within 10 calls");
+        for _ in 0..2 {
+            let started = Instant::now();
+            assert!(matches!(terminal.next().unwrap(), Next::Closed));
+            assert!(started.elapsed() < Duration::from_millis(50));
         }
     }
 
     #[test]
-    fn only_enough_noes_in_a_row_say_crossterm_holds_nothing() {
-        let (next, closeds, polls) = next_behind(REPLIES + 1, false, None);
-        assert!(matches!(next, Next::Empty));
-        assert_eq!((closeds, polls), (REPLIES + 1, REPLIES + 1));
+    fn a_resize_and_a_key_pending_together_both_arrive() {
+        let _alone = alone();
+        let (master, slave) = pty();
+        let terminal = terminal_on(&slave);
+        signal_hook::low_level::raise(libc::SIGWINCH).unwrap();
+        write_whole(&master, b"q", &AtomicBool::new(false));
+        landed(&slave, 1);
+        let (tx, rx) = mpsc::channel();
+        let input = Input::spawn_with(tx, terminal, None).unwrap();
+        let (mut resized, mut typed) = (false, false);
+        for _ in 0..2 {
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(Msg::Resize {
+                    width: 100,
+                    height: 30,
+                }) => resized = true,
+                Ok(Msg::Key(k)) if k.code == KeyCode::Char('q') => typed = true,
+                _ => panic!("the resize and the key, in either order"),
+            }
+        }
+        assert!(resized && typed);
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        drop(input);
+    }
+
+    /// Answers to a DA1 query, whole, until `stop` is set, and then `last` if there is one.
+    /// `stop` ends the stream only between two answers, never inside one.
+    fn stream_replies(
+        master: &Arc<File>,
+        stop: &Arc<AtomicBool>,
+        abort: &Arc<AtomicBool>,
+        last: Option<&'static [u8]>,
+    ) -> thread::JoinHandle<()> {
+        let (master, stop, abort) = (Arc::clone(master), Arc::clone(stop), Arc::clone(abort));
+        thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                if !write_whole(&master, b"\x1b[?62;22c", &abort) {
+                    return;
+                }
+            }
+            if let Some(last) = last {
+                write_whole(&master, last, &abort);
+            }
+        })
     }
 
     #[test]
-    fn a_hang_up_between_the_noes_ends_them_before_crossterm_is_called_again() {
-        let (next, closeds, polls) = next_behind(REPLIES, true, Some(5));
-        assert!(matches!(next, Next::Closed));
-        assert_eq!((closeds, polls), (5, 4));
+    fn a_pause_and_a_stop_are_acknowledged_while_replies_stream_in() {
+        let _alone = alone();
+        // A pause: acknowledged while replies keep coming, and the thread reads nothing until
+        // the resume, the key behind the stream included.
+        let (master, slave) = pty();
+        let (master, stop, abort) = (
+            Arc::new(master),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let writer = stream_replies(&master, &stop, &abort, Some(b"q"));
+        let (tx, rx) = mpsc::channel();
+        let input = Input::spawn_with(tx, terminal_on(&slave), None).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        assert!(input.pause(), "acknowledged within ACK");
+        assert!(started.elapsed() < ACK);
+        stop.store(true, Ordering::SeqCst);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a paused thread reads nothing"
+        );
+        input.resume();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Msg::Key(k)) if k.code == KeyCode::Char('q')
+        ));
+        writer.join().unwrap();
+        drop(input);
+        drop(slave);
+
+        // A stop: the drop is acknowledged while replies keep coming.
+        let (master, slave) = pty();
+        let (master, stop, abort) = (
+            Arc::new(master),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let writer = stream_replies(&master, &stop, &abort, None);
+        let (tx, _rx) = mpsc::channel();
+        let input = Input::spawn_with(tx, terminal_on(&slave), None).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        drop(input);
+        assert!(started.elapsed() < ACK, "acknowledged within ACK");
+        stop.store(true, Ordering::SeqCst);
+        abort.store(true, Ordering::SeqCst);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn with_nothing_pending_next_is_empty_at_once() {
+        let _alone = alone();
+        let (_master, slave) = pty();
+        let mut terminal = terminal_on(&slave);
+        let started = Instant::now();
+        assert!(matches!(terminal.next().unwrap(), Next::Empty));
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn the_terminal_s_file_status_flags_never_change() {
+        let _alone = alone();
+        let (master, slave) = pty();
+        let mut terminal = terminal_on(&slave);
+        let before = status_flags(slave.as_raw_fd()).unwrap();
+        write_whole(&master, b"jk", &AtomicBool::new(false));
+        landed(&slave, 2);
+        for _ in 0..10 {
+            if matches!(terminal.next().unwrap(), Next::Empty) {
+                break;
+            }
+        }
+        drop(master);
+        for _ in 0..10 {
+            if matches!(terminal.next().unwrap(), Next::Closed) {
+                break;
+            }
+        }
+        let after = status_flags(slave.as_raw_fd()).unwrap();
+        assert_eq!(before, after);
+        assert_eq!(after & libc::O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn a_pending_step_reads_on_without_waiting() {
+        let script = Script::default();
+        script.queue([
+            Next::Pending,
+            Next::Pending,
+            Next::Event(Event::Key(key('q'))),
+        ]);
+        let (tx, rx) = mpsc::channel();
+        let _input = Input::spawn_with(tx, script.clone(), None).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Msg::Key(k)) if k.code == KeyCode::Char('q')
+        ));
+        thread::sleep(Duration::from_millis(100));
+        // Three steps, then `Empty`, then one wait. `Pending` taken for `Empty` waits at each.
+        assert_eq!(
+            (
+                script.nexts.load(Ordering::SeqCst),
+                script.waits.load(Ordering::SeqCst)
+            ),
+            (4, 1)
+        );
     }
 }

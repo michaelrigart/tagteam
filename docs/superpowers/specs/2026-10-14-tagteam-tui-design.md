@@ -128,6 +128,7 @@ The TUI is an Elm-style loop.
 - **The input thread** turns crossterm events into `Msg`s. It waits on the terminal, on SIGWINCH
   and on a waker the UI thread uses to pause, resume or stop it, so it makes no wake-up while idle
   and acknowledges a pause at once (§7.3). *(Amended by the TUI redesign spec §14, PERF-R-9.)*
+  *(Amended by the [input reader spec](2026-10-31-tagteam-tui-input-reader-design.md) §3: the thread reads the terminal itself and decodes it with crossterm's vendored decoder.)*
 - **Five lanes.** The four engine lanes each own an `Engine` that the binary's factory builds
   from the same `Context`, so `Engine` never needs to be `Sync`. Each lane's engine takes the shutdown token
   as its cancel token, never the signal token (§2). A Ctrl-C meant for a foreground action

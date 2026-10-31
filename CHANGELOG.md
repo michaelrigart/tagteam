@@ -44,6 +44,7 @@ with the one before, so any release may contain breaking changes. Each section s
 
 - `tagteam tui`'s Tokens screen says `before tracking`, not `unknown account`, for unattributed
   usage from before tracking started.
+- `tagteam tui` no longer holds a key pressed as the terminal is resized until the next key.
 
 ## [20261023.738.0] - 2026-10-23
 
