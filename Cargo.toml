@@ -25,6 +25,9 @@ tagteam-fake = { path = "crates/tagteam-fake" }
 # ASCII armor. The `ssh` feature pulls in `rsa` (RUSTSEC-2023-0071, a timing side channel in
 # RSA decryption); tagteam never decrypts with an RSA key: `transfer::parse_identity_file`
 # refuses one and `transfer::parse_recipient` refuses `ssh-rsa`, so the advisory does not apply.
+# age's P-256 code pulls in crypto-bigint 0.5 (RUSTSEC-2026-0387, timing side channels); it serves
+# only the `age1tag` and `age1tagpq` recipients, which age cannot decrypt in-process and
+# `parse_recipient` refuses, so no P-256 arithmetic runs.
 age = { version = "0.12", features = ["armor", "ssh"] }
 clap = { version = "4", features = ["derive", "string"] }
 # `tagteam completions` (§13.7): static scripts generated from the command definitions.
