@@ -1766,7 +1766,7 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(2)),
             Ok(Msg::Key(k)) if k.code == KeyCode::Char('q')
         ));
-        thread::sleep(Duration::from_millis(100));
+        script.idle(1);
         // Three steps, then `Empty`, then one wait. `Pending` taken for `Empty` waits at each.
         assert_eq!(
             (
