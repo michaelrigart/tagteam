@@ -44,7 +44,9 @@ pub trait EventSink {
 pub enum AutoEvent {
     /// After step 3's collection: the live account, every account's decision-grade headroom
     /// by position (`None`: unknown), the threshold, each failed fetch's `last_error` token by
-    /// position, and each decision-grade reading's windows by position (key → pct).
+    /// position, each decision-grade reading's windows by position (key → pct), and the key of
+    /// the window auto counts in each (`rank::binding_window` under `autoswitch.models`; absent
+    /// when none is relevant). The wire leaves `counting_window` out.
     Poll {
         provider: ProviderId,
         active: Option<(u32, String)>,
@@ -52,6 +54,7 @@ pub enum AutoEvent {
         threshold: f64,
         fetch_errors: BTreeMap<u32, String>,
         windows_pct: BTreeMap<u32, BTreeMap<String, f64>>,
+        counting_window: BTreeMap<u32, String>,
     },
     /// A switch made, or in dry-run one that would have been made (§11.2 step 10).
     Switch {
@@ -946,6 +949,13 @@ impl AutoEngine<'_> {
                 Some((a.row.position, pct))
             })
             .collect();
+        let counting_window = accounts
+            .iter()
+            .filter_map(|a| {
+                let window = binding_window(a.windows.as_deref()?, &self.cfg.models)?;
+                Some((a.row.position, window.key.clone()))
+            })
+            .collect();
         self.emit(sink, |provider| AutoEvent::Poll {
             provider,
             active: Some((live.position, live.display_email().to_owned())),
@@ -953,6 +963,7 @@ impl AutoEngine<'_> {
             threshold: self.cfg.threshold,
             fetch_errors,
             windows_pct,
+            counting_window,
         });
     }
 

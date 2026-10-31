@@ -172,6 +172,11 @@ fn a_tick_below_the_threshold_polls_and_stays() {
                     threshold: 90.0,
                     fetch_errors: BTreeMap::new(),
                     windows_pct: BTreeMap::from([(1, pcts(&low)), (2, pcts(&high))]),
+                    // `a` ties at 10 (the earlier window counts); `b` is highest in its long one.
+                    counting_window: BTreeMap::from([
+                        (1, low[0].key.clone()),
+                        (2, high[1].key.clone()),
+                    ]),
                 },
                 no_switch(&t.provider, "below-threshold", ""),
             ],
@@ -1519,6 +1524,49 @@ fn a_quarantine_the_collection_set_is_reported_once() {
     );
     engine.tick(&sink).unwrap();
     assert!(!sink.take().contains(&quarantined));
+}
+
+#[test]
+fn a_poll_names_the_window_auto_counts_under_the_models_setting() {
+    // `models = ["Opus"]`: Fable and Opus tie at 53 with Fable first, but only Opus is relevant,
+    // so Opus counts (headroom 47). Spend is never relevant, whatever its percentage.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    let mut scoped = vec![
+        usage_window("5h", WindowKind::Short, 9.0, SHORT_RESETS),
+        usage_window("7d", WindowKind::Long, 20.0, LONG_RESETS),
+        usage_window("scoped:Fable", WindowKind::Scoped, 53.0, LONG_RESETS),
+        usage_window("scoped:Opus", WindowKind::Scoped, 53.0, LONG_RESETS),
+    ];
+    scoped.push(usage_window("spend", WindowKind::Spend, 95.0, LONG_RESETS));
+    read(&fx.engine, &a, &reading(false, 10.0, 10.0));
+    read(&fx.engine, &b, &scoped);
+    let config = AutoConfig {
+        models: vec!["Opus".into()],
+        ..cfg(fx.cc.as_ref())
+    };
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), config, false)
+        .unwrap()
+        .unwrap();
+    engine.tick(&sink).unwrap();
+    let events = sink.take();
+    let AutoEvent::Poll {
+        headroom_pct,
+        counting_window,
+        ..
+    } = &events[0]
+    else {
+        panic!("{events:?}")
+    };
+    assert_eq!(headroom_pct[&2], Some(47.0));
+    assert_eq!(
+        *counting_window,
+        BTreeMap::from([(1, "5h".to_owned()), (2, "scoped:Opus".to_owned())])
+    );
 }
 
 #[test]

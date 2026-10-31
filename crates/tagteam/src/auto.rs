@@ -88,7 +88,7 @@ struct Polled {
     email: String,
     /// The highest relevant percentage (100 − headroom); `None` when unknown.
     used: Option<f64>,
-    /// Its windows, the one at `used` marked (`words::windows_said`).
+    /// Its windows, the one auto counts marked (`words::windows_said`).
     windows: Option<String>,
     /// The switch threshold, percent: what the poll decided by.
     threshold: f64,
@@ -207,6 +207,7 @@ impl EventSink for HumanSink<'_> {
                 headroom_pct,
                 threshold,
                 windows_pct,
+                counting_window,
                 ..
             } => {
                 let used = headroom_pct
@@ -214,8 +215,9 @@ impl EventSink for HumanSink<'_> {
                     .copied()
                     .flatten()
                     .map(|h| 100.0 - h);
-                let windows = used.zip(windows_pct.get(position)).and_then(|(used, w)| {
-                    words::windows_said(w.iter().map(|(k, pct)| (k.as_str(), *pct)), used)
+                let windows = windows_pct.get(position).and_then(|w| {
+                    let counting = counting_window.get(position).map(String::as_str);
+                    words::windows_said(w.iter().map(|(k, pct)| (k.as_str(), *pct)), counting)
                 });
                 let polled = Polled {
                     position: *position,
@@ -552,6 +554,7 @@ mod tests {
             threshold: 90.0,
             fetch_errors: BTreeMap::new(),
             windows_pct: BTreeMap::new(),
+            counting_window: BTreeMap::new(),
         }
     }
 
@@ -650,6 +653,42 @@ mod tests {
              t+0  error: usage was not collected\n\
              t+0  warning: autoswitch.models names \"Fabel\"\n\
              t+0  warning: auto-switch already runs for <claude-code> in another process; skipping it\n"
+        );
+    }
+
+    #[test]
+    fn the_no_switch_line_marks_the_window_auto_counts() {
+        // `models = ["Opus"]`: Fable and Opus tie at 53 and Fable is first in the key order, but
+        // the poll names Opus as the one auto counts (headroom 47). The line marks Opus.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let now = || T0 * 1000;
+        let names = |p: &ProviderId| format!("<{p}>");
+        let sink = human(&mut out, &mut err, &now, &names, false, false);
+        let mut p = poll(2, &[(1, Some(80.0)), (2, Some(47.0))]);
+        if let AutoEvent::Poll {
+            windows_pct,
+            counting_window,
+            ..
+        } = &mut p
+        {
+            let windows = [
+                ("5h", 9.0),
+                ("7d", 20.0),
+                ("scoped:Fable", 53.0),
+                ("scoped:Opus", 53.0),
+            ];
+            windows_pct.insert(
+                2,
+                windows.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect(),
+            );
+            counting_window.insert(2, "scoped:Opus".into());
+        }
+        sink.emit(&p);
+        sink.emit(&no_switch_event("below-threshold", ""));
+        drop(sink);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "t+0  #2 b@x.co  53%  no switch needed (5h 9% · 7d 20% · Fable 53% · Opus 53%◂, switches at 90%)\n"
         );
     }
 

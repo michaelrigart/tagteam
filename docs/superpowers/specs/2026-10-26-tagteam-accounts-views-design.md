@@ -83,7 +83,7 @@ come from the engine's shared words or the TUI's existing ones.
 | AV-6 | Pace marks? | None on any bar or gauge. `▲` stays; where the row has room it ends with the expected percentage in words (§4.3) |
 | AV-7 | Spacing? | A blank row above and below every rule on Accounts |
 | AV-8 | Tokens rows from before the epoch? | `before tracking` where every unattributed response in the row lies before the epoch; `unknown account` everywhere else, the filter included |
-| AV-9 | Which window does auto's no-switch sentence count? | Every window of the account in use, in `tagteam list`'s form, `◂` after the one that counts (§4.4) |
+| AV-9 | Which window does auto's no-switch sentence count? | Every window of the account in use, in `tagteam list`'s form, `◂` after the one auto counts, its binding window (§4.4) |
 
 AV-1 to AV-7 follow the design agreed in chat on 2026-10-26 (mock v2). AV-8 follows the same
 discussion; its rule and AV-9 were settled on 2026-10-28 after the real-store run. §10 lists the
@@ -290,11 +290,25 @@ no switch needed (5h 9% · 7d 53%◂, switches at 90%)
 ```
 
 - Spend windows are left out; a scoped window is named by its model (`Fable 0%`).
-- The window that counts is the first within 0.05 points of the account's usage (100 less its
-  headroom), as the daemon's binding window already is (`protocol.rs` `PollPayload::binding`).
-- With no window that near, or no windows in the poll, the sentence reads as before: the bare
-  percentage in `tagteam auto` and `tagteam daemon`, and none on the TUI's auto line, which shows
-  only a binding window's usage (redesign T3-29).
+- The window that counts is the one auto counts: core's `rank::binding_window` over the
+  account's windows under `autoswitch.models`, the relevant window with the highest percentage
+  (ties to the earlier one; spend, and scoped windows `autoswitch.models` does not name, are not
+  relevant, §8.2 of the auto-switch spec). It is chosen by its key, never by its percentage, so a
+  tied or unrelated window at the same value is not marked: with `models = ["Opus"]` and `Fable`
+  and `Opus` both at 53%, `Opus 53%◂` is marked and `Fable 53%` is not.
+- `tagteam auto` and `tagteam daemon` get the key from the engine: `AutoEvent::Poll` carries each
+  position's counting window (`counting_window`), computed where `windows_pct` is. It is in no
+  JSON; the daemon's wire and every `--json` line are unchanged.
+- The TUI hears the poll over the wire, which carries no key, so it works the key out with the
+  same rule from its own view: `binding_window` over the account's windows in the last accounts
+  view, under that provider's `models`. It marks only when that view agrees with the poll: the
+  account is in the view with a reading, and its windows are the poll's, the same keys at the
+  same percentages to the whole percent the sentence shows. A view that lacks the account or
+  its reading, or is older than the poll, marks nothing, and the key's absence reads as the next
+  point says.
+- With no window that counts, a key the sentence does not list, or no windows in the poll, the
+  sentence reads as before: the bare percentage in `tagteam auto` and `tagteam daemon`, and none
+  on the TUI's auto line, which shows only a binding window's usage (redesign T3-29).
 - The same words show on the TUI's auto line and in `tagteam auto` and `tagteam daemon`'s tick
   lines (`words::windows_said`, `words::no_switch`). No JSON changes.
 
@@ -474,8 +488,8 @@ responses on the 23rd after 09:07:
 already reads (`view/mod.rs:406`, `store.token_epoch()?`), `None` when it has none. `TokenRow`
 gains `unattributed_last_ms`, the time of its latest unattributed response, `None` when it has
 none (§7.1). No other token-report or attribution behaviour changes; the only other engine
-changes are the shared-words split of §4.3 and the no-switch sentence of §4.4. The report's JSON
-is unchanged (§1.3).
+changes are the shared-words split of §4.3 and the no-switch sentence of §4.4 (with the
+counting window on the poll event). The report's JSON is unchanged (§1.3).
 
 ## 8. Keys
 
@@ -597,6 +611,12 @@ changing the design.
   choice and summary read `unknown account`; the detail line and a breadcrumb use the row's
   words.
 - `v`: toggles, keeps the selection across `v` and a refresh, PgUp/PgDn by whole blocks.
+- Auto's no-switch sentence marks the window auto counts: with `models = ["Opus"]` and `Fable` and
+  `Opus` tied, `Opus` carries the mark in `words::windows_said`, in a `tagteam auto` tick line and
+  on the TUI's auto line; no counting key, or one the sentence does not list, marks nothing; the
+  TUI marks nothing when its view lacks the account, its reading, or the poll's windows; the
+  engine's poll names the counting key under `models`, and the wire and `--json` lines are the
+  same bytes with and without it.
 - The CONTRIBUTING checks: `cargo fmt --all --check`, the three clippy runs, and `cargo test
   --workspace --locked --no-fail-fast --features tagteam/test-support` (the pty tests need a
   terminal).

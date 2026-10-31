@@ -411,6 +411,7 @@ mod tests {
                 threshold: 90.0,
                 fetch_errors: BTreeMap::new(),
                 windows_pct: BTreeMap::new(),
+                counting_window: BTreeMap::new(),
             }));
             sink.emit(&DaemonEvent::Auto(AutoEvent::NoSwitch {
                 provider: cc(),

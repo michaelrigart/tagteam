@@ -533,11 +533,12 @@ pub const COUNTING: &str = "◂";
 
 /// An account's windows as the no-switch sentence names them, in `tagteam list`'s form and the
 /// order given: `5h 9% · 7d 53%◂`. Each window by its key (`scoped:` dropped), spend left out,
-/// `COUNTING` after the first one within 0.05 points of `used` (100 less the headroom). `None`
-/// when no window is that near, so the sentence reads as it did without it.
+/// `COUNTING` after the one whose key is `counting`: the window auto counts (`binding_window`
+/// under `autoswitch.models`). `None` when there is none, or it is not among the windows listed,
+/// so the sentence reads as it did without them.
 pub fn windows_said<'a>(
     windows: impl IntoIterator<Item = (&'a str, f64)>,
-    used: f64,
+    counting: Option<&str>,
 ) -> Option<String> {
     let mut counted = false;
     let parts: Vec<String> = windows
@@ -545,7 +546,7 @@ pub fn windows_said<'a>(
         .filter(|(key, _)| *key != "spend")
         .map(|(key, pct)| {
             let label = key.strip_prefix("scoped:").unwrap_or(key);
-            let counts = !counted && (pct - used).abs() < 0.05;
+            let counts = !counted && Some(key) == counting;
             counted |= counts;
             let mark = if counts { COUNTING } else { "" };
             format!("{label} {}%{mark}", pct.round() as i64)
@@ -1879,7 +1880,7 @@ mod tests {
             ("scoped:Fable", 0.0),
             ("spend", 80.0),
         ];
-        let said = windows_said(windows, 53.0).unwrap();
+        let said = windows_said(windows, Some("7d")).unwrap();
         assert_eq!(said, "5h 9% · 7d 53%◂ · Fable 0%");
         let named = NoSwitchFacts {
             windows: Some(&said),
@@ -1889,8 +1890,35 @@ mod tests {
             no_switch(NoSwitchReason::BelowThreshold, &named),
             "no switch needed (5h 9% · 7d 53%◂ · Fable 0%, switches at 90%)"
         );
-        // No window near the usage: no windows to name.
-        assert_eq!(windows_said(windows, 60.0), None);
+    }
+
+    #[test]
+    fn the_mark_goes_to_the_window_auto_counts_not_to_one_at_the_same_percentage() {
+        // `models = ["Opus"]`: Fable and Opus tie at 53 and Fable comes first, but auto counts
+        // Opus. A mark by value would land on Fable.
+        let windows = [
+            ("5h", 9.0),
+            ("7d", 20.0),
+            ("scoped:Fable", 53.0),
+            ("scoped:Opus", 53.0),
+        ];
+        assert_eq!(
+            windows_said(windows, Some("scoped:Opus")).unwrap(),
+            "5h 9% · 7d 20% · Fable 53% · Opus 53%◂"
+        );
+        assert_eq!(
+            windows_said(windows, Some("scoped:Fable")).unwrap(),
+            "5h 9% · 7d 20% · Fable 53%◂ · Opus 53%"
+        );
+    }
+
+    #[test]
+    fn no_window_that_counts_leaves_the_sentence_without_windows() {
+        let windows = [("5h", 9.0), ("7d", 53.0), ("spend", 80.0)];
+        assert_eq!(windows_said(windows, None), None);
+        // Spend is left out of the sentence, so a key that is not listed marks nothing.
+        assert_eq!(windows_said(windows, Some("spend")), None);
+        assert_eq!(windows_said(windows, Some("scoped:Opus")), None);
     }
 
     #[test]

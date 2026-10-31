@@ -9,12 +9,14 @@ pub mod words;
 use std::collections::BTreeMap;
 
 use tagteam_core::autoswitch::NoSwitchReason;
-use tagteam_core::{AccountId, ProviderId};
+use tagteam_core::rank::binding_window;
+use tagteam_core::{AccountId, ProviderId, Window};
 use tagteam_daemon::events::StopReason;
 use tagteam_daemon::protocol::{
     Event, PollPayload, Status, StatusProvider, Wire, parse_token_index,
 };
 use tagteam_daemon::tokens::TOKEN_INDEX;
+use tagteam_engine::views::ProviderAccounts;
 
 use crate::live::{Live, StatusError};
 use crate::msg::Cmd;
@@ -321,6 +323,10 @@ fn note(state: &mut State, event: &Event, now_ms: i64) {
     let Event::Auto { provider, .. } = event else {
         return;
     };
+    let windows = event.no_switch().and_then(|_| {
+        let poll = state.daemon.polls.get(provider)?;
+        windows(poll, state.view_of(&ProviderId::new(provider)))
+    });
     let d = &mut state.daemon;
     if let Some(poll) = event.poll() {
         d.polls.insert(provider.clone(), poll);
@@ -353,7 +359,7 @@ fn note(state: &mut State, event: &Event, now_ms: i64) {
             reason,
             detail: no_switch.detail,
             used_pct: d.polls.get(provider).and_then(used_pct),
-            windows: d.polls.get(provider).and_then(windows),
+            windows,
             frees_at_ms: None,
         }
     } else if let Some(message) = event.error() {
@@ -368,20 +374,46 @@ fn note(state: &mut State, event: &Event, now_ms: i64) {
     state.dirty = true;
 }
 
-/// The usage of the account in use at `poll`: its binding window's (T3-29). None when the poll
-/// names no window near the account's own usage.
+/// The usage of the account in use at `poll`: a binding window's (T3-29), which any window at
+/// that usage gives. None when the poll names no window near the account's own usage.
 fn used_pct(poll: &PollPayload) -> Option<f64> {
     let active = poll.active.as_ref()?.number;
     poll.binding(active).map(|b| b.used_pct as f64)
 }
 
-/// The windows of the account in use at `poll`, as `tagteam list` names them, the one at its
-/// usage marked (`words::windows_said`). None when its usage or windows are unknown.
-fn windows(poll: &PollPayload) -> Option<String> {
+/// The windows of the account in use at `poll`, as `tagteam list` names them, the one auto counts
+/// marked (`words::windows_said`). The wire does not carry which window that is, so it is worked
+/// out as the engine does it: `binding_window` over the account's windows in `view`, the last
+/// accounts view, under that view's `autoswitch.models`. None when the poll names no windows of
+/// the account, and when `view` lacks the account or its windows, or its windows are not the
+/// poll's (a view older than the reading): the same keys at the same percentages, to the whole
+/// percent the sentence shows. Then no window is marked and the sentence reads as it does
+/// without windows.
+fn windows(poll: &PollPayload, view: Option<&ProviderAccounts>) -> Option<String> {
     let active = poll.active.as_ref()?.number;
-    let used = 100.0 - (*poll.headroom_pct.get(&active)?)?;
-    let windows = poll.windows_pct.get(&active)?;
-    tagteam_engine::words::windows_said(windows.iter().map(|(k, pct)| (k.as_str(), *pct)), used)
+    let polled = poll.windows_pct.get(&active)?;
+    let view = view?;
+    let read = view
+        .accounts
+        .iter()
+        .find(|a| a.row.position == active)?
+        .usage
+        .windows
+        .as_deref()?;
+    let agrees = polled.len() == read.len()
+        && polled.iter().all(|(key, pct)| {
+            read.iter()
+                .any(|(w, _)| &w.key == key && w.pct.round() == pct.round())
+        });
+    if !agrees {
+        return None;
+    }
+    let read: Vec<Window> = read.iter().map(|(w, _)| w.clone()).collect();
+    let counting = binding_window(&read, &view.models)?;
+    tagteam_engine::words::windows_said(
+        polled.iter().map(|(k, pct)| (k.as_str(), *pct)),
+        Some(&counting.key),
+    )
 }
 
 /// What an event asks for is read `REREAD_MS` from the first event that asks, once for every
@@ -552,8 +584,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::json;
+    use tagteam_core::{Pace, WindowKind};
     use tagteam_daemon::client::ClientError;
-    use tagteam_engine::views::ProviderAccounts;
+    use tagteam_engine::views::{UsageStatus, UsageView};
 
     use super::*;
     use crate::msg::Msg;
@@ -905,6 +938,13 @@ mod tests {
             hinted("   14:13  no switch needed (switches at 90%)"),
             "no window near the account's usage"
         );
+        // The view's account holds the poll's windows: its binding window is 7d.
+        let mut accounts = many(3);
+        accounts[0].usage = windowed(&[
+            ("5h", "5h", WindowKind::Short, 40.0),
+            ("7d", "7d", WindowKind::Long, 77.0),
+        ]);
+        state.accounts.apply(snapshot(accounts));
         let poll = json!({"active": {"number": 1}, "headroomPct": {"1": 23.0},
             "windowsPct": {"1": {"5h": 40.0, "7d": 77.0}}});
         update(&mut state, auto_with("poll", poll), NOW_MS);
@@ -914,6 +954,115 @@ mod tests {
             hinted("   14:13  no switch needed (5h 40% · 7d 77%◂, switches at 90%)"),
             "the binding window's usage"
         );
+    }
+
+    /// A reading of `windows` (key, label, kind, pct), decision-grade.
+    fn windowed(windows: &[(&str, &str, WindowKind, f64)]) -> UsageView {
+        UsageView {
+            windows: Some(
+                windows
+                    .iter()
+                    .map(|(key, label, kind, pct)| {
+                        (
+                            window(key, label, *kind, *pct, Some(3_600)),
+                            Pace::default(),
+                        )
+                    })
+                    .collect(),
+            ),
+            ..read(60, 0.0, 0.0, false)
+        }
+    }
+
+    /// A state following the daemon whose view holds account 1 with `windows`, under `models`.
+    fn viewing(models: &[&str], windows: &[(&str, &str, WindowKind, f64)]) -> State {
+        let mut accounts = many(2);
+        accounts[0].usage = windowed(windows);
+        let mut snap = snapshot(accounts);
+        snap.providers[0].models = models.iter().map(|m| (*m).to_owned()).collect();
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snap);
+        go_live(&mut state, auto_on());
+        state
+    }
+
+    /// Account `active`'s poll at 47% headroom with `polled` windows, then a `below-threshold`,
+    /// and the auto line they make.
+    fn auto_line(state: &mut State, active: u32, polled: serde_json::Value) -> String {
+        let auto_with = |kind: &str, fields: serde_json::Value| {
+            let mut raw = json!({"schemaVersion": 1, "event": kind, "ts": "2026-09-21T14:13:20Z"});
+            for (k, v) in fields.as_object().unwrap() {
+                raw[k] = v.clone();
+            }
+            event(Event::Auto {
+                kind: kind.into(),
+                provider: "claude-code".into(),
+                raw,
+            })
+        };
+        let n = active.to_string();
+        let poll = json!({"active": {"number": active}, "headroomPct": {n.clone(): 47.0},
+            "windowsPct": {n: polled}});
+        update(state, auto_with("poll", poll), NOW_MS);
+        update(
+            state,
+            auto_with("no-switch", json!({"reason": "below-threshold"})),
+            NOW_MS,
+        );
+        draw(state, 120, 24)[1].trim_end().to_owned()
+    }
+
+    const OPUS_TIE: [(&str, &str, WindowKind, f64); 4] = [
+        ("5h", "5h", WindowKind::Short, 9.0),
+        ("7d", "7d", WindowKind::Long, 20.0),
+        ("scoped:Fable", "Fable", WindowKind::Scoped, 53.0),
+        ("scoped:Opus", "Opus", WindowKind::Scoped, 53.0),
+    ];
+
+    #[test]
+    fn the_auto_line_marks_the_window_auto_counts_under_the_models_setting() {
+        // `models = ["Opus"]`: Fable ties Opus at 53 and comes first, but only Opus counts.
+        let mut state = viewing(&["Opus"], &OPUS_TIE);
+        let polled = json!({"5h": 9.0, "7d": 20.0, "scoped:Fable": 53.0, "scoped:Opus": 53.0});
+        let line = auto_line(&mut state, 1, polled);
+        assert!(
+            line.contains(
+                "no switch needed (5h 9% · 7d 20% · Fable 53% · Opus 53%◂, switches at 90%)"
+            ),
+            "{line}"
+        );
+        // Under `["Fable"]` it is Fable.
+        let mut state = viewing(&["Fable"], &OPUS_TIE);
+        let polled = json!({"5h": 9.0, "7d": 20.0, "scoped:Fable": 53.0, "scoped:Opus": 53.0});
+        let line = auto_line(&mut state, 1, polled);
+        assert!(line.contains("Fable 53%◂ · Opus 53%,"), "{line}");
+    }
+
+    #[test]
+    fn a_view_that_is_not_the_polls_leaves_the_auto_line_without_windows() {
+        let tie = json!({"5h": 9.0, "7d": 20.0, "scoped:Fable": 53.0, "scoped:Opus": 53.0});
+        let bare = "no switch needed (53%, switches at 90%)";
+        // The view has not read the account's windows yet.
+        let mut state = viewing(&["Opus"], &OPUS_TIE);
+        let mut snap = snapshot(many(2));
+        snap.providers[0].models = vec!["Opus".into()];
+        snap.providers[0].accounts[0].usage = unread(UsageStatus::Unavailable, None, None);
+        state.accounts.apply(snap);
+        let line = auto_line(&mut state, 1, tie.clone());
+        assert!(line.contains(bare) && !line.contains('◂'), "{line}");
+        // The view is older than the reading: 7d moved from 20 to 30.
+        let mut state = viewing(&["Opus"], &OPUS_TIE);
+        let moved = json!({"5h": 9.0, "7d": 30.0, "scoped:Fable": 53.0, "scoped:Opus": 53.0});
+        let line = auto_line(&mut state, 1, moved);
+        assert!(line.contains(bare) && !line.contains('◂'), "{line}");
+        // The view lacks a window the poll names.
+        let mut state = viewing(&["Opus"], &OPUS_TIE[..3]);
+        let line = auto_line(&mut state, 1, tie.clone());
+        assert!(line.contains(bare) && !line.contains('◂'), "{line}");
+        // The poll's account is not in the view.
+        let mut state = viewing(&["Opus"], &OPUS_TIE);
+        let line = auto_line(&mut state, 9, tie);
+        assert!(line.contains(bare) && !line.contains('◂'), "{line}");
     }
 
     #[test]

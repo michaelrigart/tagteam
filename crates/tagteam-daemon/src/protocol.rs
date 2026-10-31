@@ -32,6 +32,7 @@ pub fn event_json(e: &AutoEvent, now_s: i64) -> Value {
             threshold,
             fetch_errors,
             windows_pct,
+            counting_window: _,
         } => {
             let mut f = json!({
                 "active": active.as_ref().map(|(number, email)| json!({"number": number, "email": email})),
@@ -741,7 +742,10 @@ pub struct PollPayload {
     pub windows_pct: BTreeMap<u32, Vec<(String, f64)>>,
 }
 
-/// The window that bound an account at a poll, and the usage it was at.
+/// A window at the usage that bound an account at a poll. `used_pct` is what a reader can rely
+/// on. `window` is the first window of that usage in the wire's key order, which on a tie is not
+/// always the one auto counts (`rank::binding_window` under `autoswitch.models`): the wire does
+/// not say which, and nothing reads `window` outside tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingWindow {
     pub window: String,
@@ -753,9 +757,9 @@ pub struct BindingWindow {
 const BINDING_TOLERANCE: f64 = 0.05;
 
 impl PollPayload {
-    /// The window that bound `position`: its relevant usage is 100 less its headroom, and the
-    /// binding window is the first of its `windows_pct`, in wire order, within the tolerance of
-    /// that usage. `None` when the headroom is unknown or no window is that near.
+    /// The usage that bound `position`: its relevant usage is 100 less its headroom, and
+    /// `window` is the first of its `windows_pct`, in wire order, within the tolerance of that
+    /// usage (see `BindingWindow`). `None` when the headroom is unknown or no window is that near.
     pub fn binding(&self, position: u32) -> Option<BindingWindow> {
         let headroom = (*self.headroom_pct.get(&position)?)?;
         let usage = 100.0 - headroom;
@@ -1034,6 +1038,8 @@ mod tests {
             threshold: 90.0,
             fetch_errors: BTreeMap::from([(2, "http-429".into())]),
             windows_pct: BTreeMap::from([(1, BTreeMap::from([("5h".into(), 20.0)]))]),
+            // In no JSON: the event's lines below are the same with or without it.
+            counting_window: BTreeMap::from([(1, "5h".into())]),
         };
         let quiet = AutoEvent::Poll {
             provider: cc(),
@@ -1042,6 +1048,7 @@ mod tests {
             threshold: 90.0,
             fetch_errors: BTreeMap::new(),
             windows_pct: BTreeMap::new(),
+            counting_window: BTreeMap::new(),
         };
         let cases = [
             (
@@ -1155,6 +1162,8 @@ mod tests {
                     threshold: 90.0,
                     fetch_errors: BTreeMap::from([(2, "http-429".into())]),
                     windows_pct: BTreeMap::from([(1, BTreeMap::from([("5h".into(), 20.0)]))]),
+                    // In no JSON: the line below is what it was before the field.
+                    counting_window: BTreeMap::from([(1, "5h".into())]),
                 },
                 r#"{"schemaVersion":1,"event":"poll","ts":"2026-09-21T14:13:20Z","provider":"claude-code","active":{"number":2,"email":"b@x.co"},"headroomPct":{"1":80.0,"2":null},"threshold":90.0,"fetchErrors":{"2":"http-429"},"windowsPct":{"1":{"5h":20.0}}}"#,
             ),
@@ -1166,6 +1175,7 @@ mod tests {
                     threshold: 90.0,
                     fetch_errors: BTreeMap::new(),
                     windows_pct: BTreeMap::new(),
+                    counting_window: BTreeMap::new(),
                 },
                 r#"{"schemaVersion":1,"event":"poll","ts":"2026-09-21T14:13:20Z","provider":"claude-code","active":null,"headroomPct":{},"threshold":90.0}"#,
             ),
