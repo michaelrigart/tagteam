@@ -28,6 +28,10 @@ with the one before, so any release may contain breaking changes. Each section s
   account. Claude Code 2.1.316 reads it. `tagteam run` warns when the variable was set, and
   `tagteam doctor` reports it.
 - Building tagteam needs Rust 1.89 or newer; it was 1.88.
+- The user name and password in a proxy URL (`ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`) are
+  percent-decoded, as curl does, so write a literal `%` in either as `%25`. A proxy variable
+  whose user name or password does not decode to UTF-8 is skipped, like any other invalid proxy
+  URL: tagteam tries the next variable, or connects directly.
 
 ### Removed
 

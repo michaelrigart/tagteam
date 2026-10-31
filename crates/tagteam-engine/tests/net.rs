@@ -1,8 +1,10 @@
 //! The production `Http` adapter against a local server (§4.4, §15.1): the User-Agent, the body
 //! cap, and which transport failures are `PreSend` and which `Ambiguous`.
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -276,4 +278,89 @@ fn an_unreachable_proxy_is_pre_send() {
     let r = UreqHttp::with_proxy(no_such_host, Some(proxy))
         .send(&HttpRequest::get("http://unresolvable.invalid/p", T));
     assert!(is_pre_send(&r), "{r:?}");
+}
+
+/// How long `reply_to_an_interrupted_read`'s signal handler holds the client's read.
+const STALL_MS: libc::c_int = 1500;
+
+/// Sends a GET with `timeout` from a client thread, interrupts its wait for the reply with a
+/// signal whose handler stalls for `STALL_MS`, and answers `answer_after` the signal. On Linux a
+/// stop interrupts a socket read with a timeout the same way; a handler installed without
+/// `SA_RESTART` does it on both platforms.
+fn reply_to_an_interrupted_read(
+    timeout: Duration,
+    answer_after: Duration,
+) -> Result<tagteam_provider::HttpResponse, HttpError> {
+    extern "C" fn stall(_: libc::c_int) {
+        // SAFETY: `poll` is async-signal-safe; with no descriptors it only waits.
+        unsafe { libc::poll(std::ptr::null_mut(), 0, STALL_MS) };
+    }
+    // SAFETY: the handler only waits, and only a client thread below is sent the signal.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = stall as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        assert_eq!(
+            libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut()),
+            0
+        );
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/p", listener.local_addr().unwrap());
+    let (tx, rx) = mpsc::channel();
+    let client = thread::spawn(move || {
+        // SAFETY: `pthread_self` has no preconditions.
+        tx.send(unsafe { libc::pthread_self() }).unwrap();
+        UreqHttp::direct().send(&HttpRequest::get(url, timeout))
+    });
+    let reader = rx.recv().unwrap();
+    let deadline = Instant::now() + T;
+    let mut conn = loop {
+        match listener.accept() {
+            Ok((conn, _)) => break conn,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if client.is_finished() {
+                    panic!("the client gave up before connecting: {:?}", client.join());
+                }
+                assert!(Instant::now() < deadline, "the client never connected");
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    conn.set_nonblocking(false).unwrap();
+    conn.set_read_timeout(Some(T)).unwrap();
+    let mut request = Vec::new();
+    let mut buf = [0; 1024];
+    while !request.ends_with(b"\r\n\r\n") {
+        let n = conn.read(&mut buf).unwrap();
+        assert!(n > 0, "the request ended early");
+        request.extend_from_slice(&buf[..n]);
+    }
+    // The client now waits for the reply.
+    thread::sleep(Duration::from_millis(50));
+    // SAFETY: `reader` is the client thread, which is joined below, so its id stays valid.
+    assert_eq!(unsafe { libc::pthread_kill(reader, libc::SIGUSR2) }, 0);
+    thread::sleep(answer_after);
+    conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+        .unwrap();
+    client.join().unwrap()
+}
+
+/// §4.4, §7.3: a holder resumed after its timeout must not discard the reply to a token refresh
+/// that the server sent while it was stopped. The read takes it at its last look.
+#[test]
+fn a_reply_that_arrived_while_the_read_was_interrupted_past_its_timeout_is_taken() {
+    let r = reply_to_an_interrupted_read(Duration::from_millis(1000), Duration::from_millis(100));
+    assert!(matches!(&r, Ok(reply) if reply.status == 200), "{r:?}");
+}
+
+/// A stop shorter than the timeout: the read resumes with the time left, and takes a reply that
+/// comes only after the resume.
+#[test]
+fn a_read_interrupted_within_its_timeout_resumes_and_takes_a_later_reply() {
+    let after_the_stall = Duration::from_millis(STALL_MS as u64 + 500);
+    let r = reply_to_an_interrupted_read(Duration::from_secs(5), after_the_stall);
+    assert!(matches!(&r, Ok(reply) if reply.status == 200), "{r:?}");
 }

@@ -29,34 +29,35 @@ fn system_resolver(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
 
 /// §4.4, §7.3: a suspended process that is resumed makes a Linux socket read with a receive
 /// timeout fail with `EINTR` (a stop signal interrupts the call even with no handler; macOS
-/// restarts it), and `ureq` surfaces that as an I/O error. Mapped to `Ambiguous`, it would
-/// discard a reply the server already sent to a token refresh a stopped holder was waiting on.
-/// This wraps the outermost transport, above TLS, and retries only the interrupted read with
-/// what is left of its timeout: no byte was consumed, and the request is never re-sent. A
-/// timeout already spent gets one `LAST_LOOK`, enough to take a reply that arrived while the
-/// process was stopped (`ureq` would turn a zero into a full second); interrupted again, the
-/// read times out.
+/// restarts it). `ureq` resumes the read with what is left of its timeout, but a stop that
+/// outlasted the timeout leaves nothing, and `ureq` then times the read out without reading. That
+/// would discard a reply the server already sent to a token refresh a stopped holder was waiting
+/// on. So this wraps the outermost transport, above TLS, and gives each read that timed out one
+/// `LAST_LOOK`, enough to take a reply that arrived while the process was stopped (`ureq` times
+/// a zero out without reading). No byte was consumed, and the request is never re-sent. The
+/// request's timeout is therefore not a hard bound: a server that keeps sending, a chunk at least
+/// every `LAST_LOOK`, can stretch the reply's reading up to `MAX_BODY`.
 #[derive(Debug)]
-struct ResumeInterruptedRead;
+struct LastLook;
 
 const LAST_LOOK: Duration = Duration::from_millis(1);
 
-impl<In: Transport> Connector<In> for ResumeInterruptedRead {
-    type Out = ResumingTransport<In>;
+impl<In: Transport> Connector<In> for LastLook {
+    type Out = LastLookTransport<In>;
 
     fn connect(
         &self,
         _: &ConnectionDetails,
         chained: Option<In>,
     ) -> Result<Option<Self::Out>, ureq::Error> {
-        Ok(chained.map(ResumingTransport))
+        Ok(chained.map(LastLookTransport))
     }
 }
 
 #[derive(Debug)]
-struct ResumingTransport<T>(T);
+struct LastLookTransport<T>(T);
 
-impl<T: Transport> Transport for ResumingTransport<T> {
+impl<T: Transport> Transport for LastLookTransport<T> {
     fn buffers(&mut self) -> &mut dyn Buffers {
         self.0.buffers()
     }
@@ -66,25 +67,14 @@ impl<T: Transport> Transport for ResumingTransport<T> {
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
-        let started = Instant::now();
-        let mut next = timeout;
-        let mut looked = false;
-        loop {
-            match self.0.await_input(next) {
-                Err(ureq::Error::Io(e)) if e.kind() == io::ErrorKind::Interrupted => {
-                    if let WaitFor::Exact(d) = timeout.after {
-                        let left = d.saturating_sub(started.elapsed());
-                        if left.is_zero() {
-                            if looked {
-                                return Err(ureq::Error::Timeout(timeout.reason));
-                            }
-                            looked = true;
-                        }
-                        next.after = WaitFor::Exact(left.max(LAST_LOOK));
-                    }
-                }
-                other => return other,
+        match self.0.await_input(timeout) {
+            Err(ureq::Error::Timeout(_)) if matches!(timeout.after, WaitFor::Exact(_)) => {
+                self.0.await_input(NextTimeout {
+                    after: WaitFor::Exact(LAST_LOOK),
+                    ..timeout
+                })
             }
+            other => other,
         }
     }
 
@@ -142,7 +132,7 @@ impl UreqHttp {
         Self {
             agent: Agent::with_parts(
                 config,
-                DefaultConnector::new().chain(ResumeInterruptedRead),
+                DefaultConnector::new().chain(LastLook),
                 DefaultResolver::default(),
             ),
             resolver,
@@ -312,12 +302,12 @@ mod tests {
     #[derive(Debug)]
     struct Scripted {
         buffers: LazyBuffers,
-        replies: VecDeque<Result<bool, io::ErrorKind>>,
+        replies: VecDeque<Result<bool, ureq::Error>>,
         timeouts: Vec<NextTimeout>,
     }
 
     impl Scripted {
-        fn new(replies: impl IntoIterator<Item = Result<bool, io::ErrorKind>>) -> Self {
+        fn new(replies: impl IntoIterator<Item = Result<bool, ureq::Error>>) -> Self {
             Self {
                 buffers: LazyBuffers::new(64, 64),
                 replies: replies.into_iter().collect(),
@@ -337,11 +327,9 @@ mod tests {
 
         fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
             self.timeouts.push(timeout);
-            thread::sleep(Duration::from_millis(2));
             self.replies
                 .pop_front()
                 .expect("the transport was read more often than scripted")
-                .map_err(|kind| ureq::Error::Io(io::Error::from(kind)))
         }
 
         fn is_open(&mut self) -> bool {
@@ -353,53 +341,29 @@ mod tests {
         NextTimeout {
             after: WaitFor::from_secs(secs),
             reason: Timeout::RecvResponse,
+            ..NextTimeout::default()
         }
     }
 
+    fn timed_out() -> Result<bool, ureq::Error> {
+        Err(ureq::Error::Timeout(Timeout::RecvResponse))
+    }
+
     #[test]
-    fn an_interrupted_read_is_retried_with_the_time_left() {
-        let mut t = ResumingTransport(Scripted::new([
-            Err(io::ErrorKind::Interrupted),
-            Err(io::ErrorKind::Interrupted),
-            Ok(true),
-        ]));
+    fn a_read_that_timed_out_takes_a_last_look() {
+        let mut t = LastLookTransport(Scripted::new([timed_out(), Ok(true)]));
         assert!(t.await_input(wait(30)).unwrap());
-        let seen = &t.0.timeouts;
-        assert_eq!(seen.len(), 3);
-        assert_eq!(seen[0], wait(30));
-        for pair in seen.windows(2) {
-            assert!(*pair[1].after <= *pair[0].after);
-            assert_eq!(pair[1].reason, Timeout::RecvResponse);
-        }
-        assert!(*seen[2].after < *seen[0].after);
-    }
-
-    #[test]
-    fn a_read_resumed_past_its_deadline_takes_a_last_look() {
-        let mut t = ResumingTransport(Scripted::new([Err(io::ErrorKind::Interrupted), Ok(true)]));
-        let timeout = NextTimeout {
-            after: WaitFor::from_millis(1),
-            reason: Timeout::RecvResponse,
-        };
-        assert!(t.await_input(timeout).unwrap());
         let last_look = NextTimeout {
             after: WaitFor::Exact(LAST_LOOK),
-            ..timeout
+            ..wait(30)
         };
-        assert_eq!(t.0.timeouts, vec![timeout, last_look]);
+        assert_eq!(t.0.timeouts, vec![wait(30), last_look]);
     }
 
     #[test]
-    fn an_interrupted_last_look_times_out() {
-        let mut t = ResumingTransport(Scripted::new([
-            Err(io::ErrorKind::Interrupted),
-            Err(io::ErrorKind::Interrupted),
-        ]));
-        let timeout = NextTimeout {
-            after: WaitFor::from_millis(1),
-            reason: Timeout::RecvResponse,
-        };
-        let err = t.await_input(timeout).unwrap_err();
+    fn a_last_look_that_times_out_is_the_timeout() {
+        let mut t = LastLookTransport(Scripted::new([timed_out(), timed_out()]));
+        let err = t.await_input(wait(30)).unwrap_err();
         assert!(
             matches!(err, ureq::Error::Timeout(Timeout::RecvResponse)),
             "{err}"
@@ -408,8 +372,20 @@ mod tests {
     }
 
     #[test]
+    fn a_read_with_no_timeout_gets_no_last_look() {
+        let mut t = LastLookTransport(Scripted::new([timed_out()]));
+        let forever = NextTimeout {
+            after: WaitFor::NotHappening,
+            ..wait(30)
+        };
+        assert!(t.await_input(forever).is_err());
+        assert_eq!(t.0.timeouts.len(), 1);
+    }
+
+    #[test]
     fn another_io_error_is_returned_after_one_read() {
-        let mut t = ResumingTransport(Scripted::new([Err(io::ErrorKind::ConnectionReset)]));
+        let reset = ureq::Error::Io(io::Error::from(io::ErrorKind::ConnectionReset));
+        let mut t = LastLookTransport(Scripted::new([Err(reset)]));
         let err = t.await_input(wait(30)).unwrap_err();
         assert!(
             matches!(&err, ureq::Error::Io(e) if e.kind() == io::ErrorKind::ConnectionReset),
@@ -420,7 +396,7 @@ mod tests {
 
     #[test]
     fn a_read_that_made_no_progress_is_passed_through() {
-        let mut t = ResumingTransport(Scripted::new([Ok(false)]));
+        let mut t = LastLookTransport(Scripted::new([Ok(false)]));
         assert!(!t.await_input(wait(30)).unwrap());
         assert_eq!(t.0.timeouts.len(), 1);
     }
