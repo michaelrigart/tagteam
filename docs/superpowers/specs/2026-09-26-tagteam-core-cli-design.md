@@ -34,7 +34,7 @@ For Claude Code, tagteam is a Rust rewrite of claude-swap ("cswap"), aiming for:
 - **New capabilities**: usage history, a Claude Code statusline, encrypted export, `doctor`,
   and a shared daemon (sub-project 2).
 
-tagteam is public OSS under the MIT license, built for macOS and Linux.
+tagteam is public OSS under the MIT license, built for macOS 27 on Apple silicon and Linux.
 
 ### 1.1 Success criteria
 
@@ -57,6 +57,8 @@ tagteam is public OSS under the MIT license, built for macOS and Linux.
 
 - **Windows.** Platform code sits behind traits so a port stays possible, but nothing is built
   or tested for Windows.
+- **Intel Macs and macOS before 27.** The macOS build is Apple silicon only, and support is
+  macOS 27 (§16).
 - **Later sub-projects.** The TUI (#3) and the menu bar (#4). The daemon, its socket API and
   notifications (#2) are specified in
   [`2026-10-14-tagteam-daemon-design.md`](2026-10-14-tagteam-daemon-design.md), cited here as
