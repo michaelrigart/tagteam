@@ -32,6 +32,8 @@ with the one before, so any release may contain breaking changes. Each section s
   percent-decoded, as curl does, so write a literal `%` in either as `%25`. A proxy variable
   whose user name or password does not decode to UTF-8 is skipped, like any other invalid proxy
   URL: tagteam tries the next variable, or connects directly.
+- `config.toml` may use TOML 1.1: inline tables over several lines or with a trailing comma, and
+  the `\e` and `\xHH` escapes. A file that does cannot be read by an older tagteam.
 
 ### Removed
 

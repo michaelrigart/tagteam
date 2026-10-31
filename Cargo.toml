@@ -60,7 +60,7 @@ signal-hook = { version = "0.4", default-features = false }
 signal-hook-mio = { version = "0.3", features = ["support-v1_0"] }
 thiserror = "2"
 # config.toml (§6.4): read in M2b, written in M5; preserves comments and formatting.
-toml_edit = "0.22"
+toml_edit = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Blocking HTTP over rustls with the OS trust store (§4.4); no async runtime. Held to one
