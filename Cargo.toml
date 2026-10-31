@@ -40,7 +40,7 @@ fastrand = "2"
 hex = "0.4"
 # The token report's days and months in a time zone, DST included (token report §3.1): the
 # system zone database, nothing bundled. Pinned exactly, so a newer release is taken on purpose.
-jiff = { version = "=0.2.37", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+jiff = { version = "=0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 libc = "0.2"
 # The TUI's input thread blocks on the terminal, SIGWINCH and a waker, with no wake-up while idle
 # (TUI redesign spec §14, PERF-R-9): `Poll` and `Waker`, and `SourceFd` for the terminal's fd.
