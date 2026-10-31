@@ -461,8 +461,10 @@ pub(crate) fn counts(input: u64, output: u64, cache_read: u64) -> TokenCounts {
 
 /// A row of `period`, grouped by `account` and `model` when they are given, of one response
 /// counting `counts`, costing `cost` nano-dollars (or nothing), keyed as the report keys it, at
-/// the latest its period allows. An unattributed row's response is unattributed; a row of another
-/// account has none, and an ungrouped row says which it holds in its `accounts`.
+/// the latest its period allows. An unattributed row's response is unattributed, so it sets
+/// `unattributed_last_ms` to that latest; a row of another account leaves it `None`. An ungrouped
+/// row has empty `accounts` and `unattributed_last_ms: None`, so a test that pushes
+/// `RowAccount::Unattributed` into `accounts` must set `unattributed_last_ms` itself.
 pub(crate) fn token_row(
     period: PeriodKey,
     account: Option<RowAccount>,

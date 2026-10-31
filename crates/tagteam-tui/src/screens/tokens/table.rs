@@ -2658,10 +2658,13 @@ mod tests {
             );
             assert_eq!(words_of(None), ["unknown account"; 3], "{keys}");
             // The epoch's own period, its unattributed responses all before the epoch (the rest
-            // of its responses after it are another account's): before tracking.
+            // of its responses after it are another account's): before tracking. A day starts
+            // at E, so its epoch is moved inside it; the other kinds already hold E - 1.
+            let epoch = if keys == "pppp" { e + 9 * HOUR_MS } else { e };
             let mut holding = unattributed(periods[1].clone());
-            holding.unattributed_last_ms = Some(e - 1);
-            let state = showing_after_with(keys, vec![holding], |r| r.tracking_since_ms = Some(e));
+            holding.unattributed_last_ms = Some(epoch - 1);
+            let state =
+                showing_after_with(keys, vec![holding], |r| r.tracking_since_ms = Some(epoch));
             let lines = body_of(&state, 80, 24, NOW_MS);
             assert!(lines[4].contains(BEFORE_TRACKING), "{keys}: {lines:?}");
         }
@@ -2687,32 +2690,43 @@ mod tests {
 
     #[test]
     fn an_ungrouped_row_names_before_tracking_in_its_account_list() {
-        // The epoch is YESTERDAY. A row's unattributed entry is judged by its unattributed
-        // responses alone: an attributed account's, after the epoch, beside them changes nothing.
-        for (day_ago, accounts, unattributed_last_ms, listed) in [
+        // A row's unattributed entry is judged by its unattributed responses alone: an
+        // attributed account's, after the epoch, beside them changes nothing. The first two
+        // cases are wholly before the epoch YESTERDAY; the last two are on the epoch's own
+        // day, where the epoch is mid-day and the unattributed response is just before it
+        // (before tracking) or at it (unknown account).
+        let mid_day = YESTERDAY + 9 * HOUR_MS;
+        for (date, day_ago, accounts, epoch, unattributed_last_ms, listed) in [
             (
+                "2026-09-19",
                 2,
                 vec![RowAccount::Unattributed],
+                YESTERDAY,
                 YESTERDAY - 1,
                 BEFORE_TRACKING,
             ),
             (
+                "2026-09-19",
                 2,
                 vec![row_account(1), RowAccount::Unattributed],
-                YESTERDAY - 1,
-                "1 a1@x.co, before tracking",
-            ),
-            // The epoch's own day: account 1 answered after the epoch, the rest before it.
-            (
-                1,
-                vec![row_account(1), RowAccount::Unattributed],
-                YESTERDAY - 1,
-                "1 a1@x.co, before tracking",
-            ),
-            (
-                1,
-                vec![row_account(1), RowAccount::Unattributed],
                 YESTERDAY,
+                YESTERDAY - 1,
+                "1 a1@x.co, before tracking",
+            ),
+            (
+                "2026-09-20",
+                1,
+                vec![row_account(1), RowAccount::Unattributed],
+                mid_day,
+                mid_day - 1,
+                "1 a1@x.co, before tracking",
+            ),
+            (
+                "2026-09-20",
+                1,
+                vec![row_account(1), RowAccount::Unattributed],
+                mid_day,
+                mid_day,
                 "1 a1@x.co, unknown account",
             ),
         ] {
@@ -2720,13 +2734,14 @@ mod tests {
             row.accounts = accounts;
             row.unattributed_last_ms = Some(unattributed_last_ms);
             let state = showing_after_with("ggg", vec![row], |r| {
-                r.tracking_since_ms = Some(YESTERDAY);
+                r.tracking_since_ms = Some(epoch);
             });
             let lines = body_of(&state, 80, 24, NOW_MS);
+            let start = format!("▌{date}  ");
             assert!(
                 lines
                     .iter()
-                    .any(|l| l.starts_with("▌2026-09-") && l.contains(listed)),
+                    .any(|l| l.starts_with(&start) && l.contains(listed)),
                 "{listed}: {lines:?}"
             );
         }

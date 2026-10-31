@@ -446,8 +446,9 @@ when the row has none): before tracking when `unattributed_last_ms < epoch`, for
 alike. The day the epoch falls in is therefore `before tracking` when its unattributed responses
 all came before the epoch, as on a store whose first day of tracking began in the afternoon. An
 unattributed response exactly at the epoch makes the row `unknown account`. Drilled rows follow
-the same rule for their own responses. Only unattributed rows change: an attributed pre-epoch
-row keeps its account's name (§1.1).
+the same rule for their own responses. Only the unattributed entry changes, including the entry
+inside a mixed Model- or None-grouped row: an attributed pre-epoch entry keeps its account's name
+(§1.1).
 
 Amended 2026-10-28 after the real-store run: the first rule judged a row by its period's end, so
 the epoch's own day read `unknown account` although every one of its responses predated the
