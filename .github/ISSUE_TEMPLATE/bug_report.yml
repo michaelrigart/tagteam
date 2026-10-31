@@ -47,7 +47,7 @@ body:
     id: platform
     attributes:
       label: Operating system and architecture
-      placeholder: macOS 15 on Apple silicon, or Ubuntu 24.04 on x86-64
+      placeholder: macOS 27 on Apple silicon, or Ubuntu 24.04 on x86-64
     validations:
       required: true
   - type: dropdown

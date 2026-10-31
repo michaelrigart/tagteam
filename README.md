@@ -50,7 +50,7 @@ keeps its JSON field names, so scripts written for claude-swap can read tagteam'
 
 ## Requirements
 
-- **macOS** (Apple silicon or Intel) or **Linux** (x86-64 or aarch64). Windows is not supported.
+- **macOS 27** on Apple silicon, or **Linux** (x86-64 or aarch64). Windows is not supported.
 - **Claude Code**, with `claude` on your `PATH`. tagteam was developed against Claude Code
   2.1.283 and later, and the newest version it has been checked against is **2.1.292**
   (`crates/tagteam-cc/compat/tested-cc-version`). It does not refuse a newer version, but

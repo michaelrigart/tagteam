@@ -12,7 +12,7 @@ installers = ["homebrew"]
 # A GitHub repo to push Homebrew formulas to
 tap = "michaelrigart/homebrew-tap"
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 # Which actions to run on pull requests
 pr-run-mode = "upload"
 # Publish jobs to run in CI
@@ -38,3 +38,7 @@ github-attestations-phase = "host"
 # through trusted publishing (id-token)
 [dist.github-custom-job-permissions]
 "publish-crates" = { contents = "read", id-token = "write" }
+
+# GitHub has no macOS 27 image; macos-26 is its newest Apple-silicon one
+[dist.github-custom-runners.aarch64-apple-darwin]
+runner = "macos-26"
