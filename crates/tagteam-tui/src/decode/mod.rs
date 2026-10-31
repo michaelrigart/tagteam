@@ -187,13 +187,15 @@ mod tests {
             (b"\x7f", vec![named(KeyCode::Backspace)]),
             (b"[", vec![plain('[')]),
             (b"]", vec![plain(']')]),
-            // Arrows, Home and End, in CSI and SS3 forms; the Left and Right rows are CSI only.
+            // Arrows, Home and End, in CSI and SS3 forms.
             (b"\x1b[A", vec![named(KeyCode::Up)]),
             (b"\x1b[B", vec![named(KeyCode::Down)]),
             (b"\x1bOA", vec![named(KeyCode::Up)]),
             (b"\x1bOB", vec![named(KeyCode::Down)]),
             (b"\x1b[D", vec![named(KeyCode::Left)]),
             (b"\x1b[C", vec![named(KeyCode::Right)]),
+            (b"\x1bOD", vec![named(KeyCode::Left)]),
+            (b"\x1bOC", vec![named(KeyCode::Right)]),
             (b"\x1b[H", vec![named(KeyCode::Home)]),
             (b"\x1b[F", vec![named(KeyCode::End)]),
             (b"\x1bOH", vec![named(KeyCode::Home)]),
@@ -229,7 +231,8 @@ mod tests {
                 b"\x1b[?62;22c",
                 vec![InternalEvent::PrimaryDeviceAttributes],
             ),
-            (b"\x1b[1;1R", vec![InternalEvent::CursorPosition(0, 0)]),
+            // Row 2, column 5, both 1-based: `CursorPosition(column, row)`, 0-based.
+            (b"\x1b[2;5R", vec![InternalEvent::CursorPosition(4, 1)]),
             (
                 b"\x1b[?1u",
                 vec![InternalEvent::KeyboardEnhancementFlags(

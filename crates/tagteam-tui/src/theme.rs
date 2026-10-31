@@ -408,8 +408,8 @@ mod tests {
             if name == "theme.rs" || name == "testutil.rs" {
                 continue;
             }
-            // The vendored key decoder names `KeyCode::Modifier`, a key, not a style.
-            if path.starts_with(src.join("decode")) {
+            // The vendored crossterm parser names `KeyCode::Modifier`, a key, not a style.
+            if path == src.join("decode").join("parse.rs") {
                 continue;
             }
             let text = fs::read_to_string(&path).unwrap();
