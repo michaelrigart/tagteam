@@ -11,7 +11,7 @@ By contributing, you agree that your contribution is licensed under the [MIT lic
 - **Rust.** `rust-toolchain.toml` pins Rust 1.99.1 with `rustfmt` and `clippy`. With
   [rustup](https://rustup.rs) installed, cargo picks it up on first use inside the checkout. The
   workspace declares a minimum supported Rust version of 1.89 (edition 2024), which uuid 1.29
-  requires.
+  and rusqlite 0.41 require.
 - **mise.** `mise.toml` pins only `cargo-dist` 0.33.0, which builds releases. You do not need it
   for ordinary development.
 - **C compiler.** SQLite is bundled and compiled from source.

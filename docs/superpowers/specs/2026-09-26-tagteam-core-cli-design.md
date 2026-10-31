@@ -3422,7 +3422,7 @@ is a workspace crate (`publish = false`) reached through a cargo alias. It drive
 - **Toolchain.** `rust-toolchain.toml` pins the stable Rust current at implementation time
   (edition 2024), and moves to a newer stable only on purpose. mise respects that file.
   - The MSRV is `rust-version` in `Cargo.toml`, at least 1.85. The dependencies set it, not the
-    pin: 1.89 since uuid 1.29.
+    pin: 1.89 since uuid 1.29 and rusqlite 0.41.
 - **CI** (GitHub Actions) on `macos-26` (Apple silicon) and `ubuntu-latest`: `cargo fmt --check`,
   `clippy -D warnings`, and `cargo test` (plus `tagteam-provider`'s `real_keychain` test on
   macOS). GitHub has no macOS 27 image, so `macos-26`, its newest, stands in for the supported
