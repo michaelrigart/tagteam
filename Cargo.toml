@@ -5,7 +5,8 @@ members = ["crates/*"]
 [workspace.package]
 version = "20261023.738.0"
 edition = "2024"
-rust-version = "1.88"
+# The minimum supported Rust: the newest dependencies set it (uuid 1.29 declares 1.89).
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/michaelrigart/tagteam"
 homepage = "https://github.com/michaelrigart/tagteam"
@@ -33,8 +34,7 @@ clap = { version = "4", features = ["derive", "string"] }
 # `tagteam completions` (§13.7): static scripts generated from the command definitions.
 clap_complete = "4"
 # The terminal UI (TUI spec §4.1): ratatui with its default crossterm backend, and the crossterm
-# it is built against. Both are pinned exactly, so a patch release never changes what is drawn;
-# ratatui 0.30.2 declares rust-version 1.88.0, which is why the MSRV is 1.88.
+# it is built against. Both are pinned exactly, so a patch release never changes what is drawn.
 crossterm = "=0.29.0"
 fastrand = "2"
 hex = "0.4"
@@ -65,7 +65,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Blocking HTTP over rustls with the OS trust store (§4.4); no async runtime. Held to one
 # minor: tagteam-engine wraps its transport, and `ureq::unversioned` breaks only in minors.
 ureq = { version = "~3.4", default-features = false, features = ["rustls", "platform-verifier"] }
-unicode-normalization = "0.1"
+# NFC for Appendix A.2's Keychain names and §12.2's profile spelling. Claude Code names its items
+# with its JavaScript runtime's NFC, and new Unicode tables can change NFC for code points they
+# assign, so the tables move only on purpose: pinned exactly at Unicode 17 (0.1.26 has 18).
+unicode-normalization = "=0.1.25"
 # Display width of table cells: CJK and emoji take two columns.
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v7"] }
