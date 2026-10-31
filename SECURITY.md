@@ -103,8 +103,8 @@ and 14).
 - **Dependencies.** CI runs `cargo deny check advisories` on every push to main, every pull
   request, and once a week, and fails on a RustSec advisory against a locked crate (a
   vulnerability or an unsound advisory anywhere in the graph; an unmaintained crate among
-  tagteam's direct dependencies). The one advisory it ignores, and each reason, is recorded in
-  `deny.toml`.
+  tagteam's direct dependencies). The advisories it ignores, each with its reason, are recorded
+  in `deny.toml`.
 
 Anyone who can read your user account's files, or unlock your login Keychain, can read your
 stored credentials, as they can read Claude Code's own. tagteam does not defend against that.
