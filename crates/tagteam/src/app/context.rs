@@ -801,6 +801,7 @@ mod tests {
             "CLAUDE_CODE_OAUTH_TOKEN",
             "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
             "CLAUDE_CODE_HOST_CREDS_FILE",
+            "CLAUDE_CODE_SESSIONS_OAUTH_TOKEN",
             "USE_STAGING_OAUTH",
             "CLAUDE_SECURESTORAGE_CONFIG_DIR",
         ] {

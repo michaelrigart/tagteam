@@ -32,11 +32,12 @@ scrub ANTHROPIC_IDENTITY_TOKEN
 scrub ANTHROPIC_IDENTITY_TOKEN_FILE
 
 # Carries or points at a credential that `claude auth status` does not report (Claude Code
-# 2.1.299 shows no login change when one is set).
+# 2.1.299, and 2.1.316 for the cloud-sessions token, show no login change when one is set).
 scrub CLAUDE_CODE_SESSION_ACCESS_TOKEN
 scrub CLAUDE_CODE_GATEWAY_TOKEN
 scrub CLAUDE_CODE_HOST_CREDS_FILE
 scrub CLAUDE_CODE_HOST_AUTH_ENV_VAR
+scrub CLAUDE_CODE_SESSIONS_OAUTH_TOKEN
 
 # Renames CC's config file and Keychain items (Appendix A.1), or moves its secure storage.
 scrub CLAUDE_CODE_CUSTOM_OAUTH_URL
