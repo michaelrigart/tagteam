@@ -300,12 +300,19 @@ no switch needed (5h 9% · 7d 53%◂, switches at 90%)
   position's counting window (`counting_window`), computed where `windows_pct` is. It is in no
   JSON; the daemon's wire and every `--json` line are unchanged.
 - The TUI hears the poll over the wire, which carries no key, so it works the key out with the
-  same rule from its own view: `binding_window` over the account's windows in the last accounts
-  view, under that provider's `models`. It marks only when that view agrees with the poll: the
-  account is in the view with a reading, and its windows are the poll's, the same keys at the
-  same percentages to the whole percent the sentence shows. A view that lacks the account or
-  its reading, or is older than the poll, marks nothing, and the key's absence reads as the next
-  point says.
+  same rule from its own view and the poll together. The view gives what does not change between
+  readings: the account's windows' keys, kinds and labels, and their order (the stored reading's,
+  which the tie-break follows). The poll gives their percentages, because the view is always
+  older than the tick: a `poll` only schedules the view's re-read 250 ms later, and its
+  `no-switch` is heard before that. `binding_window` runs over the view's windows, in the view's
+  order, at the poll's percentages, under that provider's `models`.
+- It marks nothing when the view lacks the account or its reading, when its keys for the account
+  are not the poll's, or when the window it counts is not at the account's usage in the poll: the
+  poll's percentage for it must be within the binding tolerance (`BINDING_TOLERANCE`, 0.05 points,
+  shared with the parser) of 100 less the account's `headroomPct`. That last check catches a
+  `models` the view and the daemon do not share, as when the setting has just changed and the view
+  has not caught up. A view that is only older, with the same keys at other percentages, still
+  marks; nothing marked reads as the next point says.
 - With no window that counts, a key the sentence does not list, or no windows in the poll, the
   sentence reads as before: the bare percentage in `tagteam auto` and `tagteam daemon`, and none
   on the TUI's auto line, which shows only a binding window's usage (redesign T3-29).
@@ -615,7 +622,9 @@ changing the design.
 - Auto's no-switch sentence marks the window auto counts: with `models = ["Opus"]` and `Fable` and
   `Opus` tied, `Opus` carries the mark in `words::windows_said`, in a `tagteam auto` tick line and
   on the TUI's auto line; no counting key, or one the sentence does not list, marks nothing; the
-  TUI marks nothing when its view lacks the account, its reading, or the poll's windows; the
+  TUI marks from the poll's percentages over its view's keys, also when the view is older than
+  the poll, and marks nothing when its view lacks the account, its reading, or the poll's keys,
+  or when the window counted is not at the usage the poll's headroom gives (`models` drift); the
   engine's poll names the counting key under `models`, and the wire and `--json` lines are the
   same bytes with and without it.
 - The CONTRIBUTING checks: `cargo fmt --all --check`, the three clippy runs, and `cargo test

@@ -742,36 +742,24 @@ pub struct PollPayload {
     pub windows_pct: BTreeMap<u32, Vec<(String, f64)>>,
 }
 
-/// A window at the usage that bound an account at a poll. `used_pct` is what a reader can rely
-/// on. `window` is the first window of that usage in the wire's key order, which on a tie is not
-/// always the one auto counts (`rank::binding_window` under `autoswitch.models`): the wire does
-/// not say which, and nothing reads `window` outside tests.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BindingWindow {
-    pub window: String,
-    pub used_pct: i64,
-}
-
 /// How near a window's usage must be to the account's own to be its binding window, in
 /// percentage points. Strictly less than.
-const BINDING_TOLERANCE: f64 = 0.05;
+pub const BINDING_TOLERANCE: f64 = 0.05;
 
 impl PollPayload {
-    /// The usage that bound `position`: its relevant usage is 100 less its headroom, and
-    /// `window` is the first of its `windows_pct`, in wire order, within the tolerance of that
-    /// usage (see `BindingWindow`). `None` when the headroom is unknown or no window is that near.
-    pub fn binding(&self, position: u32) -> Option<BindingWindow> {
+    /// The usage that bound `position`, rounded: 100 less its headroom. `None` when the headroom
+    /// is unknown or none of its `windows_pct` is within `BINDING_TOLERANCE` of that usage. Which
+    /// window bound it is not said: the wire does not carry the one auto counts
+    /// (`rank::binding_window` under `autoswitch.models`), and the first within the tolerance is
+    /// not always it.
+    pub fn binding_usage(&self, position: u32) -> Option<i64> {
         let headroom = (*self.headroom_pct.get(&position)?)?;
         let usage = 100.0 - headroom;
-        let (window, _) = self
-            .windows_pct
+        self.windows_pct
             .get(&position)?
             .iter()
-            .find(|(_, pct)| (pct - usage).abs() < BINDING_TOLERANCE)?;
-        Some(BindingWindow {
-            window: window.clone(),
-            used_pct: usage.round() as i64,
-        })
+            .any(|(_, pct)| (pct - usage).abs() < BINDING_TOLERANCE)
+            .then(|| usage.round() as i64)
     }
 }
 
@@ -1552,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn the_binding_window_is_the_first_within_the_tolerance() {
+    fn the_binding_usage_is_the_headrooms_when_a_window_is_within_the_tolerance() {
         let poll = |headroom: Value, windows: Value| {
             let mut raw = json!({"event": "poll", "headroomPct": {"1": headroom}});
             if !windows.is_null() {
@@ -1560,49 +1548,51 @@ mod tests {
             }
             parse_poll(&raw).unwrap()
         };
-        let bound = |window: &str, used_pct| {
-            Some(BindingWindow {
-                window: window.into(),
-                used_pct,
-            })
-        };
-
-        // Two windows within the tolerance: the first in the wire's key order, not the nearer.
-        let both = poll(json!(60.0), json!({"7d": 40.04, "5h": 40.0}));
-        assert_eq!(both.binding(1), bound("7d", 40));
-        let both = poll(json!(60.0), json!({"5h": 40.0, "7d": 40.04}));
-        assert_eq!(both.binding(1), bound("5h", 40));
 
         // 0.049 away matches, 0.051 does not, on either side.
         assert_eq!(
-            poll(json!(60.0), json!({"5h": 40.049})).binding(1),
-            bound("5h", 40)
+            poll(json!(60.0), json!({"5h": 40.049})).binding_usage(1),
+            Some(40)
         );
         assert_eq!(
-            poll(json!(60.0), json!({"5h": 39.951})).binding(1),
-            bound("5h", 40)
+            poll(json!(60.0), json!({"5h": 39.951})).binding_usage(1),
+            Some(40)
         );
-        assert_eq!(poll(json!(60.0), json!({"5h": 40.051})).binding(1), None);
-        assert_eq!(poll(json!(60.0), json!({"5h": 39.949})).binding(1), None);
+        assert_eq!(
+            poll(json!(60.0), json!({"5h": 40.051})).binding_usage(1),
+            None
+        );
+        assert_eq!(
+            poll(json!(60.0), json!({"5h": 39.949})).binding_usage(1),
+            None
+        );
 
-        // A window further off is skipped for one that matches.
+        // A window further off is skipped for one that matches, whatever their order.
         let skipped = poll(json!(60.0), json!({"5h": 10.0, "7d": 40.0}));
-        assert_eq!(skipped.binding(1), bound("7d", 40));
+        assert_eq!(skipped.binding_usage(1), Some(40));
+        let skipped = poll(json!(60.0), json!({"7d": 40.0, "5h": 10.0}));
+        assert_eq!(skipped.binding_usage(1), Some(40));
 
-        // The used percentage is the usage, rounded.
+        // The usage is rounded.
         assert_eq!(
-            poll(json!(59.6), json!({"5h": 40.4})).binding(1),
-            bound("5h", 40)
+            poll(json!(59.6), json!({"5h": 40.4})).binding_usage(1),
+            Some(40)
         );
         assert_eq!(
-            poll(json!(59.4), json!({"5h": 40.6})).binding(1),
-            bound("5h", 41)
+            poll(json!(59.4), json!({"5h": 40.6})).binding_usage(1),
+            Some(41)
         );
 
         // An unknown headroom, a missing windowsPct, and another position bind nothing.
-        assert_eq!(poll(Value::Null, json!({"5h": 40.0})).binding(1), None);
-        assert_eq!(poll(json!(60.0), Value::Null).binding(1), None);
-        assert_eq!(poll(json!(60.0), json!({"5h": 40.0})).binding(2), None);
+        assert_eq!(
+            poll(Value::Null, json!({"5h": 40.0})).binding_usage(1),
+            None
+        );
+        assert_eq!(poll(json!(60.0), Value::Null).binding_usage(1), None);
+        assert_eq!(
+            poll(json!(60.0), json!({"5h": 40.0})).binding_usage(2),
+            None
+        );
     }
 
     #[test]

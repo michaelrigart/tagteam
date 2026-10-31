@@ -13,7 +13,7 @@ use tagteam_core::rank::binding_window;
 use tagteam_core::{AccountId, ProviderId, Window};
 use tagteam_daemon::events::StopReason;
 use tagteam_daemon::protocol::{
-    Event, PollPayload, Status, StatusProvider, Wire, parse_token_index,
+    BINDING_TOLERANCE, Event, PollPayload, Status, StatusProvider, Wire, parse_token_index,
 };
 use tagteam_daemon::tokens::TOKEN_INDEX;
 use tagteam_engine::views::ProviderAccounts;
@@ -378,17 +378,20 @@ fn note(state: &mut State, event: &Event, now_ms: i64) {
 /// that usage gives. None when the poll names no window near the account's own usage.
 fn used_pct(poll: &PollPayload) -> Option<f64> {
     let active = poll.active.as_ref()?.number;
-    poll.binding(active).map(|b| b.used_pct as f64)
+    poll.binding_usage(active).map(|usage| usage as f64)
 }
 
 /// The windows of the account in use at `poll`, as `tagteam list` names them, the one auto counts
 /// marked (`words::windows_said`). The wire does not carry which window that is, so it is worked
-/// out as the engine does it: `binding_window` over the account's windows in `view`, the last
-/// accounts view, under that view's `autoswitch.models`. None when the poll names no windows of
-/// the account, and when `view` lacks the account or its windows, or its windows are not the
-/// poll's (a view older than the reading): the same keys at the same percentages, to the whole
-/// percent the sentence shows. Then no window is marked and the sentence reads as it does
-/// without windows.
+/// out as the engine does it: `binding_window` over the account's windows, under `view`'s
+/// `autoswitch.models`, `view` being the last accounts view. The view gives what does not change
+/// between readings: the windows' keys, kinds and labels, and their order, which is the stored
+/// reading's and decides ties. The poll gives their percentages, which the view, always older
+/// than the tick, may have moved on from. None, so no window is marked and the sentence reads as
+/// it does without windows, when the poll names no windows of the account, when `view` lacks the
+/// account or its windows or has other keys than the poll, and when the window counted is not at
+/// the usage the poll gives the account (`headroomPct`): a `models` the view and the daemon do
+/// not share, or a tie the view had the other way.
 fn windows(poll: &PollPayload, view: Option<&ProviderAccounts>) -> Option<String> {
     let active = poll.active.as_ref()?.number;
     let polled = poll.windows_pct.get(&active)?;
@@ -400,16 +403,24 @@ fn windows(poll: &PollPayload, view: Option<&ProviderAccounts>) -> Option<String
         .usage
         .windows
         .as_deref()?;
-    let agrees = polled.len() == read.len()
-        && polled.iter().all(|(key, pct)| {
-            read.iter()
-                .any(|(w, _)| &w.key == key && w.pct.round() == pct.round())
-        });
-    if !agrees {
+    if polled.len() != read.len() {
         return None;
     }
-    let read: Vec<Window> = read.iter().map(|(w, _)| w.clone()).collect();
-    let counting = binding_window(&read, &view.models)?;
+    let current: Vec<Window> = read
+        .iter()
+        .map(|(w, _)| {
+            let (_, pct) = polled.iter().find(|(key, _)| key == &w.key)?;
+            Some(Window {
+                pct: *pct,
+                ..w.clone()
+            })
+        })
+        .collect::<Option<_>>()?;
+    let counting = binding_window(&current, &view.models)?;
+    let usage = 100.0 - (*poll.headroom_pct.get(&active)?)?;
+    if (counting.pct - usage).abs() >= BINDING_TOLERANCE {
+        return None;
+    }
     tagteam_engine::words::windows_said(
         polled.iter().map(|(k, pct)| (k.as_str(), *pct)),
         Some(&counting.key),
@@ -931,6 +942,9 @@ mod tests {
         );
         let unmatched = json!({"active": {"number": 1}, "headroomPct": {"1": 23.0},
             "windowsPct": {"1": {"5h": 40.0}}});
+        let mut accounts = many(3);
+        accounts[0].usage = windowed(&[("5h", "5h", WindowKind::Short, 40.0)]);
+        state.accounts.apply(snapshot(accounts));
         update(&mut state, auto_with("poll", unmatched), NOW_MS);
         update(&mut state, below(), NOW_MS);
         assert_eq!(
@@ -989,6 +1003,16 @@ mod tests {
     /// Account `active`'s poll at 47% headroom with `polled` windows, then a `below-threshold`,
     /// and the auto line they make.
     fn auto_line(state: &mut State, active: u32, polled: serde_json::Value) -> String {
+        auto_line_at(state, active, 47.0, polled)
+    }
+
+    /// `auto_line` with the poll's headroom for the account in use.
+    fn auto_line_at(
+        state: &mut State,
+        active: u32,
+        headroom: f64,
+        polled: serde_json::Value,
+    ) -> String {
         let auto_with = |kind: &str, fields: serde_json::Value| {
             let mut raw = json!({"schemaVersion": 1, "event": kind, "ts": "2026-09-21T14:13:20Z"});
             for (k, v) in fields.as_object().unwrap() {
@@ -1001,7 +1025,7 @@ mod tests {
             })
         };
         let n = active.to_string();
-        let poll = json!({"active": {"number": active}, "headroomPct": {n.clone(): 47.0},
+        let poll = json!({"active": {"number": active}, "headroomPct": {n.clone(): headroom},
             "windowsPct": {n: polled}});
         update(state, auto_with("poll", poll), NOW_MS);
         update(
@@ -1050,19 +1074,84 @@ mod tests {
         state.accounts.apply(snap);
         let line = auto_line(&mut state, 1, tie.clone());
         assert!(line.contains(bare) && !line.contains('◂'), "{line}");
-        // The view is older than the reading: 7d moved from 20 to 30.
-        let mut state = viewing(&["Opus"], &OPUS_TIE);
-        let moved = json!({"5h": 9.0, "7d": 30.0, "scoped:Fable": 53.0, "scoped:Opus": 53.0});
-        let line = auto_line(&mut state, 1, moved);
-        assert!(line.contains(bare) && !line.contains('◂'), "{line}");
         // The view lacks a window the poll names.
         let mut state = viewing(&["Opus"], &OPUS_TIE[..3]);
         let line = auto_line(&mut state, 1, tie.clone());
+        assert!(line.contains(bare) && !line.contains('◂'), "{line}");
+        // The view holds a window the poll lacks.
+        let mut state = viewing(&["Opus"], &OPUS_TIE);
+        let fewer = json!({"5h": 9.0, "7d": 20.0, "scoped:Opus": 53.0});
+        let line = auto_line(&mut state, 1, fewer);
+        assert!(line.contains(bare) && !line.contains('◂'), "{line}");
+        // The same number of windows under other keys.
+        let mut state = viewing(&["Opus"], &OPUS_TIE);
+        let renamed = json!({"5h": 9.0, "7d": 20.0, "scoped:Fable": 53.0, "scoped:Sonnet": 53.0});
+        let line = auto_line(&mut state, 1, renamed);
         assert!(line.contains(bare) && !line.contains('◂'), "{line}");
         // The poll's account is not in the view.
         let mut state = viewing(&["Opus"], &OPUS_TIE);
         let line = auto_line(&mut state, 9, tie);
         assert!(line.contains(bare) && !line.contains('◂'), "{line}");
+    }
+
+    #[test]
+    fn a_view_older_than_the_poll_still_marks_the_window_with_the_polls_percentages() {
+        // The view is re-read 250 ms after a `poll`, so a `no-switch` meets the view before it:
+        // the same keys, at percentages that have moved.
+        let mut state = viewing(&["Opus"], &OPUS_TIE);
+        let moved = json!({"5h": 9.6, "7d": 30.0, "scoped:Fable": 53.0, "scoped:Opus": 53.0});
+        let line = auto_line(&mut state, 1, moved);
+        assert!(
+            line.contains(
+                "no switch needed (5h 10% · 7d 30% · Fable 53% · Opus 53%◂, switches at 90%)"
+            ),
+            "{line}"
+        );
+        // The view's 5h was 9.4 and rounded to 9; the poll's 9.6 shows as 10.
+        let mut windows = OPUS_TIE;
+        windows[0].3 = 9.4;
+        let mut state = viewing(&["Opus"], &windows);
+        let polled = json!({"5h": 9.6, "7d": 20.0, "scoped:Fable": 53.0, "scoped:Opus": 53.0});
+        let line = auto_line(&mut state, 1, polled);
+        assert!(line.contains("5h 10% · 7d 20%"), "{line}");
+        assert!(line.contains("Opus 53%◂"), "{line}");
+        // The window that counts is chosen from the poll's percentages: 7d overtook the scoped
+        // ones in the poll.
+        let mut state = viewing(&["Opus"], &OPUS_TIE);
+        let overtaken = json!({"5h": 9.0, "7d": 53.0, "scoped:Fable": 40.0, "scoped:Opus": 40.0});
+        let line = auto_line(&mut state, 1, overtaken);
+        assert!(line.contains("7d 53%◂ · Fable 40% · Opus 40%,"), "{line}");
+    }
+
+    #[test]
+    fn a_models_setting_the_view_does_not_share_with_the_daemon_marks_nothing() {
+        // The daemon has reloaded `["Opus"]`, so auto counted Opus at 53 (headroom 47); the view
+        // still has `["all"]` and would count Fable at 60.
+        let mut windows = OPUS_TIE;
+        windows[2].3 = 60.0;
+        let mut state = viewing(&["all"], &windows);
+        let polled = json!({"5h": 9.0, "7d": 20.0, "scoped:Fable": 60.0, "scoped:Opus": 53.0});
+        let line = auto_line(&mut state, 1, polled);
+        assert!(
+            line.contains("no switch needed (53%, switches at 90%)") && !line.contains('◂'),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_near_tie_is_decided_by_the_polls_percentages_not_the_views() {
+        // The view had Fable ahead (53.2 over 52.9); the poll has Opus ahead.
+        let windows = [
+            ("scoped:Fable", "Fable", WindowKind::Scoped, 53.2),
+            ("scoped:Opus", "Opus", WindowKind::Scoped, 52.9),
+        ];
+        let mut state = viewing(&["all"], &windows);
+        let polled = json!({"scoped:Fable": 52.9, "scoped:Opus": 53.2});
+        let line = auto_line_at(&mut state, 1, 46.8, polled);
+        assert!(
+            line.contains("no switch needed (Fable 53% · Opus 53%◂, switches at 90%)"),
+            "{line}"
+        );
     }
 
     #[test]
