@@ -126,6 +126,9 @@ tagteam switch --strategy best   # switch to the account with the most headroom
 On a terminal, `tagteam` on its own opens a terminal UI with the same accounts, the token
 report, their usage history, and keys for these commands (`?` lists them, `q` quits).
 `tagteam tui tokens` opens it on the token report, and `tagteam tui history` on the history.
+Its accounts screen lists every account in full; `v` switches to a compact table with the
+selected account's details, and `tagteam config set ui.accounts_view compact` makes that the
+view it opens in.
 
 A running Claude Code session picks up the new login within about 30 seconds on macOS, and on
 the next message on Linux. If an API-key account is on either side of the switch, restart

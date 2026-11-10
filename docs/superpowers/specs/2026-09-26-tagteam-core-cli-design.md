@@ -784,12 +784,15 @@ source}], unknown: [key]}`; `get` returns `{schemaVersion, key, provider, value,
 | `statusline.format` | `"{account} · 5h {5h}% · 7d {7d}%{stale}"` | placeholders listed in §13.5 only; `{model:<name>}` needs a trimmed, non-empty name without braces | yes |
 | `run.share_extra` | `[]` | entry names of the source home to share into profiles, besides the provider's allowlist (§12.2); known-private names are ignored with a warning | yes |
 | `ui.color` | `auto` | `auto`, `always`, `never` (`NO_COLOR` and `FORCE_COLOR` also honoured) | — |
+| `ui.accounts_view` | `list` | `list`, `compact`: the view `tagteam tui`'s Accounts screen opens in | — |
 | `daemon.autoswitch` | true | bool | yes |
 | `notify.enabled` | true | bool | — |
 | `notify.events` | `["switch","quarantine","limit"]` | a list of `switch`, `quarantine` and `limit`; duplicates collapse; `''` is the empty list | yes |
 
 The `daemon.*` and `notify.*` keys are the daemon's (daemon spec D7). `daemon.autoswitch` set
 to false pauses the daemon's auto-switching for a provider. It does not affect `tagteam auto`.
+`ui.accounts_view` is the TUI's, read once when it starts; `v` toggles the view for the session
+(added 2026-11-11 in [#58](https://github.com/michaelrigart/tagteam/pull/58)).
 
 CLI flags override settings for a single invocation and are clamped to the same ranges. A
 running `auto` or daemon re-reads the file whenever its mtime changes (§11.4, daemon spec

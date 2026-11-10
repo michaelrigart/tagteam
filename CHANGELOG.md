@@ -7,8 +7,16 @@ with the one before, so any release may contain breaking changes. Each section s
 
 ## [Unreleased]
 
+### Added
+
+- `ui.accounts_view` sets the view `tagteam tui`'s Accounts screen opens in: `list` (the
+  default) or `compact`.
+
 ### Changed
 
+- `tagteam tui`'s Accounts screen opens in the full list, with the selected account in view.
+  To open in the compact view, as before, run `tagteam config set ui.accounts_view compact`.
+  `v` still switches between the two.
 - Checked against Claude Code 2.1.322, now the newest version tagteam is known to work with.
   `tagteam doctor` no longer warns about Claude Code versions up to 2.1.322.
 

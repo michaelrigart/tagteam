@@ -77,7 +77,7 @@ come from the engine's shared words or the TUI's existing ones.
 |---|---|---|
 | AV-1 | What replaces the lead card? | The Now strip (redesign §5.4), on Accounts too |
 | AV-2 | How are an account's details shown? | One format (§4) in the selected card and the full list; no sparklines on Accounts. `⏎` opens History for the account, as today |
-| AV-3 | Which view lists every account in full? | A second view, the full list, toggled by `v`; compact stays the default |
+| AV-3 | Which view lists every account in full? | A second view, the full list, toggled by `v`; compact stays the default *(Amended 2026-11-11 in [#58](https://github.com/michaelrigart/tagteam/pull/58): the full list is the default, and `ui.accounts_view = "compact"` opens in compact; §6.2.)* |
 | AV-4 | How is the account in use told apart? | `●` in the Now strip and the table, `IN USE` on its facts row, thick `▆` bars; other accounts `not in use` and thin `━` gauges |
 | AV-5 | Where is the selection in the full list? | `▌` on every row of the selected account's block, and bold on its name |
 | AV-6 | Pace marks? | None on any bar or gauge. `▲` stays; where the row has room it ends with the expected percentage in words (§4.3) |
@@ -90,6 +90,9 @@ discussion; its rule and AV-9 were settled on 2026-10-28 after the real-store ru
 calls made while writing this spec.
 
 ## 3. Accounts: the compact view (default)
+
+*(Amended 2026-11-11 in [#58](https://github.com/michaelrigart/tagteam/pull/58): no longer the
+default unless `ui.accounts_view` names it; §6.2.)*
 
 ### 3.1 Layout
 
@@ -446,7 +449,10 @@ reader the list goes on.
   do today (`card.rs:85-113`).
 - The selection is the account ID (`AccountsState::selected`), so it survives `v` and refreshes;
   `v` keeps it and scrolls it into view.
-- The view (compact or full list) lasts for the session; tagteam starts in compact.
+- The view (compact or full list) lasts for the session; tagteam starts in compact. *(Amended
+  2026-11-11 in [#58](https://github.com/michaelrigart/tagteam/pull/58): tagteam starts in the
+  view `ui.accounts_view` names, read once at start, `list` by default; in the full list the
+  selected account is whole from the first frame. `v` still toggles for the session.)*
 
 ## 7. Tokens: rows from before tracking
 

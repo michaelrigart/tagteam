@@ -52,6 +52,8 @@ the same commands the CLI runs.
   `unmap`, `history --csv` and the report's `--json`/`--csv` stay in the CLI. So does `config`,
   apart from the auto-switch pause (§7.4).
 - **Mouse support, themes, custom key bindings,** and any `[tui]` settings in `config.toml`.
+  *(Amended 2026-11-11 in [#58](https://github.com/michaelrigart/tagteam/pull/58): one `ui.*`
+  key, `ui.accounts_view`, names the view the Accounts screen opens in; core §6.4.)*
 - **Notifications.** They are the daemon's.
 - **Controlling a foreground `tagteam auto`.** Only the daemon's loop can be paused (§7.4).
 - **A `watch` command.** `tui` covers cswap's `tui` and `watch` alike (§12.1).
