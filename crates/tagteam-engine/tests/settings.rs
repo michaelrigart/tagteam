@@ -7,7 +7,7 @@ use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::AutoStrategy;
 use tagteam_core::tokens::{CardOverride, PriceOverride};
 use tagteam_engine::settings::{
-    self, COOLDOWN_SECONDS_RANGE, Choices, ColorMode, HISTORY_RETENTION_DAYS_RANGE,
+    self, AccountsView, COOLDOWN_SECONDS_RANGE, Choices, ColorMode, HISTORY_RETENTION_DAYS_RANGE,
     HYSTERESIS_PCT_RANGE, INTERVAL_SECONDS_RANGE, Inspection, KEYS, Key, KeyKind, KeyState,
     NotifyEvent, STATUSLINE_PLACEHOLDERS, Settings, SettingsError, Source, THRESHOLD_RANGE,
     TOKENS_RETENTION_DAYS_RANGE, UNHEALTHY_TICKS_RANGE, Value, inspect, is_statusline_placeholder,
@@ -53,6 +53,7 @@ fn the_defaults_are_the_specs_table() {
         "{account} · 5h {5h}% · 7d {7d}%{stale}"
     );
     assert_eq!(d.color, ColorMode::Auto);
+    assert_eq!(d.accounts_view, AccountsView::List);
     assert!(d.share_extra.is_empty());
     assert!(d.prices.is_empty());
     assert!(d.daemon_autoswitch);
@@ -107,6 +108,7 @@ format = "{5h}%"
 
 [ui]
 color = "never"
+accounts_view = "compact"
 
 [run]
 share_extra = ["hook-data"]
@@ -139,6 +141,7 @@ events = ["limit", "switch"]
             tokens_retention_days: 90,
             statusline_format: "{5h}%".to_owned(),
             color: ColorMode::Never,
+            accounts_view: AccountsView::Compact,
             share_extra: vec!["hook-data".into()],
             prices: BTreeMap::from([(
                 ProviderId::new("claude-code"),
@@ -377,6 +380,31 @@ fn an_invalid_color_falls_back_to_auto_with_a_warning() {
         assert_eq!(settings.color, ColorMode::Auto, "{text}");
         assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
         assert!(warnings[0].contains("`ui.color`"), "{warnings:?}");
+    }
+}
+
+#[test]
+fn the_accounts_view_reads_its_two_values() {
+    for (text, view) in [
+        ("list", AccountsView::List),
+        ("compact", AccountsView::Compact),
+    ] {
+        let (settings, warnings) = load(&format!("[ui]\naccounts_view = \"{text}\"\n"));
+        assert_eq!(settings.accounts_view, view);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+}
+
+#[test]
+fn an_invalid_accounts_view_falls_back_to_list_with_a_warning() {
+    for text in ["\"full\"", "\"Compact\"", "true", "1"] {
+        let (settings, warnings) = load(&format!("[ui]\naccounts_view = {text}\n"));
+        assert_eq!(settings.accounts_view, AccountsView::List, "{text}");
+        assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
+        assert!(
+            warnings[0].contains("`ui.accounts_view` must be \"list\" or \"compact\" (ignored)"),
+            "{warnings:?}"
+        );
     }
 }
 
@@ -1067,6 +1095,11 @@ fn the_registry_is_section_six_four_s_table_in_order() {
                 Shape::Choice(vec!["auto", "always", "never"]),
                 false
             ),
+            (
+                "ui.accounts_view",
+                Shape::Choice(vec!["list", "compact"]),
+                false
+            ),
             ("daemon.autoswitch", Shape::Other(KeyKind::Bool), true),
             ("notify.enabled", Shape::Other(KeyKind::Bool), false),
             ("notify.events", Shape::Other(KeyKind::NotifyEvents), true),
@@ -1079,10 +1112,13 @@ fn the_choice_keys_say_their_enums_spellings_in_order() {
     // review refactor §8.8: a choice key's values are its enum's `ALL`, not a second list.
     let strategy = reg("autoswitch.strategy");
     let color = reg("ui.color");
+    let view = reg("ui.accounts_view");
     assert_eq!(strategy.expect(), "must be \"best\" or \"consume-first\"");
     assert_eq!(color.expect(), "must be \"auto\", \"always\" or \"never\"");
+    assert_eq!(view.expect(), "must be \"list\" or \"compact\"");
     assert_eq!(strategy.kind, KeyKind::Choice(Choices::Strategy));
     assert_eq!(color.kind, KeyKind::Choice(Choices::Color));
+    assert_eq!(view.kind, KeyKind::Choice(Choices::AccountsView));
     assert_eq!(
         Choices::Strategy.values(),
         AutoStrategy::ALL.map(AutoStrategy::as_str)
@@ -1090,6 +1126,10 @@ fn the_choice_keys_say_their_enums_spellings_in_order() {
     assert_eq!(
         Choices::Color.values(),
         ColorMode::ALL.map(ColorMode::as_str)
+    );
+    assert_eq!(
+        Choices::AccountsView.values(),
+        AccountsView::ALL.map(AccountsView::as_str)
     );
 }
 
@@ -1185,6 +1225,7 @@ fn every_key_reads_back_its_default_from_the_settings() {
             ),
             ("run.share_extra", list(&[])),
             ("ui.color", Value::Str("auto".into())),
+            ("ui.accounts_view", Value::Str("list".into())),
             ("daemon.autoswitch", Value::Bool(true)),
             ("notify.enabled", Value::Bool(true)),
             ("notify.events", list(&["switch", "quarantine", "limit"])),
@@ -1250,6 +1291,10 @@ fn each_key_says_what_a_valid_value_is() {
     assert_eq!(
         expect("ui.color"),
         "must be \"auto\", \"always\" or \"never\""
+    );
+    assert_eq!(
+        expect("ui.accounts_view"),
+        "must be \"list\" or \"compact\""
     );
     for name in ["daemon.autoswitch", "notify.enabled"] {
         assert_eq!(
@@ -1404,12 +1449,17 @@ fn the_strategy_and_the_colour_read_their_values_exactly() {
             "{warnings:?}"
         );
     }
-    let i = inspect_as("[provider.claude-code.ui]\ncolor = \"never\"\n", PROVIDER);
-    assert_eq!(
-        state(&i, "ui.color").source,
-        Source::Default,
-        "ui.color has no provider table"
+    let i = inspect_as(
+        "[provider.claude-code.ui]\ncolor = \"never\"\naccounts_view = \"compact\"\n",
+        PROVIDER,
     );
+    for name in ["ui.color", "ui.accounts_view"] {
+        assert_eq!(
+            state(&i, name).source,
+            Source::Default,
+            "{name} has no provider table"
+        );
+    }
 }
 
 #[test]
@@ -1822,7 +1872,7 @@ fn every_refusal_says_what_the_value_must_be() {
 }
 
 /// One command-line sample per registry key, in the registry's order.
-const SAMPLES: [(&str, &str); 17] = [
+const SAMPLES: [(&str, &str); 18] = [
     ("default_provider", "fake-agent"),
     ("autoswitch.threshold", "75.5"),
     ("autoswitch.interval_seconds", "120"),
@@ -1837,6 +1887,7 @@ const SAMPLES: [(&str, &str); 17] = [
     ("statusline.format", "{account} {5h}%"),
     ("run.share_extra", ""),
     ("ui.color", "always"),
+    ("ui.accounts_view", "compact"),
     ("daemon.autoswitch", "no"),
     ("notify.enabled", "0"),
     ("notify.events", "limit, switch"),
@@ -1922,7 +1973,10 @@ fn every_spelling_a_choice_key_declares_reads_back_as_itself() {
             assert_eq!(key.parse_arg(spelling), Ok(value), "{}", key.name);
         }
     }
-    assert_eq!(spellings, 5, "strategy has two, colour three");
+    assert_eq!(
+        spellings, 7,
+        "strategy has two, colour three, the accounts view two"
+    );
 }
 
 #[test]

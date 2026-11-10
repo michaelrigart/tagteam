@@ -15,7 +15,7 @@ use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::EngineError;
 use tagteam_engine::config::{SETTINGS_LOCK_TIMEOUT, SettingsChange};
 use tagteam_engine::settings::{
-    ColorMode, KEYS, KeyKind, Settings, SettingsError, Value, config_path,
+    AccountsView, ColorMode, KEYS, KeyKind, Settings, SettingsError, Value, config_path,
 };
 use tagteam_provider::FlockGuard;
 use tagteam_provider::profile::RunShell;
@@ -452,6 +452,11 @@ fn the_spec_s_ranges_and_spellings_hold_at_both_ends_and_nothing_is_clamped() {
         ),
         ("ui.color", &["auto", "always", "never"], &["sometimes"]),
         (
+            "ui.accounts_view",
+            &["list", "compact"],
+            &["full", "List", ""],
+        ),
+        (
             "statusline.format",
             &["{account} {5h}%", "{model:Fable}"],
             &["", "{bogus}", "{5h"],
@@ -487,6 +492,7 @@ fn the_spec_s_ranges_and_spellings_hold_at_both_ends_and_nothing_is_clamped() {
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(settings.threshold, 99.9);
     assert_eq!(settings.color, ColorMode::Never);
+    assert_eq!(settings.accounts_view, AccountsView::Compact);
     assert_eq!(
         (
             settings.daemon_autoswitch,
@@ -585,6 +591,7 @@ fn a_key_no_provider_table_may_hold_refuses_under_either_spelling() {
     let fx = Fx::new();
     for (name, raw) in [
         ("ui.color", "never"),
+        ("ui.accounts_view", "compact"),
         ("usage.history_retention_days", "30"),
         ("tokens.retention_days", "90"),
         ("default_provider", "claude-code"),
