@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use tagteam_core::autoswitch::AutoStrategy;
@@ -892,6 +892,35 @@ pub enum SettingsError {
     Io(#[from] std::io::Error),
 }
 
+/// One `[provider.<id>.mappings]` entry (config-mappings spec §3.1), as read: the key as
+/// written, the directory it names and the value as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappingEntry {
+    /// The key as written, `~` and any trailing `/` included.
+    pub written: String,
+    /// The key expanded and rebuilt from its components (no trailing `/`), not canonicalised.
+    pub dir: PathBuf,
+    /// The account, by alias or email, as written. Resolved at lookup, never at read.
+    pub value: String,
+}
+
+/// A mapping key's directory (config-mappings spec §3.1): `~` is `home`, `~/rest` is
+/// `home.join(rest)`, and any other absolute key is kept as given. Each is rebuilt from its
+/// components, so a trailing `/` or a `.` component does not matter. An empty key, a relative
+/// one or `~user/…` is `None`.
+pub fn expand_mapping_key(home: &Path, key: &str) -> Option<PathBuf> {
+    let path = if key == "~" {
+        home.to_owned()
+    } else if let Some(rest) = key.strip_prefix("~/") {
+        home.join(rest)
+    } else if Path::new(key).is_absolute() {
+        PathBuf::from(key)
+    } else {
+        return None;
+    };
+    Some(path.components().collect())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     /// `default_provider`, read from the top level only. `None` when the file names none, or
@@ -941,6 +970,10 @@ pub struct Settings {
     /// field as read, one that is not valid dropped with a warning. Not a registry key:
     /// `config` neither lists nor writes it.
     pub prices: BTreeMap<ProviderId, BTreeMap<String, PriceOverride>>,
+    /// `[provider.<id>.mappings]` (config-mappings spec §3.1): the loaded provider's directory
+    /// mappings, in file order, one that is not valid dropped with a warning. Not a registry
+    /// key: `config` neither lists nor writes it.
+    pub mappings: Vec<MappingEntry>,
     /// `daemon.autoswitch` (D7): whether the daemon switches this provider's accounts; false
     /// pauses it (D4.3). `tagteam auto` ignores it. The provider's own table first.
     pub daemon_autoswitch: bool,
@@ -971,6 +1004,7 @@ impl Default for Settings {
             accounts_view: AccountsView::default(),
             share_extra: Vec::new(),
             prices: BTreeMap::new(),
+            mappings: Vec::new(),
             daemon_autoswitch: true,
             notify_enabled: true,
             notify_events: NotifyEvent::ALL.to_vec(),
@@ -1192,6 +1226,7 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
         read.sources[ceiling_at] = Source::Default;
     }
     read.settings.prices = reader.read_prices();
+    read.settings.mappings = reader.read_mappings(provider, &env.home);
     read.warnings = reader.warnings;
     unknown_keys(doc.as_table(), &mut Vec::new(), &mut read.unknown);
     read.unknown.sort();
@@ -1295,6 +1330,39 @@ impl<'a> Reader<'a> {
             }
         }
         None
+    }
+
+    /// `[provider.<id>.mappings]` for `provider` (config-mappings spec §3.1), in file order. An
+    /// entry whose key is not an absolute directory or `~`-relative, or whose value is not a
+    /// string, warns and is dropped; the rest stand.
+    fn read_mappings(&mut self, provider: &ProviderId, home: &Path) -> Vec<MappingEntry> {
+        let mut entries = Vec::new();
+        let Some(table) = self.table(&["provider", provider.as_str(), "mappings"]) else {
+            return entries;
+        };
+        for (key, item) in table.iter() {
+            let dotted = format!("provider.{provider}.mappings.\"{key}\"");
+            let Some(dir) = expand_mapping_key(home, key) else {
+                self.warn(format!(
+                    "{}: `{dotted}` must be an absolute directory or start with `~/` (ignored)",
+                    self.path
+                ));
+                continue;
+            };
+            let Some(value) = item.as_str() else {
+                self.warn(format!(
+                    "{}: `{dotted}` must name an account by alias or email, as a string (ignored)",
+                    self.path
+                ));
+                continue;
+            };
+            entries.push(MappingEntry {
+                written: key.to_owned(),
+                dir,
+                value: value.to_owned(),
+            });
+        }
+        entries
     }
 
     /// Every `[provider.<id>.prices]` table (token report spec §8.2), by provider: one table
@@ -1435,10 +1503,13 @@ enum Place {
 }
 
 /// `path`, from the top of the file. `provider` and `provider.<id>` are tables for any id, and
-/// under them only a per-provider key, and its table, are known, and the price tables.
+/// under them only a per-provider key, and its table, are known, and the price tables and the
+/// mappings (config-mappings spec §3.1), whose every key is known.
 fn place(path: &[&str]) -> Place {
     match path {
         ["provider"] | ["provider", _] => Place::Table,
+        ["provider", _, "mappings"] => Place::Table,
+        ["provider", _, "mappings", _, ..] => Place::Key,
         ["provider", _, "prices", rest @ ..] => place_in_prices(rest),
         ["provider", _, rest @ ..] => place_in(rest, true),
         rest => place_in(rest, false),

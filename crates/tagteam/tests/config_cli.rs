@@ -736,3 +736,17 @@ fn an_unknown_default_provider_names_the_ones_this_build_has() {
             "tagteam: unknown provider \"codex\"; name one this build has, such as claude-code\n",
         );
 }
+
+#[test]
+fn config_list_leaves_mappings_out() {
+    let d = tempfile::tempdir().unwrap();
+    write_config(
+        d.path(),
+        "[provider.claude-code.mappings]\n\"~/Code/work\" = \"work\"\n",
+    );
+    for args in [&["config", "list"][..], &["config", "list", "--json"][..]] {
+        let (out, err) = ok(d.path(), args);
+        assert!(!out.contains("~/Code/work"), "{args:?}: {out}");
+        assert_eq!(err, "", "{args:?}");
+    }
+}

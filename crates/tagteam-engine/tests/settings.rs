@@ -9,9 +9,9 @@ use tagteam_core::tokens::{CardOverride, PriceOverride};
 use tagteam_engine::settings::{
     self, AccountsView, CEILING_RANGE, COOLDOWN_SECONDS_RANGE, Choices, ColorMode,
     HISTORY_RETENTION_DAYS_RANGE, HYSTERESIS_PCT_RANGE, INTERVAL_SECONDS_RANGE, Inspection, KEYS,
-    Key, KeyKind, KeyState, NotifyEvent, STATUSLINE_PLACEHOLDERS, Settings, SettingsError, Source,
-    THRESHOLD_RANGE, TOKENS_RETENTION_DAYS_RANGE, UNHEALTHY_TICKS_RANGE, Value, inspect,
-    is_statusline_placeholder, parse_bool, resolve,
+    Key, KeyKind, KeyState, MappingEntry, NotifyEvent, STATUSLINE_PLACEHOLDERS, Settings,
+    SettingsError, Source, THRESHOLD_RANGE, TOKENS_RETENTION_DAYS_RANGE, UNHEALTHY_TICKS_RANGE,
+    Value, inspect, is_statusline_placeholder, parse_bool, resolve,
 };
 use tagteam_provider::Env;
 
@@ -158,6 +158,7 @@ events = ["limit", "switch"]
                     }
                 )])
             )]),
+            mappings: Vec::new(),
             daemon_autoswitch: false,
             notify_enabled: false,
             notify_events: vec![NotifyEvent::Limit, NotifyEvent::Switch],
@@ -2673,4 +2674,118 @@ fn the_daemon_and_notify_keys_on_the_command_line_are_strict() {
             "{raw:?}"
         );
     }
+}
+
+#[test]
+fn mapping_keys_expand_the_home_and_keep_values_as_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::for_test(dir.path());
+    fs::create_dir_all(env.config_dir()).unwrap();
+    fs::write(
+        settings::config_path(&env),
+        r#"
+[provider.claude-code.mappings]
+"~" = "home"
+"~/Code/work" = "Work"
+"/abs/x/" = "a@x.co"
+"#,
+    )
+    .unwrap();
+    let (settings, warnings) = Settings::load(&env, &ProviderId::new(PROVIDER));
+    let entry = |written: &str, dir: std::path::PathBuf, value: &str| MappingEntry {
+        written: written.to_owned(),
+        dir,
+        value: value.to_owned(),
+    };
+    assert_eq!(
+        settings.mappings,
+        vec![
+            entry("~", env.home.clone(), "home"),
+            entry("~/Code/work", env.home.join("Code/work"), "Work"),
+            entry("/abs/x/", "/abs/x".into(), "a@x.co"),
+        ]
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_relative_or_empty_mapping_key_warns_and_is_ignored() {
+    let (settings, warnings) = load(
+        r#"
+[provider.claude-code.mappings]
+"" = "a"
+"Code/x" = "a"
+"~other/x" = "a"
+"/ok" = 2
+"#,
+    );
+    assert!(settings.mappings.is_empty(), "{:?}", settings.mappings);
+    assert_eq!(warnings.len(), 4, "{warnings:?}");
+    for key in ["\"\"", "\"Code/x\"", "\"~other/x\"", "\"/ok\""] {
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(key) && w.ends_with("(ignored)")),
+            "{key}: {warnings:?}"
+        );
+    }
+}
+
+#[test]
+fn mappings_are_read_for_the_loaded_provider_only() {
+    let text = r#"
+[provider.claude-code.mappings]
+"/a" = "one"
+
+[provider.fake-agent.mappings]
+"/b" = "two"
+"#;
+    let (settings, _) = load_as(text, "claude-code");
+    let written: Vec<_> = settings
+        .mappings
+        .iter()
+        .map(|m| m.written.as_str())
+        .collect();
+    assert_eq!(written, ["/a"]);
+    let (settings, _) = load_as(text, "fake-agent");
+    let written: Vec<_> = settings
+        .mappings
+        .iter()
+        .map(|m| m.written.as_str())
+        .collect();
+    assert_eq!(written, ["/b"]);
+}
+
+#[test]
+fn a_mappings_value_that_is_not_a_table_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::for_test(dir.path());
+    fs::create_dir_all(env.config_dir()).unwrap();
+    let path = settings::config_path(&env);
+    fs::write(&path, "[provider.claude-code]\nmappings = 3\n").unwrap();
+    let (settings, warnings) = Settings::load(&env, &ProviderId::new(PROVIDER));
+    assert!(settings.mappings.is_empty());
+    assert_eq!(
+        warnings,
+        [format!(
+            "{}: `provider.claude-code.mappings` must be a table (ignored)",
+            path.display()
+        )]
+    );
+}
+
+#[test]
+fn mapping_keys_are_known_and_a_top_level_mappings_table_is_not() {
+    let known = r#"
+[provider.claude-code.mappings]
+"~/Code/work" = "work"
+"/abs" = "a@x.co"
+"#;
+    assert!(
+        inspect_as(known, PROVIDER).unknown.is_empty(),
+        "{:?}",
+        inspect_as(known, PROVIDER).unknown
+    );
+    let with_top = format!("{known}\n[mappings]\n\"/x\" = \"a\"\n");
+    assert_eq!(inspect_as(&with_top, PROVIDER).unknown, ["mappings./x"]);
 }
