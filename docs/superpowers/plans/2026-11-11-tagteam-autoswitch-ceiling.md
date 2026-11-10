@@ -106,18 +106,10 @@ Unknown headroom is never full (a `None` never reaches `full`). A window is full
 
 ## Execution order
 
-Each task's `Depends on:` line is binding. Every engine and daemon task compiles the core crate,
-so only tasks whose tests load disjoint files share a batch:
-
-| Batch | Tasks |
-|---|---|
-| 1 | 1 |
-| 2 | 2 |
-| 3 | 3 |
-| 4 | 4 |
-| 5 | 5 |
-| 6 | 6, 8 |
-| 7 | 7, 9 |
+Each task's `Depends on:` line is binding. The tasks run one at a time, in number order, each its
+own batch: every engine and daemon task compiles the core crate that another task changes, Task 8
+plants a deliberate fault in `autoswitch.rs` that any concurrent build would compile, and Task 9
+depends on all the others.
 
 ---
 
@@ -263,7 +255,7 @@ so only tasks whose tests load disjoint files share a batch:
 
 ### Task 3: `rank::blocked_until` takes the level it judges at
 
-**Depends on:** none (runs after Task 2 in batch order)
+**Depends on:** none (runs third, in number order)
 
 **Files:**
 - Modify: `crates/tagteam-core/src/rank.rs:95-104`, `crates/tagteam-core/src/autoswitch.rs:341`
@@ -616,9 +608,10 @@ so only tasks whose tests load disjoint files share a batch:
     7. `all-exhausted` only when every OAuth candidate is known to be full; `earliest_reset` is the
        minimum `back_at` at the level of the tick's move; `exhausted` is
        `AllOut { wake_at: min back_at at 100 }` when every one is out, else `RoomLeft`. The level
-       comes from the live account as core §11.2 step 5 reads it: quarantined, or usage unknown
-       (an `all-exhausted` then means failover) → 100; an API key → `ceiling`; out → 100; full →
-       `ceiling − 3`; otherwise → `ceiling`.
+       comes from the live account, judged in `triggered()`'s order (core §11.2 steps 4 and 5),
+       first match wins: an API key → `ceiling` (its usage is unknown, and it moves
+       `proactive`); quarantined → 100; usage unknown (an `all-exhausted` then means failover) →
+       100; out → 100; full → `ceiling − 3`; otherwise → `ceiling`.
   - `check_delay`: `AllOut { wake_at: Some(_) }` → `interval.min(600)..=600`;
     `AllOut { wake_at: None }` and the other BLOCKED reasons except `no-qualifying-candidate` →
     `interval.max(300)`; `RoomLeft` → the normal-cadence bound.
