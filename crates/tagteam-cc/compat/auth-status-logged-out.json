@@ -4,5 +4,6 @@
   "apiProvider": "firstParty",
   "analyticsDisabled": false,
   "projectsDirectory": "<HOME>/.claude/projects",
-  "configDirectory": "<HOME>/.claude"
+  "configDirectory": "<HOME>/.claude",
+  "loginExpiresAt": null
 }

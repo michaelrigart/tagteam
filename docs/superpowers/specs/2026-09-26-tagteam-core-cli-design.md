@@ -3750,19 +3750,21 @@ caches account- and org-scoped data (`groveConfigCache`, `modelAccessCache`,
   socket (*2.1.292*). The installed
   launchd or systemd service is for the default config dir only: `claude daemon install`
   refuses when `CLAUDE_CONFIG_DIR` is set.
-- **`claude auth status`** prints JSON by default; `--json` is accepted and changes nothing,
-  and `--text` prints text. Fields: `loggedIn`, `authMethod`, `apiProvider`,
-  `analyticsDisabled`, `projectsDirectory`, `configDirectory` always; `email`, `orgId`,
-  `orgName` and `subscriptionType` for a `claude.ai` login; `apiKeySource` and others when
-  they apply. `authMethod` is `claude.ai`, `api_key`, `api_key_helper`, `oauth_token`,
-  `third_party`, or `none` when logged out. It exits 0 only when logged in. Its source order is
-  `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, the token file descriptor, an
-  `apiKeyHelper`, a workload-identity profile, and only then the stored `claude.ai` login. In
-  a home whose global config CC has initialized, it writes nothing. In one whose config is
-  absent, or present but not yet initialized by CC (as one tagteam seeded, or the first start
-  after an upgrade, which runs CC's migrations), CC's start-up runs first: it writes the global
-  config and `backups/`, and leaves its `.claude.json.lock` behind, whose mtime can be up to 1 s
-  in the future (`proper-lockfile`'s first probe), before answering (*2.1.292*).
+- **`claude auth status`** prints JSON by default; `--json` is accepted and changes nothing, and
+  `--text` prints text. Fields: `loggedIn`, `authMethod`, `apiProvider`, `analyticsDisabled`,
+  `projectsDirectory`, `configDirectory` and `loginExpiresAt` (*2.1.318*) always; `email`, `orgId`,
+  `orgName` and `subscriptionType` for a `claude.ai` login; `apiKeySource` and others when they
+  apply. `authMethod` is `claude.ai`, `api_key`, `api_key_helper`, `oauth_token`, `third_party`, or
+  `none` when logged out. It exits 0 only when logged in. `loginExpiresAt` is the ISO 8601 time at
+  which CC expects the stored `claude.ai` login to end, and `null` when there is none, as when
+  logged out; §12.3 does not read it. Its source order is `ANTHROPIC_AUTH_TOKEN`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, the token file descriptor, an `apiKeyHelper`, a workload-identity
+  profile, and only then the stored `claude.ai` login. In a home whose global config CC has
+  initialized, it writes nothing. In one whose config is absent, or present but not yet initialized
+  by CC (as one tagteam seeded, or the first start after an upgrade, which runs CC's migrations),
+  CC's start-up runs first: it writes the global config and `backups/`, and leaves its
+  `.claude.json.lock` behind, whose mtime can be up to 1 s in the future (`proper-lockfile`'s first
+  probe), before answering (*2.1.292*).
 - **Environment names and `auth status`** (*2.1.299*, a throwaway config dir and fake values).
   `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and `CLAUDE_CODE_USE_FOUNDRY` each make it
   report `authMethod` `third_party`, with `apiProvider` `bedrock`, `vertex` or `foundry`. It
