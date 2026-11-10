@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jiff::tz::TimeZone;
 use tagteam_core::ProviderId;
+use tagteam_engine::settings::AccountsView;
 use tagteam_engine::views::ProviderNames;
 use tagteam_provider::Cancel;
 
@@ -69,6 +70,8 @@ pub struct TuiOptions {
     /// `config.toml`'s modification time, read before the settings were loaded
     /// (`Settings::mtime`): an accounts read that sees another one clears `warnings`.
     pub config_mtime: Option<SystemTime>,
+    /// `ui.accounts_view`: the view the Accounts screen opens in.
+    pub accounts_view: AccountsView,
 }
 
 /// How the TUI ended.
@@ -293,6 +296,7 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
             },
             now,
         );
+        state.accounts.start_in(opts.accounts_view);
         if opts.daemon.is_some() {
             // C-R20: the first collection waits to know who collects.
             state.daemon.await_daemon(now);
@@ -1134,6 +1138,7 @@ mod tests {
             names: CC_NAMES,
             warnings: vec![],
             config_mtime: None,
+            accounts_view: AccountsView::List,
         }
     }
 
@@ -1251,6 +1256,25 @@ mod tests {
             ui.run()
         };
         assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    #[test]
+    fn the_accounts_screen_opens_in_the_view_the_options_name() {
+        for view in AccountsView::ALL {
+            let opts = TuiOptions {
+                accounts_view: view,
+                ..options()
+            };
+            let fx = Fixture::with(opts, quick(), |_| idle());
+            let ending = {
+                let mut ui = fx.ui();
+                ui.start();
+                assert_eq!(ui.state.accounts.view(), view);
+                fx.key('q');
+                ui.run()
+            };
+            assert_eq!(fx.finish(ending).code, 0);
+        }
     }
 
     #[test]
