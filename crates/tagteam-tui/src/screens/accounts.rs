@@ -47,23 +47,24 @@ pub struct AccountsState {
     /// The first of the selected account's windows the card shows (`J`/`K`), when they do not
     /// all fit.
     card_from: usize,
-    /// Compact, or every account in full (`v`); it lasts for the session.
+    /// The full list or compact (S§6): `ui.accounts_view` at start, then `v` toggles it for the
+    /// session.
     view: View,
     /// The first block the full list shows, as last kept whole around the selection.
     list_from: usize,
 }
 
-/// What the Accounts screen shows (S§6): the table and the selected card, or every account.
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum View {
-    #[default]
-    Compact,
-    List,
-}
+/// What the Accounts screen shows (S§6): every account, or the table and the selected card.
+pub(crate) use tagteam_engine::settings::AccountsView as View;
 
 impl AccountsState {
     pub(crate) fn view(&self) -> View {
         self.view
+    }
+
+    /// Opens the screen in `view`, the one `ui.accounts_view` names.
+    pub(crate) fn start_in(&mut self, view: View) {
+        self.view = view;
     }
 
     pub fn snapshot(&self) -> Option<&AccountsSnapshot> {
@@ -4020,6 +4021,22 @@ mod tests {
         update(&mut state, key(KeyCode::Home), NOW_MS);
         update(&mut state, ch('v'), NOW_MS);
         assert!(draw(&state, 80, 24)[6].contains("a1@x.co"));
+    }
+
+    #[test]
+    fn opening_in_the_full_list_shows_the_selected_account_on_the_first_frame() {
+        // `ui.accounts_view = "list"`: the screen opens in the full list before the first read,
+        // which selects account 7, the one in use. The first frame at 80×24 shows the fewest
+        // moves from block 1 that make block 7 whole (rows[6] is block 6's title), as `v` does.
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.start_in(View::List);
+        let mut accounts = many(8);
+        accounts[6].active = true;
+        state.accounts.apply(snapshot(accounts));
+        let rows = draw(&state, 80, 24);
+        assert_eq!(state.accounts.selected().unwrap().position, 7);
+        assert!(rows[6].contains("a6@x.co"), "{rows:#?}");
+        assert!(rows[23].contains("v compact"), "{rows:#?}");
     }
 
     #[test]

@@ -238,6 +238,26 @@ fn the_first_frame_shows_the_accounts_and_q_leaves_the_terminal_as_it_was() {
 }
 
 #[test]
+fn the_accounts_screen_opens_in_the_full_list_unless_ui_accounts_view_says_compact() {
+    // `ui.accounts_view` unset: the full list, whose footer offers `v compact`. Set to `compact`:
+    // the table and card, whose footer offers `v full list`.
+    let home = Home::new();
+    for (setting, offered) in [(None, "v compact"), (Some("compact"), "v full list")] {
+        if let Some(value) = setting {
+            cmd(home.root())
+                .args(["config", "set", "ui.accounts_view", value])
+                .assert()
+                .success();
+        }
+        let mut tui = home.tui(&["tui"]);
+        tui.wait_for(LONG, offered, |s| accounts(s) && s.contains(offered));
+        tui.type_keys(b"q");
+        let f = tui.finish(LONG);
+        assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+    }
+}
+
+#[test]
 fn three_shows_history_and_one_the_accounts_again() {
     let home = Home::new();
     let mut tui = home.tui(&["tui"]);
@@ -317,8 +337,13 @@ fn a_resize_while_idle_redraws_at_the_new_size() {
 #[test]
 fn a_key_typed_with_a_resize_is_read() {
     // A key typed as the terminal is resized must not wait for the next key (input reader
-    // spec §1). Each round resizes and types at once, without waiting for the redraw.
+    // spec §1). Each round resizes and types at once, without waiting for the redraw. In
+    // compact, whose card names the selection.
     let home = Home::new();
+    cmd(home.root())
+        .args(["config", "set", "ui.accounts_view", "compact"])
+        .assert()
+        .success();
     let mut tui = home.tui(&["tui"]);
     tui.wait_for(LONG, "the account in use selected", |s| {
         accounts(s) && s.contains("SELECTED  2 ")

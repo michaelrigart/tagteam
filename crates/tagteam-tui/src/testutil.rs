@@ -31,6 +31,7 @@ use tagteam_provider::KindTraits;
 
 use crate::live::Live;
 use crate::msg::{Cmd, Msg};
+use crate::screens::accounts::View;
 use crate::screens::tokens::TokensState;
 use crate::source::AccountsSnapshot;
 use crate::state::{Screen, Startup, State};
@@ -207,8 +208,8 @@ pub(crate) fn many(n: u32) -> Vec<AccountView> {
         .collect()
 }
 
-/// A State on `screen` at 80×24, without colour, nothing loaded yet. Tokens reports on Claude
-/// Code in UTC.
+/// A State on `screen` at 80×24, without colour, nothing loaded yet, Accounts in compact (the
+/// view its tests start from; `v` opens the full list). Tokens reports on Claude Code in UTC.
 pub(crate) fn fresh(screen: Screen) -> State {
     let tokens = TokensState::new(cc(), TimeZone::UTC);
     let mut state = State::new(
@@ -221,6 +222,7 @@ pub(crate) fn fresh(screen: Screen) -> State {
         NOW_MS,
     );
     state.size = (80, 24);
+    state.accounts.start_in(View::Compact);
     state
 }
 

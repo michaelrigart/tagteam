@@ -52,8 +52,8 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
     // An engine of the UI thread's own, built as `run_command` builds one and dropped before
     // the TUI starts. Core §12.8: an unreadable marker refuses, as it does every command but
     // `statusline`. It refuses an unknown `--provider`, prints the settings warnings once,
-    // before the alternate screen hides them, and reads `ui.color`. It reads the settings file
-    // and nothing else.
+    // before the alternate screen hides them, and reads `ui.color` and `ui.accounts_view`. It
+    // reads the settings file and nothing else.
     let (probe, warnings) =
         match app::engine_for(inside.clone(), provider.as_ref(), EventSource::Cli) {
             Ok(built) => built,
@@ -73,6 +73,7 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
         ..app::ColorEnv::of(&ctx, cli.no_color)
     }
     .enabled(probe.settings().color);
+    let accounts_view = probe.settings().accounts_view;
     // Spec §5.3: Tokens reports on `--provider`'s provider, else the default, in the system
     // zone, which is read here so that the UI thread reads no zone file (B6).
     let tokens_provider = provider
@@ -123,6 +124,7 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
         names,
         warnings,
         config_mtime,
+        accounts_view,
     };
     let exit = tagteam_tui::run(opts, sources(inside, provider), host);
     if let Some(report) = &exit.report {
