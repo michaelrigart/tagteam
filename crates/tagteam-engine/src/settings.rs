@@ -105,6 +105,17 @@ str_enum! {
     }
 }
 
+str_enum! {
+    /// `ui.accounts_view`: the view the TUI's Accounts screen opens in. `v` toggles it for the
+    /// session.
+    #[derive(Default)]
+    pub enum AccountsView {
+        #[default]
+        List => "list",
+        Compact => "compact",
+    }
+}
+
 /// D6.1's notification kinds, as `notify.events` names them (D7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NotifyEvent {
@@ -142,6 +153,8 @@ pub enum Choices {
     Strategy,
     /// `ui.color`: [`ColorMode`]'s spellings.
     Color,
+    /// `ui.accounts_view`: [`AccountsView`]'s spellings.
+    AccountsView,
 }
 
 impl Choices {
@@ -150,6 +163,7 @@ impl Choices {
         match self {
             Choices::Strategy => AutoStrategy::ALL.map(AutoStrategy::as_str).to_vec(),
             Choices::Color => ColorMode::ALL.map(ColorMode::as_str).to_vec(),
+            Choices::AccountsView => AccountsView::ALL.map(AccountsView::as_str).to_vec(),
         }
     }
 }
@@ -202,6 +216,7 @@ pub(crate) enum KeyId {
     StatuslineFormat,
     ShareExtra,
     Color,
+    AccountsView,
     DaemonAutoswitch,
     NotifyEnabled,
     NotifyEvents,
@@ -305,6 +320,12 @@ pub const KEYS: &[Key] = &[
         id: KeyId::Color,
         name: "ui.color",
         kind: KeyKind::Choice(Choices::Color),
+        per_provider: false,
+    },
+    Key {
+        id: KeyId::AccountsView,
+        name: "ui.accounts_view",
+        kind: KeyKind::Choice(Choices::AccountsView),
         per_provider: false,
     },
     Key {
@@ -896,6 +917,8 @@ pub struct Settings {
     pub statusline_format: String,
     /// `ui.color`.
     pub color: ColorMode,
+    /// `ui.accounts_view`.
+    pub accounts_view: AccountsView,
     /// `run.share_extra`: entry names of the source home a profile shares besides the
     /// provider's allowlist (§6.4, §12.2). The provider's own table first. A name that is not
     /// an entry name (`is_share_name`) is dropped here with a warning; the link sync drops a
@@ -932,6 +955,7 @@ impl Default for Settings {
             tokens_retention_days: DEFAULT_TOKENS_RETENTION_DAYS,
             statusline_format: DEFAULT_STATUSLINE_FORMAT.to_owned(),
             color: ColorMode::Auto,
+            accounts_view: AccountsView::default(),
             share_extra: Vec::new(),
             prices: BTreeMap::new(),
             daemon_autoswitch: true,
@@ -982,6 +1006,7 @@ impl Settings {
             KeyId::StatuslineFormat => Value::Str(self.statusline_format.clone()),
             KeyId::ShareExtra => Value::List(self.share_extra.clone()),
             KeyId::Color => Value::Str(self.color.as_str().to_owned()),
+            KeyId::AccountsView => Value::Str(self.accounts_view.as_str().to_owned()),
             KeyId::DaemonAutoswitch => Value::Bool(self.daemon_autoswitch),
             KeyId::NotifyEnabled => Value::Bool(self.notify_enabled),
             KeyId::NotifyEvents => Value::List(
@@ -1018,6 +1043,10 @@ impl Settings {
             KeyId::Color => {
                 self.color = ColorMode::parse(&value.into_string())
                     .expect("parse_item admits only ColorMode::ALL's spellings")
+            }
+            KeyId::AccountsView => {
+                self.accounts_view = AccountsView::parse(&value.into_string())
+                    .expect("parse_item admits only AccountsView::ALL's spellings")
             }
             KeyId::DaemonAutoswitch => self.daemon_autoswitch = value.into_bool(),
             KeyId::NotifyEnabled => self.notify_enabled = value.into_bool(),
