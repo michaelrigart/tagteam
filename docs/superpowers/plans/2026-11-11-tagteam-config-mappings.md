@@ -85,9 +85,14 @@ The core spec is cited "core §n". Line numbers are as of `18e2260f` and will dr
 ## Rulings made while planning (inside S)
 
 - **Which providers `Settings` carries.** It holds only the provider it was loaded for, as S§3.1
-  says. The listing, `doctor` and the `alias`/`remove` warnings read each provider's entries with
-  `Settings::load(env, p)`, as doctor's `auto` check already does. Warnings about another
-  provider's table show only when a command acts on that provider, as for every per-provider key.
+  says. Warnings about another provider's table show only when a command acts on that provider,
+  as for every per-provider key.
+- **Every mapping read takes the file as it stands,** through `Settings::load(env, p)`, as doctor's
+  `auto` check already reads. That covers `run`'s lookup, the listing, `doctor`, and the
+  `alias`/`remove` warnings. None of them reads the engine's settings snapshot.
+  - `run` plans a second time after a `TargetChanged` (`app/commands/launch.rs`). That second
+    plan must see an `unmap` made meanwhile, as it already sees the store's.
+  - The second parse costs one small file read on `claude`'s start.
 - **`map` replacing an entry for the same directory.** The first such entry keeps its key as
   written and its comments; only its value changes. Every other equivalent entry is removed. A new
   entry gets the `~/…` or absolute key. S§3.3's "rewritten in place" is read as the entry's
@@ -315,18 +320,23 @@ The core spec is cited "core §n". Line numbers are as of `18e2260f` and will dr
 - Test: `crates/tagteam-engine/tests/run_plan.rs`.
 
 **Interfaces:**
-- Consumes: `mapped_dir`, `resolve_value`, `MappingProblem::describe` (Task 2), and
-  `self.settings().mappings` (Task 1). The CLI loads the settings for the provider the command
-  acts on, which is `plan_run`'s lookup provider when no ACCOUNT is named. Say so in a comment.
+- Consumes: `mapped_dir`, `resolve_value` and `MappingProblem::describe` (Task 2), and
+  `Settings::load(&self.env, provider).0.mappings` (Task 1).
+  - The file is read on every call, never from `self.settings()`, so a second plan sees the file
+    as it stands now (ruling).
+  - The load's warnings are dropped: the command's own load already printed them.
 - Produces: `Mapped` gains `NotHere { why: String }`. `plan_run` turns it into `self.plain(req,
   launch, why, Some(format!("{why}; running plain {command}")))`, so `--require-session` refuses
   with `RequiresSession { why }`.
 
 - [ ] **Step 1: Write the failing tests** (`run_plan.rs`)
 
-  Add a helper, `map_in_file(fx, engine, &[(key, value)])`. It writes
-  `[provider.claude-code.mappings]` and calls `engine.reload_settings(&fx.provider())` on the
-  engine under test (`engine_on_path` builds one with default settings). Then:
+  Add a helper, `map_in_file(fx, &[(key, value)])`, which writes
+  `[provider.claude-code.mappings]` to `settings::config_path(&fx.env)`. No reload is needed,
+  since `plan_run` reads the file itself. Then:
+  - `a_second_plan_sees_the_file_as_it_stands`. Map `~/work` → a in the file, and plan from
+    `~/work` on one engine: a's session. Rewrite the file to map `~/work` → c, and plan again on
+    the same engine: c's session. Empty the file and plan once more: plain, with no warning.
   - `a_file_mapping_starts_a_session_by_alias_or_email`. An alias entry and an email entry each
     give `session(..)` of their account (a non-live one).
   - `the_deeper_mapping_wins_whichever_source_holds_it`:
@@ -354,7 +364,7 @@ The core spec is cited "core §n". Line numbers are as of `18e2260f` and will dr
     `an_api_key_account_is_refused_named_or_mapped` stays as it is, for database rows.
   - `with_no_store_a_file_mapping_warns_and_creates_nothing`.
   - `a_corrupt_settings_file_leaves_database_mappings_working`. Write `not toml [` as the
-    file, reload, and map `cwd` → c in the database. The result is c's session.
+    file, and map `cwd` → c in the database. The result is c's session.
 
 - [ ] **Step 2: Run them to verify they fail.** `cargo test -p tagteam-engine --test run_plan`:
   the new tests fail, and every existing one passes.
@@ -616,7 +626,9 @@ The core spec is cited "core §n". Line numbers are as of `18e2260f` and will dr
   - `a_mapped_target_removed_before_the_launch_reads_it_runs_plain_claude_after_one_more_plan`:
     after `remove 1`, the file entry names no account. The second plan still runs plain `claude`
     with one warning, which now holds `names no account`, not `was removed`. Update its comment.
-  - `a_target_that_changes_again_…`: `unmap` still removes the file entry. Re-run it.
+  - `a_target_that_changes_again_under_the_second_plan_s_launch_is_the_command_s_error`. Its
+    `unmap` of `work/app` now removes the file entry, and the second plan must see that,
+    through Task 3's fresh read. It passes with its assertions unchanged.
   - Report each test changed, and why, in the task report.
 
 - [ ] **Step 6: Commit**: `Map and unmap in config.toml, and list both sources`.
@@ -670,22 +682,36 @@ The core spec is cited "core §n". Line numbers are as of `18e2260f` and will dr
 ### Task 8: End to end and the records
 
 **Files:**
-- Test: `crates/tagteam/tests/map_cli.rs`. Follow the wrapper tests (`wrapper`,
-  `through_each_shell`, `recorder`) and `run_cli.rs`'s `Home` for a session launch.
+- Test: `crates/tagteam/tests/run_cli.rs`. Use its `Home` (two accounts; the fake `claude` in
+  `<root>/bin`, recording into `FAKE_CLAUDE_OUT`; `<root>/work`), `session(out)` and
+  `Home::profile()`.
 - Modify: `docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md`, `README.md`,
   `CHANGELOG.md`.
 
 - [ ] **Step 1: Write the end-to-end test.**
-  `the_wrapper_in_a_directory_mapped_in_config_toml_starts_a_session`:
-  - the file holds `"~/work" = "a@x.co"`, a non-live account;
-  - the wrapper (`shell-init` sourced in each installed shell) runs `claude` from `~/work/app`;
-  - the stand-in `claude` sees `CLAUDE_CONFIG_DIR` set to that account's profile.
+  `the_wrapper_in_a_directory_mapped_in_config_toml_starts_a_session`. It must go through the
+  wrapper; there is no fallback to calling `tagteam run` directly. Setup:
+  - The settings file holds `"<root>/work" = "a@x.co"`, under
+    `[provider.claude-code.mappings]`. Account a is not the live login.
+  - Run `bash -c '<shell-init bash output>\nclaude x'` from `<root>/work`:
+    - with `std_cmd`'s environment;
+    - with `FAKE_CLAUDE_OUT` set;
+    - with a `PATH` that puts `<root>/bin` (the fake `claude`) and the directory of
+      `assert_cmd::cargo::cargo_bin("tagteam")` before the inherited `PATH`.
 
-  Build it on whichever existing session-launch test is nearest. If none launches through the
-  wrapper, call `tagteam run` directly and say so in the report.
+  Expected:
+  - the shell exits 0;
+  - `session(&out)` is `Some`;
+  - its `CLAUDE_CONFIG_DIR` is `Home::profile()` (a's).
+
+  When `bash` is not installed, use `zsh -f` with `shell-init zsh`. When neither is, the test
+  fails, naming both.
 - [ ] **Step 2: Run it**, unsandboxed: `cargo test -p tagteam --features test-support --test
-  map_cli the_wrapper_in`. It passes on Tasks 3 and 6. Revert Task 3's `run.rs` change locally,
-  check that it fails, then restore.
+  run_cli the_wrapper_in`. It passes on Tasks 3 and 6. Then check that it fails without the
+  feature:
+  1. Revert Task 3's `run.rs` change locally.
+  2. Run the test, and see it fail.
+  3. Restore the change.
 - [ ] **Step 3: The core spec.** Each passage ends with "*(Amended by the config-mappings
   spec.)*", linking the spec:
   - §12.7: mappings live in `config.toml`, the database is a legacy source, and the lookup and
