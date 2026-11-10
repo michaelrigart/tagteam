@@ -26,7 +26,7 @@ fake_claude() {
 case "\${1:-}" in
   --version) echo "$tested (Claude Code)" ;;
   auth)
-    printf '{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty","analyticsDisabled":false,"projectsDirectory":"%s/.claude/projects","configDirectory":"%s/.claude"}\n' "\$HOME" "\$HOME"
+    printf '{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty","analyticsDisabled":false,"projectsDirectory":"%s/.claude/projects","configDirectory":"%s/.claude","loginExpiresAt":null}\n' "\$HOME" "\$HOME"
     exit 1
     ;;
   -p)
