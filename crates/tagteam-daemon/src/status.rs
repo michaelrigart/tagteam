@@ -159,6 +159,11 @@ impl StatusBoard {
         }
     }
 
+    /// Drops the provider's line, when it has one.
+    pub fn remove_provider(&self, provider: &ProviderId) {
+        self.lock().providers.retain(|p| &p.provider != provider);
+    }
+
     /// Replaces the job's line by its name, or adds it last.
     pub fn set_job(&self, s: JobStatus) {
         let mut snap = self.lock();

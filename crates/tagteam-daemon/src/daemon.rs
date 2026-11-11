@@ -295,11 +295,11 @@ impl<'e> Started<'e> {
         let mut scheduler = Scheduler::new().with_settings_mtime(settings_mtime);
         // First, so the engine's own settings are read again before any provider job hears of
         // a change.
-        let settings = SettingsJob {
-            board: Arc::clone(&board),
-            backend: opts.backend.as_ref().map(Backend::name),
-            provider: settings_provider,
-        };
+        let settings = SettingsJob::new(
+            Arc::clone(&board),
+            opts.backend.as_ref().map(Backend::name),
+            settings_provider,
+        );
         scheduler.add(Box::new(settings), now);
         // The watches before every provider job (Decision 11's invariant): a tie runs in the
         // order added, so the first pass's store and program checks precede any provider work.
@@ -366,7 +366,7 @@ impl<'e> Started<'e> {
 /// The reload's warnings are dropped: each provider job emits its own provider's as
 /// `config-warning` events (Decision 8), so a second emitter would print every warning twice.
 /// It writes no `JobStatus`, so it never shows in `status.jobs`.
-struct SettingsJob {
+pub(crate) struct SettingsJob {
     board: Arc<StatusBoard>,
     backend: Option<&'static str>,
     /// `--provider`'s, else the default provider: whose tables the command read (Decision 3).
@@ -374,6 +374,18 @@ struct SettingsJob {
 }
 
 impl SettingsJob {
+    pub(crate) fn new(
+        board: Arc<StatusBoard>,
+        backend: Option<&'static str>,
+        provider: ProviderId,
+    ) -> Self {
+        SettingsJob {
+            board,
+            backend,
+            provider,
+        }
+    }
+
     /// The board's `notifications`, from the engine's settings as they now stand.
     fn publish(&self, engine: &Engine) {
         let settings = engine.settings();
