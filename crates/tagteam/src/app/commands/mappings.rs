@@ -61,26 +61,26 @@ fn invalid_path(path: &Path, why: &str) -> Failure {
 
 /// The command whose change to the accounts [`mapping_warnings`] reports (config-mappings spec
 /// §3.6).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::app) enum AccountChange {
+#[derive(Clone, Copy, Debug)]
+pub(in crate::app) enum AccountChange<'a> {
     /// `alias`: set, renamed or unset.
     Alias,
-    Remove,
+    /// `remove`, of this account.
+    Remove(&'a AccountRow),
 }
 
-/// Warnings for the file entries whose value `change` moved off the account it named
-/// (config-mappings spec §3.6), judged from the value alone, whether or not its directory exists
-/// here:
-/// - a value that named one account, an API-key account included, and now names another or none;
-/// - for `remove`, a value that named more than one account, the removed one among them, and now
-///   names one.
+/// Warnings for the file entries whose value `change` affected (config-mappings spec §3.6),
+/// judged from the value alone, whether or not its directory exists here:
+/// - for `alias`, a value that named one account, an API-key account included, and now names
+///   another or none;
+/// - for `remove`, a value that named the removed account, alone or among others.
 ///
-/// A value that names the same account as before warns about nothing. Each warning names the
-/// file, the entry as written and what it named, and says what it does now as if its directory
-/// existed. Entries are matched by key and value, as written, and one that has left the file is
-/// not this command's doing. `launch` is the provider's launch command.
+/// Each warning names the file, the entry as written and what it named, and says what it names now
+/// and whether a launch there runs plain, as if its directory existed. Entries are matched by key
+/// and value, as written, and one that has left the file is not this command's doing. `launch` is
+/// the provider's launch command.
 pub(in crate::app) fn mapping_warnings(
-    change: AccountChange,
+    change: AccountChange<'_>,
     before: &[ConfigMapping],
     after: &[ConfigMapping],
     file: &Path,
@@ -95,18 +95,31 @@ pub(in crate::app) fn mapping_warnings(
             let now = after.iter().find(|m| {
                 m.entry.written == was.entry.written && m.entry.value == was.entry.value
             })?;
-            let ambiguous = matches!(was.named, Named::Several(_));
-            let named = match (was.named.account(), now.named.account()) {
-                (Some(a), Some(b)) if a.id == b.id => return None,
-                (Some(a), _) => format!("no longer names {}", who(a)),
-                (None, Some(_)) if ambiguous && change == AccountChange::Remove => {
-                    "named more than one account".to_owned()
+            let several = matches!(was.named, Named::Several(_));
+            let named = match change {
+                AccountChange::Alias => match (was.named.account(), now.named.account()) {
+                    (Some(a), Some(b)) if a.id == b.id => return None,
+                    (Some(a), _) => format!("no longer names {}", who(a)),
+                    (None, _) => return None,
+                },
+                AccountChange::Remove(removed) if was.named.names(&removed.id) => {
+                    if several {
+                        format!("named more than one account, {} among them", who(removed))
+                    } else {
+                        format!("no longer names {}", who(removed))
+                    }
                 }
-                (None, _) => return None,
+                AccountChange::Remove(_) => return None,
             };
             let (names, starts) = match &now.named {
                 Named::Applies(b) => (Some(format!("it now names {}", who(b))), true),
-                Named::Several(_) => (None, false),
+                Named::Several(_) => {
+                    let when = if several { "still" } else { "now" };
+                    (
+                        Some(format!("it {when} names more than one account")),
+                        false,
+                    )
+                }
                 Named::DoesNot { account, .. } => (
                     account
                         .as_ref()
@@ -118,7 +131,10 @@ pub(in crate::app) fn mapping_warnings(
                 (Some(names), false) if starts => names,
                 (Some(names), false) => format!("{names}, so {plain}"),
                 (None, false) => format!("{plain}, with a warning"),
-                (Some(names), true) => format!("{names}, but {conflict}, so {plain}"),
+                (Some(names), true) => {
+                    let and = if starts { "but" } else { "and" };
+                    format!("{names}, {and} {conflict}, so {plain}")
+                }
                 (None, true) => format!("{conflict}, so {plain}"),
             };
             Some(format!(
@@ -140,10 +156,10 @@ impl App<'_, '_> {
     }
 
     /// Reads `provider`'s entries again and warns about each in `before` whose value `change`
-    /// moved off the account it named (config-mappings spec §3.6, [`mapping_warnings`]).
+    /// affected (config-mappings spec §3.6, [`mapping_warnings`]).
     pub(in crate::app) fn warn_changed_mappings(
         &mut self,
-        change: AccountChange,
+        change: AccountChange<'_>,
         provider: &ProviderId,
         before: &[ConfigMapping],
     ) {
@@ -356,17 +372,25 @@ mod tests {
     use super::{AccountChange, mapping_warnings};
     use crate::render::testutil::{OAUTH, unread, view};
 
-    /// What the entry's value names in a case: account 1 is a@x.co, account 2 is b@x.co.
+    /// What the entry's value names in a case, by position: account 1 is a@x.co, 2 is b@x.co and
+    /// 3 is c@x.co.
     #[derive(Clone, Copy)]
     enum Names {
         Applies(u32),
         ApiKey(u32),
         Nothing,
-        Ambiguous,
+        Several(&'static [u32]),
+    }
+
+    /// The command a case runs under: `Remove(n)` removes account n.
+    #[derive(Clone, Copy, Debug)]
+    enum Under {
+        Alias,
+        Remove(u32),
     }
 
     fn account(position: u32) -> AccountRow {
-        let email = ["a@x.co", "b@x.co"][position as usize - 1];
+        let email = ["a@x.co", "b@x.co", "c@x.co"][position as usize - 1];
         view(
             position,
             email,
@@ -379,18 +403,17 @@ mod tests {
     /// The entry `"~/x" = "work"`, judged as the engine judges it: a missing directory first,
     /// then a conflict, which only an existing directory can have, then the value's problem.
     fn judged(names: Names, present: bool, conflict: bool) -> ConfigMapping {
-        let none = |problem| Named::DoesNot {
-            account: None,
-            problem,
-        };
         let named = match names {
             Names::Applies(n) => Named::Applies(account(n)),
             Names::ApiKey(n) => Named::DoesNot {
                 account: Some(account(n)),
                 problem: MappingProblem::ApiKey,
             },
-            Names::Nothing => none(MappingProblem::NoAccount),
-            Names::Ambiguous => Named::Several(vec![account(1).id, account(2).id]),
+            Names::Nothing => Named::DoesNot {
+                account: None,
+                problem: MappingProblem::NoAccount,
+            },
+            Names::Several(ns) => Named::Several(ns.iter().map(|&n| account(n).id).collect()),
         };
         let path = PathBuf::from("/h/x");
         let (dir, problem) = match (&named, present, conflict) {
@@ -422,29 +445,29 @@ mod tests {
     }
 
     #[test]
-    fn alias_and_remove_warn_when_the_value_names_another_account_or_none_wherever_it_points() {
-        use AccountChange::{Alias, Remove};
-        use Names::{Ambiguous, ApiKey, Applies, Nothing};
-        const BOTH: &[AccountChange] = &[Alias, Remove];
+    fn alias_and_remove_warn_about_what_the_value_named_wherever_it_points() {
+        use Names::{ApiKey, Applies, Nothing, Several};
+        use Under::{Alias, Remove};
         const A: &str = "no longer names a@x.co (position 1)";
+        const SEVERAL_A: &str = "named more than one account, a@x.co (position 1) among them";
         const B: &str = "it now names b@x.co (position 2)";
         const B_KEY: &str =
             "it now names b@x.co (position 2), an API-key account, so `fakeagent` runs plain there";
         const PLAIN: &str = "`fakeagent` runs plain there, with a warning";
-        const SEVERAL: &str = "named more than one account";
+        const STILL: &str = "it still names more than one account, so `fakeagent` runs plain there";
         // (name, commands, before, after, in a conflict, what it named and what it does now)
         type Case = (
             &'static str,
-            &'static [AccountChange],
+            &'static [Under],
             Names,
             Names,
             bool,
             Option<(&'static str, &'static str)>,
         );
-        let cases: [Case; 17] = [
+        let cases: [Case; 24] = [
             (
                 "applies A, then A",
-                BOTH,
+                &[Alias],
                 Applies(1),
                 Applies(1),
                 false,
@@ -452,7 +475,7 @@ mod tests {
             ),
             (
                 "applies A, then B",
-                BOTH,
+                &[Alias],
                 Applies(1),
                 Applies(2),
                 false,
@@ -460,7 +483,7 @@ mod tests {
             ),
             (
                 "applies A, then API key B",
-                BOTH,
+                &[Alias],
                 Applies(1),
                 ApiKey(2),
                 false,
@@ -468,16 +491,34 @@ mod tests {
             ),
             (
                 "applies A, then none",
-                BOTH,
+                &[Alias, Remove(1)],
                 Applies(1),
                 Nothing,
                 false,
                 Some((A, PLAIN)),
             ),
-            ("API key A, then A", BOTH, ApiKey(1), ApiKey(1), false, None),
+            (
+                "applies A, then several",
+                &[Alias],
+                Applies(1),
+                Several(&[2, 3]),
+                false,
+                Some((
+                    A,
+                    "it now names more than one account, so `fakeagent` runs plain there",
+                )),
+            ),
+            (
+                "API key A, then A",
+                &[Alias],
+                ApiKey(1),
+                ApiKey(1),
+                false,
+                None,
+            ),
             (
                 "API key A, then API key B",
-                BOTH,
+                &[Alias],
                 ApiKey(1),
                 ApiKey(2),
                 false,
@@ -485,7 +526,7 @@ mod tests {
             ),
             (
                 "API key A, then none",
-                BOTH,
+                &[Alias, Remove(1)],
                 ApiKey(1),
                 Nothing,
                 false,
@@ -493,55 +534,87 @@ mod tests {
             ),
             (
                 "API key A, then applies B",
-                BOTH,
+                &[Alias],
                 ApiKey(1),
                 Applies(2),
                 false,
                 Some((A, B)),
             ),
             (
-                "ambiguous, then applies B, as remove",
-                &[Remove],
-                Ambiguous,
-                Applies(2),
-                false,
-                Some((SEVERAL, B)),
-            ),
-            (
-                "ambiguous, then API key B, as remove",
-                &[Remove],
-                Ambiguous,
-                ApiKey(2),
-                false,
-                Some((SEVERAL, B_KEY)),
-            ),
-            (
-                "ambiguous, then applies B, as alias: it named no one account before",
+                "several, then applies B, as alias: it named no one account before",
                 &[Alias],
-                Ambiguous,
+                Several(&[1, 2]),
                 Applies(2),
                 false,
                 None,
             ),
             (
-                "ambiguous, then ambiguous",
-                BOTH,
-                Ambiguous,
-                Ambiguous,
+                "several, then the same",
+                &[Alias],
+                Several(&[1, 2]),
+                Several(&[1, 2]),
                 false,
                 None,
             ),
             (
                 "none, then applies B",
-                BOTH,
+                &[Alias],
                 Nothing,
                 Applies(2),
                 false,
                 None,
             ),
             (
+                "applies A, then A, removing B",
+                &[Remove(2)],
+                Applies(1),
+                Applies(1),
+                false,
+                None,
+            ),
+            (
+                "A and B, then B, removing A",
+                &[Remove(1)],
+                Several(&[1, 2]),
+                Applies(2),
+                false,
+                Some((SEVERAL_A, B)),
+            ),
+            (
+                "A and API key B, then API key B, removing A",
+                &[Remove(1)],
+                Several(&[1, 2]),
+                ApiKey(2),
+                false,
+                Some((SEVERAL_A, B_KEY)),
+            ),
+            (
+                "A, B and C, then B and C, removing A",
+                &[Remove(1)],
+                Several(&[1, 2, 3]),
+                Several(&[2, 3]),
+                false,
+                Some((SEVERAL_A, STILL)),
+            ),
+            (
+                "A and B, removing C, which they do not include",
+                &[Remove(3)],
+                Several(&[1, 2]),
+                Several(&[1, 2]),
+                false,
+                None,
+            ),
+            (
+                "none, then none, removing A",
+                &[Remove(1)],
+                Nothing,
+                Nothing,
+                false,
+                None,
+            ),
+            (
                 "in conflict, applies A, then A",
-                BOTH,
+                &[Alias],
                 Applies(1),
                 Applies(1),
                 true,
@@ -549,7 +622,7 @@ mod tests {
             ),
             (
                 "in conflict, applies A, then none",
-                BOTH,
+                &[Alias, Remove(1)],
                 Applies(1),
                 Nothing,
                 true,
@@ -561,7 +634,7 @@ mod tests {
             ),
             (
                 "in conflict, applies A, then B",
-                BOTH,
+                &[Alias],
                 Applies(1),
                 Applies(2),
                 true,
@@ -573,7 +646,7 @@ mod tests {
             ),
             (
                 "in conflict, API key A, then B",
-                BOTH,
+                &[Alias],
                 ApiKey(1),
                 Applies(2),
                 true,
@@ -583,10 +656,42 @@ mod tests {
                      the same directory, so `fakeagent` runs plain there",
                 )),
             ),
+            (
+                "in conflict, applies A, then API key B",
+                &[Alias],
+                Applies(1),
+                ApiKey(2),
+                true,
+                Some((
+                    A,
+                    "it now names b@x.co (position 2), an API-key account, and it conflicts with \
+                     another entry for the same directory, so `fakeagent` runs plain there",
+                )),
+            ),
+            (
+                "in conflict, A, B and C, then B and C, removing A",
+                &[Remove(1)],
+                Several(&[1, 2, 3]),
+                Several(&[2, 3]),
+                true,
+                Some((
+                    SEVERAL_A,
+                    "it still names more than one account, and it conflicts with another entry \
+                     for the same directory, so `fakeagent` runs plain there",
+                )),
+            ),
         ];
         let file = Path::new("/c/config.toml");
-        for (name, changes, before, after, conflict, says) in cases {
-            for &change in changes {
+        for (name, commands, before, after, conflict, says) in cases {
+            for &under in commands {
+                let removed;
+                let change = match under {
+                    Under::Alias => AccountChange::Alias,
+                    Under::Remove(n) => {
+                        removed = account(n);
+                        AccountChange::Remove(&removed)
+                    }
+                };
                 for present in [true, false] {
                     let warnings = mapping_warnings(
                         change,
@@ -596,7 +701,7 @@ mod tests {
                         "fakeagent",
                     );
                     let at = format!(
-                        "{name}, under {change:?}, directory {}: {warnings:?}",
+                        "{name}, under {under:?}, directory {}: {warnings:?}",
                         if present { "present" } else { "missing" }
                     );
                     let Some((named, does)) = says else {

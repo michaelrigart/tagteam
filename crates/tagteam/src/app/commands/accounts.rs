@@ -233,7 +233,7 @@ impl App<'_, '_> {
         let active = self.is_active(&row)?;
         let before = self.mappings_snapshot(&row.provider);
         let row = self.engine.remove(&row.id)?;
-        self.warn_changed_mappings(AccountChange::Remove, &row.provider, &before);
+        self.warn_changed_mappings(AccountChange::Remove(&row), &row.provider, &before);
         let human = format!(
             "Removed {} (position {}).\n",
             render::name(&row),

@@ -357,16 +357,16 @@ fn removing_an_account_warns_about_config_mappings_that_named_it() {
     assert_eq!(fs::read(&config).unwrap(), before);
 }
 
-/// Two accounts that share the email `a@x.co`, in organizations o1 and o2, and the entry
-/// `"~/client" = "a@x.co"`, which names both.
-fn two_accounts_sharing_an_email(root: &Path) {
+/// `n` accounts that share the email `a@x.co`, in organizations o1, o2 and so on, and the entry
+/// `"~/client" = "a@x.co"`, which names them all.
+fn accounts_sharing_an_email(root: &Path, n: u32) {
     let env = Env::for_test(root);
     let kc = FileKeychain::new(root.join("keychain"));
     seed_home(&env);
-    login(&env, &kc, "a@x.co", "o1", "rt-1");
-    cmd(root).arg("add").assert().success();
-    login(&env, &kc, "a@x.co", "o2", "rt-2");
-    cmd(root).arg("add").assert().success();
+    for i in 1..=n {
+        login(&env, &kc, "a@x.co", &format!("o{i}"), &format!("rt-{i}"));
+        cmd(root).arg("add").assert().success();
+    }
     write_config(
         root,
         "[provider.claude-code.mappings]\n\"~/client\" = \"a@x.co\"\n",
@@ -377,7 +377,7 @@ fn two_accounts_sharing_an_email(root: &Path) {
 fn removing_an_account_warns_when_an_ambiguous_entry_now_names_the_other() {
     // Two accounts share an email, so the entry ran plain; once one goes, it names the other.
     let d = tempfile::tempdir().unwrap();
-    two_accounts_sharing_an_email(d.path());
+    accounts_sharing_an_email(d.path(), 2);
     fs::create_dir_all(d.path().join("home").join("client")).unwrap();
     let out = cmd(d.path()).args(["remove", "1"]).assert().success();
     let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
@@ -390,12 +390,29 @@ fn removing_an_account_warns_about_an_ambiguous_entry_whose_directory_is_missing
     // The value is judged, not this machine's directory: another machine with `~/client` now
     // launches it as the remaining account.
     let d = tempfile::tempdir().unwrap();
-    two_accounts_sharing_an_email(d.path());
+    accounts_sharing_an_email(d.path(), 2);
     assert!(!d.path().join("home").join("client").exists());
     let out = cmd(d.path()).args(["remove", "1"]).assert().success();
     let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(err.contains("~/client"), "{err}");
     assert!(err.contains("it now names a@x.co (position 2)"), "{err}");
+}
+
+#[test]
+fn removing_an_account_warns_about_an_entry_that_still_names_several() {
+    // Three accounts share an email; once one goes the entry still names two and runs plain,
+    // but it named the removed account.
+    let d = tempfile::tempdir().unwrap();
+    accounts_sharing_an_email(d.path(), 3);
+    fs::create_dir_all(d.path().join("home").join("client")).unwrap();
+    let out = cmd(d.path()).args(["remove", "1"]).assert().success();
+    let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("~/client"), "{err}");
+    assert!(err.contains("a@x.co (position 1)"), "{err}");
+    assert!(
+        err.contains("it still names more than one account"),
+        "{err}"
+    );
 }
 
 #[test]
