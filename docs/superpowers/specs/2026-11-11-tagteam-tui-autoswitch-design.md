@@ -207,7 +207,9 @@ collection waiting on a request) finishes first, within its requests' own timeou
 change, and the job drops to `collect` and records `autoswitch-paused`.
 
 - **The toast for "no daemon runs"** now appears only when the lane cannot run either: inside a
-  run shell, or after a newer store schema.
+  run shell, or after a newer store schema. While the lane starts, or runs with no job line for
+  the focus provider, `P` changes nothing and says `auto has no state for {provider} yet`.
+  *(Pre-merge ruling.)*
 - **A daemon without its socket:** `P` changes nothing and says "the TUI isn't connected to the
   daemon, so it can't show its state; `tagteam daemon status` says more". The TUI changes no setting
   whose effect it cannot show (T2-16).
