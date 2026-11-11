@@ -20,8 +20,7 @@ use common::{
     two_fresh_accounts, usage_reply, usage_window, write_transcript,
 };
 use serde_json::json;
-use tagteam_cc::CLAUDE_CODE;
-use tagteam_core::{AccountId, ProviderId, WindowKind};
+use tagteam_core::{AccountId, WindowKind};
 use tagteam_engine::store::Store;
 use tagteam_provider::mock_server::{MockReply, MockServer};
 use tagteam_provider::{Env, FileKeychain, MARKER_FILE, profile_path};
@@ -61,9 +60,13 @@ impl Home {
     }
 
     /// `in_dir`, with accounts that have an access token each (`two_bearers`), so that a usage
-    /// server's log tells them apart.
+    /// server's log tells them apart, and notifications off, so that nothing starts `osascript`.
     fn with_bearers(dir: tempfile::TempDir) -> Home {
         let (a, _b) = two_bearers(dir.path());
+        cmd(dir.path())
+            .args(["config", "set", "notify.enabled", "false"])
+            .assert()
+            .success();
         Home::around(dir, a.as_str().to_owned())
     }
 
@@ -1287,23 +1290,16 @@ fn with_no_daemon_the_tui_switches_an_account_at_its_limit() {
     // server.
     let home = Home::with_bearers(short_tempdir());
     let root = home.root();
-    cmd(root)
-        .args(["config", "set", "notify.enabled", "false"])
-        .assert()
-        .success();
     let env = Env::for_test(root);
     let open_store = || {
         Store::open_existing(&env.data_dir().join("tagteam.db"))
             .unwrap()
             .unwrap()
     };
-    let rows = open_store()
-        .accounts(&ProviderId::new(CLAUDE_CODE))
-        .unwrap();
     let now = now_epoch_s();
     record_reading(
         root,
-        rows[0].id.as_str(),
+        &home.a,
         now,
         &[
             usage_window(
@@ -1338,22 +1334,27 @@ fn with_no_daemon_the_tui_switches_an_account_at_its_limit() {
     tui.wait_for(LONG, "the lane switching", |s| {
         accounts(s) && s.contains("● auto on in this window")
     });
+    // The switch writes the live login before `commit_switch` stores its event, so wait for both.
     tui.wait_until(LONG, "the switch to a", || live_email(root) == "a@x.co");
     let lock = env.data_dir().join("locks/autoswitch-claude-code.lock");
     tui.wait_until(LONG, "the engine lock naming the TUI", || {
         fs::read_to_string(&lock).is_ok_and(|r| r.contains(r#""holder":"tui""#))
     });
-    let switches: Vec<_> = open_store()
-        .events()
-        .unwrap()
-        .into_iter()
-        .filter(|e| e.kind.as_str() == "switch")
-        .collect();
+    let switches = || -> Vec<_> {
+        open_store()
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind.as_str() == "switch")
+            .collect()
+    };
+    tui.wait_until(LONG, "the switch event", || !switches().is_empty());
+    let switches = switches();
     assert_eq!(switches.len(), 1, "{switches:?}");
     assert_eq!(switches[0].source.as_str(), "auto", "{switches:?}");
     assert_eq!(
-        switches[0].to_id.as_ref(),
-        Some(&rows[0].id),
+        switches[0].to_id.as_ref().map(|id| id.as_str()),
+        Some(home.a.as_str()),
         "{switches:?}"
     );
     assert_eq!(sent_with(&server, "at-b"), 1, "b was collected once");
