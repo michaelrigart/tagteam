@@ -5,6 +5,7 @@
 //! may not name what those providers' profiles keep private. Its cancel token, which the
 //! settings lock waits on.
 
+use std::cell::RefCell;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -18,9 +19,11 @@ use toml_edit::{Array, Decor, DocumentMut, Item, RawString, Table, TableLike, Va
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
+use crate::mappings::mapped_dir;
 use crate::profiles::is_private;
 use crate::settings::{
-    Key, KeyId, KeyKind, SettingsError, Value, autoswitch_pair, config_path, pair_holds, resolve,
+    Key, KeyId, KeyKind, SettingsError, Value, autoswitch_pair, config_path, expand_mapping_key,
+    pair_holds, resolve,
 };
 
 /// How long a write waits for the settings lock (§4.3, §6.4). Each poll of the wait is a
@@ -210,43 +213,46 @@ impl Engine {
         Ok(())
     }
 
-    /// One edit of the file, in two passes:
-    /// 1. A first look without the lock. When the edit changes nothing it returns here, so it
+    /// One edit of the file, in two passes (config-mappings spec §3.3 shares it with `map`):
+    /// 1. A first look without the lock. When `change` returns no text it returns here, so it
     ///    creates nothing, not even the lock file (§5).
-    /// 2. Otherwise, under the settings lock: the read, the edit, and the write. The atomic
-    ///    writer replaces the file through a symlink to its target, keeps an existing file's
-    ///    mode and creates a new one 0600 (§6.4).
+    /// 2. Otherwise, under the settings lock: the read, `change` again, and the write. The
+    ///    atomic writer replaces the file through a symlink to its target, keeps an existing
+    ///    file's mode and creates a new one 0600 (§6.4).
     ///
-    /// Both reads refuse a corrupt file, which is never written. A write is logged once the
-    /// lock is released: nothing else is taken while it is held (§4.3).
-    fn edit(&self, entry: Entry, value: Option<Value>) -> Result<SettingsChange, EngineError> {
+    /// `change` gets the file as read, `None` when there is none, and returns the new text, or
+    /// `None` to leave the file as it is. Both reads refuse a corrupt file, which is never
+    /// written. Returns whether the file changed. The caller logs a write once this returns:
+    /// nothing else is taken while the lock is held (§4.3).
+    fn edit_file(
+        &self,
+        change: impl Fn(Option<(String, DocumentMut)>) -> Result<Option<String>, SettingsError>,
+    ) -> Result<bool, EngineError> {
         let path = config_path(&self.env);
-        if self.edited(&entry, value.as_ref(), read(&path)?)?.is_none() {
-            return Ok(SettingsChange {
-                key: entry.name,
-                value,
-                changed: false,
-                path,
-            });
+        if change(read(&path)?)?.is_none() {
+            return Ok(false);
         }
-        let changed = {
-            let _lock = FlockGuard::lock(
-                &self.env.data_dir().join(SETTINGS_LOCK),
-                SETTINGS_LOCK_TIMEOUT,
-                &self.env.cancel,
-            )
-            .map_err(SettingsError::Lock)?;
-            let current = read(&path)?;
-            hooks::point(self, "settings-read")?;
-            match self.edited(&entry, value.as_ref(), current)? {
-                None => false,
-                Some(text) => {
-                    ensure_private_dir(&self.env.config_dir()).map_err(SettingsError::Io)?;
-                    write_atomic(&path, text.as_bytes(), 0o600).map_err(SettingsError::Io)?;
-                    true
-                }
+        let _lock = FlockGuard::lock(
+            &self.env.data_dir().join(SETTINGS_LOCK),
+            SETTINGS_LOCK_TIMEOUT,
+            &self.env.cancel,
+        )
+        .map_err(SettingsError::Lock)?;
+        let current = read(&path)?;
+        hooks::point(self, "settings-read")?;
+        match change(current)? {
+            None => Ok(false),
+            Some(text) => {
+                ensure_private_dir(&self.env.config_dir()).map_err(SettingsError::Io)?;
+                write_atomic(&path, text.as_bytes(), 0o600).map_err(SettingsError::Io)?;
+                Ok(true)
             }
-        };
+        }
+    }
+
+    /// One `set` or `unset` of `entry`, through [`Engine::edit_file`].
+    fn edit(&self, entry: Entry, value: Option<Value>) -> Result<SettingsChange, EngineError> {
+        let changed = self.edit_file(|file| self.edited(&entry, value.as_ref(), file))?;
         if changed {
             // The key alone: a value can be free text (`statusline.format`) that holds an email
             // or a name, which the log never records (§14.2).
@@ -257,9 +263,251 @@ impl Engine {
             key: entry.name,
             value,
             changed,
-            path,
+            path: config_path(&self.env),
         })
     }
+
+    /// `tagteam map`'s write (config-mappings spec §3.3): `value` for `dir`, which is
+    /// canonical, in `provider`'s `mappings` table. The first entry for the directory, whatever
+    /// its spelling, keeps its key and comments and takes the value; every other entry for it
+    /// goes. With none, [`mapping_key`] is added at the end of the table, which is made when
+    /// absent. The value already there writes nothing.
+    pub fn write_mapping(
+        &self,
+        provider: &ProviderId,
+        dir: &Path,
+        value: &str,
+    ) -> Result<MappingWrite, EngineError> {
+        let owned = mappings_path(provider);
+        let written = RefCell::new(String::new());
+        let changed = self.edit_file(|file| {
+            let (before, mut doc) = file.unwrap_or_else(|| (String::new(), DocumentMut::new()));
+            let tables: Vec<&str> = owned.iter().map(String::as_str).collect();
+            let inline = is_inline(doc.as_table(), &tables);
+            let entries = table_at(doc.as_table_mut(), &tables, 0)
+                .map_err(|segment| mappings_invalid(provider, &segment))?;
+            *written.borrow_mut() = put_mapping(entries, inline, &self.env.home, dir, value);
+            let after = tidy(&before, doc.to_string());
+            Ok((after != before).then_some(after))
+        })?;
+        if changed {
+            tracing::info!(key = %mappings_name(provider), action = "map", "settings written");
+        }
+        Ok(MappingWrite {
+            written: written.into_inner(),
+            changed,
+            path: config_path(&self.env),
+        })
+    }
+
+    /// `tagteam unmap`'s write to the file (config-mappings spec §3.4): removes every entry for
+    /// `dir` from `provider`'s `mappings` table, or from each provider's when `provider` is
+    /// `None`. A table that leaves empty goes, then its parents, unless one holds a comment, as
+    /// `config unset` does. Returns the number removed; no file, or no match, writes and creates
+    /// nothing.
+    pub fn remove_config_mappings(
+        &self,
+        provider: Option<&ProviderId>,
+        dir: &Path,
+    ) -> Result<usize, EngineError> {
+        let removed = RefCell::new(Vec::<(ProviderId, usize)>::new());
+        let changed = self.edit_file(|file| {
+            removed.borrow_mut().clear();
+            let Some((before, mut doc)) = file else {
+                return Ok(None);
+            };
+            let owners = match provider {
+                Some(p) => vec![p.clone()],
+                None => provider_ids(&doc),
+            };
+            for owner in owners {
+                let count = remove_mappings(&mut doc, &owner, &self.env.home, dir)?;
+                if count > 0 {
+                    removed.borrow_mut().push((owner, count));
+                }
+            }
+            if removed.borrow().is_empty() {
+                return Ok(None);
+            }
+            let after = tidy(&before, doc.to_string());
+            Ok((after != before).then_some(after))
+        })?;
+        let removed = removed.into_inner();
+        if changed {
+            for (owner, _) in &removed {
+                tracing::info!(key = %mappings_name(owner), action = "unmap", "settings written");
+            }
+        }
+        Ok(removed.iter().map(|(_, count)| count).sum())
+    }
+}
+
+/// A mapping the file takes or drops (config-mappings spec §3.3): the key a new entry is
+/// written under, and what the write did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MappingWrite {
+    /// The entry's key as the file now holds it: the one it already had, or the new one.
+    pub written: String,
+    /// Whether the file changed. When it did not, nothing was written or created.
+    pub changed: bool,
+    /// The settings file, as `config path` names it: a symlink is not resolved.
+    pub path: PathBuf,
+}
+
+/// The key a new mapping for `dir`, canonical, is written under (config-mappings spec §3.3):
+/// `~` or `~/rest` when `dir` is the home or under it, as the home is spelled or as it
+/// canonicalises, and `dir` as text otherwise. The key expands back to `dir` through
+/// [`expand_mapping_key`].
+pub fn mapping_key(home: &Path, dir: &Path) -> String {
+    let canonical_home = fs::canonicalize(home).ok();
+    let rest = [Some(home), canonical_home.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(|home| dir.strip_prefix(home).ok());
+    match rest {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => dir.display().to_string(),
+    }
+}
+
+/// The dotted name of `provider`'s mappings table, as a warning or the log names it.
+fn mappings_name(provider: &ProviderId) -> String {
+    format!("provider.{provider}.mappings")
+}
+
+fn mappings_path(provider: &ProviderId) -> [String; 3] {
+    [
+        "provider".to_owned(),
+        provider.to_string(),
+        "mappings".to_owned(),
+    ]
+}
+
+fn mappings_invalid(provider: &ProviderId, segment: &str) -> SettingsError {
+    SettingsError::Invalid {
+        key: mappings_name(provider),
+        reason: format!("`{segment}` in the settings file is not a table"),
+    }
+}
+
+/// The keys of `table` that name `dir`: each key expanded against `home`, then judged by
+/// [`mapped_dir`], the one comparison every reader of a file mapping uses.
+fn keys_for(table: &dyn TableLike, home: &Path, dir: &Path) -> Vec<String> {
+    table
+        .iter()
+        .map(|(key, _)| key)
+        .filter(|key| {
+            expand_mapping_key(home, key).is_some_and(|path| mapped_dir(&path).path() == dir)
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Puts `value` for `dir` into the mappings `table`, and returns the key that holds it: the
+/// first entry for `dir` keeps its key and its decor and takes the value, the others go, and
+/// with none a [`mapping_key`] entry is added at the end.
+fn put_mapping(
+    table: &mut dyn TableLike,
+    inline: bool,
+    home: &Path,
+    dir: &Path,
+    value: &str,
+) -> String {
+    let mut keys = keys_for(table, home, dir).into_iter();
+    let Some(first) = keys.next() else {
+        let key = mapping_key(home, dir);
+        let mut new = TomlValue::from(value);
+        // An inline table's last value holds the space before `}`; the new last one takes it.
+        let last = table
+            .iter_mut()
+            .filter_map(|(_, item)| item.as_value_mut().filter(|_| inline))
+            .last();
+        if let Some(last) = last {
+            let tail = last.decor().suffix().cloned();
+            last.decor_mut().set_suffix("");
+            if let Some(tail) = tail {
+                new.decor_mut().set_suffix(tail);
+            }
+        }
+        table.insert(&key, Item::Value(new));
+        return key;
+    };
+    for other in keys {
+        table.remove(&other);
+    }
+    if let Some(old) = table.get_mut(&first) {
+        let same = old.as_str() == Some(value);
+        if !same {
+            let decor = old.as_value().map(|v| v.decor().clone());
+            let mut new = TomlValue::from(value);
+            if let Some(decor) = decor {
+                *new.decor_mut() = decor;
+            }
+            *old = Item::Value(new);
+        }
+    }
+    first
+}
+
+/// Whether the table at `path` under `table` is written inline, `{ … }`.
+fn is_inline(table: &dyn TableLike, path: &[&str]) -> bool {
+    let mut current = table;
+    for (at, segment) in path.iter().enumerate() {
+        let Some(item) = current.get(segment) else {
+            return false;
+        };
+        if at + 1 == path.len() {
+            return item.is_inline_table();
+        }
+        match item.as_table_like() {
+            Some(child) => current = child,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// The ids of the provider tables in `doc`, in file order.
+fn provider_ids(doc: &DocumentMut) -> Vec<ProviderId> {
+    doc.get("provider")
+        .and_then(Item::as_table_like)
+        .map(|providers| {
+            providers
+                .iter()
+                .filter(|(_, item)| item.is_table_like())
+                .map(|(id, _)| ProviderId::new(id))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Removes every entry for `dir` from `provider`'s mappings table in `doc`, and the tables that
+/// leaves empty, as [`remove_entry`] does. Returns how many entries went. An absent table has
+/// none; one that is not a table is `Invalid`.
+fn remove_mappings(
+    doc: &mut DocumentMut,
+    provider: &ProviderId,
+    home: &Path,
+    dir: &Path,
+) -> Result<usize, SettingsError> {
+    let owned = mappings_path(provider);
+    let tables: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let mut table = doc.as_table() as &dyn TableLike;
+    for (at, segment) in tables.iter().enumerate() {
+        match table.get(segment) {
+            None => return Ok(0),
+            Some(item) => match item.as_table_like() {
+                Some(child) => table = child,
+                None => return Err(mappings_invalid(provider, &tables[..=at].join("."))),
+            },
+        }
+    }
+    let keys = keys_for(table, home, dir);
+    for key in &keys {
+        remove_entry(doc.as_table_mut(), &tables, key);
+    }
+    Ok(keys.len())
 }
 
 /// Why `set` and `unset` refuse an entry that is a table, inline or not.
