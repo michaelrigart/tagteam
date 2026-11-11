@@ -460,6 +460,7 @@ fn undecided(detail: String) -> Decision {
         outcome: Outcome::NoAction,
         detail,
         earliest_reset: None,
+        exhausted: None,
     }
 }
 
@@ -1057,6 +1058,7 @@ impl AutoEngine<'_> {
             outcome: reason.outcome(),
             detail,
             earliest_reset: None,
+            exhausted: None,
         };
         self.announce(sink, &decision)?;
         Ok((TickOutcome::of(&decision), decision))
