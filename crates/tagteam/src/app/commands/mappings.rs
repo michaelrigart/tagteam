@@ -31,20 +31,16 @@ fn canonical_dir(path: Option<PathBuf>) -> Result<String, Failure> {
 }
 
 /// `unmap`'s PATH, twice: as given, made absolute and rebuilt from its components, for the file,
-/// which compares it as it compares its keys; and canonical, as `map` stored it, or, for a
-/// directory that is gone, absolute as given, so the path `map` listed still unmaps, for the
-/// database and the output.
+/// which compares it as it compares its keys; and canonical, as `map` stored it, or, for a path
+/// that cannot be resolved (gone, or under something that is no longer a directory), the same
+/// absolute path, so the path `map` listed still unmaps, for the database and the output.
 fn unmapped_path(path: Option<PathBuf>) -> Result<(PathBuf, String), Failure> {
     let given = path.unwrap_or_else(|| PathBuf::from("."));
     let absolute: PathBuf = std::path::absolute(&given)
         .map_err(|e| invalid_path(&given, &e.to_string()))?
         .components()
         .collect();
-    let resolved = match std::fs::canonicalize(&given) {
-        Ok(p) => p,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => absolute.clone(),
-        Err(e) => return Err(invalid_path(&given, &e.to_string())),
-    };
+    let resolved = std::fs::canonicalize(&given).unwrap_or_else(|_| absolute.clone());
     Ok((absolute, stored_path(resolved)?))
 }
 
