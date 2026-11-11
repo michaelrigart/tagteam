@@ -8,10 +8,11 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::{API_KEY, Fx, two_accounts};
+use common::{API_KEY, Fx, add_same_email, two_accounts};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::EngineError;
 use tagteam_engine::run::{RunPlan, RunRequest};
+use tagteam_engine::settings::config_path;
 use tagteam_provider::process::SpawnSpec;
 use tagteam_provider::profile::MARKER_FILE;
 
@@ -42,6 +43,32 @@ fn map(fx: &Fx, dir: &Path, id: &AccountId) {
         .unwrap()
         .set_mapping(path.to_str().unwrap(), &fx.provider(), id, 1)
         .unwrap();
+}
+
+/// Writes `[provider.claude-code.mappings]` to `config.toml`, which `plan_run` reads itself on
+/// every plan: no reload is needed.
+fn map_in_file(fx: &Fx, entries: &[(&str, &str)]) {
+    let mut body = String::from("[provider.claude-code.mappings]\n");
+    for (key, value) in entries {
+        body.push_str(&format!("{key:?} = {value:?}\n"));
+    }
+    let path = config_path(&fx.env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, body).unwrap();
+}
+
+/// Accounts `a@x.co` and `c@x.co`, and a `live@x.co` login after them: neither of the first two
+/// is the live login, so each gets a session when a mapping names it.
+fn a_and_c(fx: &Fx) -> (AccountId, AccountId) {
+    let a = fx.add("a@x.co", "rt-a");
+    let c = fx.add("c@x.co", "rt-c");
+    fx.add("live@x.co", "rt-live");
+    (a, c)
+}
+
+/// The path as a mapping key: the absolute spelling of `dir`.
+fn key(dir: &Path) -> String {
+    dir.to_str().unwrap().to_owned()
 }
 
 /// What Decision 7's race leaves: a mapping of `dir` whose account is gone, as `plan_run` reads
@@ -474,4 +501,301 @@ fn an_unreadable_run_shell_refuses_every_plan_before_anything_else() {
         let err = engine.plan_run(&req).unwrap_err();
         assert_eq!(err.kind(), "run-shell-unreadable", "{err}");
     }
+}
+
+#[test]
+fn a_second_plan_sees_the_file_as_it_stands() {
+    // The launch re-plans after a `TargetChanged`: an `unmap` made meanwhile must show.
+    let fx = Fx::new();
+    let (a, c) = a_and_c(&fx);
+    let cwd = fx.work_dir("");
+    let engine = fx.engine_on_path(&fx.fake_bin("claude"));
+
+    map_in_file(&fx, &[("~/work", "a@x.co")]);
+    let (id, _, _) = session(engine.plan_run(&request(None, &cwd)).unwrap());
+    assert_eq!(id, a);
+
+    map_in_file(&fx, &[("~/work", "c@x.co")]);
+    let (id, _, _) = session(engine.plan_run(&request(None, &cwd)).unwrap());
+    assert_eq!(id, c);
+
+    map_in_file(&fx, &[]);
+    let (_, warning) = plain(engine.plan_run(&request(None, &cwd)).unwrap());
+    assert_eq!(warning, None);
+}
+
+#[test]
+fn a_file_mapping_starts_a_session_by_alias_or_email() {
+    let fx = Fx::new();
+    let (a, c) = a_and_c(&fx);
+    fx.engine.set_alias(&a, Some("alpha")).unwrap();
+    let (by_alias, by_email) = (fx.work_dir("x"), fx.work_dir("y"));
+    map_in_file(&fx, &[("~/work/x", "alpha"), ("~/work/y", "c@x.co")]);
+    let engine = fx.engine_on_path(&fx.fake_bin("claude"));
+
+    let (id, provider, _) = session(engine.plan_run(&request(None, &by_alias)).unwrap());
+    assert_eq!((id, provider), (a, fx.provider()));
+    let (id, _, _) = session(engine.plan_run(&request(None, &by_email)).unwrap());
+    assert_eq!(id, c);
+}
+
+#[test]
+fn the_deeper_mapping_wins_whichever_source_holds_it() {
+    let (file_shallow, database_shallow) = (Fx::new(), Fx::new());
+
+    // File `~/work` and database `~/work/app`: the database's is nearer.
+    let (a, c) = a_and_c(&file_shallow);
+    let cwd = file_shallow.work_dir("app/src");
+    map(&file_shallow, &file_shallow.work_dir("app"), &c);
+    map_in_file(&file_shallow, &[("~/work", "a@x.co")]);
+    let (id, _, _) = session(
+        file_shallow
+            .engine_on_path(&file_shallow.fake_bin("claude"))
+            .plan_run(&request(None, &cwd))
+            .unwrap(),
+    );
+    assert_eq!(
+        id, c,
+        "the database's `~/work/app` is nearer than the file's"
+    );
+    let _ = a;
+
+    // Database `~/work` and file `~/work/app`: the file's is nearer.
+    let (a, c) = a_and_c(&database_shallow);
+    let cwd = database_shallow.work_dir("app/src");
+    map(&database_shallow, &database_shallow.work_dir(""), &c);
+    map_in_file(&database_shallow, &[("~/work/app", "a@x.co")]);
+    let (id, _, _) = session(
+        database_shallow
+            .engine_on_path(&database_shallow.fake_bin("claude"))
+            .plan_run(&request(None, &cwd))
+            .unwrap(),
+    );
+    assert_eq!(
+        id, a,
+        "the file's `~/work/app` is nearer than the database's"
+    );
+}
+
+#[test]
+fn the_file_wins_a_directory_both_sources_map() {
+    let fx = Fx::new();
+    let (a, c) = a_and_c(&fx);
+    let cwd = fx.work_dir("app");
+    map(&fx, &cwd, &c);
+    map_in_file(&fx, &[("~/work/app", "a@x.co")]);
+
+    let (id, _, _) = session(
+        fx.engine_on_path(&fx.fake_bin("claude"))
+            .plan_run(&request(None, &cwd))
+            .unwrap(),
+    );
+
+    assert_eq!(id, a);
+}
+
+#[test]
+fn a_trailing_slash_or_symlinked_key_maps_its_directory() {
+    let fx = Fx::new();
+    let (a, c) = a_and_c(&fx);
+    let cwd = fx.work_dir("app");
+    let link = fx.env.home.join("link");
+    std::os::unix::fs::symlink(fx.env.home.join("work"), &link).unwrap();
+    let engine = fx.engine_on_path(&fx.fake_bin("claude"));
+
+    map_in_file(&fx, &[("~/work/", "a@x.co")]);
+    let (id, _, _) = session(engine.plan_run(&request(None, &cwd)).unwrap());
+    assert_eq!(id, a, "a trailing `/`");
+
+    map_in_file(&fx, &[("~/link", "c@x.co")]);
+    let (id, _, _) = session(engine.plan_run(&request(None, &cwd)).unwrap());
+    assert_eq!(id, c, "a symlink to `~/work`");
+}
+
+#[test]
+fn a_symlinked_cwd_finds_a_file_mapping() {
+    let fx = Fx::new();
+    let (a, _) = a_and_c(&fx);
+    let real = fx.env.home.join("real");
+    fs::create_dir_all(&real).unwrap();
+    let link = fx.env.home.join("lnk");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    map_in_file(&fx, &[("~/real", "a@x.co")]);
+
+    let (id, _, _) = session(
+        fx.engine_on_path(&fx.fake_bin("claude"))
+            .plan_run(&request(None, &link))
+            .unwrap(),
+    );
+
+    assert_eq!(id, a);
+}
+
+#[test]
+fn a_missing_directory_is_skipped() {
+    let fx = Fx::new();
+    let (_, c) = a_and_c(&fx);
+    let cwd = fx.work_dir("app");
+    map(&fx, &cwd, &c);
+    map_in_file(&fx, &[("~/gone", "a@x.co")]);
+
+    let plan = fx
+        .engine_on_path(&fx.fake_bin("claude"))
+        .plan_run(&request(None, &cwd))
+        .unwrap();
+
+    assert!(
+        matches!(&plan, RunPlan::Session { account, .. } if account.id == c),
+        "{plan:?}"
+    );
+}
+
+#[test]
+fn a_file_mapping_that_names_no_account_runs_plain_claude_with_a_warning() {
+    let fx = Fx::new();
+    add_same_email(&fx, "dup@x.co");
+    let (nobody, ambiguous) = (fx.work_dir("nobody"), fx.work_dir("ambiguous"));
+    map_in_file(
+        &fx,
+        &[
+            ("~/work/nobody", "nobody"),
+            ("~/work/ambiguous", "dup@x.co"),
+        ],
+    );
+    let engine = fx.engine_on_path(&fx.fake_bin("claude"));
+    let file = config_path(&fx.env);
+
+    for (cwd, written, what) in [
+        (&nobody, "~/work/nobody", "names no account"),
+        (
+            &ambiguous,
+            "~/work/ambiguous",
+            "names more than one account",
+        ),
+    ] {
+        let (spec, warning) = plain(engine.plan_run(&request(None, cwd)).unwrap());
+        assert!(spec.set.is_empty() && spec.remove.is_empty(), "{spec:?}");
+        let warning = warning.expect("a warning names the entry");
+        for part in [
+            written,
+            file.to_str().unwrap(),
+            what,
+            "running plain claude",
+        ] {
+            assert!(warning.contains(part), "{part:?} missing from {warning}");
+        }
+
+        let err = engine.plan_run(&requiring(request(None, cwd))).unwrap_err();
+        match err {
+            EngineError::RequiresSession { why } => {
+                assert!(why.contains(written), "{why}");
+                assert!(why.contains(file.to_str().unwrap()), "{why}");
+            }
+            other => panic!("{other}"),
+        }
+    }
+}
+
+#[test]
+fn a_position_value_wins_its_directory_and_runs_plain_claude() {
+    // A position never resolves (§3.1), and it cannot hand its directory to the database either.
+    let fx = Fx::new();
+    let (a, _) = a_and_c(&fx);
+    let cwd = fx.work_dir("app");
+    map(&fx, &cwd, &a);
+    map_in_file(&fx, &[(&key(&cwd), "2")]);
+
+    let (_, warning) = plain(
+        fx.engine_on_path(&fx.fake_bin("claude"))
+            .plan_run(&request(None, &cwd))
+            .unwrap(),
+    );
+
+    let warning = warning.expect("a warning names the entry");
+    assert!(warning.contains(&key(&cwd)), "{warning}");
+    assert!(warning.contains("is a position"), "{warning}");
+}
+
+#[test]
+fn equivalent_entries_with_different_values_run_plain_claude() {
+    let fx = Fx::new();
+    let (a, c) = a_and_c(&fx);
+    let cwd = fx.work_dir("app");
+    map(&fx, &cwd, &a);
+    let absolute = key(&fs::canonicalize(&cwd).unwrap());
+    let engine = fx.engine_on_path(&fx.fake_bin("claude"));
+
+    map_in_file(&fx, &[("~/work/app", "a@x.co"), (&absolute, "c@x.co")]);
+    let (_, warning) = plain(engine.plan_run(&request(None, &cwd)).unwrap());
+    let warning = warning.expect("a warning names both entries");
+    assert!(warning.contains("~/work/app"), "{warning}");
+    assert!(warning.contains(&absolute), "{warning}");
+    assert!(
+        warning.contains(config_path(&fx.env).to_str().unwrap()),
+        "{warning}"
+    );
+    assert!(warning.contains("different value"), "{warning}");
+
+    map_in_file(&fx, &[("~/work/app", "c@x.co"), (&absolute, "c@x.co")]);
+    let (id, _, _) = session(engine.plan_run(&request(None, &cwd)).unwrap());
+    assert_eq!(id, c, "with equal values they are one mapping");
+}
+
+#[test]
+fn a_file_mapping_to_an_api_key_account_runs_plain_claude_with_a_warning() {
+    // Unlike a database mapping, which keeps `ApiKeyAccount` (above): a shared file can name an
+    // account that is an API key on this machine, and `claude` still starts.
+    let fx = Fx::new();
+    two_accounts(&fx);
+    let k = fx.add_api_key(API_KEY);
+    fx.engine.set_alias(&k, Some("key")).unwrap();
+    let cwd = fx.work_dir("app");
+    map_in_file(&fx, &[("~/work/app", "key")]);
+    let engine = fx.engine_on_path(&fx.fake_bin("claude"));
+
+    let (_, warning) = plain(engine.plan_run(&request(None, &cwd)).unwrap());
+    let warning = warning.expect("a warning names the entry");
+    assert!(warning.contains("~/work/app"), "{warning}");
+    assert!(warning.contains("API-key account"), "{warning}");
+
+    let err = engine
+        .plan_run(&requiring(request(None, &cwd)))
+        .unwrap_err();
+    assert_eq!(err.kind(), "requires-session", "{err}");
+}
+
+#[test]
+fn with_no_store_a_file_mapping_warns_and_creates_nothing() {
+    let fx = Fx::new();
+    let cwd = fx.work_dir("app");
+    map_in_file(&fx, &[("~/work/app", "a@x.co")]);
+
+    let (_, warning) = plain(
+        fx.engine_on_path(&fx.fake_bin("claude"))
+            .plan_run(&request(None, &cwd))
+            .unwrap(),
+    );
+
+    let warning = warning.expect("a warning names the entry");
+    assert!(warning.contains("names no account"), "{warning}");
+    assert!(!fx.env.data_dir().exists());
+}
+
+#[test]
+fn a_corrupt_settings_file_leaves_database_mappings_working() {
+    let fx = Fx::new();
+    let (_, c) = a_and_c(&fx);
+    let cwd = fx.work_dir("app");
+    map(&fx, &cwd, &c);
+    let path = config_path(&fx.env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, "not toml [").unwrap();
+
+    let (id, _, _) = session(
+        fx.engine_on_path(&fx.fake_bin("claude"))
+            .plan_run(&request(None, &cwd))
+            .unwrap(),
+    );
+
+    assert_eq!(id, c);
 }

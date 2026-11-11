@@ -55,6 +55,29 @@ pub fn identity(email: &str) -> Identity {
     }
 }
 
+/// Two accounts sharing `email` in one provider, told apart only by their identity keys, as
+/// Claude Code's email-and-org identity makes them.
+pub fn add_same_email(fx: &Fx, email: &str) {
+    let store = fx.engine.store().unwrap();
+    for (n, org) in [(1, "org-1"), (2, "org-2")] {
+        let id = AccountId::from_string(format!("same-{n}"));
+        let key = format!("{email}\n{org}");
+        store
+            .insert_account(&NewAccount {
+                id: &id,
+                provider: &cc(),
+                position: n,
+                identity_key: &key,
+                identity: &identity(email),
+                kind: "oauth",
+                alias: None,
+                login_expires_at: None,
+                added_at: 1,
+            })
+            .unwrap();
+    }
+}
+
 /// Inserts an account whose identity key is `"<email>\n"`.
 pub fn add(s: &Store, p: &ProviderId, id: &str, email: &str, pos: u32) -> AccountId {
     let aid = AccountId::from_string(id);
