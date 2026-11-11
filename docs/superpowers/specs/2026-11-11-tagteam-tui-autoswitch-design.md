@@ -189,6 +189,10 @@ collection waiting on a request) finishes first, within its requests' own timeou
   · not connected, so its state is unknown`), because those did not fit the 120-column header;
   §6 allows the change.
 
+  While the lane has reported nothing, because its first run is still in a request or a lock
+  wait, and no daemon record or lock holder says who runs auto, the header shows nothing
+  rather than `○ auto off · no daemon`. *(Pre-merge ruling.)*
+
   With a live daemon and a link, the header is the daemon's, as today. The lane has no jobs
   then. The last three rows replace today's false `○ auto off · no daemon` for a daemon that
   runs without its socket: `foreign_engine_holders` leaves the daemon's pid out, so nothing

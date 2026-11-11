@@ -163,6 +163,11 @@ impl DaemonState {
         job_in(self.hosted.as_ref()?, provider)
     }
 
+    /// The lane is configured and has reported nothing yet.
+    pub(crate) fn lane_starting(&self) -> bool {
+        self.lane == LaneLife::Starting
+    }
+
     /// The lane is configured and has not ended `Off` or `Upgraded`: it runs, or is starting.
     pub(crate) fn lane_can_run(&self) -> bool {
         matches!(self.lane, LaneLife::Starting | LaneLife::Running)

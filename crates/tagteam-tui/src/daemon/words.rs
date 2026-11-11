@@ -17,7 +17,8 @@ use crate::theme::Role;
 
 /// §5.2's state for the focus provider, long from 120 columns; each piece with its role.
 /// Nothing while the TUI waits for the daemon's first `status` (T2-11) or the lane's first
-/// report. In order (Ruling 6): the provider's job in a live daemon's last `status`; the lane
+/// report, and nothing after that wait for a lane that still has not reported where nothing
+/// else says who runs auto (S§3.3). In order (Ruling 6): the provider's job in a live daemon's last `status`; the lane
 /// stopped for a newer store; a protocol this TUI does not speak; the daemon's `stopping`; the
 /// lane's own job; a live daemon record with no link; the holder of the provider's engine lock
 /// (C-16); no daemon.
@@ -68,6 +69,8 @@ pub(crate) fn auto_state(state: &State, wide: bool) -> Vec<(String, Role)> {
             Some("not connected, state unknown"),
         ),
         (None, Some(_)) => said("○", Role::Muted, "daemon state unknown", None),
+        // A lane still in its first run has said nothing, and may be running auto.
+        (None, None) if d.lane_starting() => vec![],
         (None, None) => said("○", Role::Muted, "auto off", Some("no daemon")),
     }
 }
@@ -234,6 +237,7 @@ mod tests {
     use tagteam_daemon::protocol::StatusBackoff;
 
     use super::*;
+    use crate::daemon::SETTLE_MS;
     use crate::msg::{LaneReport, Msg};
     use crate::source::AccountsSnapshot;
     use crate::state::Screen;
@@ -569,6 +573,39 @@ mod tests {
         );
         update_live(&mut state, daemon_job("claude-code", "idle", true));
         assert_eq!(auto_state(&state, false)[0], piece("○", Role::Muted));
+    }
+
+    #[test]
+    fn a_lane_that_has_not_reported_says_nothing_after_the_settle_and_not_no_daemon() {
+        // G5: past `SETTLE_MS` the first collection no longer waits, but a lane still in its
+        // first run has said nothing, so "auto off · no daemon" would be false.
+        let mut state = fresh(Screen::Accounts);
+        state.daemon.await_lane(NOW_MS);
+        state.accounts.apply(held(&[], None));
+        crate::update::update(&mut state, Msg::Tick, NOW_MS + SETTLE_MS);
+        assert!(state.daemon.settled());
+        assert!(auto_state(&state, true).is_empty());
+        assert!(auto_state(&state, false).is_empty());
+        crate::update::update(
+            &mut state,
+            Msg::Lane(LaneReport::Off),
+            NOW_MS + SETTLE_MS + 1,
+        );
+        assert_eq!(joined(&auto_state(&state, true)), "○ auto off · no daemon");
+        assert_eq!(joined(&auto_state(&state, false)), "○ auto off · no daemon");
+        // A board shows its job's words.
+        let mut state = fresh(Screen::Accounts);
+        state.daemon.await_lane(NOW_MS);
+        state.accounts.apply(held(&[], None));
+        crate::update::update(
+            &mut state,
+            Msg::Lane(lane_job("auto", true, None)),
+            NOW_MS + SETTLE_MS + 1,
+        );
+        assert_eq!(
+            joined(&auto_state(&state, true)),
+            "● auto on in this window · switches at 90%"
+        );
     }
 
     /// A new link whose `status` has `job` alone.
