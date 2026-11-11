@@ -4,6 +4,10 @@
 //! things. Its registry: `default_provider` must name a provider there, and `run.share_extra`
 //! may not name what those providers' profiles keep private. Its cancel token, which the
 //! settings lock waits on.
+//!
+//! `tagteam map` and `unmap` write the directory mappings of `provider.<id>.mappings` through the
+//! same locked edit (config-mappings spec §3.3, §3.4): [`Engine::write_mapping`] and
+//! [`Engine::remove_config_mappings`].
 
 use std::cell::RefCell;
 use std::fs;
@@ -418,22 +422,16 @@ fn put_mapping(
     let Some(first) = keys.next() else {
         let key = mapping_key(home, dir);
         let mut new = TomlValue::from(value);
-        // An inline table's last value holds the space before `}`; the new last one takes it.
-        let last = table
-            .iter_mut()
-            .filter_map(|(_, item)| item.as_value_mut().filter(|_| inline))
-            .last();
-        if let Some(last) = last {
-            let tail = last.decor().suffix().cloned();
-            last.decor_mut().set_suffix("");
-            if let Some(tail) = tail {
-                new.decor_mut().set_suffix(tail);
-            }
+        if inline && let Some(tail) = last_value(table, None).and_then(take_suffix) {
+            new.decor_mut().set_suffix(tail);
         }
         table.insert(&key, Item::Value(new));
         return key;
     };
     for other in keys {
+        if inline {
+            hand_back_tail(table, &other);
+        }
         table.remove(&other);
     }
     if let Some(old) = table.get_mut(&first) {
@@ -448,6 +446,39 @@ fn put_mapping(
         }
     }
     first
+}
+
+/// The last value of `table` whose key is not `except`.
+fn last_value<'t>(table: &'t mut dyn TableLike, except: Option<&str>) -> Option<&'t mut TomlValue> {
+    table
+        .iter_mut()
+        .filter(|(key, _)| Some(key.get()) != except)
+        .filter_map(|(_, item)| item.as_value_mut())
+        .last()
+}
+
+/// Empties `value`'s suffix and returns it.
+fn take_suffix(value: &mut TomlValue) -> Option<RawString> {
+    let tail = value.decor().suffix().cloned();
+    value.decor_mut().set_suffix("");
+    tail
+}
+
+/// In an inline table `{ "a" = 1 }` the last value's suffix is the space before `}`. When an
+/// entry is added after it or the last entry goes, the space moves to the new last value, so the
+/// braces keep their spacing. This is the removal side: `key`, about to go, hands its suffix to
+/// the entry before it. Nothing moves when `key` is not the last.
+fn hand_back_tail(table: &mut dyn TableLike, key: &str) {
+    if table.iter().last().map(|(last, _)| last) != Some(key) {
+        return;
+    }
+    let tail = table
+        .get_mut(key)
+        .and_then(Item::as_value_mut)
+        .and_then(take_suffix);
+    if let (Some(tail), Some(previous)) = (tail, last_value(table, Some(key))) {
+        previous.decor_mut().set_suffix(tail);
+    }
 }
 
 /// Whether the table at `path` under `table` is written inline, `{ … }`.
@@ -504,7 +535,11 @@ fn remove_mappings(
         }
     }
     let keys = keys_for(table, home, dir);
+    let inline = is_inline(doc.as_table(), &tables);
     for key in &keys {
+        if inline && let Ok(table) = table_at(doc.as_table_mut(), &tables, 0) {
+            hand_back_tail(table, key);
+        }
         remove_entry(doc.as_table_mut(), &tables, key);
     }
     Ok(keys.len())
