@@ -34,7 +34,7 @@ impl Run<'_> {
                     ),
                 )
                 .fix(format!(
-                    "restore the store's account rows (see `store.accounts`), then run `{}` again",
+                    "run `{}` again; if the problem persists, check that the store is readable",
                     command(self.engine, &id, "doctor")
                 )),
             );
@@ -132,7 +132,8 @@ impl Run<'_> {
                                 format!("{left} directory {noun} {verb} still in the database"),
                             )
                             .fix(format!(
-                                "`{}` moves each to config.toml",
+                                "`{}` moves each to config.toml; `{}` lists them",
+                                command(self.engine, &id, "map ACCOUNT PATH"),
                                 command(self.engine, &id, "map")
                             )),
                         );
