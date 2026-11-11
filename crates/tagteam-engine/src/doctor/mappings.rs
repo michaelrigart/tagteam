@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use tagteam_provider::doctor::quoted;
 use tagteam_provider::{Check, Provider};
 
 use crate::mappings::{ConfigMapping, MappingProblem, judge};
@@ -18,11 +19,29 @@ impl Run<'_> {
         let usable = self.all_accounts().is_some();
         let entries = Settings::load(&self.engine.env, &id).0.mappings;
         // No store at all still judges values: on a fresh machine an entry names no account.
-        let Ok(judged) = judge(self.store_ref(), p, &entries) else {
-            return;
-        };
-        let mut conflicts: BTreeMap<PathBuf, Vec<&ConfigMapping>> = BTreeMap::new();
+        // A store that cannot be read judges directories only.
+        let mut judged = judge(self.store_ref().filter(|_| usable), p, &entries);
         let mut found = Vec::new();
+        let mut usable = usable;
+        if let Err(e) = &judged {
+            found.push(
+                Check::warn(
+                    Id::MAPPINGS_VALUE,
+                    format!(
+                        "the accounts {} maps directories to cannot be read: {e}",
+                        file.display()
+                    ),
+                )
+                .fix(format!(
+                    "`{}` shows why the store cannot be read",
+                    command(self.engine, &id, "doctor")
+                )),
+            );
+            judged = judge(None, p, &entries);
+            usable = false;
+        }
+        let judged = judged.unwrap_or_default();
+        let mut conflicts: BTreeMap<PathBuf, Vec<&ConfigMapping>> = BTreeMap::new();
         for m in &judged {
             let key = &m.entry.written;
             match m.problem {
@@ -36,7 +55,7 @@ impl Run<'_> {
                     )
                     .fix(format!(
                         "if no machine uses it, remove the entry by hand or run `{}`",
-                        command(self.engine, &id, &format!("unmap {key}"))
+                        command(self.engine, &id, &format!("unmap {}", quoted(m.dir.path())))
                     )),
                 ),
                 _ if !usable => {}
@@ -63,7 +82,11 @@ impl Run<'_> {
                     )
                     .fix(format!(
                         "`{}` writes a value that resolves",
-                        command(self.engine, &id, &format!("map ACCOUNT {key}"))
+                        command(
+                            self.engine,
+                            &id,
+                            &format!("map ACCOUNT {}", quoted(m.dir.path()))
+                        )
                     )),
                 ),
                 _ => {}
@@ -87,26 +110,42 @@ impl Run<'_> {
                 )
                 .fix(format!(
                     "keep one entry, or run `{}`",
-                    command(self.engine, &id, &format!("map ACCOUNT {}", dir.display()))
+                    command(self.engine, &id, &format!("map ACCOUNT {}", quoted(&dir)))
                 )),
             );
         }
         if let Some(store) = self.store_ref() {
-            let left = store
-                .mappings()
-                .map(|rows| rows.iter().filter(|r| r.provider == id).count())
-                .unwrap_or(0);
-            if left > 0 {
-                found.push(
+            match store.mappings() {
+                Ok(rows) => {
+                    let left = rows.iter().filter(|r| r.provider == id).count();
+                    if left > 0 {
+                        let (noun, verb) = if left == 1 {
+                            ("mapping", "is")
+                        } else {
+                            ("mappings", "are")
+                        };
+                        found.push(
+                            Check::info(
+                                Id::MAPPINGS_DATABASE,
+                                format!("{left} directory {noun} {verb} still in the database"),
+                            )
+                            .fix(format!(
+                                "`{}` moves each to config.toml",
+                                command(self.engine, &id, "map")
+                            )),
+                        );
+                    }
+                }
+                Err(e) => found.push(
                     Check::info(
                         Id::MAPPINGS_DATABASE,
-                        format!("{left} directory mapping(s) are still in the database"),
+                        format!("the database's directory mappings cannot be read: {e}"),
                     )
                     .fix(format!(
-                        "`{}` moves each to config.toml",
-                        command(self.engine, &id, "map")
+                        "`{}` shows why the store cannot be read",
+                        command(self.engine, &id, "doctor")
                     )),
-                );
+                ),
             }
         }
         for check in found {

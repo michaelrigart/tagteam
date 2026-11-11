@@ -3349,9 +3349,32 @@ fn doctor_reports_config_mappings_that_do_not_apply() {
     let values = with("mappings.value");
     assert_eq!(values.len(), 2);
     assert!(values.iter().all(|c| c.status == CheckStatus::Warn));
+    assert!(
+        values
+            .iter()
+            .any(|c| c.message.contains("names no account here")),
+        "{values:#?}"
+    );
+    assert!(
+        values.iter().any(|c| c
+            .message
+            .contains("is a position, which a mapping never names")),
+        "{values:#?}"
+    );
+    assert!(
+        values
+            .iter()
+            .all(|c| c.message.contains("`claude` runs plain")),
+        "{values:#?}"
+    );
     let conflicts = with("mappings.conflict");
     assert_eq!(conflicts.len(), 1);
     assert_eq!(conflicts[0].status, CheckStatus::Warn);
+    assert!(
+        conflicts[0].message.contains("`x`") && conflicts[0].message.contains("`y`"),
+        "{}",
+        conflicts[0].message
+    );
     let database = with("mappings.database");
     assert_eq!(database.len(), 1);
     assert_eq!(database[0].status, CheckStatus::Info);
@@ -3371,4 +3394,28 @@ fn doctor_reports_config_mappings_that_do_not_apply() {
         "{:#?}",
         report.checks
     );
+}
+
+#[test]
+fn an_unusable_store_leaves_only_the_missing_directories_of_the_mappings() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let root = fx.dir.path().join("maps");
+    fs::create_dir_all(root.join("known")).unwrap();
+    let r = root.display();
+    let path = fx.env.config_dir().join("config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        format!(
+            "[provider.claude-code.mappings]\n\"{r}/gone\" = \"a\"\n\"{r}/known\" = \"nobody\"\n\"{r}/known/\" = \"y\"\n"
+        ),
+    )
+    .unwrap();
+    sql(&fx).pragma_update(None, "user_version", 99).unwrap();
+    let report = doctor(&fx);
+    assert_eq!(one(&report, "store.schema").status, CheckStatus::Fail);
+    assert_eq!(found(&report, "mappings.directory").len(), 1);
+    assert!(found(&report, "mappings.value").is_empty());
+    assert!(found(&report, "mappings.conflict").is_empty());
 }
