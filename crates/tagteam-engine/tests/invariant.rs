@@ -479,6 +479,7 @@ fn run_the_daemon_s_work_on(fx: &Fx) {
     let provider = fx.provider();
     let cfg = AutoConfig {
         threshold: 90.0,
+        ceiling: 100.0,
         hysteresis_pct: 10.0,
         cooldown_s: 300,
         interval_s: 60,

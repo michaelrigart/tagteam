@@ -23,6 +23,7 @@ const T0: i64 = 1_790_000_000;
 fn cfg(p: &dyn Provider) -> AutoConfig {
     AutoConfig {
         threshold: 90.0,
+        ceiling: 100.0,
         hysteresis_pct: 10.0,
         cooldown_s: 300,
         interval_s: 60,

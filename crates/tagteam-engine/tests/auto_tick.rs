@@ -37,6 +37,7 @@ const LONG_RESETS: i64 = T0 + 291_630;
 fn cfg(p: &dyn Provider) -> AutoConfig {
     AutoConfig {
         threshold: 90.0,
+        ceiling: 100.0,
         hysteresis_pct: 10.0,
         cooldown_s: 300,
         interval_s: 60,

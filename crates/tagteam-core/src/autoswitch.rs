@@ -64,6 +64,9 @@ impl Trigger {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AutoConfig {
     pub threshold: f64,
+    /// `autoswitch.ceiling` (ceiling spec §3.2): usage at or above it is full. 100 decides as
+    /// before the ceiling existed.
+    pub ceiling: f64,
     pub hysteresis_pct: f64,
     pub cooldown_s: i64,
     pub interval_s: i64,
@@ -353,6 +356,18 @@ fn at_limit(headroom: f64) -> bool {
     headroom <= 0.0
 }
 
+/// Ceiling spec §3.1: usage at or above the ceiling. A window at exactly the ceiling is full too
+/// (`blocked_until`'s level test).
+fn full(headroom: f64, ceiling: f64) -> bool {
+    headroom <= 100.0 - ceiling
+}
+
+/// Ceiling spec §3.1: usage more than `RECOVERED_PTS` below the ceiling. A soft move lands only
+/// on a clear account.
+fn clear(headroom: f64, ceiling: f64) -> bool {
+    headroom > 100.0 - ceiling + RECOVERED_PTS
+}
+
 /// §11.2 step 5: `n` unknown ticks in a row have reached `autoswitch.unhealthy_ticks`.
 fn unhealthy_limit_reached(n: u32, cfg: &AutoConfig) -> bool {
     n >= cfg.unhealthy_ticks
@@ -404,15 +419,16 @@ fn every_account_above(active_h: Option<f64>, oauth: &[Rated], threshold: f64) -
 }
 
 /// §11.2 step 8, every account above the threshold: this pair is judged on the recovery axis
-/// when both are spent (headroom within 3 points of none) or either recovers within 4 h.
+/// when both are spent (headroom within 3 points of the ceiling's) or either recovers within 4 h.
 fn recovery_axis_useful(
     active_h: f64,
     headroom: f64,
     active_at: Option<i64>,
     at: Option<i64>,
     now: i64,
+    ceiling: f64,
 ) -> bool {
-    let spent = |h: f64| h <= SPENT_HEADROOM_PCT;
+    let spent = |h: f64| h - (100.0 - ceiling) <= SPENT_HEADROOM_PCT;
     let soon = |at: Option<i64>| at.is_some_and(|at| at - now <= RECOVERY_HORIZON_S);
     (spent(active_h) && spent(headroom)) || soon(active_at) || soon(at)
 }
@@ -539,7 +555,7 @@ fn triggered(active: &Rated, st: &AutoState, cfg: &AutoConfig) -> Result<Trigger
         return go(Trigger::Failover, kept);
     }
     match active.headroom {
-        Some(h) if at_limit(h) => go(Trigger::AtLimit, 0),
+        Some(h) if full(h, cfg.ceiling) => go(Trigger::AtLimit, 0),
         Some(h) if below_threshold(h, cfg.threshold) => match cfg.effective_strategy() {
             AutoStrategy::Best => Err(no_switch(NoSwitchReason::BelowThreshold, String::new(), 0)),
             AutoStrategy::ConsumeFirst => go(Trigger::ConsumeFirst, 0),
@@ -578,18 +594,31 @@ impl Ranking<'_> {
             self.active.headroom
         }
     }
+
+    /// Ceiling spec §3.1: `failover`, or `at-limit` with the active account out. Such a move
+    /// takes any room and falls back to the API keys; any other `at-limit` is soft.
+    fn hard(&self) -> bool {
+        self.trigger == Trigger::Failover
+            || (self.trigger == Trigger::AtLimit && self.active.headroom.is_some_and(at_limit))
+    }
 }
 
 /// §11.2 step 8 and §11.3: the OAuth targets, best first. Unknown headroom and headroom ≤ 0
-/// never rank. `at-limit` and `failover` skip every anti-flap gate; the bar is lifted only when
-/// the barred ranking is empty and the barred account has recovered, and then the ranking runs
-/// again without it.
+/// never rank. `at-limit` and `failover` skip every anti-flap gate: a hard move takes any room,
+/// a soft one only a clear account (ceiling spec §3.3). The bar is lifted only when the barred
+/// ranking is empty and the barred account has recovered, and then the ranking runs again
+/// without it.
 fn rank(r: &Ranking, oauth: &[Rated]) -> Vec<AccountId> {
     if r.trigger.must_move() {
-        let usable = oauth
-            .iter()
-            .filter(|c| c.headroom.is_some_and(|h| !at_limit(h)));
-        return ordered(usable.collect(), most_headroom);
+        let usable = |h: f64| {
+            if r.hard() {
+                !at_limit(h)
+            } else {
+                clear(h, r.cfg.ceiling)
+            }
+        };
+        let landing = oauth.iter().filter(|c| c.headroom.is_some_and(usable));
+        return ordered(landing.collect(), most_headroom);
     }
     let bar = barred(r.st, &r.active.account.id);
     let ranked = gated(r, oauth, bar);
@@ -617,13 +646,24 @@ fn gated(r: &Ranking, oauth: &[Rated], bar: Option<&AccountId>) -> Vec<AccountId
         let Some(h) = c.headroom else {
             return false;
         };
-        if at_limit(h) || bar == Some(&c.account.id) || !landing_ok(h, r.cfg.threshold, all_above) {
+        if full(h, r.cfg.ceiling)
+            || bar == Some(&c.account.id)
+            || !landing_ok(h, r.cfg.threshold, all_above)
+        {
             return false;
         }
         match r.trigger {
             Trigger::ConsumeFirst => resets_sooner(c.long_reset, r.active.long_reset),
             _ if all_above => {
-                if recovery_axis_useful(active_h, h, r.active.recovery_at, c.recovery_at, r.now) {
+                let useful = recovery_axis_useful(
+                    active_h,
+                    h,
+                    r.active.recovery_at,
+                    c.recovery_at,
+                    r.now,
+                    r.cfg.ceiling,
+                );
+                if useful {
                     recovers_sooner(c.recovery_at, r.active.recovery_at)
                 } else {
                     doubles_headroom(h, active_h)
@@ -749,8 +789,8 @@ pub fn decide(s: &Snapshot, st: &AutoState, cfg: &AutoConfig, phase: Phase) -> D
         now: s.now,
     };
     let mut targets = rank(&ranking, &oauth);
-    // Steps 9 and 10: at-limit and failover fall back to the API keys, in position order.
-    if t.trigger.must_move() {
+    // Steps 9 and 10: a hard move falls back to the API keys, in position order.
+    if ranking.hard() {
         let mut keys: Vec<&AccountSnapshot> =
             candidates.iter().copied().filter(|a| a.api_key).collect();
         keys.sort_by_key(|a| a.position);
@@ -966,6 +1006,7 @@ mod tests {
     fn cfg() -> AutoConfig {
         AutoConfig {
             threshold: 90.0,
+            ceiling: 100.0,
             hysteresis_pct: 10.0,
             cooldown_s: 300,
             interval_s: 60,
@@ -1880,17 +1921,32 @@ mod tests {
     #[test]
     fn the_recovery_axis_is_useful_when_both_are_spent_or_either_recovers_within_4_h() {
         let far = Some(NOW + 86_400);
-        assert!(recovery_axis_useful(3.0, 2.0, far, far, NOW));
-        assert!(!recovery_axis_useful(3.1, 2.0, far, far, NOW));
-        assert!(!recovery_axis_useful(2.0, 3.1, far, far, NOW));
-        assert!(recovery_axis_useful(8.0, 9.0, Some(NOW + 14_400), far, NOW));
-        assert!(recovery_axis_useful(8.0, 9.0, far, Some(NOW + 14_400), NOW));
+        assert!(recovery_axis_useful(3.0, 2.0, far, far, NOW, 100.0));
+        assert!(!recovery_axis_useful(3.1, 2.0, far, far, NOW, 100.0));
+        assert!(!recovery_axis_useful(2.0, 3.1, far, far, NOW, 100.0));
+        assert!(recovery_axis_useful(
+            8.0,
+            9.0,
+            Some(NOW + 14_400),
+            far,
+            NOW,
+            100.0
+        ));
+        assert!(recovery_axis_useful(
+            8.0,
+            9.0,
+            far,
+            Some(NOW + 14_400),
+            NOW,
+            100.0
+        ));
         assert!(!recovery_axis_useful(
             8.0,
             9.0,
             Some(NOW + 14_401),
             None,
-            NOW
+            NOW,
+            100.0
         ));
     }
 
@@ -2458,5 +2514,199 @@ mod tests {
             130,
             "an unexpected code is never hidden"
         );
+    }
+
+    fn ceiling(c: f64) -> AutoConfig {
+        AutoConfig {
+            ceiling: c,
+            ..cfg()
+        }
+    }
+
+    fn is_no_switch(d: &Decided) -> bool {
+        matches!(d.decision, Decision::NoSwitch { .. })
+    }
+
+    #[test]
+    fn a_full_live_account_moves_at_once_past_the_cooldown_and_the_bar() {
+        let s = snap(2, vec![at(1, 80.0), at(2, 95.0)]);
+        let st = AutoState {
+            last_switch_at: Some(NOW - 10),
+            last_switch_from: Some(id(1)),
+            last_switch_to: Some(id(2)),
+            left_headroom: Some(50.0),
+            left_trigger: Some(Trigger::Proactive),
+            ..AutoState::default()
+        };
+        assert_eq!(
+            switched(&run(&s, &st, &ceiling(95.0))),
+            (Trigger::AtLimit, vec![1])
+        );
+        assert_eq!(stopped(&run(&s, &st, &ceiling(100.0))).0, Cooldown);
+    }
+
+    #[test]
+    fn a_soft_move_lands_only_more_than_three_points_below_the_ceiling() {
+        let state = AutoState::default();
+        let run_at = |c: f64, live: f64, candidate: f64| {
+            let s = snap(2, vec![at(1, candidate), at(2, live)]);
+            run(&s, &state, &ceiling(c))
+        };
+        for candidate in [93.0, 92.0] {
+            let d = run_at(95.0, 95.0, candidate);
+            assert_eq!(
+                stopped(&d).0,
+                NoQualifyingCandidate,
+                "{candidate}% is not clear"
+            );
+            assert_eq!(stopped(&d).1, Outcome::Blocked);
+        }
+        assert_eq!(
+            switched(&run_at(95.0, 95.0, 91.9)),
+            (Trigger::AtLimit, vec![1])
+        );
+        assert_eq!(
+            switched(&run_at(95.0, 100.0, 93.0)),
+            (Trigger::AtLimit, vec![1]),
+            "a live account that is out takes any room"
+        );
+        for candidate in [93.0, 91.9] {
+            let d = run_at(100.0, 95.0, candidate);
+            assert_eq!(stopped(&d).0, NoQualifyingCandidate, "{candidate}%");
+            assert_eq!(stopped(&d).1, Outcome::Blocked);
+        }
+        assert_eq!(
+            switched(&run_at(100.0, 100.0, 93.0)),
+            (Trigger::AtLimit, vec![1])
+        );
+    }
+
+    #[test]
+    fn a_hard_move_takes_room_wherever_it_is() {
+        for c in [95.0, 100.0] {
+            let one = snap(5, vec![at(1, 96.0), at(5, 100.0)]);
+            assert_eq!(
+                switched(&run(&one, &AutoState::default(), &ceiling(c))),
+                (Trigger::AtLimit, vec![1]),
+                "ceiling {c}"
+            );
+            let many = snap(
+                5,
+                vec![
+                    at(1, 97.0),
+                    at(2, 93.0),
+                    at(3, 99.0),
+                    at(4, 85.0),
+                    at(5, 100.0),
+                ],
+            );
+            assert_eq!(
+                switched(&run(&many, &AutoState::default(), &ceiling(c))),
+                (Trigger::AtLimit, vec![4, 2, 1, 3]),
+                "ceiling {c}: most headroom first, full or not"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ceiling_never_moves_auto_onto_an_api_key() {
+        let keys = |c: f64| AutoConfig {
+            ceiling: c,
+            ..with_keys()
+        };
+        let state = AutoState::default();
+        let live_at = |pct: f64| snap(2, vec![at(1, 97.0), at(2, pct), api_key(3)]);
+        assert!(
+            is_no_switch(&run(&live_at(95.0), &state, &keys(95.0))),
+            "a soft move never appends the API keys"
+        );
+        assert_eq!(
+            switched(&run(&live_at(100.0), &state, &keys(95.0))),
+            (Trigger::AtLimit, vec![1, 3])
+        );
+        let d = run(&live_at(95.0), &state, &keys(100.0));
+        assert_eq!(stopped(&d).0, NoQualifyingCandidate);
+        assert_eq!(
+            switched(&run(&live_at(100.0), &state, &keys(100.0))),
+            (Trigger::AtLimit, vec![1, 3])
+        );
+    }
+
+    #[test]
+    fn proactive_never_lands_on_a_full_account() {
+        let s = snap(2, vec![oauth(1, 96.0, 10.0), at(2, 92.0)]);
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &ceiling(100.0))),
+            (Trigger::Proactive, vec![1]),
+            "by the recovery axis"
+        );
+        assert!(is_no_switch(&run(
+            &s,
+            &AutoState::default(),
+            &ceiling(95.0)
+        )));
+    }
+
+    #[test]
+    fn spent_is_measured_from_the_ceiling() {
+        let s = snap(
+            2,
+            vec![reset(at(1, 92.5), "7d", Some(NOW + 20_000)), at(2, 93.0)],
+        );
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &ceiling(95.0))),
+            (Trigger::Proactive, vec![1]),
+            "both within 3 points of the ceiling: the recovery axis, and 1 recovers sooner"
+        );
+        assert_eq!(
+            stopped(&run(&s, &AutoState::default(), &ceiling(100.0))).0,
+            NoQualifyingCandidate,
+            "the headroom axis: 7.5 is under twice 7"
+        );
+    }
+
+    #[test]
+    fn a_dip_below_the_ceiling_never_draws_a_soft_move_back() {
+        let two = snap(2, vec![at(1, 94.9), at(2, 95.0)]);
+        for c in [95.0, 100.0] {
+            assert_eq!(
+                stopped(&run(&two, &AutoState::default(), &ceiling(c))).0,
+                NoQualifyingCandidate,
+                "two accounts, ceiling {c}"
+            );
+        }
+        let first = snap(1, vec![at(1, 95.0), at(2, 94.9), at(3, 91.0)]);
+        assert_eq!(
+            switched(&run(&first, &AutoState::default(), &ceiling(95.0))),
+            (Trigger::AtLimit, vec![3])
+        );
+        assert_eq!(
+            stopped(&run(&first, &AutoState::default(), &ceiling(100.0))).0,
+            NoQualifyingCandidate
+        );
+        let st = AutoState {
+            last_switch_from: Some(id(1)),
+            last_switch_to: Some(id(3)),
+            left_trigger: Some(Trigger::AtLimit),
+            left_headroom: Some(5.0),
+            last_switch_at: Some(NOW),
+            ..AutoState::default()
+        };
+        let second = snap(3, vec![at(1, 94.9), at(2, 94.9), at(3, 95.0)]);
+        assert_eq!(
+            stopped(&run(&second, &st, &ceiling(95.0))).0,
+            NoQualifyingCandidate
+        );
+        assert_eq!(stopped(&run(&second, &st, &ceiling(100.0))).0, Cooldown);
+    }
+
+    #[test]
+    fn full_agrees_with_the_window_test_at_a_fractional_ceiling() {
+        let on = |live: f64| {
+            let s = snap(2, vec![at(1, 50.0), at(2, live)]);
+            run(&s, &AutoState::default(), &ceiling(97.3))
+        };
+        assert_eq!(switched(&on(97.3)), (Trigger::AtLimit, vec![1]));
+        assert_eq!(switched(&on(97.2)), (Trigger::Proactive, vec![1]));
     }
 }

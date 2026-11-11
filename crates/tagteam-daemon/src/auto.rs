@@ -13,7 +13,8 @@ use tagteam_core::autoswitch::{
 };
 use tagteam_engine::auto::{AutoEngine, AutoEvent, EventSink, TickOutcome};
 use tagteam_engine::settings::{
-    COOLDOWN_SECONDS_RANGE, INTERVAL_SECONDS_RANGE, Settings, THRESHOLD_RANGE,
+    COOLDOWN_SECONDS_RANGE, DEFAULT_CEILING, INTERVAL_SECONDS_RANGE, Settings, THRESHOLD_RANGE,
+    pair_holds,
 };
 use tagteam_engine::{Engine, EngineError};
 
@@ -38,10 +39,16 @@ pub struct AutoFlags {
 /// What one provider's engine decides with: its settings, the flags over them, and the
 /// provider's long window (§4.5).
 pub fn auto_config(s: &Settings, flags: &AutoFlags, long_window: Option<&str>) -> AutoConfig {
+    let threshold = flags
+        .threshold
+        .map_or(s.threshold, |v| clamped(v, THRESHOLD_RANGE));
     AutoConfig {
-        threshold: flags
-            .threshold
-            .map_or(s.threshold, |v| clamped(v, THRESHOLD_RANGE)),
+        threshold,
+        ceiling: if pair_holds(threshold, s.ceiling) {
+            s.ceiling
+        } else {
+            DEFAULT_CEILING
+        },
         hysteresis_pct: s.hysteresis_pct,
         cooldown_s: flags
             .cooldown_s
@@ -402,6 +409,35 @@ mod tests {
     }
 
     #[test]
+    fn the_ceiling_is_the_setting_unless_the_threshold_reaches_it() {
+        let settings = Settings {
+            threshold: 90.0,
+            ceiling: 95.0,
+            ..Settings::default()
+        };
+        let ceiling = |settings: &Settings, threshold: Option<f64>| {
+            let flags = AutoFlags {
+                threshold,
+                ..AutoFlags::default()
+            };
+            auto_config(settings, &flags, None).ceiling
+        };
+        assert_eq!(ceiling(&settings, None), 95.0);
+        assert_eq!(ceiling(&settings, Some(94.0)), 95.0);
+        assert_eq!(ceiling(&settings, Some(95.0)), 100.0, "a flag reaches it");
+        assert_eq!(
+            ceiling(&settings, Some(120.0)),
+            100.0,
+            "clamped, then above"
+        );
+        let broken = Settings {
+            threshold: 96.0,
+            ..settings
+        };
+        assert_eq!(ceiling(&broken, None), 100.0, "a broken pair runs at 100");
+    }
+
+    #[test]
     fn flags_override_the_settings_clamped_to_their_ranges() {
         let settings = Settings {
             threshold: 80.0,
@@ -419,6 +455,7 @@ mod tests {
             from_file,
             AutoConfig {
                 threshold: 80.0,
+                ceiling: 100.0,
                 hysteresis_pct: 5.0,
                 cooldown_s: 600,
                 interval_s: 120,

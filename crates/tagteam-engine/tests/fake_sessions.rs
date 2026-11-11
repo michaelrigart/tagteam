@@ -658,6 +658,7 @@ fn a_tick_never_targets_a_fakeagent_candidate_a_session_owns() {
     assert_eq!(ffx.fake_live_label().as_deref(), Some("bob@ws"));
     let config = AutoConfig {
         threshold: 90.0,
+        ceiling: 100.0,
         hysteresis_pct: 10.0,
         cooldown_s: 300,
         interval_s: 60,
