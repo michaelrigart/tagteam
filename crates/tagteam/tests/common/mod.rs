@@ -20,12 +20,14 @@ use assert_cmd::Command;
 use serde_json::{Value, json};
 use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::live::Platform;
+use tagteam_cc::usage::format_iso8601;
 use tagteam_cc::{ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Window, WindowKind};
 use tagteam_engine::daemon::{MAX_SOCKET_PATH, daemon_socket_path};
 use tagteam_engine::store::{Eligibility, Reserve, Store};
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::atomic::ensure_private_dir;
+use tagteam_provider::mock_server::{MockReply, MockServer};
 use tagteam_provider::splice::replace_top_level;
 use tagteam_provider::{
     Env, FakeKeychain, FileKeychain, FlockGuard, Keychain, LAUNCH_DIR, ProfileMarker, Provider,
@@ -321,6 +323,55 @@ pub fn live_email(root: &Path) -> String {
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+/// The usage endpoint's path.
+pub const USAGE: &str = "/api/oauth/usage";
+
+/// The recorded usage reply, its windows' resets moved to fixed distances from `now` (as
+/// usage_cli.rs's).
+pub fn usage_reply(now: i64) -> MockReply {
+    let recorded: Value = serde_json::from_str(include_str!(
+        "../../../tagteam-cc/tests/fixtures/endpoints/usage-200.json"
+    ))
+    .unwrap();
+    let mut body = recorded["body"].clone();
+    body["five_hour"]["resets_at"] = json!(format_iso8601(now + 9_630));
+    body["seven_day"]["resets_at"] = json!(format_iso8601(now + 291_630));
+    body["limits"][2]["resets_at"] = json!(format_iso8601(now + 291_630));
+    MockReply::Json { status: 200, body }
+}
+
+/// `a@x.co` at position 1 and `b@x.co` at position 2 (live), each with its own access token, so
+/// the server's log tells their identities apart. Neither has a reading.
+pub fn two_bearers(root: &Path) -> (AccountId, AccountId) {
+    let env = Env::for_test(root);
+    let kc = FileKeychain::new(root.join("keychain"));
+    seed_home(&env);
+    login_with_token(&env, &kc, "a@x.co", "", "at-a", "rt-a");
+    cmd(root).arg("add").assert().success();
+    login_with_token(&env, &kc, "b@x.co", "", "at-b", "rt-b");
+    cmd(root).arg("add").assert().success();
+    let store = Store::open_existing(&env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap();
+    let rows = store.accounts(&ProviderId::new(CLAUDE_CODE)).unwrap();
+    (rows[0].id.clone(), rows[1].id.clone())
+}
+
+/// The usage requests the server logged with `Bearer <at>`, from any process.
+pub fn sent_with(server: &MockServer, at: &str) -> usize {
+    let bearer = format!("Bearer {at}");
+    server
+        .requests()
+        .iter()
+        .filter(|r| {
+            r.path.starts_with(USAGE)
+                && r.headers
+                    .iter()
+                    .any(|(k, v)| k == "authorization" && *v == bearer)
+        })
+        .count()
 }
 
 /// A running binary whose stdout and stderr are read on threads of their own while it runs, so
