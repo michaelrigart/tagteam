@@ -1591,6 +1591,31 @@ fn map_and_unmap_keep_an_inline_mappings_table_inline() {
 }
 
 #[test]
+fn map_and_unmap_keep_a_dotted_mappings_table_dotted() {
+    // Review focus 4: a hand-written dotted table is edited in its own style.
+    let fx = Fx::new();
+    let x = home_dir(&fx, "x");
+    let y = home_dir(&fx, "y");
+    write_config(&fx, "[provider.claude-code]\nmappings.\"~/x\" = \"a\"\n");
+
+    map(&fx, &y, "b");
+    assert_eq!(
+        config_text(&fx),
+        "[provider.claude-code]\nmappings.\"~/x\" = \"a\"\nmappings.\"~/y\" = \"b\"\n"
+    );
+
+    assert_eq!(
+        fx.engine.remove_config_mappings(Some(&cc()), &x).unwrap(),
+        1
+    );
+    assert_eq!(
+        fx.engine.remove_config_mappings(Some(&cc()), &y).unwrap(),
+        1
+    );
+    assert_eq!(config_text(&fx), "");
+}
+
+#[test]
 fn a_mappings_entry_that_is_not_a_table_is_invalid() {
     let fx = Fx::new();
     let dir = home_dir(&fx, "w");
