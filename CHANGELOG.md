@@ -30,6 +30,9 @@ with the one before, so any release may contain breaking changes. Each section s
   to an account before and resolves to another account, or to none, after. Each warning says what
   the mapping names now, whether or not its directory exists on this machine. They never edit the
   file.
+- `tagteam tui` switches accounts while it is open and no daemon runs, with the same decision,
+  settings and request budget as `tagteam auto` and the daemon. When a daemon starts, the TUI
+  stands down. `P` pauses and resumes it through `daemon.autoswitch`, which now pauses both.
 
 ### Changed
 
@@ -51,6 +54,16 @@ with the one before, so any release may contain breaking changes. Each section s
 - `tagteam map` refuses an API-key account, since `run` never starts a session for one.
 - `tagteam map` refuses an account that has no alias and whose email names more than one
   account, and says to give it an alias first.
+- `tagteam auto` refuses a provider that a `tagteam tui` switches for, naming the window's pid
+  and saying to press `P` there to pause it, or to quit it. `tagteam doctor` names the window the
+  same way when it reports who holds an engine lock.
+- `tagteam tui`'s header says `auto on in this window` for its own switching, and `auto runs in
+  another tagteam window` for another TUI's. It says when the daemon runs but the TUI has no
+  link to its socket (`daemon runs (pid N) · not connected, state unknown`), where it said
+  `auto off · no daemon`. `P` then changes nothing and says why.
+- `tagteam tui` writes nothing once a newer tagteam has migrated the store: it stops its
+  refreshes and refuses `r` and every account action but `doctor` and `P`, with `tagteam was
+  upgraded; restart the TUI`.
 
 ## [20261031.2215.0] - 2026-10-31
 

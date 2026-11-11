@@ -138,7 +138,7 @@ internal (`relogin required`, `pts/h (regression)`, `no-qualifying-candidate`).
 | C-13 | The live `token-index` re-query throttle rises from 5 s to 30 s, except while the TUI's own refresh runs and after `r` | Each live session's heartbeat moves `changed_at` (PERF-D-2); hardening keeps the store side as is (H2 decision 3) |
 | C-14 | Old switch events without a stored reason are worded from their trigger | Reconstructing the binding window from samples is guesswork for rows that predate §12.4 |
 | C-15 | The shared words (§11.1) change in T3, with the Accounts screen, and T3 waits for R4 | T3's screens are written in the new words; shipping them earlier would either edit `usage_words` under R4 or make the TUI and `list` disagree until T5 |
-| C-16 | Without a daemon, the header checks the engine lock: a foreground `tagteam auto` shows as `● auto runs in another terminal (pid N)` | `Engine::engine_holder` (`auto.rs:385`) reads it without trying the lock; "auto off" would be false while that runs. A cron `auto --once` between runs is genuinely off |
+| C-16 | Without a daemon, the header checks the engine lock: a foreground `tagteam auto` shows as `● auto runs in another terminal (pid N)`, and another TUI as `● auto runs in another tagteam window (pid N)` | `Engine::engine_holder` (`auto.rs:385`) reads it without trying the lock; "auto off" would be false while that runs. The holder record says whether the holder is the daemon, a `tagteam auto` or a TUI. A cron `auto --once` between runs is genuinely off. *(Amended by the TUI autoswitch spec, [§3.3, §3.6](2026-11-11-tagteam-tui-autoswitch-design.md).)* |
 | C-17 | Under `autoswitch.strategy = consume-first` the header says `● auto on · uses the soonest reset first`, and switch sentences use the trigger's words, never the stored percentage | That strategy switches below the threshold (`autoswitch.rs:526-528`), so "switches at 90%" and "alex's 5h reached 40%" would mislead |
 
 ## 3. Constraints
@@ -353,11 +353,19 @@ account's provider, then `? keys`, which is never dropped.
 | `auto`, strategy `consume-first` (C-17) | `● auto on · uses the soonest reset first` | `● auto on · soonest reset` |
 | `collect`, `autoswitch` false | `‖ auto paused · P resumes` | `‖ paused · P resumes` |
 | `collect`, `autoswitch` true | `○ auto idle · needs 2 usable accounts` | `○ needs 2 usable accounts` |
-| `waiting` for `engine-lock` | `● auto runs in another terminal (pid 4711)` | `● auto in pid 4711` |
+| `waiting` for `engine-lock` | `● auto runs in another terminal (pid 4711)`; a TUI holder: `● auto runs in another tagteam window (pid 4711)` | `● auto in pid 4711` |
 | `waiting` for `schema` | `! daemon is outdated · restarting` | `! daemon outdated` |
 | `idle` | `○ auto off · no usable account` | `○ no usable account` |
 | any, with `backoff` | adds ` · keychain locked until 15:05` in warn | `! keychain locked 15:05` replaces the state |
 | no daemon, the engine lock held by a live `tagteam auto` (C-16) | `● auto runs in another terminal (pid 4711)` | `● auto in pid 4711` |
+| no daemon, the engine lock held by another TUI (C-16) | `● auto runs in another tagteam window (pid 4711)` | `● auto in pid 4711` |
+| the TUI's own auto lane, `auto` | `● auto on in this window · switches at 90%` | `● auto on · at 90%` |
+| the same, strategy `consume-first` (C-17) | `● auto on in this window · uses the soonest reset first` | `● auto on · soonest reset` |
+| the lane's `collect`, `idle` and `backoff` | as the daemon's rows above | as the daemon's rows above |
+| the lane stopped for a newer store schema | `! auto stopped · tagteam was upgraded; restart the TUI` | `! restart the TUI` |
+| a live daemon record, no socket link, the engine lock held by the daemon | `● auto runs in the daemon (pid 4711) · not connected` | `● auto in daemon` |
+| the same, the lock held by another process | that holder's row above | that holder's row above |
+| the same, the lock not held (the daemon paused, idle or waiting) | `○ daemon runs (pid 4711) · not connected, state unknown` | `○ daemon state unknown` |
 | no daemon, no live holder | `○ auto off · no daemon` | `○ auto off · no daemon` |
 | `stopping` | `! daemon stopping (upgrade)` | `! daemon stopping` |
 | protocol mismatch | `! daemon version unsupported` | `! daemon unsupported` |
@@ -368,6 +376,11 @@ account's provider, then `? keys`, which is never dropped.
 - **The engine lock** (timer mode only) is read with every `accounts` by `EngineSource`, through
   `Engine::engine_holder`, and judged live by an exact pid and start-time match, as `doctor` and
   the daemon's `collect` mode judge it.
+- **The rows from "the TUI's own auto lane" down** are the TUI autoswitch spec's. While no daemon
+  runs, the TUI's own lane hosts the daemon's provider jobs and the header renders its status
+  board as it renders a daemon's `status`. The daemon-without-a-socket rows read the daemon's
+  lock record, since the socket link is not the signal.
+  *(Amended by the TUI autoswitch spec, [§3.3](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 - **"Live"** is no longer used for the daemon link: it also meant Claude Code's current login.
 - **Mode changes toast once:** `! lost the daemon; tagteam updates on its own every 30 s` and
   `✓ connected to the daemon` (UX-5).
@@ -832,7 +845,7 @@ re-read of the views.
 | Everywhere | `q` | close the open overlay, else quit | pinned |
 | Everywhere | `Esc` | close the overlay; else back one level (Tokens drill-down; History opened from Accounts returns there; a History scope returns to all accounts) | — |
 | Everywhere | `w` | History at auto's last action (§5.3) | — |
-| Everywhere | `P` | pause or resume auto (confirm); without a daemon, says how to install it | Accounts |
+| Everywhere | `P` | pause or resume auto (confirm), the daemon's or the TUI's own lane; with neither, says how to install a daemon; with a daemon it has no link to, says the TUI isn't connected to it *(Amended by the TUI autoswitch spec, [§3.4](2026-11-11-tagteam-tui-autoswitch-design.md).)* | Accounts |
 | Everywhere | `r` | update usage now (Tokens: the index), with feedback (§9.7) | yes |
 | Everywhere | `A`, `D` | add Claude Code's current login, doctor | — |
 | Everywhere | `Ctrl-C`, `Ctrl-Z` | quit, suspend | — |

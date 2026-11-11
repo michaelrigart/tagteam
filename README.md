@@ -199,6 +199,14 @@ breaks this. A file that already breaks it, by hand, blocks no write and runs wi
 but it cannot stop usage that reaches the ceiling from elsewhere between two checks, so a ceiling
 below 100 is a margin, not a guarantee.
 
+An open `tagteam tui` switches accounts too while no daemon runs, with the same settings, and
+its header says `auto on in this window`. When a daemon starts, the TUI stands down and the
+daemon takes over, so the daemon covers the hours the TUI is closed. `P` in the TUI pauses and
+resumes it, and so does the `daemon.autoswitch` setting (see [Daemon](#daemon)), which pauses
+both. Only one process switches a provider at a time, so `tagteam auto` is refused while a TUI
+switches. The refusal gives the window's pid and says to press `P` there to pause it, or to quit
+it.
+
 ### Daemon
 
 The daemon runs tagteam in the background. Install it once:
@@ -227,6 +235,9 @@ and lasts until you change it back:
 tagteam config set daemon.autoswitch false   # pause
 tagteam config set daemon.autoswitch true    # resume
 ```
+
+The same setting pauses the switching an open TUI does while no daemon runs, and `P` in the TUI
+writes it.
 
 In the TUI, `P` pauses or resumes it for the selected account's provider, and the header says
 `auto paused` or `auto on`.
