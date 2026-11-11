@@ -145,6 +145,7 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
         // The runtime takes the live queue at each wake, and applies what it holds as `Live`.
         Msg::LiveReady => vec![],
         Msg::DaemonStatus { link, result } => daemon::on_status(state, link, result, now_ms),
+        Msg::Lane(report) => daemon::on_lane(state, report, now_ms),
         Msg::ShutdownBegan { code } => {
             state.quitting = Some(code);
             state.dirty = true;

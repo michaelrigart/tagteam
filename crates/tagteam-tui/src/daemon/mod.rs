@@ -18,7 +18,7 @@ use tagteam_daemon::tokens::TOKEN_INDEX;
 use tagteam_engine::views::ProviderAccounts;
 
 use crate::live::{Live, StatusError};
-use crate::msg::Cmd;
+use crate::msg::{Cmd, LaneReport};
 use crate::screens;
 use crate::state::{Reread, Screen, State, ToastKind};
 
@@ -103,6 +103,13 @@ pub struct DaemonState {
     /// C-R20: until when the first collection waits to know who collects: no daemon, or the
     /// daemon's first `status`. `None` once known, and for a TUI that follows no daemon.
     unsettled_until: Option<i64>,
+    /// The same wait for the auto lane's first report (Ruling 9). `None` once it came, and for a
+    /// TUI with no lane.
+    lane_unsettled_until: Option<i64>,
+    /// The auto lane's last board: its jobs, which run here while no daemon does (S§3.3).
+    hosted: Option<Status>,
+    /// The lane found the store newer than this build and stopped (S§3.7).
+    upgraded: bool,
     /// Each provider's latest decision on this link (spec §5.3's rank 2).
     noted: BTreeMap<String, Noted>,
     /// Each provider's last `poll` on this link, whose usage a `no-switch` of the same tick
@@ -124,12 +131,33 @@ impl DaemonState {
         self.status.as_ref().filter(|_| self.link.is_some())
     }
 
-    /// `provider`'s job in the last `status`, in live mode.
+    /// `provider`'s job: in live mode, the one in the daemon's last `status`; otherwise the
+    /// lane's. A live daemon's `status` is the whole story, so a job it does not list is none,
+    /// whatever the lane last said.
     pub fn job(&self, provider: &ProviderId) -> Option<&StatusProvider> {
-        self.status()?
-            .providers
-            .iter()
-            .find(|p| p.provider == provider.as_str())
+        match self.status() {
+            Some(status) => job_in(status, provider),
+            None => self.hosted_job(provider),
+        }
+    }
+
+    /// `provider`'s job on the auto lane's last board.
+    pub fn hosted_job(&self, provider: &ProviderId) -> Option<&StatusProvider> {
+        job_in(self.hosted.as_ref()?, provider)
+    }
+
+    /// The lane stopped for a store newer than this build, until the TUI restarts.
+    // Task 4 shows it in the header; drop the allow there.
+    #[allow(dead_code)]
+    pub fn upgraded(&self) -> bool {
+        self.upgraded
+    }
+
+    /// Whether the lane's last board lists a job.
+    fn hosts_jobs(&self) -> bool {
+        self.hosted
+            .as_ref()
+            .is_some_and(|s| !s.providers.is_empty())
     }
 
     /// The reason the daemon gave for stopping, while the header names it.
@@ -143,9 +171,10 @@ impl DaemonState {
     }
 
     /// C-R20: whether the TUI knows who collects: no daemon answered, the daemon's first
-    /// `status` came, or `SETTLE_MS` passed.
+    /// `status` came, or `SETTLE_MS` passed; and, for a TUI with a lane, its first report came
+    /// or `SETTLE_MS` passed.
     pub fn settled(&self) -> bool {
-        self.unsettled_until.is_none()
+        self.unsettled_until.is_none() && self.lane_unsettled_until.is_none()
     }
 
     /// C-R20: a TUI that follows a daemon, started at `now_ms`, waits for it before its first
@@ -154,10 +183,25 @@ impl DaemonState {
         self.unsettled_until = Some(now_ms + SETTLE_MS);
     }
 
+    /// A TUI with an auto lane, started at `now_ms`, waits for its first report before its first
+    /// collection too (Ruling 9).
+    // Task 6 calls it when it starts the lane; drop the allow there.
+    #[allow(dead_code)]
+    pub(crate) fn await_lane(&mut self, now_ms: i64) {
+        self.lane_unsettled_until = Some(now_ms + SETTLE_MS);
+    }
+
     /// The daemon's latest decision for `provider` on this link (spec §5.3's rank 2).
     pub(crate) fn noted(&self, provider: &str) -> Option<&Noted> {
         self.noted.get(provider)
     }
+}
+
+fn job_in<'a>(status: &'a Status, provider: &ProviderId) -> Option<&'a StatusProvider> {
+    status
+        .providers
+        .iter()
+        .find(|p| p.provider == provider.as_str())
 }
 
 /// The provider the header follows and `P` acts on (spec §7.4): the selected account's, else
@@ -289,30 +333,64 @@ fn on_event(state: &mut State, event: Event, now_ms: i64) -> Vec<Cmd> {
     if state.daemon.link.is_none() || state.quitting.is_some() {
         return vec![];
     }
+    apply_event(state, event, now_ms, true)
+}
+
+/// What an event does. `socket`: it came over the daemon's link, which `status`, `stopping` and
+/// the token index belong to. A lane's events (S§3.3) are auto's and `usage`'s only: its board
+/// arrives by itself, the lane has no link to end, and it hosts no token jobs.
+fn apply_event(state: &mut State, event: Event, now_ms: i64, socket: bool) -> Vec<Cmd> {
     note(state, &event, now_ms);
     match event {
         Event::Auto { .. } => {
             let views = event.changes_an_account();
-            reread(state, now_ms, views, true);
+            reread(state, now_ms, views, socket);
             state.daemon.reread_timeline |= views && event.poll().is_none();
         }
-        Event::Usage { .. } => reread(state, now_ms, true, true),
+        Event::Usage { .. } => reread(state, now_ms, true, socket),
         Event::Changed => reread(state, now_ms, true, false),
-        Event::Mode { .. } => return fetch(state, now_ms).into_iter().collect(),
+        Event::Mode { .. } if socket => return fetch(state, now_ms).into_iter().collect(),
         // C-R18: the link ends here, whether or not the daemon goes on to close it; the live
         // thread drops it and connects again with backoff.
-        Event::Stopping { reason } => {
+        Event::Stopping { reason } if socket => {
             down(state, now_ms);
             state.daemon.stopping = Some((reason, now_ms + STOPPING_MS));
             state.dirty = true;
         }
-        Event::TokenIndex { provider, raw } => {
+        Event::TokenIndex { provider, raw } if socket => {
             let index = parse_token_index(&raw);
             return screens::tokens::index::on_token_index(state, &provider, &index, now_ms);
         }
+        Event::Mode { .. } | Event::Stopping { .. } | Event::TokenIndex { .. } => {}
         Event::Unknown { .. } => {}
     }
     vec![]
+}
+
+/// What the auto lane reported (S§3.3). A board is kept as the lane's jobs; when its jobs start
+/// or stop the views are read again, so the header's daemon pid and holders follow within one
+/// read (Ruling 8). Any first report says who collects (Ruling 9). Its events act as a socket's
+/// do, bar what belongs to a link.
+pub(crate) fn on_lane(state: &mut State, report: LaneReport, now_ms: i64) -> Vec<Cmd> {
+    if state.quitting.is_some() {
+        return vec![];
+    }
+    let hosted_before = state.daemon.hosts_jobs();
+    match report {
+        LaneReport::Event(event) => return apply_event(state, event, now_ms, false),
+        LaneReport::Status(status) => state.daemon.hosted = Some(status),
+        LaneReport::Off => state.daemon.hosted = None,
+        LaneReport::Upgraded => {
+            state.daemon.hosted = None;
+            state.daemon.upgraded = true;
+        }
+    }
+    state.daemon.lane_unsettled_until = None;
+    state.dirty = true;
+    if hosted_before == state.daemon.hosts_jobs() {
+        return vec![];
+    }
+    state.reload_views(now_ms)
 }
 
 /// Auto's decisions, for the auto line (spec §5.3): a `no-switch`, `error` or `config-warning`
@@ -541,14 +619,23 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
         d.unsettled_until = None;
         state.dirty = true;
     }
-    let Some(link) = d.link.filter(|_| state.quitting.is_none()) else {
+    if d.lane_unsettled_until.is_some_and(|until| now_ms >= until) {
+        d.lane_unsettled_until = None;
+        state.dirty = true;
+    }
+    if state.quitting.is_some() {
         return vec![];
-    };
-    if d.status_due_ms.is_some_and(|due| now_ms >= due) {
+    }
+    // The link's own timers: its `status` fetches, the 60 s poll and C-R19's wait.
+    let link = d.link;
+    if let Some(link) = link
+        && d.status_due_ms.is_some_and(|due| now_ms >= due)
+    {
         return broken(state, link, now_ms);
     }
     let (mut views, mut all, mut fetch_now) = (false, false, false);
     let mut timeline = Reread::Paced;
+    // The events' reads, a lane's as well as the socket's, are made with or without a link.
     if d.reread_ms.is_some_and(|at| now_ms >= at) {
         d.reread_ms = None;
         views = std::mem::take(&mut d.reread_views);
@@ -558,14 +645,16 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
             timeline = Reread::Now;
         }
     }
-    if d.recheck_ms.is_some_and(|at| now_ms >= at) {
-        d.recheck_ms = None;
-        fetch_now = true;
-    }
-    if now_ms >= d.next_poll_ms {
-        d.next_poll_ms = now_ms + POLL_MS;
-        fetch_now = true;
-        views |= d.live();
+    if link.is_some() {
+        if d.recheck_ms.is_some_and(|at| now_ms >= at) {
+            d.recheck_ms = None;
+            fetch_now = true;
+        }
+        if now_ms >= d.next_poll_ms {
+            d.next_poll_ms = now_ms + POLL_MS;
+            fetch_now = true;
+            views |= d.live();
+        }
     }
     let mut cmds = Vec::new();
     if fetch_now {
@@ -614,7 +703,7 @@ mod tests {
     use tagteam_engine::views::{UsageStatus, UsageView};
 
     use super::*;
-    use crate::msg::Msg;
+    use crate::msg::{LaneReport, Msg};
     use crate::testutil::*;
     use crate::update::{drawn, update};
 
@@ -1659,5 +1748,261 @@ mod tests {
         assert!(update(&mut state, event(mode("collect")), NOW_MS).is_empty());
         assert!(update(&mut state, event(Event::Changed), NOW_MS).is_empty());
         assert!(tick(&mut state, NOW_MS + 60_000).is_empty());
+    }
+
+    fn lane(report: LaneReport) -> Msg {
+        Msg::Lane(report)
+    }
+
+    /// The board the lane reports while it runs `jobs`.
+    fn lane_status(jobs: Vec<StatusProvider>) -> LaneReport {
+        LaneReport::Status(daemon_status(jobs, vec![]))
+    }
+
+    fn lane_auto_on() -> LaneReport {
+        lane_status(vec![daemon_job("claude-code", "auto", true)])
+    }
+
+    #[test]
+    fn a_lane_status_gives_its_jobs_until_a_live_daemon_s_status_replaces_them() {
+        let mut state = fresh(Screen::Accounts);
+        update(&mut state, lane(lane_auto_on()), NOW_MS);
+        let mode = |job: Option<&StatusProvider>| job.map(|j| j.mode.as_str().to_owned());
+        assert_eq!(mode(state.daemon.job(&cc())), Some("auto".into()));
+        assert_eq!(mode(state.daemon.hosted_job(&cc())), Some("auto".into()));
+        assert!(!state.daemon.live(), "the lane's board is not a link");
+        // A live daemon's status, and its jobs, are the ones followed.
+        let idle = daemon_status(vec![daemon_job("claude-code", "idle", false)], vec![]);
+        go_live(&mut state, idle);
+        assert_eq!(mode(state.daemon.job(&cc())), Some("idle".into()));
+        assert_eq!(mode(state.daemon.hosted_job(&cc())), Some("auto".into()));
+        // The daemon runs no job for a provider the lane still lists: the lane's is not used.
+        let mut state = fresh(Screen::Accounts);
+        update(&mut state, lane(lane_auto_on()), NOW_MS);
+        go_live(&mut state, daemon_status(vec![], vec![]));
+        assert!(state.daemon.job(&cc()).is_none());
+        assert!(state.daemon.hosted_job(&cc()).is_some());
+    }
+
+    #[test]
+    fn the_timer_skips_a_lane_provider_in_auto_and_collects_one_in_idle() {
+        // The timer's rule for a daemon's jobs (§6.3), applied to the lane's (S§3.5).
+        for (fake_job, collected) in [
+            (Some(("auto", None)), false),
+            (Some(("collect", None)), false),
+            (Some(("waiting", Some("engine-lock"))), false),
+            (Some(("waiting", Some("schema"))), true),
+            (Some(("idle", None)), true),
+            (None, true),
+        ] {
+            let mut state = fresh(Screen::Accounts);
+            state.accounts.apply(two_providers());
+            let mut jobs = vec![daemon_job("claude-code", "auto", true)];
+            if let Some((mode, waiting_for)) = fake_job {
+                let mut job = daemon_job("fake-agent", mode, false);
+                job.waiting_for = waiting_for.map(Wire::from_wire);
+                jobs.push(job);
+            }
+            update(&mut state, lane(lane_status(jobs)), NOW_MS);
+            let at_30 = names(&tick(&mut state, NOW_MS + 30_000));
+            let want = if collected {
+                vec!["accounts", "collect"]
+            } else {
+                vec!["accounts"]
+            };
+            assert_eq!(at_30, want, "{fake_job:?}");
+            // `r` still collects every account shown.
+            let r = update(&mut state, ch('r'), NOW_MS + 31_000);
+            let all = r.iter().find_map(|c| match c {
+                Cmd::CollectDue { accounts, .. } => Some(accounts.clone()),
+                _ => None,
+            });
+            assert_eq!(all, Some(vec![id(1), id(2), id(3)]), "{fake_job:?}");
+        }
+    }
+
+    /// A TUI whose lane has not reported, on Accounts with `accounts` read.
+    fn awaiting_lane(accounts: crate::source::AccountsSnapshot) -> State {
+        let mut state = fresh(Screen::Accounts);
+        state.daemon.await_lane(NOW_MS);
+        state.accounts.apply(accounts);
+        state
+    }
+
+    #[test]
+    fn the_first_collection_waits_for_the_lane_s_first_report_or_2_s() {
+        // C-R20 for the lane (Ruling 9): `Off` says nobody collects, a status says who does.
+        let mut state = awaiting_lane(snapshot(many(2)));
+        assert!(!state.daemon.settled());
+        assert!(reads(drawn(&mut state)).is_empty(), "waiting for the lane");
+        update(&mut state, lane(LaneReport::Off), NOW_MS + 10);
+        assert!(state.daemon.settled());
+        assert_eq!(
+            reads(drawn(&mut state)),
+            [Cmd::CollectDue {
+                r#gen: 1,
+                accounts: vec![id(1), id(2)]
+            }]
+        );
+        // Or `SETTLE_MS` on the ticks.
+        let mut state = awaiting_lane(snapshot(many(2)));
+        update(&mut state, Msg::Tick, NOW_MS + 1_999);
+        assert!(reads(drawn(&mut state)).is_empty(), "within the 2 s");
+        update(&mut state, Msg::Tick, NOW_MS + 2_000);
+        assert_eq!(
+            reads(drawn(&mut state)),
+            [Cmd::CollectDue {
+                r#gen: 1,
+                accounts: vec![id(1), id(2)]
+            }]
+        );
+        // A status leaves out what the lane collects for.
+        let mut state = awaiting_lane(two_providers());
+        update(&mut state, lane(lane_auto_on()), NOW_MS + 10);
+        assert_eq!(
+            reads(drawn(&mut state)),
+            [Cmd::CollectDue {
+                r#gen: 1,
+                accounts: vec![id(3)]
+            }]
+        );
+        // The daemon's wait and the lane's are two: each settles by its own answer.
+        let mut state = awaiting_lane(snapshot(many(2)));
+        state.daemon.await_daemon(NOW_MS);
+        update(&mut state, Msg::Live(Live::Down), NOW_MS + 10);
+        assert!(!state.daemon.settled(), "the lane has not reported");
+        update(&mut state, lane(LaneReport::Off), NOW_MS + 20);
+        assert!(state.daemon.settled());
+        let mut state = awaiting_lane(snapshot(many(2)));
+        state.daemon.await_daemon(NOW_MS);
+        update(&mut state, lane(LaneReport::Off), NOW_MS + 10);
+        assert!(!state.daemon.settled(), "the daemon has not answered");
+        update(&mut state, Msg::Live(Live::Down), NOW_MS + 20);
+        assert!(state.daemon.settled());
+    }
+
+    #[test]
+    fn a_lane_event_reaches_the_auto_line_and_re_reads_as_a_socket_event_does() {
+        // S§3.3 "Live events": with no link, `no-switch` is noted, `usage` reads the views once
+        // `REREAD_MS` later, a `switch` reads History's timeline at once, and nothing fetches
+        // `status`, which a lane event never asks for (Ruling 8's board arrives by itself).
+        let mut state = showing(Screen::History, 1);
+        update(&mut state, lane(lane_auto_on()), NOW_MS);
+        tick(&mut state, NOW_MS + 250);
+        let on =
+            |state: &mut State, e: Event, at: i64| update(state, lane(LaneReport::Event(e)), at);
+        let below = Event::Auto {
+            kind: "no-switch".into(),
+            provider: "claude-code".into(),
+            raw: json!({"schemaVersion": 1, "event": "no-switch", "ts": "2026-09-21T14:13:20Z",
+                "reason": "below-threshold"}),
+        };
+        assert!(on(&mut state, below, NOW_MS + 1_000).is_empty());
+        assert!(
+            matches!(
+                state.daemon.noted("claude-code").map(|n| &n.what),
+                Some(NotedWhat::NoSwitch {
+                    reason: NoSwitchReason::BelowThreshold,
+                    ..
+                })
+            ),
+            "the auto line has the decision"
+        );
+        assert!(
+            tick(&mut state, NOW_MS + 1_250).is_empty(),
+            "nothing to read"
+        );
+        let mut at = NOW_MS + 2_000;
+        for (e, want) in [
+            (usage(), vec!["accounts"]),
+            (auto("switch"), vec!["accounts", "history"]),
+            (auto("account-quarantined"), vec!["accounts", "history"]),
+            (Event::Changed, vec!["accounts"]),
+            (auto("poll"), vec!["accounts"]),
+        ] {
+            assert!(on(&mut state, e.clone(), at).is_empty(), "{e:?}");
+            assert!(tick(&mut state, at + 249).is_empty(), "{e:?}");
+            let read = tick(&mut state, at + 250);
+            assert_eq!(names(&read), want, "{e:?}");
+            assert!(tick(&mut state, at + 500).is_empty(), "once: {e:?}");
+            at += 1_000;
+        }
+        // A burst within the 250 ms is one read.
+        for (i, e) in [usage(), Event::Changed].into_iter().enumerate() {
+            on(&mut state, e, at + i as i64 * 20);
+        }
+        assert_eq!(names(&tick(&mut state, at + 250)), ["accounts"]);
+        // What a socket event does about the link, a lane event does not.
+        let down = on(&mut state, mode("idle"), at + 1_000);
+        assert!(down.is_empty());
+        let stopping = Event::Stopping {
+            reason: Wire::from_wire("upgrade"),
+        };
+        on(&mut state, stopping, at + 1_000);
+        assert_eq!(state.daemon.stopping(), None);
+        assert!(tick(&mut state, at + 1_250).is_empty());
+        // Nothing once the shutdown has begun.
+        state.quitting = Some(0);
+        on(&mut state, usage(), at + 2_000);
+        assert!(tick(&mut state, at + 2_250).is_empty());
+    }
+
+    #[test]
+    fn a_lane_event_does_not_touch_a_live_link_s_own_reads() {
+        // With a link, a socket event still fetches `status`; the lane's reads views only.
+        let mut state = showing(Screen::Accounts, 1);
+        let link = go_live(&mut state, auto_on());
+        let asked = update(&mut state, event(mode("collect")), NOW_MS + 1_000);
+        assert_eq!(asked, [Cmd::FetchStatus { link }]);
+        update(&mut state, lane(LaneReport::Event(usage())), NOW_MS + 2_000);
+        let read = tick_answered(&mut state, NOW_MS + 2_250);
+        assert_eq!(names(&read), ["accounts"]);
+    }
+
+    #[test]
+    fn the_views_are_read_again_when_the_lane_s_jobs_start_or_stop() {
+        // Ruling 8: the header's daemon pid and holders follow within one read.
+        let mut state = fresh(Screen::Accounts);
+        let none = || lane_status(vec![]);
+        let cmds = update(&mut state, lane(none()), NOW_MS);
+        assert!(names(&cmds).is_empty(), "no jobs before and after");
+        let cmds = update(&mut state, lane(lane_auto_on()), NOW_MS + 1_000);
+        assert_eq!(names(&cmds), ["accounts"], "jobs start");
+        let changed = lane_status(vec![daemon_job("claude-code", "collect", true)]);
+        let cmds = update(&mut state, lane(changed), NOW_MS + 2_000);
+        assert!(cmds.is_empty(), "a line that only changes: {cmds:?}");
+        let more = lane_status(vec![
+            daemon_job("claude-code", "collect", true),
+            daemon_job("fake-agent", "idle", false),
+        ]);
+        let cmds = update(&mut state, lane(more), NOW_MS + 3_000);
+        assert!(cmds.is_empty(), "a line that comes: {cmds:?}");
+        let cmds = update(&mut state, lane(none()), NOW_MS + 4_000);
+        assert_eq!(names(&cmds), ["accounts"], "jobs stop");
+        let cmds = update(&mut state, lane(none()), NOW_MS + 5_000);
+        assert!(cmds.is_empty(), "still none");
+        assert!(state.daemon.hosted_job(&cc()).is_none());
+    }
+
+    #[test]
+    fn off_and_upgraded_end_the_lane_s_jobs_and_settle() {
+        for (report, upgraded) in [(LaneReport::Off, false), (LaneReport::Upgraded, true)] {
+            let mut state = fresh(Screen::Accounts);
+            state.daemon.await_lane(NOW_MS);
+            update(&mut state, lane(lane_auto_on()), NOW_MS);
+            assert!(state.daemon.hosted_job(&cc()).is_some());
+            assert!(!state.daemon.upgraded());
+            state.dirty = false;
+            let cmds = update(&mut state, lane(report), NOW_MS + 1_000);
+            assert_eq!(names(&cmds), ["accounts"], "its jobs stopped");
+            assert!(state.dirty);
+            assert!(state.daemon.hosted_job(&cc()).is_none());
+            assert!(state.daemon.job(&cc()).is_none());
+            assert!(state.daemon.settled());
+            assert_eq!(state.daemon.upgraded(), upgraded);
+        }
+        // Without jobs before, nothing is read.
+        let mut state = fresh(Screen::Accounts);
+        assert!(update(&mut state, lane(LaneReport::Off), NOW_MS).is_empty());
     }
 }
