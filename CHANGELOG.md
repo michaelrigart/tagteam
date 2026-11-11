@@ -7,6 +7,8 @@ with the one before, so any release may contain breaking changes. Each section s
 
 ## [Unreleased]
 
+## [20261111.1935.0] - 2026-11-11
+
 ### Added
 
 - `ui.accounts_view` sets the view `tagteam tui`'s Accounts screen opens in: `list` (the
@@ -346,7 +348,8 @@ First release. tagteam is a multi-account switcher for Claude Code on macOS and 
   `tagteam` crate on crates.io (`cargo install tagteam --locked`) with the internal
   `tagteam-*` crates it depends on.
 
-[Unreleased]: https://github.com/michaelrigart/tagteam/compare/v20261031.2215.0...HEAD
+[Unreleased]: https://github.com/michaelrigart/tagteam/compare/v20261111.1935.0...HEAD
+[20261111.1935.0]: https://github.com/michaelrigart/tagteam/compare/v20261031.2215.0...v20261111.1935.0
 [20261031.2215.0]: https://github.com/michaelrigart/tagteam/compare/v20261023.738.0...v20261031.2215.0
 [20261023.738.0]: https://github.com/michaelrigart/tagteam/compare/v20261016.2230.0...v20261023.738.0
 [20261016.2230.0]: https://github.com/michaelrigart/tagteam/compare/v20261014.2045.0...v20261016.2230.0
