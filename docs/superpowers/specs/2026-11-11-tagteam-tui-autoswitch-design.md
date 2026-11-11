@@ -1,6 +1,6 @@
 # tagteam — The TUI switches accounts while it is open
 
-**Status:** In progress
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/61
 **Date:** 2026-11-11
 **Scope:**
 - The TUI (`crates/tagteam-tui`) runs auto-switching itself while it is open and no daemon runs,
