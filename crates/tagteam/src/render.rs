@@ -789,7 +789,7 @@ mod tests {
     use std::path::PathBuf;
 
     use tagteam_cc::CLAUDE_CODE;
-    use tagteam_engine::mappings::{MappedDir, MappingProblem};
+    use tagteam_engine::mappings::{MappedDir, MappingProblem, Named};
     use tagteam_engine::settings::MappingEntry;
     use tagteam_engine::switch::{LiveLogin, SwitchReason};
     use tagteam_engine::views::{NO_DATA, forecast_of};
@@ -1728,6 +1728,13 @@ mod tests {
                 value: value.into(),
             },
             dir: MappedDir::Found(dir.into()),
+            named: match problem {
+                None => Named::Applies(account.clone().unwrap()),
+                Some(problem) => Named::DoesNot {
+                    account: account.clone(),
+                    problem,
+                },
+            },
             account,
             problem,
         }

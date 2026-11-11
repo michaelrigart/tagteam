@@ -350,7 +350,7 @@ impl App<'_, '_> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use tagteam_engine::mappings::{ConfigMapping, MappedDir, MappingProblem};
+    use tagteam_engine::mappings::{ConfigMapping, MappedDir, MappingProblem, Named};
     use tagteam_engine::settings::MappingEntry;
 
     use super::mapping_warnings;
@@ -373,6 +373,7 @@ mod tests {
                 value: "work".into(),
             },
             dir: MappedDir::Found(PathBuf::from("/h/x")),
+            named: Named::Applies(row.clone()),
             account: Some(row),
             problem: None,
         }
@@ -411,6 +412,12 @@ mod tests {
         );
         if !named {
             m.account = None;
+        }
+        if let Some(problem) = problem {
+            m.named = Named::DoesNot {
+                account: m.account.clone(),
+                problem,
+            };
         }
         m.problem = problem;
         m
