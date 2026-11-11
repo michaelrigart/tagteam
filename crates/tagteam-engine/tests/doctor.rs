@@ -3419,3 +3419,34 @@ fn an_unusable_store_leaves_only_the_missing_directories_of_the_mappings() {
     assert!(found(&report, "mappings.value").is_empty());
     assert!(found(&report, "mappings.conflict").is_empty());
 }
+
+#[test]
+fn accounts_that_cannot_be_read_leave_only_the_missing_directories_of_the_mappings() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let root = fx.dir.path().join("maps");
+    fs::create_dir_all(root.join("known")).unwrap();
+    let r = root.display();
+    let path = fx.env.config_dir().join("config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        format!(
+            "[provider.claude-code.mappings]\n\"{r}/gone\" = \"a\"\n\"{r}/known\" = \"b@x.co\"\n\"{r}/known/\" = \"y\"\n"
+        ),
+    )
+    .unwrap();
+    sql(&fx)
+        .execute(
+            "UPDATE accounts SET position = 'x' WHERE id = ?1",
+            [b.as_str()],
+        )
+        .unwrap();
+    let report = doctor(&fx);
+    assert_eq!(one(&report, "store.accounts").status, CheckStatus::Warn);
+    assert_eq!(found(&report, "mappings.directory").len(), 1);
+    assert!(found(&report, "mappings.value").is_empty());
+    assert!(found(&report, "mappings.conflict").is_empty());
+    assert!(found(&report, "mappings.database").is_empty());
+}

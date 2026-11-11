@@ -17,6 +17,7 @@ impl Run<'_> {
         let id = p.id();
         let file = config_path(&self.engine.env);
         let usable = self.all_accounts().is_some();
+        let readable = usable;
         let entries = Settings::load(&self.engine.env, &id).0.mappings;
         // No store at all still judges values: on a fresh machine an entry names no account.
         // A store that cannot be read judges directories only.
@@ -33,7 +34,7 @@ impl Run<'_> {
                     ),
                 )
                 .fix(format!(
-                    "`{}` shows why the store cannot be read",
+                    "restore the store's account rows (see `store.accounts`), then run `{}` again",
                     command(self.engine, &id, "doctor")
                 )),
             );
@@ -114,7 +115,7 @@ impl Run<'_> {
                 )),
             );
         }
-        if let Some(store) = self.store_ref() {
+        if let Some(store) = self.store_ref().filter(|_| readable) {
             match store.mappings() {
                 Ok(rows) => {
                     let left = rows.iter().filter(|r| r.provider == id).count();
@@ -142,7 +143,7 @@ impl Run<'_> {
                         format!("the database's directory mappings cannot be read: {e}"),
                     )
                     .fix(format!(
-                        "`{}` shows why the store cannot be read",
+                        "make the store readable, then run `{}` again",
                         command(self.engine, &id, "doctor")
                     )),
                 ),
