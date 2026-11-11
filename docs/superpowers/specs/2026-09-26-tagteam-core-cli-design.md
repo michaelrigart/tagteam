@@ -1700,7 +1700,8 @@ Captures the live login.
     §9.3, §12.3). The row goes last, so the account stays listed, and running `remove` again
     finishes, since every delete treats an absent item as done.
   - **`config.toml` entries are not edited.** `remove` warns about each entry whose value named
-    the removed account, and those directories run plain `claude` (config-mappings spec §3.6).
+    the removed account, alone or among others, and now names one other account or none,
+    whether or not its directory exists here (config-mappings spec §3.6).
     *(Amended by the [config-mappings spec](2026-11-11-tagteam-config-mappings-design.md).)*
 - **`disable` / `enable <ACCOUNT>`** hold an account out of automatic selection. It stays a
   valid explicit `switch` target.
