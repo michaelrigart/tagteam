@@ -12,6 +12,7 @@ use crate::SCHEMA_VERSION;
 use crate::cli::StrategyArg;
 use crate::render;
 
+use super::mappings::AccountChange;
 use crate::app::App;
 use crate::app::failure::{Failure, KIND_STALE_SELECTION, KIND_UNMANAGED_ACCOUNT, cancelled};
 
@@ -232,7 +233,7 @@ impl App<'_, '_> {
         let active = self.is_active(&row)?;
         let before = self.mappings_snapshot(&row.provider);
         let row = self.engine.remove(&row.id)?;
-        self.warn_changed_mappings(&row.provider, &before);
+        self.warn_changed_mappings(AccountChange::Remove, &row.provider, &before);
         let human = format!(
             "Removed {} (position {}).\n",
             render::name(&row),
@@ -281,7 +282,7 @@ impl App<'_, '_> {
                 let row = self.resolve(&account)?;
                 let before = self.mappings_snapshot(&row.provider);
                 let row = self.engine.set_alias(&row.id, Some(&name))?;
-                self.warn_changed_mappings(&row.provider, &before);
+                self.warn_changed_mappings(AccountChange::Alias, &row.provider, &before);
                 let alias = row.alias.clone().unwrap_or_default();
                 let human = format!("Position {} is now {alias}.\n", row.position);
                 self.print_account(&human, row, None);
@@ -290,7 +291,7 @@ impl App<'_, '_> {
                 let row = self.resolve(&account)?;
                 let before = self.mappings_snapshot(&row.provider);
                 let row = self.engine.set_alias(&row.id, None)?;
-                self.warn_changed_mappings(&row.provider, &before);
+                self.warn_changed_mappings(AccountChange::Alias, &row.provider, &before);
                 let human = format!("Position {} has no alias now.\n", row.position);
                 self.print_account(&human, row, None);
             }

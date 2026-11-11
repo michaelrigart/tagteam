@@ -59,73 +59,75 @@ fn invalid_path(path: &Path, why: &str) -> Failure {
     Failure::Message(KIND_INVALID_INPUT, format!("{}: {why}", path.display()))
 }
 
-/// What launching in an entry's directory does (config-mappings spec §3.6): a session as one
-/// account, or plain.
-#[derive(Clone, Copy)]
-enum Outcome<'a> {
-    Names(&'a AccountRow),
-    Plain,
+/// The command whose change to the accounts [`mapping_warnings`] reports (config-mappings spec
+/// §3.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum AccountChange {
+    /// `alias`: set, renamed or unset.
+    Alias,
+    Remove,
 }
 
-impl<'a> Outcome<'a> {
-    /// A session as the entry's account, when it names exactly one that can start one. A missing
-    /// directory does not change who it names: it launches as that account once it exists.
-    /// Every other problem is plain, as is no entry.
-    fn of(entry: Option<&'a ConfigMapping>) -> Self {
-        match entry {
-            Some(m) if matches!(m.problem, None | Some(MappingProblem::MissingDirectory)) => {
-                m.account.as_ref().map_or(Outcome::Plain, Outcome::Names)
-            }
-            _ => Outcome::Plain,
-        }
-    }
-
-    fn differs(self, other: Self) -> bool {
-        match (self, other) {
-            (Outcome::Names(a), Outcome::Names(b)) => a.id != b.id,
-            (Outcome::Plain, Outcome::Plain) => false,
-            _ => true,
-        }
-    }
-}
-
-/// Warnings for the file entries whose launch changed between `before` and `after`, when `before`
-/// named an account or more than one (config-mappings spec §3.6): the entry's [`Outcome`] differs.
-/// Each says what the entry named and what it does now. Entries are matched by key and value, as
-/// written. `launch` is the provider's launch command, which runs plain where an entry does not
-/// name a session's account.
+/// Warnings for the file entries whose value `change` moved off the account it named
+/// (config-mappings spec §3.6), judged from the value alone, whether or not its directory exists
+/// here:
+/// - a value that named one account, an API-key account included, and now names another or none;
+/// - for `remove`, a value that named more than one account, the removed one among them, and now
+///   names one.
+///
+/// A value that names the same account as before warns about nothing. Each warning names the
+/// file, the entry as written and what it named, and says what it does now as if its directory
+/// existed. Entries are matched by key and value, as written, and one that has left the file is
+/// not this command's doing. `launch` is the provider's launch command.
 pub(in crate::app) fn mapping_warnings(
+    change: AccountChange,
     before: &[ConfigMapping],
     after: &[ConfigMapping],
     file: &Path,
     launch: &str,
 ) -> Vec<String> {
-    let account = |a: &AccountRow| format!("{} (position {})", render::name(a), a.position);
+    let who = |a: &AccountRow| format!("{} (position {})", render::name(a), a.position);
+    let plain = format!("`{launch}` runs plain there");
+    let conflict = "it conflicts with another entry for the same directory";
     before
         .iter()
         .filter_map(|was| {
-            let now = after
-                .iter()
-                .find(|m| m.entry.written == was.entry.written && m.entry.value == was.entry.value);
-            let (was_outcome, now_outcome) = (Outcome::of(Some(was)), Outcome::of(now));
-            if !was_outcome.differs(now_outcome)
-                || (was.account.is_none() && was.problem != Some(MappingProblem::Ambiguous))
-            {
-                return None;
-            }
-            let named = match (was_outcome, &was.account) {
-                (Outcome::Names(a), _) => format!("no longer names {}", account(a)),
-                (Outcome::Plain, Some(a)) => {
-                    format!("named {}, which did not start a session", account(a))
+            let now = after.iter().find(|m| {
+                m.entry.written == was.entry.written && m.entry.value == was.entry.value
+            })?;
+            let ambiguous = matches!(
+                was.named,
+                Named::DoesNot {
+                    problem: MappingProblem::Ambiguous,
+                    ..
                 }
-                (Outcome::Plain, None) => "named more than one account".to_owned(),
+            );
+            let named = match (was.named.account(), now.named.account()) {
+                (Some(a), Some(b)) if a.id == b.id => return None,
+                (Some(a), _) => format!("no longer names {}", who(a)),
+                (None, Some(_)) if ambiguous && change == AccountChange::Remove => {
+                    "named more than one account".to_owned()
+                }
+                (None, _) => return None,
             };
-            let outcome = match now_outcome {
-                Outcome::Names(a) => format!("it now names {}", account(a)),
-                Outcome::Plain => format!("`{launch}` runs plain there, with a warning"),
+            let (names, starts) = match &now.named {
+                Named::Applies(b) => (Some(format!("it now names {}", who(b))), true),
+                Named::DoesNot { account, .. } => (
+                    account
+                        .as_ref()
+                        .map(|b| format!("it now names {}, an API-key account", who(b))),
+                    false,
+                ),
+            };
+            let does = match (names, now.problem == Some(MappingProblem::Conflict)) {
+                (Some(names), false) if starts => names,
+                (Some(names), false) => format!("{names}, so {plain}"),
+                (None, false) => format!("{plain}, with a warning"),
+                (Some(names), true) => format!("{names}, but {conflict}, so {plain}"),
+                (None, true) => format!("{conflict}, so {plain}"),
             };
             Some(format!(
-                "{}: provider.{}.mappings \"{}\" = \"{}\" {named}; {outcome}",
+                "{}: provider.{}.mappings \"{}\" = \"{}\" {named}; {does}",
                 file.display(),
                 was.provider,
                 was.entry.written,
@@ -142,10 +144,11 @@ impl App<'_, '_> {
         self.engine.config_mappings(provider).unwrap_or_default()
     }
 
-    /// Reads `provider`'s entries again and warns about each in `before` that now names another
-    /// account, or none (config-mappings spec §3.6).
+    /// Reads `provider`'s entries again and warns about each in `before` whose value `change`
+    /// moved off the account it named (config-mappings spec §3.6, [`mapping_warnings`]).
     pub(in crate::app) fn warn_changed_mappings(
         &mut self,
+        change: AccountChange,
         provider: &ProviderId,
         before: &[ConfigMapping],
     ) {
@@ -160,7 +163,7 @@ impl App<'_, '_> {
             return;
         };
         let file = tagteam_engine::settings::config_path(self.engine.env());
-        for w in mapping_warnings(before, &after, &file, p.launch_command()) {
+        for w in mapping_warnings(change, before, &after, &file, p.launch_command()) {
             self.io.warn(&w);
         }
     }
@@ -352,175 +355,268 @@ mod tests {
 
     use tagteam_engine::mappings::{ConfigMapping, MappedDir, MappingProblem, Named};
     use tagteam_engine::settings::MappingEntry;
-
-    use super::mapping_warnings;
-    use crate::render::testutil::{OAUTH, unread, view};
+    use tagteam_engine::store::AccountRow;
     use tagteam_engine::views::UsageStatus;
 
-    fn entry(position: u32, email: &str) -> ConfigMapping {
-        let row = view(
+    use super::{AccountChange, mapping_warnings};
+    use crate::render::testutil::{OAUTH, unread, view};
+
+    /// What the entry's value names in a case: account 1 is a@x.co, account 2 is b@x.co.
+    #[derive(Clone, Copy)]
+    enum Names {
+        Applies(u32),
+        ApiKey(u32),
+        Nothing,
+        Ambiguous,
+    }
+
+    fn account(position: u32) -> AccountRow {
+        let email = ["a@x.co", "b@x.co"][position as usize - 1];
+        view(
             position,
             email,
             OAUTH,
             unread(UsageStatus::Unavailable, None, None),
         )
-        .row;
+        .row
+    }
+
+    /// The entry `"~/x" = "work"`, judged as the engine judges it: a missing directory first,
+    /// then a conflict, which only an existing directory can have, then the value's problem.
+    fn judged(names: Names, present: bool, conflict: bool) -> ConfigMapping {
+        let none = |problem| Named::DoesNot {
+            account: None,
+            problem,
+        };
+        let named = match names {
+            Names::Applies(n) => Named::Applies(account(n)),
+            Names::ApiKey(n) => Named::DoesNot {
+                account: Some(account(n)),
+                problem: MappingProblem::ApiKey,
+            },
+            Names::Nothing => none(MappingProblem::NoAccount),
+            Names::Ambiguous => none(MappingProblem::Ambiguous),
+        };
+        let path = PathBuf::from("/h/x");
+        let (dir, problem) = match (&named, present, conflict) {
+            (_, false, _) => (
+                MappedDir::Missing(path),
+                Some(MappingProblem::MissingDirectory),
+            ),
+            (_, true, true) => (MappedDir::Found(path), Some(MappingProblem::Conflict)),
+            (Named::Applies(_), true, false) => (MappedDir::Found(path), None),
+            (Named::DoesNot { problem, .. }, true, false) => {
+                (MappedDir::Found(path), Some(*problem))
+            }
+        };
         ConfigMapping {
-            provider: row.provider.clone(),
+            provider: account(1).provider,
             entry: MappingEntry {
                 written: "~/x".into(),
-                dir: PathBuf::from("/h/x"),
+                dir: "/h/x".into(),
                 value: "work".into(),
             },
-            dir: MappedDir::Found(PathBuf::from("/h/x")),
-            named: Named::Applies(row.clone()),
-            account: Some(row),
-            problem: None,
+            dir,
+            account: named.account().cloned(),
+            named,
+            problem,
         }
     }
 
     #[test]
-    fn an_entry_that_names_another_account_now_warns_with_its_position() {
-        let warnings = mapping_warnings(
-            &[entry(1, "a@x.co")],
-            &[entry(2, "b@x.co")],
-            Path::new("/c/config.toml"),
-            "fakeagent",
+    fn alias_and_remove_warn_when_the_value_names_another_account_or_none_wherever_it_points() {
+        use AccountChange::{Alias, Remove};
+        use Names::{Ambiguous, ApiKey, Applies, Nothing};
+        const BOTH: &[AccountChange] = &[Alias, Remove];
+        const A: &str = "no longer names a@x.co (position 1)";
+        const B: &str = "it now names b@x.co (position 2)";
+        const B_KEY: &str =
+            "it now names b@x.co (position 2), an API-key account, so `fakeagent` runs plain there";
+        const PLAIN: &str = "`fakeagent` runs plain there, with a warning";
+        const SEVERAL: &str = "named more than one account";
+        // (name, commands, before, after, in a conflict, what it named and what it does now)
+        type Case = (
+            &'static str,
+            &'static [AccountChange],
+            Names,
+            Names,
+            bool,
+            Option<(&'static str, &'static str)>,
         );
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].contains("it now names b@x.co (position 2)"),
-            "{warnings:?}"
-        );
-        assert!(warnings[0].contains("\"~/x\" = \"work\""), "{warnings:?}");
-        assert!(
-            mapping_warnings(
-                &[entry(1, "a@x.co")],
-                &[entry(1, "a@x.co")],
-                Path::new("/c"),
-                "fakeagent"
-            )
-            .is_empty()
-        );
-    }
-
-    /// `entry(position, email)` with `problem`; the account is dropped when `named` is false.
-    fn judged(position: u32, named: bool, problem: Option<MappingProblem>) -> ConfigMapping {
-        let mut m = entry(
-            position,
-            &format!("{}@x.co", (b'a' + position as u8 - 1) as char),
-        );
-        if !named {
-            m.account = None;
-        }
-        if let Some(problem) = problem {
-            m.named = Named::DoesNot {
-                account: m.account.clone(),
-                problem,
-            };
-        }
-        m.problem = problem;
-        m
-    }
-
-    #[test]
-    fn a_mapping_warns_when_what_it_launches_changes_and_says_what_it_does_now() {
-        use MappingProblem::{Ambiguous, ApiKey, Conflict, MissingDirectory, NoAccount};
-        // (name, before, after, words the warning has, or None for silence)
-        let table: Vec<(&str, ConfigMapping, ConfigMapping, Option<&str>)> = vec![
+        let cases: [Case; 17] = [
+            (
+                "applies A, then A",
+                BOTH,
+                Applies(1),
+                Applies(1),
+                false,
+                None,
+            ),
+            (
+                "applies A, then B",
+                BOTH,
+                Applies(1),
+                Applies(2),
+                false,
+                Some((A, B)),
+            ),
+            (
+                "applies A, then API key B",
+                BOTH,
+                Applies(1),
+                ApiKey(2),
+                false,
+                Some((A, B_KEY)),
+            ),
             (
                 "applies A, then none",
-                judged(1, true, None),
-                judged(1, false, Some(NoAccount)),
-                Some("`fakeagent` runs plain there, with a warning"),
+                BOTH,
+                Applies(1),
+                Nothing,
+                false,
+                Some((A, PLAIN)),
+            ),
+            ("API key A, then A", BOTH, ApiKey(1), ApiKey(1), false, None),
+            (
+                "API key A, then API key B",
+                BOTH,
+                ApiKey(1),
+                ApiKey(2),
+                false,
+                Some((A, B_KEY)),
             ),
             (
-                "applies A, then applies B",
-                judged(1, true, None),
-                judged(2, true, None),
-                Some("it now names b@x.co (position 2)"),
-            ),
-            (
-                "missing directory A, then missing directory B",
-                judged(1, true, Some(MissingDirectory)),
-                judged(2, true, Some(MissingDirectory)),
-                Some("it now names b@x.co (position 2)"),
+                "API key A, then none",
+                BOTH,
+                ApiKey(1),
+                Nothing,
+                false,
+                Some((A, PLAIN)),
             ),
             (
                 "API key A, then applies B",
-                judged(1, true, Some(ApiKey)),
-                judged(2, true, None),
-                Some("it now names b@x.co (position 2)"),
+                BOTH,
+                ApiKey(1),
+                Applies(2),
+                false,
+                Some((A, B)),
             ),
             (
-                "API key A, then API key B",
-                judged(1, true, Some(ApiKey)),
-                judged(2, true, Some(ApiKey)),
+                "ambiguous, then applies B, as remove",
+                &[Remove],
+                Ambiguous,
+                Applies(2),
+                false,
+                Some((SEVERAL, B)),
+            ),
+            (
+                "ambiguous, then API key B, as remove",
+                &[Remove],
+                Ambiguous,
+                ApiKey(2),
+                false,
+                Some((SEVERAL, B_KEY)),
+            ),
+            (
+                "ambiguous, then applies B, as alias: it named no one account before",
+                &[Alias],
+                Ambiguous,
+                Applies(2),
+                false,
                 None,
             ),
             (
-                "conflict, then conflict",
-                judged(1, true, Some(Conflict)),
-                judged(2, true, Some(Conflict)),
+                "ambiguous, then ambiguous",
+                BOTH,
+                Ambiguous,
+                Ambiguous,
+                false,
                 None,
             ),
             (
-                "ambiguous, then applies B",
-                judged(1, false, Some(Ambiguous)),
-                judged(2, true, None),
-                Some("it now names b@x.co (position 2)"),
-            ),
-            (
-                "ambiguous, then API key",
-                judged(1, false, Some(Ambiguous)),
-                judged(2, true, Some(ApiKey)),
+                "none, then applies B",
+                BOTH,
+                Nothing,
+                Applies(2),
+                false,
                 None,
             ),
             (
-                "applies A, then applies A",
-                judged(1, true, None),
-                judged(1, true, None),
+                "in conflict, applies A, then A",
+                BOTH,
+                Applies(1),
+                Applies(1),
+                true,
                 None,
             ),
             (
-                "API key A, then API key A",
-                judged(1, true, Some(ApiKey)),
-                judged(1, true, Some(ApiKey)),
-                None,
+                "in conflict, applies A, then none",
+                BOTH,
+                Applies(1),
+                Nothing,
+                true,
+                Some((
+                    A,
+                    "it conflicts with another entry for the same directory, so `fakeagent` runs \
+                     plain there",
+                )),
+            ),
+            (
+                "in conflict, applies A, then B",
+                BOTH,
+                Applies(1),
+                Applies(2),
+                true,
+                Some((
+                    A,
+                    "it now names b@x.co (position 2), but it conflicts with another entry for \
+                     the same directory, so `fakeagent` runs plain there",
+                )),
+            ),
+            (
+                "in conflict, API key A, then B",
+                BOTH,
+                ApiKey(1),
+                Applies(2),
+                true,
+                Some((
+                    A,
+                    "it now names b@x.co (position 2), but it conflicts with another entry for \
+                     the same directory, so `fakeagent` runs plain there",
+                )),
             ),
         ];
-        for (name, before, after, says) in table {
-            let warnings = mapping_warnings(
-                &[before],
-                &[after],
-                Path::new("/c/config.toml"),
-                "fakeagent",
-            );
-            match says {
-                Some(words) => {
-                    assert_eq!(warnings.len(), 1, "{name}: {warnings:?}");
-                    assert!(warnings[0].contains(words), "{name}: {warnings:?}");
+        let file = Path::new("/c/config.toml");
+        for (name, changes, before, after, conflict, says) in cases {
+            for &change in changes {
+                for present in [true, false] {
+                    let warnings = mapping_warnings(
+                        change,
+                        &[judged(before, present, conflict)],
+                        &[judged(after, present, conflict)],
+                        file,
+                        "fakeagent",
+                    );
+                    let at = format!(
+                        "{name}, under {change:?}, directory {}: {warnings:?}",
+                        if present { "present" } else { "missing" }
+                    );
+                    let Some((named, does)) = says else {
+                        assert!(warnings.is_empty(), "{at}");
+                        continue;
+                    };
+                    assert_eq!(warnings.len(), 1, "{at}");
+                    let said = format!(
+                        "/c/config.toml: provider.claude-code.mappings \"~/x\" = \"work\" {named}; "
+                    );
+                    assert!(warnings[0].starts_with(&said), "{at}");
+                    // A missing directory is never in a conflict, so there a conflict case only
+                    // warns as it does in one; the cases without one pin what it then says.
+                    if present || !conflict {
+                        assert_eq!(warnings[0], format!("{said}{does}"), "{at}");
+                    }
                 }
-                None => assert!(warnings.is_empty(), "{name}: {warnings:?}"),
             }
         }
-    }
-
-    #[test]
-    fn an_entry_that_names_no_account_now_says_which_launch_command_runs_plain() {
-        let mut gone = entry(1, "a@x.co");
-        gone.account = None;
-        gone.problem = Some(MappingProblem::NoAccount);
-        let warnings = mapping_warnings(
-            &[entry(1, "a@x.co")],
-            &[gone],
-            Path::new("/c/config.toml"),
-            "fakeagent",
-        );
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].contains("`fakeagent` runs plain there, with a warning"),
-            "{warnings:?}"
-        );
     }
 }
