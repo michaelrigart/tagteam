@@ -98,7 +98,7 @@ pub(in crate::app) fn mapping_warnings(
 
 impl App<'_, '_> {
     /// `provider`'s file entries as they stand, for `alias` and `remove` to compare. Best-effort:
-    /// a failed read gives none, and the command goes on.
+    /// a failed read gives none, which warns about nothing, and the command goes on.
     pub(in crate::app) fn mappings_snapshot(&self, provider: &ProviderId) -> Vec<ConfigMapping> {
         self.engine.config_mappings(provider).unwrap_or_default()
     }
@@ -113,7 +113,10 @@ impl App<'_, '_> {
         if before.is_empty() {
             return;
         }
-        let after = self.mappings_snapshot(provider);
+        // Not `mappings_snapshot`: an empty `after` would read as every entry gone.
+        let Ok(after) = self.engine.config_mappings(provider) else {
+            return;
+        };
         let file = tagteam_engine::settings::config_path(self.engine.env());
         for w in mapping_warnings(before, &after, &file) {
             self.io.warn(&w);
@@ -298,5 +301,61 @@ impl App<'_, '_> {
             displaced_cmd::purged_json(&deleted),
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use tagteam_engine::mappings::{ConfigMapping, MappedDir};
+    use tagteam_engine::settings::MappingEntry;
+
+    use super::mapping_warnings;
+    use crate::render::testutil::{OAUTH, unread, view};
+    use tagteam_engine::views::UsageStatus;
+
+    fn entry(position: u32, email: &str) -> ConfigMapping {
+        let row = view(
+            position,
+            email,
+            OAUTH,
+            unread(UsageStatus::Unavailable, None, None),
+        )
+        .row;
+        ConfigMapping {
+            provider: row.provider.clone(),
+            entry: MappingEntry {
+                written: "~/x".into(),
+                dir: PathBuf::from("/h/x"),
+                value: "work".into(),
+            },
+            dir: MappedDir::Found(PathBuf::from("/h/x")),
+            account: Some(row),
+            problem: None,
+        }
+    }
+
+    #[test]
+    fn an_entry_that_names_another_account_now_warns_with_its_position() {
+        let warnings = mapping_warnings(
+            &[entry(1, "a@x.co")],
+            &[entry(2, "b@x.co")],
+            Path::new("/c/config.toml"),
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("it now names b@x.co (position 2)"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("\"~/x\" = \"work\""), "{warnings:?}");
+        assert!(
+            mapping_warnings(
+                &[entry(1, "a@x.co")],
+                &[entry(1, "a@x.co")],
+                Path::new("/c")
+            )
+            .is_empty()
+        );
     }
 }
