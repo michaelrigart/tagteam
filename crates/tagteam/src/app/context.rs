@@ -15,6 +15,7 @@ use tagteam_engine::settings::{self, ColorMode, Settings};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
 use tagteam_engine::{Engine, EngineConfig, EngineError, EventSource};
 use tagteam_provider::http::Http;
+use tagteam_provider::keychain::ReadCounts;
 use tagteam_provider::liveness::SystemProcessProbe;
 use tagteam_provider::process::SystemSpawner;
 use tagteam_provider::profile::RunShell;
@@ -23,6 +24,7 @@ use tagteam_provider::security::ProcessRunner;
 use tagteam_provider::security::SecurityCli;
 use tagteam_provider::{Clock, Env, EnvError, Keychain, Platform, SystemClock};
 
+use crate::daemon_cmd;
 use crate::prompt::Prompter;
 
 const NO_COLOR: &str = "NO_COLOR";
@@ -109,6 +111,17 @@ fn test_overrides(_var: &dyn Fn(&str) -> Option<OsString>) -> Overrides {
 }
 
 impl Context {
+    /// Decision 7: the read counts of the Keychain the command reads and of the vault's own,
+    /// which a provider job's backoff compares (D4.1). Empty on Linux, which has no Keychain.
+    pub(crate) fn keychain_counts(&self) -> Vec<Arc<ReadCounts>> {
+        match self.platform {
+            Platform::MacOs => daemon_cmd::keychain_counts(
+                std::iter::once(&self.keychain).chain(self.vault_keychain.as_ref()),
+            ),
+            Platform::Linux => Vec::new(),
+        }
+    }
+
     /// The binary's context, read from the process. Fails when `HOME` cannot place tagteam's
     /// files (§5), before anything else is read.
     pub fn from_process() -> Result<Self, EnvError> {

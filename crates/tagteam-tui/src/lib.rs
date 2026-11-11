@@ -5,6 +5,7 @@
 
 pub(crate) mod actions;
 mod ask;
+pub mod auto_lane;
 mod autoline;
 mod chrome;
 pub(crate) mod daemon;

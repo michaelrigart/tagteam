@@ -183,8 +183,6 @@ impl DaemonState {
 
     /// A TUI with an auto lane, started at `now_ms`, waits for its first report before its first
     /// collection too (Ruling 9).
-    // Task 6 calls it when it starts the lane; drop the allow there.
-    #[allow(dead_code)]
     pub(crate) fn await_lane(&mut self, now_ms: i64) {
         self.lane_unsettled_until = Some(now_ms + SETTLE_MS);
     }

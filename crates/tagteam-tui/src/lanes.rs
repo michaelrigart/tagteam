@@ -3,6 +3,7 @@
 //! and stops taking requests once it is closed or has died. `Lanes` is the set the TUI runs.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -12,12 +13,14 @@ use tagteam_core::ProviderId;
 use tagteam_daemon::protocol::Status;
 use tagteam_provider::Cancel;
 
+use crate::actions::UPGRADED;
 use crate::ask::{Answers, ChannelAsk};
-use crate::host::Host;
+use crate::auto_lane::{AutoFactory, AutoLane};
+use crate::host::{ActionOutcome, Host};
 use crate::live::{LIVE_QUEUE, LiveQueue, StatusError};
 use crate::msg::{ActionsReq, DaemonReq, IndexReq, Msg, ReportReq, ViewsReq};
 use crate::runtime::WAKE;
-use crate::source::{Source, SourceFactory};
+use crate::source::{Source, SourceError, SourceFactory};
 
 /// Whether a queued request is replaced by a newer one (spec §4.3, "Coalescing").
 pub trait Coalesce {
@@ -168,10 +171,36 @@ const PROGRESS_EVERY: Duration = WAKE;
 /// What fetches the daemon's `status` on the daemon lane: `live::fetch_status` on its socket.
 pub(crate) type StatusFetch = Arc<dyn Fn() -> Result<Status, StatusError> + Send + Sync>;
 
+/// Why a request that writes the store is refused as it is taken, once the auto lane found the
+/// store newer than this build (S§3.7, Ruling 5): `UPGRADED`. Work already started is never
+/// stopped. Every lane that takes such a request, and the UI thread before it hands the terminal
+/// to one, asks here, before it calls the source or the host.
+pub(crate) fn refusal(upgraded: &AtomicBool, writes_store: bool) -> Option<&'static str> {
+    (writes_store && upgraded.load(Ordering::SeqCst)).then_some(UPGRADED)
+}
+
+/// The outcome of an action refused under `refusal`: it failed, with the refusal as its message.
+pub(crate) fn refused_outcome(why: &str) -> ActionOutcome {
+    ActionOutcome::Done {
+        exit: 1,
+        out: String::new(),
+        err: why.to_owned(),
+    }
+}
+
+/// The error a read or write of the store is refused with under `refusal`.
+fn refused_read(why: &str) -> SourceError {
+    SourceError {
+        kind: "store".into(),
+        message: why.to_owned(),
+    }
+}
+
 /// The lanes (§4.3). The engine lanes: views (`accounts`, `history`, store-served), report
 /// (the token report, which reads the index only), index (the token index's catch-up) and
 /// actions (the collector and every `Host` action, one at a time). And the daemon lane, which
-/// fetches the daemon's `status` and has no engine.
+/// fetches the daemon's `status` and has no engine. And, when the TUI switches accounts itself,
+/// the auto lane, which runs the daemon's jobs on an engine of its own (TUI auto-switch spec §3.1).
 pub(crate) struct Lanes {
     pub(crate) views: Lane<ViewsReq>,
     pub(crate) report: Lane<ReportReq>,
@@ -179,6 +208,11 @@ pub(crate) struct Lanes {
     pub(crate) actions: Lane<ActionsReq>,
     /// When the TUI follows a daemon.
     pub(crate) daemon: Option<Lane<DaemonReq>>,
+    /// The auto lane, when the TUI has a factory for its engine.
+    auto: Option<AutoLane>,
+    /// Set once, by the auto lane, when it finds the store newer than this build (S§3.7): the
+    /// actions and index lanes and the UI thread then refuse what would write it.
+    pub(crate) upgraded: Arc<AtomicBool>,
     /// The threads that are let go rather than joined, the daemon lane and the live thread,
     /// that died: named in the report as a joined lane that panicked is (§10.4).
     strays: Arc<Mutex<Vec<&'static str>>>,
@@ -190,7 +224,8 @@ pub(crate) struct Lanes {
 impl Lanes {
     /// Spawns them. Each engine lane builds its own `Source` in its own thread (R4), and a lane
     /// that panics says so on `tx` (§4.3, §10.4). The daemon lane is spawned when `status` is
-    /// given.
+    /// given, and the auto lane when `auto` is.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         provider: Option<ProviderId>,
         sources: &SourceFactory,
@@ -199,8 +234,11 @@ impl Lanes {
         shutdown: &Cancel,
         answers: &Answers,
         status: Option<StatusFetch>,
+        auto: Option<AutoFactory>,
     ) -> Lanes {
         let strays = Arc::default();
+        let upgraded = Arc::new(AtomicBool::new(false));
+        let auto_provider = provider.clone();
         let views = spawn_lane("views", sources, tx, move |source, req: ViewsReq, out| {
             let msg = match req {
                 ViewsReq::Accounts { r#gen } => Msg::Accounts {
@@ -237,20 +275,31 @@ impl Lanes {
             };
             let _ = out.send(msg);
         });
-        let index = spawn_lane("index", sources, tx, |source, req: IndexReq, out| {
-            let IndexReq::Refresh { provider } = req;
-            // The engine reports progress per chunk; the loop is told at its own pace.
-            let mut told: Option<Instant> = None;
-            let result = source.refresh_tokens(&provider, &mut |progress| {
-                if told.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
-                    told = Some(Instant::now());
-                    let _ = out.send(Msg::IndexProgress(*progress));
+        let index = {
+            let upgraded = Arc::clone(&upgraded);
+            spawn_lane("index", sources, tx, move |source, req: IndexReq, out| {
+                let IndexReq::Refresh { provider } = req;
+                // The token index lives in the store: its refreshes write it (Ruling 5).
+                if let Some(why) = refusal(&upgraded, true) {
+                    let _ = out.send(Msg::Refreshed {
+                        result: Err(refused_read(why)),
+                    });
+                    return;
                 }
-            });
-            let _ = out.send(Msg::Refreshed { result });
-        });
+                // The engine reports progress per chunk; the loop is told at its own pace.
+                let mut told: Option<Instant> = None;
+                let result = source.refresh_tokens(&provider, &mut |progress| {
+                    if told.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
+                        told = Some(Instant::now());
+                        let _ = out.send(Msg::IndexProgress(*progress));
+                    }
+                });
+                let _ = out.send(Msg::Refreshed { result });
+            })
+        };
         let actions = {
             let (host, shutdown, answers) = (Arc::clone(host), shutdown.clone(), answers.clone());
+            let upgraded = Arc::clone(&upgraded);
             spawn_lane(
                 "actions",
                 sources,
@@ -259,14 +308,25 @@ impl Lanes {
                     let msg = match req {
                         ActionsReq::Collect { r#gen, accounts } => Msg::Collected {
                             r#gen,
-                            result: source.collect_due(&accounts),
+                            result: match refusal(&upgraded, true) {
+                                Some(why) => Err(refused_read(why)),
+                                None => source.collect_due(&accounts),
+                            },
                         },
                         ActionsReq::Act { action } => {
-                            // Its prompts become dialogs, declined once the shutdown begins
-                            // (§7.2, §10.2 step 3).
-                            let mut ask =
-                                ChannelAsk::new(out.clone(), shutdown.clone(), answers.clone());
-                            let outcome = host.act(&action, &mut ask);
+                            let outcome = match refusal(&upgraded, action.writes_store()) {
+                                Some(why) => refused_outcome(why),
+                                None => {
+                                    // Its prompts become dialogs, declined once the shutdown
+                                    // begins (§7.2, §10.2 step 3).
+                                    let mut ask = ChannelAsk::new(
+                                        out.clone(),
+                                        shutdown.clone(),
+                                        answers.clone(),
+                                    );
+                                    host.act(&action, &mut ask)
+                                }
+                            };
                             Msg::ActionDone { action, outcome }
                         }
                     };
@@ -292,14 +352,33 @@ impl Lanes {
         let live = Arc::new(LiveQueue::new(LIVE_QUEUE, move || {
             wake.send(Msg::LiveReady).is_ok()
         }));
+        let auto =
+            auto.map(|factory| AutoLane::spawn(factory, auto_provider, tx, Arc::clone(&upgraded)));
         Lanes {
             views,
             report,
             index,
             actions,
             daemon,
+            auto,
+            upgraded,
             strays,
             live,
+        }
+    }
+
+    /// Ctrl-Z (S§3.1): the auto lane stops and is joined, so that no lock it held is held by a
+    /// stopped process. Nothing without a lane.
+    pub(crate) fn suspend_auto(&self) {
+        if let Some(auto) = &self.auto {
+            auto.suspend();
+        }
+    }
+
+    /// After Ctrl-Z: the auto lane starts again by S§3.2's rule. Nothing without a lane.
+    pub(crate) fn resume_auto(&self) {
+        if let Some(auto) = &self.auto {
+            auto.resume();
         }
     }
 
@@ -324,12 +403,15 @@ impl Lanes {
         if let Some(daemon) = &self.daemon {
             daemon.close();
         }
+        if let Some(auto) = &self.auto {
+            auto.close();
+        }
         // The loop stops listening to the live thread: its next push says `Gone`, whatever the
         // queue holds, and it returns.
         self.live.close();
     }
 
-    /// §10.2 step 5: joins every engine lane, lets the daemon lane go (§4.3: it touches no
+    /// §10.2 step 5: joins every engine lane and the auto lane, lets the daemon lane go (§4.3: it touches no
     /// store, and a `status` it waits for may take 2 s), and names the lanes that panicked.
     pub(crate) fn join(self) -> Vec<&'static str> {
         let mut died = Vec::new();
@@ -344,6 +426,11 @@ impl Lanes {
         }
         if self.actions.join().is_err() {
             died.push("actions");
+        }
+        if let Some(auto) = self.auto
+            && auto.join().is_err()
+        {
+            died.push("auto");
         }
         drop(self.daemon);
         died.extend(lock(&self.strays).iter());
@@ -396,6 +483,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::host::{Action, ActionOutcome};
+    use crate::source::SourceError;
 
     const WAIT: Duration = Duration::from_secs(5);
 
@@ -568,5 +657,209 @@ mod tests {
         );
         assert!(lane.join().is_err());
         assert_eq!(deaths.load(Ordering::SeqCst), 1);
+    }
+
+    /// What the source and the host of `a_store_write_queued_when_the_store_turns_newer_never_starts`
+    /// were asked to do.
+    #[derive(Default)]
+    struct Ran {
+        collects: AtomicUsize,
+        refreshes: AtomicUsize,
+        acts: Mutex<Vec<&'static str>>,
+    }
+
+    /// Its first `collect_due` waits on `gate`; every call is counted in `ran`.
+    struct Counting {
+        ran: Arc<Ran>,
+        gate: Arc<Mutex<Receiver<()>>>,
+    }
+
+    impl Source for Counting {
+        fn accounts(
+            &self,
+            _: Option<&ProviderId>,
+        ) -> Result<crate::source::AccountsSnapshot, SourceError> {
+            unreachable!("no accounts are read")
+        }
+
+        fn timeline(
+            &self,
+            _: &ProviderId,
+            _: &tagteam_engine::timeline::Scope,
+            _: i64,
+            _: usize,
+        ) -> Result<tagteam_engine::timeline::TimelineView, SourceError> {
+            unreachable!("no timeline is read")
+        }
+
+        fn collect_due(
+            &self,
+            _: &[tagteam_core::AccountId],
+        ) -> Result<crate::source::CollectSummary, SourceError> {
+            if self.ran.collects.fetch_add(1, Ordering::SeqCst) == 0 {
+                let gate = self.gate.lock().unwrap();
+                gate.recv_timeout(WAIT).expect("the test opens the gate");
+            }
+            Ok(crate::source::CollectSummary {
+                fetched: 0,
+                warnings: Vec::new(),
+                updated: 0,
+                rate_limited: Vec::new(),
+            })
+        }
+
+        fn refresh_tokens(
+            &self,
+            _: &ProviderId,
+            _: &mut dyn FnMut(&tagteam_engine::tokens::IndexProgress),
+        ) -> Result<tagteam_engine::tokens::RefreshOutcome, SourceError> {
+            self.ran.refreshes.fetch_add(1, Ordering::SeqCst);
+            Ok(tagteam_engine::tokens::RefreshOutcome::Busy)
+        }
+
+        fn token_report(
+            &self,
+            _: &tagteam_engine::tokens::TokenQuery,
+        ) -> Result<tagteam_engine::tokens::TokenReport, SourceError> {
+            unreachable!("no token report is read")
+        }
+
+        fn token_index_state(
+            &self,
+            _: &ProviderId,
+        ) -> Result<tagteam_engine::tokens::IndexState, SourceError> {
+            unreachable!("no token index state is read")
+        }
+    }
+
+    struct Recording(Arc<Ran>);
+
+    impl Host for Recording {
+        fn act(&self, action: &Action, _: &mut dyn crate::host::Ask) -> ActionOutcome {
+            self.0.acts.lock().unwrap().push(action.name());
+            ActionOutcome::Done {
+                exit: 0,
+                out: String::new(),
+                err: String::new(),
+            }
+        }
+
+        fn act_foreground(&self, _: &Action) -> ActionOutcome {
+            unreachable!("nothing runs on the terminal here")
+        }
+    }
+
+    #[test]
+    fn a_store_write_queued_when_the_store_turns_newer_never_starts() {
+        let ran = Arc::<Ran>::default();
+        let (open, gate) = mpsc::channel();
+        let gate = Arc::new(Mutex::new(gate));
+        let sources: SourceFactory = {
+            let ran = Arc::clone(&ran);
+            Arc::new(move || {
+                Box::new(Counting {
+                    ran: Arc::clone(&ran),
+                    gate: Arc::clone(&gate),
+                }) as Box<dyn Source>
+            })
+        };
+        let host: Arc<dyn Host> = Arc::new(Recording(Arc::clone(&ran)));
+        let (tx, rx) = mpsc::channel();
+        let lanes = Lanes::spawn(
+            None,
+            &sources,
+            &host,
+            &tx,
+            &Cancel::new(),
+            &Answers::default(),
+            None,
+            None,
+        );
+        let account = crate::host::AccountRef {
+            id: tagteam_core::AccountId::from_string("0192-a"),
+            provider: ProviderId::new("claude-code"),
+            position: 1,
+        };
+        let collect = |r#gen| ActionsReq::Collect {
+            r#gen,
+            accounts: vec![],
+        };
+        assert!(lanes.actions.submit(collect(1)));
+        let deadline = Instant::now() + WAIT;
+        while ran.collects.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the first collection never began"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Behind the first, which waits on the gate.
+        assert!(lanes.actions.submit(collect(2)));
+        let switch = Action::Switch(account);
+        assert!(lanes.actions.submit(ActionsReq::Act {
+            action: switch.clone()
+        }));
+        let doctor = Action::Doctor {
+            provider: None,
+            online: false,
+        };
+        assert!(lanes.actions.submit(ActionsReq::Act {
+            action: doctor.clone()
+        }));
+        lanes.upgraded.store(true, Ordering::SeqCst);
+        open.send(()).unwrap();
+
+        let next = || rx.recv_timeout(WAIT).expect("the lane answered");
+        assert!(
+            matches!(
+                next(),
+                Msg::Collected {
+                    r#gen: 1,
+                    result: Ok(_)
+                }
+            ),
+            "the collection already started finishes"
+        );
+        let upgraded = || SourceError {
+            kind: "store".into(),
+            message: crate::actions::UPGRADED.into(),
+        };
+        match next() {
+            Msg::Collected { r#gen: 2, result } => assert_eq!(result.unwrap_err(), upgraded()),
+            _ => panic!("the queued collection was not refused"),
+        }
+        match next() {
+            Msg::ActionDone { action, outcome } => {
+                assert_eq!(action, switch);
+                assert_eq!(
+                    outcome,
+                    ActionOutcome::Done {
+                        exit: 1,
+                        out: String::new(),
+                        err: crate::actions::UPGRADED.into()
+                    }
+                );
+            }
+            _ => panic!("the queued switch was not refused"),
+        }
+        match next() {
+            Msg::ActionDone { action, outcome } => {
+                assert_eq!(action, doctor);
+                assert!(matches!(outcome, ActionOutcome::Done { exit: 0, .. }));
+            }
+            _ => panic!("doctor writes nothing and still runs"),
+        }
+        assert_eq!(ran.collects.load(Ordering::SeqCst), 1, "one collection ran");
+        assert_eq!(*ran.acts.lock().unwrap(), ["doctor"], "only doctor ran");
+
+        let provider = ProviderId::new("claude-code");
+        assert!(lanes.index.submit(IndexReq::Refresh { provider }));
+        match next() {
+            Msg::Refreshed { result } => assert_eq!(result.unwrap_err(), upgraded()),
+            _ => panic!("the queued refresh was not refused"),
+        }
+        assert_eq!(ran.refreshes.load(Ordering::SeqCst), 0, "no refresh ran");
+        lanes.close();
+        assert!(lanes.join().is_empty());
     }
 }

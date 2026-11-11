@@ -123,8 +123,6 @@ impl Coalesce for ActionsReq {
 
 /// What the auto lane reports (TUI autoswitch spec §3.3): its board and events as the daemon's
 /// protocol encodes them, so the state machine reads them as it reads a socket's.
-// Task 6's lane thread constructs these; drop the allow there.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) enum LaneReport {
     /// The lane's board as `status` encodes it; no `providers` while it runs no job.
@@ -197,7 +195,6 @@ pub enum Msg {
         result: Result<Status, StatusError>,
     },
     /// What the auto lane reported (TUI autoswitch spec §3.3).
-    #[allow(dead_code)]
     Lane(LaneReport),
     /// The runtime began the shutdown (spec §10.2 step 1); it exits with `code`.
     ShutdownBegan {

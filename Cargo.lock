@@ -3298,6 +3298,7 @@ dependencies = [
  "libc",
  "mio",
  "ratatui",
+ "rusqlite",
  "serde_json",
  "signal-hook 0.4.6",
  "signal-hook-mio 0.3.0",
