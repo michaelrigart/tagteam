@@ -717,6 +717,32 @@ fn a_position_value_wins_its_directory_and_runs_plain_claude() {
 }
 
 #[test]
+fn an_integer_value_is_a_position_and_wins_its_directory() {
+    // `"<dir>" = 2` unquoted is the natural way to write a position: it blocks the directory
+    // like the string does, rather than being dropped and handing it to the database.
+    let fx = Fx::new();
+    let (a, _) = a_and_c(&fx);
+    let cwd = fx.work_dir("app");
+    map(&fx, &cwd, &a);
+    let path = config_path(&fx.env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        path,
+        format!("[provider.claude-code.mappings]\n{:?} = 2\n", key(&cwd)),
+    )
+    .unwrap();
+
+    let (_, warning) = plain(
+        fx.engine_on_path(&fx.fake_bin("claude"))
+            .plan_run(&request(None, &cwd))
+            .unwrap(),
+    );
+
+    let warning = warning.expect("a warning names the entry");
+    assert!(warning.contains("is a position"), "{warning}");
+}
+
+#[test]
 fn equivalent_entries_with_different_values_run_plain_claude() {
     let fx = Fx::new();
     let (a, c) = a_and_c(&fx);

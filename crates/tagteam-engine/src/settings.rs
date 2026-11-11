@@ -1333,8 +1333,9 @@ impl<'a> Reader<'a> {
     }
 
     /// `[provider.<id>.mappings]` for `provider` (config-mappings spec §3.1), in file order. An
-    /// entry whose key is not an absolute directory or `~`-relative, or whose value is not a
-    /// string, warns and is dropped; the rest stand.
+    /// entry whose key is not an absolute directory or `~`-relative, or whose value is neither a
+    /// string nor an integer, warns and is dropped; the rest stand. An integer is kept as its
+    /// decimal text: a position written unquoted still blocks its directory (§3.1).
     fn read_mappings(&mut self, provider: &ProviderId, home: &Path) -> Vec<MappingEntry> {
         let mut entries = Vec::new();
         let Some(table) = self.table(&["provider", provider.as_str(), "mappings"]) else {
@@ -1349,7 +1350,11 @@ impl<'a> Reader<'a> {
                 ));
                 continue;
             };
-            let Some(value) = item.as_str() else {
+            let value = item
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| item.as_integer().map(|n| n.to_string()));
+            let Some(value) = value else {
                 self.warn(format!(
                     "{}: `{dotted}` must name an account by alias or email, as a string (ignored)",
                     self.path
@@ -1359,7 +1364,7 @@ impl<'a> Reader<'a> {
             entries.push(MappingEntry {
                 written: key.to_owned(),
                 dir,
-                value: value.to_owned(),
+                value,
             });
         }
         entries

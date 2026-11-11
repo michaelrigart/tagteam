@@ -2720,7 +2720,7 @@ fn a_relative_or_empty_mapping_key_warns_and_is_ignored() {
 "" = "a"
 "Code/x" = "a"
 "~other/x" = "a"
-"/ok" = 2
+"/ok" = true
 "#,
     );
     assert!(settings.mappings.is_empty(), "{:?}", settings.mappings);
@@ -2744,6 +2744,23 @@ fn a_relative_or_empty_mapping_key_warns_and_is_ignored() {
             "{expected}: {warnings:?}"
         );
     }
+}
+
+#[test]
+fn an_integer_mapping_value_is_kept_as_its_decimal_text() {
+    let (settings, warnings) = load(
+        r#"
+[provider.claude-code.mappings]
+"/ok" = 2
+"#,
+    );
+    let kept: Vec<_> = settings
+        .mappings
+        .iter()
+        .map(|e| (e.written.as_str(), e.value.as_str()))
+        .collect();
+    assert_eq!(kept, [("/ok", "2")]);
+    assert!(warnings.is_empty(), "{warnings:?}");
 }
 
 #[test]
