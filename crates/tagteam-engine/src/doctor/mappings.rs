@@ -12,7 +12,8 @@ use super::{Id, Run, command};
 impl Run<'_> {
     /// Config-mappings spec §3.5, for `p`: the `config.toml` entries that do not apply here, and
     /// the database mappings left. With a store that cannot be read, values are not judged:
-    /// only the entries whose directory is missing are reported, and `store.*` reports the store.
+    /// only the entries whose directory is missing, and the conflicts, which the file alone
+    /// decides, are reported, and `store.*` reports the store.
     pub(super) fn mappings(&mut self, p: &dyn Provider) {
         let id = p.id();
         let file = config_path(&self.engine.env);
@@ -20,7 +21,7 @@ impl Run<'_> {
         let readable = usable;
         let entries = Settings::load(&self.engine.env, &id).0.mappings;
         // No store at all still judges values: on a fresh machine an entry names no account.
-        // A store that cannot be read judges directories only.
+        // A store that cannot be read judges directories and conflicts only.
         let mut judged = judge(self.store_ref().filter(|_| usable), p, &entries);
         let mut found = Vec::new();
         let mut usable = usable;
@@ -59,13 +60,13 @@ impl Run<'_> {
                         command(self.engine, &id, &format!("unmap {}", quoted(m.dir.path())))
                     )),
                 ),
-                _ if !usable => {}
                 Some(MappingProblem::Conflict) => {
                     conflicts
                         .entry(m.dir.path().to_owned())
                         .or_default()
                         .push(m);
                 }
+                _ if !usable => {}
                 Some(
                     problem @ (MappingProblem::NoAccount
                     | MappingProblem::Ambiguous
