@@ -61,10 +61,12 @@ fn invalid_path(path: &Path, why: &str) -> Failure {
 
 /// Warnings for the file entries that named an account in `before` and name another, or none,
 /// in `after` (config-mappings spec §3.6). Entries are matched by key and value, as written.
+/// `launch` is the provider's launch command, which runs plain where an entry names none.
 pub(in crate::app) fn mapping_warnings(
     before: &[ConfigMapping],
     after: &[ConfigMapping],
     file: &Path,
+    launch: &str,
 ) -> Vec<String> {
     before
         .iter()
@@ -81,7 +83,7 @@ pub(in crate::app) fn mapping_warnings(
                     render::name(a),
                     a.position
                 ),
-                None => "`claude` runs plain there, with a warning".to_owned(),
+                None => format!("`{launch}` runs plain there, with a warning"),
             };
             Some(format!(
                 "{}: provider.{}.mappings \"{}\" = \"{}\" no longer names {} (position {}); {outcome}",
@@ -117,8 +119,11 @@ impl App<'_, '_> {
         let Ok(after) = self.engine.config_mappings(provider) else {
             return;
         };
+        let Ok(p) = self.engine.provider(provider) else {
+            return;
+        };
         let file = tagteam_engine::settings::config_path(self.engine.env());
-        for w in mapping_warnings(before, &after, &file) {
+        for w in mapping_warnings(before, &after, &file, p.launch_command()) {
             self.io.warn(&w);
         }
     }
@@ -308,7 +313,7 @@ impl App<'_, '_> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use tagteam_engine::mappings::{ConfigMapping, MappedDir};
+    use tagteam_engine::mappings::{ConfigMapping, MappedDir, MappingProblem};
     use tagteam_engine::settings::MappingEntry;
 
     use super::mapping_warnings;
@@ -342,6 +347,7 @@ mod tests {
             &[entry(1, "a@x.co")],
             &[entry(2, "b@x.co")],
             Path::new("/c/config.toml"),
+            "fakeagent",
         );
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
@@ -353,9 +359,28 @@ mod tests {
             mapping_warnings(
                 &[entry(1, "a@x.co")],
                 &[entry(1, "a@x.co")],
-                Path::new("/c")
+                Path::new("/c"),
+                "fakeagent"
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_entry_that_names_no_account_now_says_which_launch_command_runs_plain() {
+        let mut gone = entry(1, "a@x.co");
+        gone.account = None;
+        gone.problem = Some(MappingProblem::NoAccount);
+        let warnings = mapping_warnings(
+            &[entry(1, "a@x.co")],
+            &[gone],
+            Path::new("/c/config.toml"),
+            "fakeagent",
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("`fakeagent` runs plain there, with a warning"),
+            "{warnings:?}"
         );
     }
 }
