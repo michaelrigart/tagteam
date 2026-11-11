@@ -157,7 +157,8 @@ impl Job for GateJob<'_> {
 /// One provider's job behind the gate: built while the jobs run, dropped (and with it the
 /// engine lock) while they do not. It looks before each run and each settings change, since
 /// the scheduler offers a change to every job before it picks one, and a provider job that
-/// hears of one writes the store and may take its lock.
+/// hears of one writes the store and may take its lock. It looks once more after a run, so a
+/// daemon that came up meanwhile has the lock as the run returns.
 struct HostedJob<'e, 'a> {
     engine: &'e Engine,
     provider: ProviderId,
@@ -190,11 +191,19 @@ impl Job for HostedJob<'_, '_> {
                 };
                 ProviderJob::new(self.engine, self.provider.clone(), ctx)
             });
-            job.run(cx)
+            match job.run(cx) {
+                // A daemon came up while the job ran: one more look, so the lock goes as the job
+                // returns (S§3.2) and not at the next look.
+                Ran::After(_) if !self.shared.look(self.engine) => None,
+                ran => Some(ran),
+            }
         } else {
+            None
+        };
+        let ran = ran.unwrap_or_else(|| {
             self.stand_down();
             Ran::After(STOPPED_RECHECK_MS)
-        };
+        });
         self.shared.report();
         ran
     }
@@ -220,8 +229,8 @@ impl Job for HostedJob<'_, '_> {
 ///
 /// Every job is first due now, and a tie runs in the order added. `on_status` is called with
 /// the board whenever its provider lines differ from the last passed: after every provider
-/// job's run and every look of the gate, and with no lines once no provider job runs. Every
-/// event goes to `sink`. The jobs drop, and release their locks, before this returns.
+/// job's run and every look of the gate, and with no lines once no provider job runs. It is not
+/// called while the jobs run and no provider job has a line yet. Every event goes to `sink`. The jobs drop, and release their locks, before this returns.
 pub fn run_hosted(
     engine: &Engine,
     opts: HostedOptions,
@@ -625,6 +634,43 @@ mod tests {
         assert!(freed, "the lock was released before the next tick");
         assert!(!during.is_empty(), "the tick asked for usage");
         assert_eq!(http.usage_urls(), during, "and asked for nothing after it");
+    }
+
+    #[test]
+    fn the_lock_goes_as_the_job_returns_and_not_at_the_next_look_of_the_gate() {
+        // S§3.2: "once the job in flight returns". The daemon comes up while the request is
+        // open; the first report after the run, which comes before any other job looks, finds
+        // the lock free and the provider's line gone. Without the look after the run, the lock
+        // would still be held then, and until the gate's next look a second later.
+        let fx = Fx::new();
+        two(&fx);
+        let env = fx.env.clone();
+        let http = HeldOpen::new(move || daemon_up(&env));
+        let engine = fx.tui_engine_on(http);
+        let cancel = engine.cancel().clone();
+        let first = RefCell::new(None);
+        let on_status = |s: &StatusSnapshot| {
+            first
+                .borrow_mut()
+                .get_or_insert_with(|| (absent(&fx, &cc()), s.providers.len()));
+        };
+        let slices = Slices::new(&fx.clock, |_| cancel.request(libc::SIGTERM));
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let end = run_hosted(
+            &engine,
+            options(),
+            &events,
+            &on_status,
+            &slices,
+            &mut jitter,
+        );
+        assert_eq!(end, HostedEnd::Signal);
+        assert_eq!(
+            *first.borrow(),
+            Some((true, 0)),
+            "free, and no line, at the first report after the run"
+        );
     }
 
     #[test]
