@@ -569,7 +569,7 @@ impl Engine {
         let named: Vec<String> = rated.iter().map(|r| r.described(models)).collect();
         let reset = rated
             .iter()
-            .filter_map(|r| blocked_until(r.windows.as_deref().unwrap_or_default(), models))
+            .filter_map(|r| blocked_until(r.windows.as_deref().unwrap_or_default(), models, 100.0))
             .min();
         let now_s = self.now_s();
         let when = reset.map_or_else(String::new, |at| {
