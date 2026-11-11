@@ -842,6 +842,12 @@ mod tests {
                 "● auto in pid 4711",
             ),
             (
+                "lane waiting, this window's own pid",
+                lane(waiting(std::process::id()), on()),
+                "● auto moving to the daemon",
+                "● auto → daemon",
+            ),
+            (
                 "upgraded",
                 upgraded,
                 "! auto stopped · tagteam was upgraded; restart the TUI",

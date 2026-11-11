@@ -102,6 +102,11 @@ fn held_by(holder: &AutoHolder, wide: bool) -> Vec<(String, Role)> {
     }
 }
 
+/// This process's pid: a job that waits for the engine lock on it waits for this window's lane.
+fn own_pid() -> u32 {
+    std::process::id()
+}
+
 /// `mark` in `role`, then `words` in text, then `· rest` muted.
 fn said(mark: &str, role: Role, words: &str, rest: Option<&str>) -> Vec<(String, Role)> {
     let mut pieces = vec![(mark.to_owned(), role), (format!(" {words}"), Role::Text)];
@@ -165,6 +170,16 @@ fn job_state(
                     .is_some_and(|h| h.pid == pid && h.kind == HolderKind::Tui)
             });
             let words = match (job.holder_pid, wide, window) {
+                (Some(pid), wide, _) if pid == own_pid() => {
+                    // A daemon that started beside this window waits on the lock this window's
+                    // lane still holds, and says so until it next looks (S§6).
+                    if wide {
+                        "auto moving to the daemon"
+                    } else {
+                        "auto → daemon"
+                    }
+                    .to_owned()
+                }
                 (Some(pid), true, true) => {
                     format!("auto runs in another tagteam window (pid {pid})")
                 }
@@ -382,6 +397,10 @@ mod tests {
         };
         let mut live_state = live(live_waiting);
         live_state.accounts.apply(tui(4711));
+        let mut own_waiting = daemon_job("claude-code", "waiting", true);
+        own_waiting.waiting_for = Some(Wire::from_wire("engine-lock"));
+        own_waiting.holder_pid = Some(std::process::id());
+        let live_own = live(own_waiting);
         let mut live_auto = live(daemon_job("claude-code", "auto", true));
         live_auto.accounts.apply(held(&[], Some(4242)));
         let daemon = |holders: &[(HolderKind, u32)]| held(holders, Some(4242));
@@ -436,6 +455,12 @@ mod tests {
                 live_state,
                 window,
                 "● auto in pid 4711",
+            ),
+            (
+                "live waiting, holder this window's own lane",
+                live_own,
+                "● auto moving to the daemon",
+                "● auto → daemon",
             ),
             (
                 "no lane jobs, holder tui",
