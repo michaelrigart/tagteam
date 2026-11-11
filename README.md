@@ -316,11 +316,12 @@ moves one to the file when you map that directory again. So a script that reads 
 `map --json` sees an entry leave it when `map` moves it. `map` refuses an API-key account, since
 `run` never starts a session for one.
 
-If a dotfile manager deploys `config.toml`, `map` writes the deployed file. Edit the source
-instead, or add the file to the manager again after `map`.
+If a dotfile manager deploys `config.toml`, `map` and `unmap` write the deployed file. Edit the
+source instead, or add the file to the manager again after either.
 
-Mappings apply only through `tagteam run`, which the shell wrapper calls. The IDE extensions and the desktop app do not go through
-it, so they use your default login. The desktop app's Code tab uses its own sign-in.
+Mappings apply only through `tagteam run`, which the shell wrapper calls. The IDE extensions and
+the desktop app do not go through it, so they use your default login. The desktop app's Code
+tab uses its own sign-in.
 
 ### Statusline
 

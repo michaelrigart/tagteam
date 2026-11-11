@@ -20,8 +20,9 @@ with the one before, so any release may contain breaking changes. Each section s
 - Directory mappings in `config.toml`, under `[provider.<id>.mappings]`: each key is a directory
   (`~/…` expands to your home) and each value the alias or email of an account. `tagteam run`
   takes the nearest mapped directory from either source, and where both map the same directory,
-  `config.toml` wins. An entry that names no account here warns and runs plain `claude`. A
-  mapping follows the name, not the account.
+  `config.toml` wins. An entry that does not apply here warns and runs plain `claude`: one that
+  names no account, several accounts, an API-key account or a position, or that conflicts with
+  another entry for the same directory. A mapping follows the name, not the account.
 - `tagteam doctor` checks the mappings: `mappings.directory`, `mappings.value`,
   `mappings.conflict` and `mappings.database`.
 - `tagteam remove` warns about each `config.toml` mapping that named the removed account, and

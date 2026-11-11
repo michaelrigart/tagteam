@@ -1709,8 +1709,7 @@ Captures the live login.
   - They cannot be all digits or start with `-`, and they are unique case-insensitively.
   - Setting, renaming or unsetting an alias warns about each `config.toml` mapping entry that
     resolved to an account before and resolves to a different account, or to none, afterwards;
-    it never edits the file
-    (config-mappings spec §3.6). *(Amended by the [config-mappings spec](2026-11-11-tagteam-config-mappings-design.md).)*
+    it never edits the file (config-mappings spec §3.6). *(Amended by the [config-mappings spec](2026-11-11-tagteam-config-mappings-design.md).)*
 - **`move <ACCOUNT> <POSITION>`.** If the target position is taken, the two accounts swap
   positions.
 - **Guard.** Destructive commands (`remove`, `purge`, `add` over an occupied position, and
