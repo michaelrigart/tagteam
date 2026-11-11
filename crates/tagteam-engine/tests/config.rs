@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use common::{FakeFx, Fx, capture_logs, cc};
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_engine::config::{SETTINGS_LOCK_TIMEOUT, SettingsChange};
+use tagteam_engine::config::{MappingWrite, SETTINGS_LOCK_TIMEOUT, SettingsChange};
 use tagteam_engine::settings::{
     AccountsView, ColorMode, KEYS, Key, KeyKind, Settings, SettingsError, Value, config_path,
 };
@@ -1333,5 +1333,345 @@ fn config_set_refuses_a_price_key() {
     assert_eq!(
         settings.prices[&cc()]["claude-opus-5-5"].base.input,
         Some(4.0)
+    );
+}
+
+/// Creates `rel` under the fixture's home and returns it canonical, as `map` is given it.
+fn home_dir(fx: &Fx, rel: &str) -> std::path::PathBuf {
+    let dir = fx.env.home.join(rel);
+    fs::create_dir_all(&dir).unwrap();
+    fs::canonicalize(dir).unwrap()
+}
+
+fn map(fx: &Fx, dir: &Path, value: &str) -> MappingWrite {
+    fx.engine
+        .write_mapping(&cc(), dir, value)
+        .unwrap_or_else(|e| panic!("map {dir:?} {value:?}: {e}"))
+}
+
+fn lock_file(fx: &Fx) -> std::path::PathBuf {
+    fx.env.data_dir().join("locks/config.lock")
+}
+
+#[test]
+fn map_writes_a_home_relative_key_and_creates_the_table() {
+    // Config-mappings spec §3.3: a directory under the home is keyed `~/…`, and the table is
+    // made as `config set` makes one, in a file made 0600.
+    let fx = Fx::new();
+    let dir = home_dir(&fx, "Code/work");
+
+    let written = map(&fx, &dir, "work");
+
+    assert_eq!(
+        config_text(&fx),
+        "[provider.claude-code.mappings]\n\"~/Code/work\" = \"work\"\n"
+    );
+    assert_eq!(mode(&config_path(&fx.env)), 0o600);
+    assert!(written.changed);
+    assert_eq!(written.written, "~/Code/work");
+    assert_eq!(written.path, config_path(&fx.env));
+}
+
+#[test]
+fn map_writes_an_absolute_key_outside_the_home() {
+    let fx = Fx::new();
+    let outside = fx.dir.path().join("elsewhere");
+    fs::create_dir_all(&outside).unwrap();
+    let dir = fs::canonicalize(outside).unwrap();
+
+    let written = map(&fx, &dir, "work");
+
+    assert_eq!(written.written, dir.to_str().unwrap());
+    assert_eq!(
+        config_text(&fx),
+        format!(
+            "[provider.claude-code.mappings]\n\"{}\" = \"work\"\n",
+            dir.display()
+        )
+    );
+}
+
+#[test]
+fn map_writes_a_home_relative_key_when_the_home_is_a_symlink() {
+    // Review focus 1: `$HOME` reached through a symlink. The directory is passed canonical, so
+    // it does not start with the home as spelled; the key is still `~/…`, and it expands back to
+    // the same directory.
+    let fx = Fx::with(tagteam_provider::Platform::MacOs, |env| {
+        let real = env.home.with_file_name("real-home");
+        fs::create_dir_all(&real).unwrap();
+        symlink(&real, &env.home).unwrap();
+    });
+    let dir = home_dir(&fx, "Code/work");
+    assert!(
+        !dir.starts_with(&fx.env.home),
+        "{dir:?} is canonical, the home is a link"
+    );
+
+    let written = map(&fx, &dir, "work");
+
+    assert_eq!(written.written, "~/Code/work");
+    let key = tagteam_engine::settings::expand_mapping_key(&fx.env.home, &written.written);
+    assert_eq!(fs::canonicalize(key.unwrap()).unwrap(), dir);
+}
+
+#[test]
+fn map_rewrites_the_first_equivalent_entry_in_place_and_removes_the_others() {
+    // Config-mappings spec §3.3: the first entry for the directory keeps its key and comments
+    // and takes the value; every other spelling of it goes; the rest stays.
+    let fx = Fx::new();
+    let dir = home_dir(&fx, "w");
+    write_config(
+        &fx,
+        &format!(
+            "[provider.claude-code.mappings]\n# work\n\"~/w\" = \"a\" # old\n\"/elsewhere\" = \"x\"\n\"{}/w\" = \"b\"\n",
+            fs::canonicalize(&fx.env.home).unwrap().display()
+        ),
+    );
+
+    let written = map(&fx, &dir, "c");
+
+    assert!(written.changed);
+    assert_eq!(written.written, "~/w");
+    assert_eq!(
+        config_text(&fx),
+        "[provider.claude-code.mappings]\n# work\n\"~/w\" = \"c\" # old\n\"/elsewhere\" = \"x\"\n"
+    );
+}
+
+#[test]
+fn map_of_the_value_already_there_writes_nothing() {
+    // The no-change path of `edit`: no write, no lock file.
+    let fx = Fx::new();
+    let dir = home_dir(&fx, "w");
+    let text = "[provider.claude-code.mappings]\n\"~/w\" = \"a\" # kept\n";
+    write_config(&fx, text);
+    let before = fs::metadata(config_path(&fx.env))
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    let written = map(&fx, &dir, "a");
+
+    assert!(!written.changed);
+    assert_eq!(written.written, "~/w");
+    assert_eq!(config_text(&fx), text);
+    assert_eq!(
+        fs::metadata(config_path(&fx.env))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        before
+    );
+    assert!(!lock_file(&fx).exists());
+}
+
+#[test]
+fn unmap_removes_equivalent_entries_and_drops_an_empty_table() {
+    let fx = Fx::new();
+    let dir = home_dir(&fx, "w");
+    write_config(
+        &fx,
+        "default_provider = \"claude-code\"\n\n[provider.claude-code.mappings]\n\"~/w\" = \"a\"\n",
+    );
+
+    assert_eq!(
+        fx.engine.remove_config_mappings(Some(&cc()), &dir).unwrap(),
+        1
+    );
+
+    assert_eq!(config_text(&fx), "default_provider = \"claude-code\"\n");
+}
+
+#[test]
+fn unmap_keeps_a_table_that_holds_a_comment() {
+    let fx = Fx::new();
+    let dir = home_dir(&fx, "w");
+    write_config(
+        &fx,
+        "# my mappings\n[provider.claude-code.mappings]\n\"~/w\" = \"a\"\n",
+    );
+
+    assert_eq!(
+        fx.engine.remove_config_mappings(Some(&cc()), &dir).unwrap(),
+        1
+    );
+
+    assert_eq!(
+        config_text(&fx),
+        "# my mappings\n[provider.claude-code.mappings]\n"
+    );
+}
+
+#[test]
+fn unmap_without_a_provider_removes_every_provider_s_entries() {
+    let fx = Fx::new();
+    let dir = home_dir(&fx, "w");
+    let text = "[provider.claude-code.mappings]\n\"~/w\" = \"a\"\n\n[provider.fake-agent.mappings]\n\"~/w\" = \"b\"\n\"~/other\" = \"c\"\n";
+    write_config(&fx, text);
+
+    assert_eq!(
+        fx.engine.remove_config_mappings(Some(&cc()), &dir).unwrap(),
+        1
+    );
+    assert_eq!(
+        config_text(&fx),
+        "[provider.fake-agent.mappings]\n\"~/w\" = \"b\"\n\"~/other\" = \"c\"\n",
+        "only claude-code's entry goes"
+    );
+
+    write_config(&fx, text);
+    assert_eq!(fx.engine.remove_config_mappings(None, &dir).unwrap(), 2);
+    assert_eq!(
+        config_text(&fx),
+        "[provider.fake-agent.mappings]\n\"~/other\" = \"c\"\n"
+    );
+}
+
+#[test]
+fn unmap_of_a_gone_directory_matches_its_expanded_path() {
+    // Config-mappings spec §3.4: a directory that is gone is compared by its expanded path.
+    let fx = Fx::new();
+    let gone = fx.env.home.join("gone");
+    write_config(&fx, "[provider.claude-code.mappings]\n\"~/gone\" = \"a\"\n");
+
+    assert_eq!(
+        fx.engine
+            .remove_config_mappings(Some(&cc()), &gone)
+            .unwrap(),
+        1
+    );
+
+    assert_eq!(config_text(&fx), "");
+}
+
+#[test]
+fn unmap_that_matches_nothing_changes_nothing() {
+    let fx = Fx::new();
+    let dir = home_dir(&fx, "w");
+    let text = "[provider.claude-code.mappings]\n\"~/other\" = \"a\"\n";
+    write_config(&fx, text);
+
+    assert_eq!(
+        fx.engine.remove_config_mappings(Some(&cc()), &dir).unwrap(),
+        0
+    );
+
+    assert_eq!(config_text(&fx), text);
+    assert!(!lock_file(&fx).exists());
+}
+
+#[test]
+fn map_and_unmap_keep_an_inline_mappings_table_inline() {
+    // Review focus 4: a hand-written inline table is edited in its own style.
+    let fx = Fx::new();
+    let x = home_dir(&fx, "x");
+    let y = home_dir(&fx, "y");
+    write_config(
+        &fx,
+        "[provider.claude-code]\nmappings = { \"~/x\" = \"a\" }\n",
+    );
+
+    map(&fx, &y, "b");
+    assert_eq!(
+        config_text(&fx),
+        "[provider.claude-code]\nmappings = { \"~/x\" = \"a\", \"~/y\" = \"b\" }\n"
+    );
+
+    assert_eq!(
+        fx.engine.remove_config_mappings(Some(&cc()), &x).unwrap(),
+        1
+    );
+    assert_eq!(
+        fx.engine.remove_config_mappings(Some(&cc()), &y).unwrap(),
+        1
+    );
+    // As `config unset` does, the tables the removal empties go with it, the header the file
+    // wrote by hand included.
+    assert_eq!(config_text(&fx), "");
+}
+
+#[test]
+fn a_mappings_entry_that_is_not_a_table_is_invalid() {
+    let fx = Fx::new();
+    let dir = home_dir(&fx, "w");
+    let text = "[provider.claude-code]\nmappings = \"oops\"\n";
+    write_config(&fx, text);
+
+    for err in [
+        fx.engine.write_mapping(&cc(), &dir, "a").unwrap_err(),
+        fx.engine
+            .remove_config_mappings(Some(&cc()), &dir)
+            .unwrap_err(),
+    ] {
+        match err {
+            EngineError::Settings(SettingsError::Invalid { key, .. }) => {
+                assert_eq!(key, "provider.claude-code.mappings");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(config_text(&fx), text);
+}
+
+#[test]
+fn a_corrupt_file_is_never_written() {
+    // Review focus 5: `map` refuses to write a file that is not valid TOML.
+    let fx = Fx::new();
+    let dir = home_dir(&fx, "w");
+    let text = "[provider.claude-code.mappings\n\"~/w\" = \n";
+    write_config(&fx, text);
+
+    for err in [
+        fx.engine.write_mapping(&cc(), &dir, "a").unwrap_err(),
+        fx.engine
+            .remove_config_mappings(Some(&cc()), &dir)
+            .unwrap_err(),
+    ] {
+        assert!(
+            matches!(err, EngineError::Settings(SettingsError::Corrupt { .. })),
+            "{err:?}"
+        );
+    }
+    assert_eq!(config_text(&fx), text);
+}
+
+#[test]
+fn with_no_file_unmap_creates_nothing() {
+    let fx = Fx::new();
+    let dir = home_dir(&fx, "w");
+
+    assert_eq!(fx.engine.remove_config_mappings(None, &dir).unwrap(), 0);
+
+    assert!(!config_path(&fx.env).exists());
+    assert!(!lock_file(&fx).exists());
+}
+
+#[test]
+fn a_mapping_write_logs_its_key_and_never_the_directory_or_value() {
+    // Core §14.2: the log records `provider.<id>.mappings` and an action, nothing more.
+    let fx = Fx::new();
+    let dir = home_dir(&fx, "secret-project");
+
+    let (_, logs) = capture_logs(|| map(&fx, &dir, "me@example.com"));
+    let info: Vec<&String> = logs.iter().filter(|l| l.contains("INFO")).collect();
+    assert_eq!(info.len(), 1, "{logs:?}");
+    assert!(
+        info[0].contains("settings written")
+            && info[0].contains("provider.claude-code.mappings")
+            && info[0].contains("map"),
+        "{info:?}"
+    );
+
+    let (_, logs) = capture_logs(|| fx.engine.remove_config_mappings(None, &dir).unwrap());
+    assert!(
+        logs.iter().any(|l| l.contains("INFO")
+            && l.contains("unmap")
+            && l.contains("provider.claude-code.mappings")),
+        "{logs:?}"
+    );
+    assert!(
+        logs.iter()
+            .all(|l| !l.contains("secret-project") && !l.contains("me@example.com")),
+        "{logs:?}"
     );
 }
