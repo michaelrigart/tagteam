@@ -2645,6 +2645,53 @@ mod tests {
     }
 
     #[test]
+    fn q_ends_a_sleeping_auto_lane_at_once_and_not_at_the_end_of_its_slice() {
+        // The scheduler sleeps in slices of up to a second; the lane's sleep wakes when its
+        // token is set, so the key costs no part of the slice it lands in.
+        let home = Arc::new(LaneHome::new());
+        let fx = with_a_lane(&home, |_| idle());
+        let (ending, pressed) = {
+            let mut ui = fx.ui();
+            ui.start();
+            assert!(lock_within(&home, true), "the lane never took the lock");
+            // The lane's first pass is over: it sleeps, with most of a slice left.
+            thread::sleep(Duration::from_millis(250));
+            let pressed = Instant::now();
+            fx.key('q');
+            (ui.run(), pressed)
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+        assert!(
+            pressed.elapsed() < Duration::from_millis(300),
+            "q took {:?} to end a sleeping lane",
+            pressed.elapsed()
+        );
+        assert!(matches!(home.lock(), Read::Absent));
+    }
+
+    #[test]
+    fn ctrl_z_stops_a_sleeping_auto_lane_at_once_and_not_at_the_end_of_its_slice() {
+        let home = Arc::new(LaneHome::new());
+        let fx = with_a_lane(&home, |_| idle());
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            assert!(lock_within(&home, true), "the lane never took the lock");
+            thread::sleep(Duration::from_millis(250));
+            let pressed = Instant::now();
+            ui.execute(vec![Cmd::Stop]);
+            assert!(
+                pressed.elapsed() < Duration::from_millis(300),
+                "Ctrl-Z took {:?} to stop a sleeping lane",
+                pressed.elapsed()
+            );
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    #[test]
     fn ctrl_z_frees_the_lock_before_the_process_stops_and_resume_takes_it_again() {
         let home = Arc::new(LaneHome::new());
         let fx = with_a_lane(&home, |_| idle());

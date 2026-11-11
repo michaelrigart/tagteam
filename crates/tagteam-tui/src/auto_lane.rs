@@ -2,19 +2,20 @@
 //! daemon runs, and says what they do as the daemon's protocol encodes it, so the state machine
 //! reads it as it reads a socket's. Its engine is built inside the thread by the binary's
 //! factory, under a cancel token of the lane's own: Ctrl-Z and the shutdown set it, and the
-//! scheduler returns within a slice, releasing every lock.
+//! scheduler returns at once, even from a sleep, releasing every lock.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use tagteam_core::ProviderId;
 use tagteam_daemon::events::{DaemonEvent, DaemonSink};
 use tagteam_daemon::hosted::{HostedEnd, HostedOptions, run_hosted};
 use tagteam_daemon::protocol::{Status, daemon_event_json, parse_event, status_json};
-use tagteam_daemon::scheduler::{ThreadSleeper, uniform_jitter};
+use tagteam_daemon::scheduler::{Sleeper, uniform_jitter};
 use tagteam_daemon::status::StatusSnapshot;
 use tagteam_engine::Engine;
 use tagteam_provider::Cancel;
@@ -32,6 +33,17 @@ pub struct LaneEngine {
 
 /// Builds the lane's engine inside its thread, under the token given (S§3.1).
 pub type AutoFactory = Arc<dyn Fn(Cancel) -> Result<LaneEngine, SourceError> + Send + Sync>;
+
+/// The lane's sleep: it ends early when the lane's thread is unparked, which `suspend`, `close`
+/// and `join` do after they set the token. The scheduler looks at its token and the clock after
+/// every sleep, so a wake-up for any other reason is harmless.
+struct ParkSleeper;
+
+impl Sleeper for ParkSleeper {
+    fn sleep(&self, d: Duration) {
+        thread::park_timeout(d);
+    }
+}
 
 /// The lane's current run: the token that ends it and its thread.
 struct Run {
@@ -121,6 +133,7 @@ impl AutoLane {
         let mut run = self.lock();
         run.cancel.request(libc::SIGINT);
         if let Some(handle) = run.handle.take() {
+            handle.thread().unpark();
             run.died |= handle.join().is_err();
         }
     }
@@ -130,6 +143,9 @@ impl AutoLane {
         let mut run = self.lock();
         run.closed = true;
         run.cancel.request(libc::SIGINT);
+        if let Some(handle) = &run.handle {
+            handle.thread().unpark();
+        }
     }
 
     /// Joins the run; `Err` when it, or one joined before it, panicked.
@@ -139,7 +155,10 @@ impl AutoLane {
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner);
         run.cancel.request(libc::SIGINT);
-        let ended = run.handle.map_or(Ok(()), JoinHandle::join);
+        let ended = run.handle.map_or(Ok(()), |handle| {
+            handle.thread().unpark();
+            handle.join()
+        });
         if run.died {
             return Err(Box::new("the auto lane panicked"));
         }
@@ -192,7 +211,7 @@ fn serve(
         opts,
         &sink,
         &on_status,
-        &ThreadSleeper,
+        &ParkSleeper,
         &mut uniform_jitter,
     );
     match end {
