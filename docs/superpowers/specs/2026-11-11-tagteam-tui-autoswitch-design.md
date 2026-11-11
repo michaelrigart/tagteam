@@ -103,8 +103,8 @@ that reason (daemon spec, lines 63-67).
   - It gets its `Engine` from a factory the binary supplies, as the other lanes do. The TUI
     crate builds no engine of its own (`crates/tagteam/src/tui_cmd.rs:140-147`).
   - The engine is built inside the thread with `EventSource::Auto`, so History words its
-    switches as auto's. It also gets the shutdown token and the counted Keychain
-    (`app/mod.rs:158-163`).
+    switches as auto's. It also gets a cancel token of the lane's own, which Ctrl-Z and the
+    shutdown set (never the signal token), and the counted Keychain (`app/mod.rs:158-163`).
 - **The jobs:** it runs a `Scheduler` with the daemon's own jobs, in the daemon's order
   (`daemon.rs:290-334`):
   - the settings job, so engine-level settings reload as in the daemon;
@@ -115,9 +115,9 @@ that reason (daemon spec, lines 63-67).
 - **Not hosted:** the program half of the upgrade watch (the TUI is not restarted for an
   upgrade), and the token jobs.
 - **Joining:** the lane is joined at shutdown, unlike the daemon lane, because it writes the
-  store. On quit the shutdown sets the lane's token, and the lane's sleep wakes on it, so the scheduler
-  stops at once and not at the end of a 1 s slice. A tick finishes
-  only its critical span (core §14.1).
+  store. On quit the shutdown sets the lane's token, and the lane's sleep wakes on it at once, so
+  the scheduler does not wait out a 1 s slice. A job already running finishes first, within its
+  requests' own timeouts (§3.2), and a tick finishes only its critical span (core §14.1).
 - **Hand-overs keep it running.** A foreground action, such as an `R` session, runs on the UI
   thread for as long as it lasts (`runtime.rs:578-583`). The lane carries on through it, as
   every background lane does (TUI §7.3). This is when switching matters most. Its start and

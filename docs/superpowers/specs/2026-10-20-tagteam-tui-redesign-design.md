@@ -362,6 +362,7 @@ account's provider, then `? keys`, which is never dropped.
 | the TUI's own auto lane, `auto` | `● auto on in this window · switches at 90%` | `● auto on · at 90%` |
 | the same, strategy `consume-first` (C-17) | `● auto on in this window · uses the soonest reset first` | `● auto on · soonest reset` |
 | the lane's `collect`, `idle` and `backoff` | as the daemon's rows above | as the daemon's rows above |
+| a live daemon job `waiting` for `engine-lock`, the holder this TUI itself (the hand-over to a daemon started beside it) *(Amended by the TUI autoswitch spec, [§3.3](2026-11-11-tagteam-tui-autoswitch-design.md).)* | `● auto moving to the daemon` | `● auto → daemon` |
 | the lane stopped for a newer store schema | `! auto stopped · tagteam was upgraded; restart the TUI` | `! restart the TUI` |
 | a live daemon record, no socket link, the engine lock held by the daemon | `● auto runs in the daemon (pid 4711) · not connected` | `● auto in daemon` |
 | the same, the lock held by another process | that holder's row above | that holder's row above |
