@@ -1,6 +1,6 @@
 # The TUI switches accounts while it is open: implementation plan
 
-**Status:** In progress
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/61
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
