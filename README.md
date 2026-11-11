@@ -307,14 +307,15 @@ an account:
 ```
 
 A key may start with `~/`, so the same file works on several machines. A mapping follows the
-name, not the account: if you rename the alias or remove the account, the directory runs plain
-`claude` with a warning, and `tagteam alias` and `tagteam remove` tell you which directories are
-affected. `tagteam doctor` reports entries that do not apply. `tagteam map` with no arguments
-lists the mappings, and `tagteam map --json` lists the ones in `config.toml` under
-`configMappings`. Mappings that an older tagteam stored in its database still work, and `map`
-moves one to the file when you map that directory again. So a script that reads `mappings` from
-`map --json` sees an entry leave it when `map` moves it. `map` refuses an API-key account, since
-`run` never starts a session for one.
+name, not the account. If you rename the alias or remove the account, the entry names whatever
+that name names now: no account, and the directory runs plain `claude` with a warning, or another
+account, such as the one left of two that share an email. `tagteam alias` and `tagteam remove`
+warn about each entry they affect and say what it names now. `tagteam doctor` reports entries
+that do not apply. `tagteam map` with no arguments lists the mappings, and `tagteam map --json`
+lists the ones in `config.toml` under `configMappings`. Mappings that an older tagteam stored in
+its database still work, and `map` moves one to the file when you map that directory again. So a
+script that reads `mappings` from `map --json` sees an entry leave it when `map` moves it. `map`
+refuses an API-key account, since `run` never starts a session for one.
 
 If a dotfile manager deploys `config.toml`, `map` and `unmap` write the deployed file. Edit the
 source instead, or add the file to the manager again after either.

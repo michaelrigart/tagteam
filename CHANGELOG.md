@@ -25,9 +25,11 @@ with the one before, so any release may contain breaking changes. Each section s
   another entry for the same directory. A mapping follows the name, not the account.
 - `tagteam doctor` checks the mappings: `mappings.directory`, `mappings.value`,
   `mappings.conflict` and `mappings.database`.
-- `tagteam remove` warns about each `config.toml` mapping that named the removed account, and
-  `tagteam alias` about each that resolved to an account before and resolves to another account,
-  or to none, after. They never edit the file.
+- `tagteam remove` warns about each `config.toml` mapping whose value named the removed account,
+  alone or with other accounts that share its email, and `tagteam alias` about each that resolved
+  to an account before and resolves to another account, or to none, after. Each warning says what
+  the mapping names now, whether or not its directory exists on this machine. They never edit the
+  file.
 
 ### Changed
 
