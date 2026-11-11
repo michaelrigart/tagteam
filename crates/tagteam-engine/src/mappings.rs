@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tagteam_core::ProviderId;
 use tagteam_core::validate::{AccountRefInput, parse_account_ref};
+use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::Provider;
 
 use crate::engine::Engine;
@@ -145,6 +145,8 @@ pub(crate) fn judge(
 pub enum Named {
     /// Exactly one account, which a session can start for.
     Applies(AccountRow),
+    /// More than one account, by id. The entry does not apply: its problem is `Ambiguous`.
+    Several(Vec<AccountId>),
     /// The entry does not apply. `account` is the one account the value names, when it names
     /// exactly one (an API-key account).
     DoesNot {
@@ -165,7 +167,16 @@ impl Named {
     pub fn account(&self) -> Option<&AccountRow> {
         match self {
             Named::Applies(row) => Some(row),
+            Named::Several(_) => None,
             Named::DoesNot { account, .. } => account.as_ref(),
+        }
+    }
+
+    /// Whether the value names `id`, alone or among others.
+    pub fn names(&self, id: &AccountId) -> bool {
+        match self {
+            Named::Several(ids) => ids.contains(id),
+            _ => self.account().is_some_and(|row| &row.id == id),
         }
     }
 
@@ -173,6 +184,7 @@ impl Named {
     fn problem(&self) -> Option<MappingProblem> {
         match self {
             Named::Applies(_) => None,
+            Named::Several(_) => Some(MappingProblem::Ambiguous),
             Named::DoesNot { problem, .. } => Some(*problem),
         }
     }
@@ -207,7 +219,7 @@ pub(crate) fn resolve_value(
                 Named::Applies(row)
             }
         }
-        _ => Named::none(MappingProblem::Ambiguous),
+        _ => Named::Several(found.into_iter().map(|row| row.id).collect()),
     })
 }
 

@@ -14,7 +14,7 @@ use tagteam_provider::profile::RunShell;
 
 use crate::engine::Engine;
 use crate::error::EngineError;
-use crate::mappings::{MappedDir, Named, mapped_dir, resolve_value};
+use crate::mappings::{MappedDir, MappingProblem, Named, mapped_dir, resolve_value};
 use crate::settings::{self, MappingEntry, Settings};
 use crate::store::{AccountRow, Store};
 
@@ -261,15 +261,17 @@ impl Engine {
                 ),
             });
         }
+        let not_here = |problem: MappingProblem| Mapped::NotHere {
+            why: format!(
+                "the mapping {keys} in {} {}",
+                file.display(),
+                problem.describe()
+            ),
+        };
         Ok(match resolve_value(store, p, value)? {
             Named::Applies(row) => Mapped::Account(row),
-            Named::DoesNot { problem, .. } => Mapped::NotHere {
-                why: format!(
-                    "the mapping {keys} in {} {}",
-                    file.display(),
-                    problem.describe()
-                ),
-            },
+            Named::Several(_) => not_here(MappingProblem::Ambiguous),
+            Named::DoesNot { problem, .. } => not_here(problem),
         })
     }
 
