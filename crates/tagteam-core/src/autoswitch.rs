@@ -255,7 +255,7 @@ pub const ALL_ABOVE: &str = "all-above";
 pub enum Exhausted {
     /// Every one is out; `wake_at` is when the first has room again (§3.4's wake time), if known.
     AllOut { wake_at: Option<i64> },
-    /// One is full and has room left.
+    /// Every one is full and at least one still has room.
     RoomLeft,
 }
 
@@ -265,7 +265,8 @@ pub enum Decision {
         reason: NoSwitchReason,
         outcome: Outcome,
         /// `"2/3"` for active-usage-unknown, the time left for cooldown (`4m`), the time until
-        /// the earliest recovery for all-exhausted; `""` otherwise.
+        /// the earliest recovery for all-exhausted, `all-above` for no-qualifying-candidate when
+        /// every account is above the threshold; `""` otherwise.
         detail: String,
         /// all-exhausted: when the move this tick wanted could first land (`earliestResetAt`,
         /// ceiling spec §3.4).
@@ -667,20 +668,20 @@ fn gated(r: &Ranking, oauth: &[Rated], bar: Option<&AccountId>) -> Vec<AccountId
     let Some(active_h) = r.active_h() else {
         return Vec::new();
     };
-    let all_above = all_above(r, oauth);
+    let every_above = all_above(r, oauth);
     let passing = oauth.iter().filter(|c| {
         let Some(h) = c.headroom else {
             return false;
         };
         if full(h, r.cfg.ceiling)
             || bar == Some(&c.account.id)
-            || !landing_ok(h, r.cfg.threshold, all_above)
+            || !landing_ok(h, r.cfg.threshold, every_above)
         {
             return false;
         }
         match r.trigger {
             Trigger::ConsumeFirst => resets_sooner(c.long_reset, r.active.long_reset),
-            _ if all_above => {
+            _ if every_above => {
                 let useful = recovery_axis_useful(
                     active_h,
                     h,
@@ -700,7 +701,7 @@ fn gated(r: &Ranking, oauth: &[Rated], bar: Option<&AccountId>) -> Vec<AccountId
     });
     let order = match r.trigger {
         Trigger::ConsumeFirst => soonest_long_reset,
-        _ if all_above => soonest_recovery,
+        _ if every_above => soonest_recovery,
         _ => most_headroom,
     };
     ordered(passing.collect(), order)

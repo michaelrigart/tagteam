@@ -3,7 +3,7 @@
 //! `history.rs` and `tokens_cmd.rs` with their bodies unchanged; the CLI adds its ANSI colours
 //! around them.
 
-use tagteam_core::autoswitch::{NoSwitchReason, Trigger};
+use tagteam_core::autoswitch::{ALL_ABOVE, NoSwitchReason, Trigger};
 use tagteam_core::time::ms_to_s;
 use tagteam_core::{Window, WindowKind};
 use tagteam_provider::TransientKind;
@@ -575,6 +575,9 @@ pub fn no_switch(reason: NoSwitchReason, facts: &NoSwitchFacts<'_>) -> String {
             Some(at) => format!("every account is near its limit; the first frees up at {at}"),
             None => "every account is near its limit".into(),
         },
+        NoSwitchReason::NoQualifyingCandidate if facts.detail == ALL_ABOVE => {
+            format!("every account is above {t}, and none is far enough ahead to switch to")
+        }
         NoSwitchReason::NoQualifyingCandidate => "no other account has enough headroom".into(),
         NoSwitchReason::NoCandidates => "no other account can be used".into(),
         NoSwitchReason::NoComparison => "no other account has a reading to compare".into(),
@@ -1830,6 +1833,28 @@ mod tests {
             let want = expected.iter().find(|(r, _)| *r == reason).unwrap().1;
             assert_eq!(no_switch(reason, &facts(detail)), want, "{reason:?}");
         }
+    }
+
+    #[test]
+    fn no_qualifying_candidate_names_the_threshold_when_every_account_is_above_it() {
+        let at = |detail, threshold| {
+            no_switch(
+                NoSwitchReason::NoQualifyingCandidate,
+                &NoSwitchFacts {
+                    threshold,
+                    ..facts(detail)
+                },
+            )
+        };
+        assert_eq!(
+            at(ALL_ABOVE, 90.0),
+            "every account is above 90%, and none is far enough ahead to switch to"
+        );
+        assert_eq!(
+            at(ALL_ABOVE, 92.5),
+            "every account is above 92.5%, and none is far enough ahead to switch to"
+        );
+        assert_eq!(at("", 90.0), "no other account has enough headroom");
     }
 
     #[test]
