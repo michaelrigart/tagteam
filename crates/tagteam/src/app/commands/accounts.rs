@@ -230,7 +230,9 @@ impl App<'_, '_> {
         // Decided before the row is gone. Removal never touches the live login
         // (§10.3), so this also says whether the removed login is still the live one.
         let active = self.is_active(&row)?;
+        let before = self.mappings_snapshot(&row.provider);
         let row = self.engine.remove(&row.id)?;
+        self.warn_changed_mappings(&row.provider, &before);
         let human = format!(
             "Removed {} (position {}).\n",
             render::name(&row),
@@ -277,14 +279,18 @@ impl App<'_, '_> {
             }
             (Some(account), Some(name), false) => {
                 let row = self.resolve(&account)?;
+                let before = self.mappings_snapshot(&row.provider);
                 let row = self.engine.set_alias(&row.id, Some(&name))?;
+                self.warn_changed_mappings(&row.provider, &before);
                 let alias = row.alias.clone().unwrap_or_default();
                 let human = format!("Position {} is now {alias}.\n", row.position);
                 self.print_account(&human, row, None);
             }
             (Some(account), None, true) => {
                 let row = self.resolve(&account)?;
+                let before = self.mappings_snapshot(&row.provider);
                 let row = self.engine.set_alias(&row.id, None)?;
+                self.warn_changed_mappings(&row.provider, &before);
                 let human = format!("Position {} has no alias now.\n", row.position);
                 self.print_account(&human, row, None);
             }

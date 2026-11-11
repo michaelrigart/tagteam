@@ -286,6 +286,64 @@ fn removing_an_account_removes_its_mappings() {
 }
 
 #[test]
+fn removing_an_account_warns_about_config_mappings_that_named_it() {
+    let d = tempfile::tempdir().unwrap();
+    two_accounts(d.path());
+    let config = write_config(
+        d.path(),
+        "[provider.claude-code.mappings]\n\"~/x\" = \"a@x.co\"\n",
+    );
+    let before = fs::read(&config).unwrap();
+    let out = cmd(d.path()).args(["remove", "1"]).assert().success();
+    let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("~/x"), "{err}");
+    assert!(err.contains("a@x.co"), "{err}");
+    assert!(err.contains(&config.display().to_string()), "{err}");
+    assert_eq!(fs::read(&config).unwrap(), before);
+}
+
+#[test]
+fn unsetting_or_renaming_an_alias_warns_about_config_mappings_that_used_it() {
+    let d = tempfile::tempdir().unwrap();
+    two_accounts(d.path());
+    cmd(d.path())
+        .args(["alias", "1", "work"])
+        .assert()
+        .success();
+    let config = write_config(
+        d.path(),
+        "[provider.claude-code.mappings]\n\"~/x\" = \"work\"\n",
+    );
+    let before = fs::read(&config).unwrap();
+    let stderr = |args: &[&str]| {
+        let out = cmd(d.path()).arg("alias").args(args).assert().success();
+        String::from_utf8(out.get_output().stderr.clone()).unwrap()
+    };
+    let err = stderr(&["1", "home"]);
+    assert!(err.contains("~/x"), "{err}");
+    assert!(err.contains(&config.display().to_string()), "{err}");
+    assert_eq!(stderr(&["1", "work"]), "", "it named no account before");
+    let err = stderr(&["1", "--unset"]);
+    assert!(err.contains("~/x"), "{err}");
+    assert_eq!(fs::read(&config).unwrap(), before);
+}
+
+#[test]
+fn an_alias_change_no_entry_used_says_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    two_accounts(d.path());
+    write_config(
+        d.path(),
+        "[provider.claude-code.mappings]\n\"~/x\" = \"work\"\n",
+    );
+    cmd(d.path())
+        .args(["alias", "2", "other"])
+        .assert()
+        .success()
+        .stderr("");
+}
+
+#[test]
 fn on_a_fresh_machine_map_and_unmap_create_nothing() {
     // §5: a command that changes nothing creates nothing.
     let d = tempfile::tempdir().unwrap();
