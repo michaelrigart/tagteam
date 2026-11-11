@@ -2551,6 +2551,16 @@ mod tests {
     fn p_says_no_daemon_runs_only_when_the_lane_cannot_run() {
         for report in [LaneReport::Off, LaneReport::Upgraded] {
             let mut state = loaded(1);
+            // The lane had a job first: one it no longer runs must not answer `P`.
+            let job = daemon_job("claude-code", "auto", true);
+            let board = LaneReport::Status(daemon_status(vec![job], vec![]));
+            update(&mut state, Msg::Lane(board), NOW_MS);
+            assert!(
+                state
+                    .daemon
+                    .hosted_job(&tagteam_core::ProviderId::new("claude-code"))
+                    .is_some()
+            );
             update(&mut state, Msg::Lane(report.clone()), NOW_MS);
             assert!(update(&mut state, ch('P'), NOW_MS).is_empty());
             let toast = state.toast.as_ref().unwrap();
