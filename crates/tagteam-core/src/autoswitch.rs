@@ -316,7 +316,7 @@ struct Rated<'s> {
     recovery_at: Option<i64>,
     /// When `cfg.long_window` resets (consume-first); `None` when unknown or already past.
     long_reset: Option<i64>,
-    /// When every relevant window at its limit has reset (`rank::blocked_until`).
+    /// When every relevant window at its limit has reset (`rank::blocked_until` at 100).
     back_at: Option<i64>,
 }
 
@@ -338,7 +338,7 @@ impl<'s> Rated<'s> {
                     .and_then(|w| w.resets_at),
             ),
             long_reset: future(long.and_then(|w| w.resets_at)),
-            back_at: windows.and_then(|w| blocked_until(w, &cfg.models)),
+            back_at: windows.and_then(|w| blocked_until(w, &cfg.models, 100.0)),
         }
     }
 }

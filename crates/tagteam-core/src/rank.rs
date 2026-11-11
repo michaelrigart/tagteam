@@ -92,13 +92,13 @@ pub fn binding_window<'w>(windows: &'w [Window], models: &[String]) -> Option<&'
         })
 }
 
-/// When an account at its limit is usable again: the latest reset among its relevant windows
-/// that are at 100% or more, since it is blocked until every one of them has reset. `None` when
-/// none of those windows names a reset.
-pub fn blocked_until(windows: &[Window], models: &[String]) -> Option<i64> {
+/// When an account is usable again at `level`: the latest reset among its relevant windows at
+/// `level` percent or more, since it is back for that level once every one of them has reset.
+/// `None` when none of those windows names a reset.
+pub fn blocked_until(windows: &[Window], models: &[String], level: f64) -> Option<i64> {
     windows
         .iter()
-        .filter(|w| is_relevant(w, models) && w.pct >= 100.0)
+        .filter(|w| is_relevant(w, models) && w.pct >= level)
         .filter_map(|w| w.resets_at)
         .max()
 }
@@ -331,9 +331,13 @@ mod tests {
             at("scoped:Fable", WindowKind::Scoped, 100.0, 50_000),
             at("spend", WindowKind::Spend, 100.0, 70_000),
         ];
-        assert_eq!(blocked_until(&windows, &[]), Some(9_000), "the later reset");
         assert_eq!(
-            blocked_until(&windows, &models(&["fable"])),
+            blocked_until(&windows, &[], 100.0),
+            Some(9_000),
+            "the later reset"
+        );
+        assert_eq!(
+            blocked_until(&windows, &models(&["fable"]), 100.0),
             Some(50_000),
             "a scoped window the models name counts too"
         );
@@ -341,11 +345,28 @@ mod tests {
             at("5h", WindowKind::Short, 100.0, 1_000),
             at("7d", WindowKind::Long, 60.0, 9_000),
         ];
-        assert_eq!(blocked_until(&one_blocking, &[]), Some(1_000));
+        assert_eq!(blocked_until(&one_blocking, &[], 100.0), Some(1_000));
         assert_eq!(
-            blocked_until(&[win("5h", "5h", WindowKind::Short, 100.0)], &[]),
+            blocked_until(&[win("5h", "5h", WindowKind::Short, 100.0)], &[], 100.0),
             None
         );
+    }
+
+    #[test]
+    fn a_level_below_100_waits_for_every_window_at_or_above_it() {
+        let at = |key: &str, kind, pct, reset| Window {
+            resets_at: Some(reset),
+            ..win(key, key, kind, pct)
+        };
+        let windows = vec![
+            at("5h", WindowKind::Short, 100.0, 1_000),
+            at("7d", WindowKind::Long, 97.0, 9_000),
+        ];
+        assert_eq!(blocked_until(&windows, &[], 100.0), Some(1_000));
+        assert_eq!(blocked_until(&windows, &[], 98.0), Some(1_000));
+        assert_eq!(blocked_until(&windows, &[], 95.0), Some(9_000));
+        let exact = vec![at("7d", WindowKind::Long, 97.3, 9_000)];
+        assert_eq!(blocked_until(&exact, &[], 97.3), Some(9_000));
     }
 
     #[test]
