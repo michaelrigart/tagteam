@@ -905,14 +905,14 @@ pub struct MappingEntry {
 }
 
 /// A mapping key's directory (config-mappings spec §3.1): `~` is `home`, `~/rest` is
-/// `home.join(rest)`, and any other absolute key is kept as given. Each is rebuilt from its
-/// components, so a trailing `/` or a `.` component does not matter. An empty key, a relative
-/// one or `~user/…` is `None`.
+/// `home.join(rest)` however many `/` lead `rest` (as a shell reads `~//x`), and any other
+/// absolute key is kept as given. Each is rebuilt from its components, so a trailing `/` or a
+/// `.` component does not matter. An empty key, a relative one or `~user/…` is `None`.
 pub fn expand_mapping_key(home: &Path, key: &str) -> Option<PathBuf> {
     let path = if key == "~" {
         home.to_owned()
     } else if let Some(rest) = key.strip_prefix("~/") {
-        home.join(rest)
+        home.join(rest.trim_start_matches('/'))
     } else if Path::new(key).is_absolute() {
         PathBuf::from(key)
     } else {

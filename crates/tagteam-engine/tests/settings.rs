@@ -2688,6 +2688,8 @@ fn mapping_keys_expand_the_home_and_keep_values_as_written() {
 "~" = "home"
 "~/Code/work" = "Work"
 "/abs/x/" = "a@x.co"
+"~//Code/doubled" = "d"
+"/abs/./y" = "e"
 "#,
     )
     .unwrap();
@@ -2703,6 +2705,8 @@ fn mapping_keys_expand_the_home_and_keep_values_as_written() {
             entry("~", env.home.clone(), "home"),
             entry("~/Code/work", env.home.join("Code/work"), "Work"),
             entry("/abs/x/", "/abs/x".into(), "a@x.co"),
+            entry("~//Code/doubled", env.home.join("Code/doubled"), "d"),
+            entry("/abs/./y", "/abs/y".into(), "e"),
         ]
     );
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -2721,12 +2725,23 @@ fn a_relative_or_empty_mapping_key_warns_and_is_ignored() {
     );
     assert!(settings.mappings.is_empty(), "{:?}", settings.mappings);
     assert_eq!(warnings.len(), 4, "{warnings:?}");
-    for key in ["\"\"", "\"Code/x\"", "\"~other/x\"", "\"/ok\""] {
+    let bad_key = |key: &str| {
+        format!(
+            "`provider.claude-code.mappings.\"{key}\"` must be an absolute directory or start with `~/` (ignored)"
+        )
+    };
+    let bad_value = "`provider.claude-code.mappings.\"/ok\"` must name an account by alias or email, as a string (ignored)";
+    for expected in [
+        bad_key(""),
+        bad_key("Code/x"),
+        bad_key("~other/x"),
+        bad_value.to_owned(),
+    ] {
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains(key) && w.ends_with("(ignored)")),
-            "{key}: {warnings:?}"
+                .any(|w| w.ends_with(&format!(": {expected}"))),
+            "{expected}: {warnings:?}"
         );
     }
 }
