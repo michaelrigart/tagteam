@@ -17,11 +17,14 @@ use crate::state::{Screen, State, ToastKind};
 /// `P` without a daemon to pause (spec §10, T2-16).
 pub const NO_DAEMON_RUNNING: &str = "no daemon runs · tagteam daemon install starts one";
 
+/// What a refused write says once the store is newer than this build (S§3.7).
+pub const UPGRADED: &str = "tagteam was upgraded; restart the TUI";
+
 /// Starts `action`: on the actions lane, or suspended when it needs the terminal (spec §7.3).
 /// While another runs it says `still <label> · wait for it to finish` and drops it (redesign
 /// §9.4).
 pub(crate) fn start(state: &mut State, action: Action, now_ms: i64) -> Vec<Cmd> {
-    if busy(state, now_ms) {
+    if (action.writes_store() && refuses_write(state, now_ms)) || busy(state, now_ms) {
         return vec![];
     }
     state.running = Some(action.clone());
@@ -32,6 +35,16 @@ pub(crate) fn start(state: &mut State, action: Action, now_ms: i64) -> Vec<Cmd> 
     } else {
         vec![Cmd::Act(action)]
     }
+}
+
+/// Whether the store is newer than this build, which stops every write the TUI starts (S§3.7):
+/// it says so, and the caller starts nothing.
+fn refuses_write(state: &mut State, now_ms: i64) -> bool {
+    let refuses = state.daemon.upgraded();
+    if refuses {
+        state.toast(ToastKind::Warn, UPGRADED, now_ms);
+    }
+    refuses
 }
 
 /// `still <label> · wait for it to finish` when an action runs; the action keys that open a
@@ -83,6 +96,9 @@ pub fn handle_action_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Optio
 /// `r` (spec §7.1): the views re-read, and the shown accounts offered to the collector at once;
 /// on Tokens, a refresh of the token index, on its own lane.
 fn refresh(state: &mut State, now_ms: i64) -> Vec<Cmd> {
+    if refuses_write(state, now_ms) {
+        return vec![];
+    }
     if state.screen == Screen::Tokens {
         return screens::tokens::index::refresh_now(state, now_ms);
     }
@@ -184,6 +200,10 @@ fn account_key(state: &mut State, c: char, now_ms: i64) -> Vec<Cmd> {
     let (disabled, alias) = (view.row.disabled, view.row.alias.clone());
     let named = format!("{} {}", account.position, words::email(&view.row));
     if busy(state, now_ms) {
+        return vec![];
+    }
+    // Each account key writes the store, a dialog's at its end: none starts once it is newer.
+    if refuses_write(state, now_ms) {
         return vec![];
     }
     let provider = account.provider.clone();
@@ -426,7 +446,7 @@ mod tests {
     use tagteam_engine::views::UsageStatus;
 
     use crate::host::AccountRef;
-    use crate::msg::Msg;
+    use crate::msg::{LaneReport, Msg};
     use crate::source::CollectSummary;
     use crate::state::GUARD_MS;
     use crate::testutil::*;
@@ -744,6 +764,62 @@ mod tests {
             assert!(state.overlay.is_none(), "{c}");
         }
         assert_eq!(state.running, Some(Action::Switch(sel(1))));
+    }
+
+    fn upgraded(mut state: State) -> State {
+        update(&mut state, Msg::Lane(LaneReport::Upgraded), NOW_MS);
+        assert!(state.daemon.upgraded());
+        state
+    }
+
+    fn refused(state: &State) -> bool {
+        state
+            .toast
+            .as_ref()
+            .is_some_and(|t| (t.kind, t.text.as_str()) == (ToastKind::Warn, UPGRADED))
+    }
+
+    #[test]
+    fn after_an_upgrade_r_and_every_store_writing_action_refuse_before_they_start() {
+        for screen in [Screen::Accounts, Screen::Tokens, Screen::History] {
+            let mut state = fresh(screen);
+            state.accounts.apply(snapshot(many(2)));
+            let mut state = upgraded(state);
+            let cmds = update(&mut state, ch('r'), NOW_MS);
+            assert!(cmds.is_empty(), "{screen:?}: {cmds:?}");
+            assert!(refused(&state), "{screen:?}");
+            assert!(state.running.is_none() && state.overlay.is_none());
+        }
+        for c in ['s', 'b', 'n', 'e', 'x', 'a', 'm', 'R', 'A'] {
+            let mut state = upgraded(loaded(2));
+            let cmds = update(&mut state, ch(c), NOW_MS);
+            assert!(cmds.is_empty(), "{c}: {cmds:?}");
+            assert!(refused(&state), "{c}");
+            assert!(
+                state.running.is_none() && state.overlay.is_none() && !state.on_terminal,
+                "{c}"
+            );
+        }
+        // A dialog opened before the upgrade is refused when it answers, and starts nothing.
+        for (opens, reply) in [('x', KeyCode::Char('y')), ('R', KeyCode::Enter)] {
+            let mut state = loaded(2);
+            update(&mut state, ch(opens), NOW_MS);
+            assert!(state.overlay.is_some(), "{opens}");
+            update(&mut state, Msg::Lane(LaneReport::Upgraded), NOW_MS);
+            let cmds = update(&mut state, key(reply), NOW_MS);
+            assert!(cmds.is_empty(), "{opens}: {cmds:?}");
+            assert!(refused(&state) && state.running.is_none(), "{opens}");
+        }
+        let mut state = upgraded(loaded(2));
+        let doctor = Action::Doctor {
+            provider: None,
+            online: false,
+        };
+        assert_eq!(
+            update(&mut state, ch('D'), NOW_MS),
+            [Cmd::Act(doctor.clone())]
+        );
+        assert_eq!(state.running, Some(doctor));
     }
 
     /// Review Focus 3: with no accounts, every account key does nothing; `A`, `D` and `?` work.

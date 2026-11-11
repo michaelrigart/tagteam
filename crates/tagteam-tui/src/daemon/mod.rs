@@ -147,8 +147,6 @@ impl DaemonState {
     }
 
     /// The lane stopped for a store newer than this build, until the TUI restarts.
-    // Task 4 shows it in the header; drop the allow there.
-    #[allow(dead_code)]
     pub fn upgraded(&self) -> bool {
         self.upgraded
     }
@@ -681,8 +679,12 @@ pub(crate) fn collected_elsewhere(state: &State, provider: &ProviderId) -> bool 
 }
 
 /// The accounts the timer offers the collector (spec §6.2, §6.3): those shown whose provider
-/// nothing else collects for. In timer mode, every one shown.
+/// nothing else collects for. In timer mode, every one shown. None once the store is newer than
+/// this build: a collection writes it (S§3.7).
 pub(crate) fn to_collect(state: &State) -> Vec<AccountId> {
+    if state.daemon.upgraded() {
+        return vec![];
+    }
     let Some(snap) = state.accounts.snapshot() else {
         return vec![];
     };
