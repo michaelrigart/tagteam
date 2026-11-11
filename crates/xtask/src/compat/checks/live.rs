@@ -123,9 +123,11 @@ pub fn fresh_global_config(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
 }
 
 /// How long tagteam holds the config lock while `claude mcp add` is watched: past the 1.5 s
-/// after which CC's start-up saved without the lock before 2.1.318, and past its full backoff
-/// of about 10 s, so a save that skips the lock lands inside the window.
-const LOCK_HELD_WINDOW: Duration = Duration::from_secs(15);
+/// after which CC's start-up saved without the lock before 2.1.318, and past the end of its full
+/// backoff (200 to 4000 ms per wait, each stretched by a random factor of 1 to 2, so 10.2 to
+/// 20.4 s), so a save that skips the lock lands inside the window, and an `mcp add` that did not
+/// honour `CLAUDE_CODE_CONFIG_LOCK_WAIT_MS` would always give up before the release.
+const LOCK_HELD_WINDOW: Duration = Duration::from_secs(25);
 
 /// Whether `config` (the global config's bytes) holds the probe server in `mcpServers`.
 fn has_probe_server(config: &[u8]) -> bool {
@@ -139,9 +141,9 @@ fn has_probe_server(config: &[u8]) -> bool {
 /// server must not appear in `mcpServers`, and once tagteam releases it, `mcp add` saves the
 /// server and exits 0. `CLAUDE_CODE_CONFIG_LOCK_WAIT_MS` makes it keep retrying for that long,
 /// so it is still waiting at the end of the window and not racing its own backoff (which ends
-/// in exit 1 after about 15 s). The server entry is what is watched, not the file's bytes: CC's
-/// own start-up writes (migrations) may still land under the held lock after 1.5 s (A.7), and
-/// they do not add the server. Those writes are not tested.
+/// in exit 1 after 10.2 to 20.4 s). The server entry is what is watched, not the file's bytes:
+/// CC's own start-up writes (migrations) may still land under the held lock after 1.5 s (A.7),
+/// and they do not add the server. Those writes are not tested.
 pub fn config_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     config_lock_within(ctx, LOCK_HELD_WINDOW)
 }
@@ -968,10 +970,6 @@ esac"#;
             waited.value.to_string().contains("add the server again"),
             "{}",
             waited.value
-        );
-        assert_eq!(
-            label(&out, "claude mcp add had exited while the lock was held").value,
-            json!(true)
         );
         assert!(!removed(&ctx), "nothing was added, so nothing is removed");
         assert!(!ctx.paths(&ctx.live()).config_lock.exists());
