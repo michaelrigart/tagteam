@@ -1948,15 +1948,47 @@ mod tests {
     }
 
     #[test]
-    fn a_lane_event_does_not_touch_a_live_link_s_own_reads() {
-        // With a link, a socket event still fetches `status`; the lane's reads views only.
+    fn a_lane_event_never_fetches_the_status_even_with_a_link_up() {
+        // S§3.3: a lane event is auto's or `usage`'s kind and reads the views only. `status`
+        // belongs to the link, so a lane's `mode` does nothing, and nor does its token index.
+        // Every fetch is answered, so a lane event that asked for one would show.
         let mut state = showing(Screen::Accounts, 1);
         let link = go_live(&mut state, auto_on());
-        let asked = update(&mut state, event(mode("collect")), NOW_MS + 1_000);
+        tick_answered(&mut state, NOW_MS + REREAD_MS);
+        // The socket's own `mode` does fetch, which is the contrast.
+        let asked = update(&mut state, event(mode("collect")), NOW_MS + 500);
         assert_eq!(asked, [Cmd::FetchStatus { link }]);
-        update(&mut state, lane(LaneReport::Event(usage())), NOW_MS + 2_000);
-        let read = tick_answered(&mut state, NOW_MS + 2_250);
-        assert_eq!(names(&read), ["accounts"]);
+        let answered = Msg::DaemonStatus {
+            link,
+            result: Ok(auto_on()),
+        };
+        update(&mut state, answered, NOW_MS + 600);
+        let mut at = NOW_MS + 2_000;
+        for (e, want) in [
+            (usage(), vec!["accounts"]),
+            (auto("switch"), vec!["accounts"]),
+            (auto("poll"), vec!["accounts"]),
+            (mode("collect"), vec![]),
+        ] {
+            let cmds = update(&mut state, lane(LaneReport::Event(e.clone())), at);
+            assert!(cmds.is_empty(), "{e:?}: {cmds:?}");
+            let read = names(&tick_answered(&mut state, at + REREAD_MS));
+            assert_eq!(read, want, "{e:?}");
+            at += 1_000;
+        }
+        // The token index on Tokens: the socket's event reads the report, the lane's does not.
+        let index = Event::TokenIndex {
+            provider: "claude-code".into(),
+            raw: json!({"changedAt": "2026-09-21T14:13:20Z"}),
+        };
+        let mut socket = showing(Screen::Tokens, 1);
+        go_live(&mut socket, auto_on());
+        let cmds = update(&mut socket, event(index.clone()), NOW_MS + 10);
+        assert_eq!(names(&cmds), ["report"], "the socket's");
+        let mut hosted = showing(Screen::Tokens, 1);
+        go_live(&mut hosted, auto_on());
+        let cmds = update(&mut hosted, lane(LaneReport::Event(index)), NOW_MS + 10);
+        assert!(cmds.is_empty(), "the lane's: {cmds:?}");
     }
 
     #[test]
