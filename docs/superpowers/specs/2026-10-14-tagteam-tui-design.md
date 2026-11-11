@@ -37,10 +37,11 @@ the same commands the CLI runs.
 3. **The UI thread never waits on I/O** other than the terminal. Store reads, transcript reads,
    the network, the Keychain and the daemon's socket all run on other threads (§4.3).
 4. **Usage requests go only through the collector** and its budget (core §8.3, §8.6). The TUI
-   never fetches on its own schedule. When a daemon runs, or while the TUI's own auto lane
-   collects for a provider (§4.3), the TUI fetches for that provider only when a person asks
-   (`r`), or when an action's CLI command does (`switch --strategy best`, for example).
-   *(Amended by the TUI autoswitch spec, [§3.5](2026-11-11-tagteam-tui-autoswitch-design.md).)*
+   never fetches on its own schedule, apart from the timer's collection without a daemon (§6.2)
+   and the auto lane's jobs, which collect as the daemon's do. When a daemon runs, or while the
+   auto lane's job collects for a provider (§6.2, §6.3), the TUI fetches for that provider only
+   when a person asks (`r`), or when an action's CLI command does (`switch --strategy best`, for
+   example). *(Amended by the TUI autoswitch spec, [§3.5](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 5. **Actions are the CLI's.** Every action runs the CLI's own command path, so its prompts,
    refusals, messages and outcome are identical by construction (§7).
 6. **It works without a daemon**, refreshing on a timer, and updates live when one runs (§6).
@@ -138,9 +139,12 @@ The TUI is an Elm-style loop.
   and acknowledges a pause at once (§7.3). *(Amended by the TUI redesign spec §14, PERF-R-9.)*
   *(Amended by the [input reader spec](2026-10-31-tagteam-tui-input-reader-design.md) §3: the thread reads the terminal itself and decodes it with crossterm's vendored decoder.)*
 - **Six lanes.** The five engine lanes each own an `Engine` that the binary's factory builds
-  from the same `Context`, so `Engine` never needs to be `Sync`. Each lane's engine takes the shutdown token
-  as its cancel token, never the signal token (§2). A Ctrl-C meant for a foreground action
-  (§7.3) therefore never interrupts a lane.
+  from the same `Context`, so `Engine` never needs to be `Sync`. The engines of the four older
+  lanes take the shutdown token as their cancel token, never the signal token (§2). The auto
+  lane's engine runs under a cancel token of the lane's own: Ctrl-Z sets it and then joins the
+  lane, resume starts a new run with a fresh token, and the shutdown sets it too, on every quit
+  path. The signal token never does. A Ctrl-C meant for a foreground action (§7.3) therefore
+  never interrupts a lane. *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 
   | Lane | Serves |
   |---|---|
@@ -167,8 +171,8 @@ The TUI is an Elm-style loop.
   request has unwound. The shutdown closes the channels and sets the token before it joins the
   engine lanes (§10.2). The live thread and the daemon lane are not joined: they never touch the
   store, so a process exit can leave nothing of theirs half written. The auto lane is joined,
-  because it writes the store: the shutdown token stops its scheduler within one 1 s slice, and a
-  tick finishes only its critical span (core §14.1). *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
+  because it writes the store: the shutdown sets the lane's own token, which stops its scheduler
+  within one 1 s slice, and a tick finishes only its critical span (core §14.1). *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 - **A lane that panics** closes its channel. The UI thread sees the disconnect and ends the TUI
   as an error (§10.4).
 
@@ -474,7 +478,13 @@ With no daemon connection, every 30 s:
 - the actions lane runs `collect_due` for the shown accounts. `CollectMode::OnDemand` fetches
   only an account whose reading is older than the 180 s floor and whose poll is due (core §8.3),
   within the hourly budget (core §8.6). The poll plan, not the timer, decides what is fetched.
+  It leaves out each provider whose auto-lane job collects for itself, with the check live mode
+  uses (§6.3); the first-frame collection (§6.1) does the same. `r` still collects on demand.
 - the views are re-read once more when a collection returns a fetch.
+
+Once a newer tagteam has migrated the store, the timer's collection, the first-frame collection
+and the token index's refreshes (§6.4) all stop, and the views are still re-read.
+*(Amended by the TUI autoswitch spec, [§3.5, §3.7](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 
 ### 6.3 Live mode
 
@@ -488,13 +498,16 @@ timer mode, since nothing else collects for it.
   except on the auto line (§8). *(Amended by the TUI redesign spec §5.3.)*
 - A 60 s timer still re-reads `accounts` and re-fetches the daemon's `status`, so a missed
   event, or a setting changed elsewhere, costs at most a minute.
-- Which providers `collect_due` skips is decided from the latest `status` reply (§8).
+- Which providers `collect_due` skips is decided from the latest `status` reply (§8), or, for a
+  provider the auto lane runs, from its own job's mode. *(Amended by the TUI autoswitch spec, [§3.5](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 - `r` still runs `collect_due`, exactly as `list` would.
 
 ### 6.4 Token index
 
 - **Timer mode.** The index lane runs `refresh_tokens(provider, Wait::Try, None, …)` (TR §5)
   when the TUI starts, then every 60 s while Tokens is open. `r` on Tokens runs one at once.
+  Once a newer tagteam has migrated the store, these refreshes stop, and `r` refuses with
+  `tagteam was upgraded; restart the TUI`. *(Amended by the TUI autoswitch spec, [§3.7](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 - **Live mode, with a daemon that keeps the index current.** That is, one whose `status.jobs`
   includes the index refresh job (D13, TR §12). The TUI does not refresh on a timer. It re-runs
   `token_report` on the daemon's `token-index` event when the event's `changedAt` is newer than
@@ -586,21 +599,22 @@ runs (core §12.5):
   in-process foreground action sees them in the signal token, at its own cancellation points.
   Either way, once the action has returned they stay recorded, and the TUI shuts down (§10.2)
   without waiting for Enter.
-- **Lanes and the live thread are untouched.** Lanes watch only the shutdown token (§4.3), and
-  the live thread watches no token, so background work and the daemon connection carry on across
-  a suspension. The auto lane carries on too, and keeps switching while the action runs. It
+- **Lanes and the live thread are untouched.** The four older lanes watch only the shutdown
+  token (§4.3), and the live thread watches no token, so background work and the daemon
+  connection carry on across a suspension. The auto lane carries on too, under its own cancel
+  token, which a foreground action never sets, and keeps switching while the action runs. It
   judges whether a daemon runs inside the lane, so that works while the UI thread waits.
   *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 
-**Ctrl-Z.** Before the TUI stops its process, it stops the auto lane and joins it, so a stopped
-process holds no engine lock. A stopped process reads as live, and would otherwise block a daemon
-or `tagteam auto` for as long as it stays stopped. On resume the lane starts again by its usual
+**Ctrl-Z.** Before the TUI stops its process, it sets the auto lane's own cancel token and joins
+the lane, so a stopped process holds no engine lock. A stopped process reads as live, and would otherwise block a daemon
+or `tagteam auto` for as long as it stays stopped. On resume a new run starts with a fresh token, by the lane's usual
 rule (autoswitch spec §3.2). *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 
 ### 7.4 Pause and resume auto
 
 Pausing is the daemon's persistent setting `provider.<id>.daemon.autoswitch` (§8), so it
-survives a daemon restart. The same setting pauses the TUI's own auto lane.
+survives a daemon restart. The same setting pauses the TUI's own auto lane. *(Amended by the TUI autoswitch spec, [§3.4](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 - **In live mode,** `P` asks `Pause auto for <display name>?` (or `Resume…`), from the
   effective `autoswitch` in the daemon's `status`. *(Amended by the TUI redesign spec §9.4.)* A
   yes runs `config set provider.<id>.daemon.autoswitch false` (or `true`) through `Host`,
