@@ -536,8 +536,9 @@ with `detail` `{"message", "transient"}`; `all-exhausted` by the auto engine on 
 `AllExhausted` decision after any other, with `{"earliest_reset_at"}`; `autoswitch-paused` and
 `autoswitch-resumed` by the daemon's provider job when the effective `daemon.autoswitch` changes,
 with `{"at_start": true}` when recorded at daemon start. An automatic `switch` stores
-`{"window", "label", "pct", "threshold"}` and `remove` `{"label"}`. `kind` is free text, so none
-needs a migration. *(Amended by the TUI redesign spec §12.4.)*
+`{"window", "label", "pct", "threshold", "ceiling"}` and `remove` `{"label"}`. `kind` is free
+text, so none needs a migration. *(Amended by the TUI redesign spec §12.4 and by the
+[autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.6: `ceiling` is new.)*
 
 **Identity.** An account's identity is `(provider, identity_key)`. The provider derives the key
 (CC: email and org uuid) and the engine never parses it. `account_uuid` corroborates it:
@@ -772,6 +773,7 @@ source}], unknown: [key]}`; `get` returns `{schemaVersion, key, provider, value,
 |---|---|---|---|
 | `default_provider` | `claude-code` | a registered `ProviderId` | — |
 | `autoswitch.threshold` | 90.0 | 50–99.9 | yes |
+| `autoswitch.ceiling` | 100.0 | 50–100, above the threshold | yes |
 | `autoswitch.interval_seconds` | 60 | 15–3600 | yes |
 | `autoswitch.cooldown_seconds` | 300 | 0–86400 | yes |
 | `autoswitch.hysteresis_pct` | 10.0 | 0–50 | yes |
@@ -793,6 +795,23 @@ The `daemon.*` and `notify.*` keys are the daemon's (daemon spec D7). `daemon.au
 to false pauses the daemon's auto-switching for a provider. It does not affect `tagteam auto`.
 `ui.accounts_view` is the TUI's, read once when it starts; `v` toggles the view for the session
 (added 2026-11-11 in [#58](https://github.com/michaelrigart/tagteam/pull/58)).
+
+**`autoswitch.ceiling`** is the usage level auto treats as full (§11.2). At 100, the default,
+nothing changes. For each provider the effective `threshold` must be below the effective
+`ceiling`, each taken from the provider's table, then the top level, then the default.
+
+- Reading stays forgiving. A provider whose pair breaks the rule runs with a ceiling of 100, and
+  one warning names both keys and their values. The ceiling then shows as 100, with source
+  `default`, in `config get` and `config list`. The threshold is kept.
+- `set` and `unset` refuse a write that breaks a provider's pair when it held before the write,
+  in either spelling (`provider.<id>.…` or `--provider`): `invalid-input`, naming the provider
+  and both values, and nothing is written. Only writes of `autoswitch.threshold` and
+  `autoswitch.ceiling` are checked. A pair a hand edit already broke blocks no write, so the
+  TUI's `P` (`daemon.autoswitch`) keeps working.
+- `auto --threshold` at or above a provider's ceiling runs that provider with a ceiling of 100,
+  and emits a `config-warning` at start and after each reload that still has the conflict.
+
+*(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.2.)*
 
 CLI flags override settings for a single invocation and are clamped to the same ranges. A
 running `auto` or daemon re-reads the file whenever its mtime changes (§11.4, daemon spec
@@ -1864,7 +1883,9 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
    - **Known headroom** resets the unhealthy-tick counter.
      - With `best`: usage below the threshold → `below-threshold` (NO_ACTION).
      - With `consume-first`: usage below the threshold → trigger `consume-first`.
-     - Headroom ≤ 0 → `at-limit`. Otherwise → `proactive`.
+     - Usage at or above `autoswitch.ceiling` (headroom ≤ 100 − ceiling) → `at-limit`.
+       Otherwise → `proactive`. At ceiling 100 that is headroom ≤ 0, as before.
+       *(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.3.)*
    - **Otherwise unknown:** increment `unhealthy_ticks`. At `autoswitch.unhealthy_ticks`,
      trigger `failover`; before that, `active-usage-unknown n/N`.
 
@@ -1879,7 +1900,9 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
    `no-candidates` (BLOCKED); for a `consume-first` trigger, whose active account is healthy,
    `below-threshold` (NO_ACTION) instead.
 8. **Rank** the OAuth candidates:
-   - **Skip** unknown headroom, headroom ≤ 0, and the barred account (§11.3).
+   - **Skip** unknown headroom, full candidates, and the barred account (§11.3). *(Amended by
+     the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.3: it
+     skipped headroom ≤ 0.)*
    - **Landing rule.** For `proactive` and `consume-first`, the landing account must be below
      the threshold, unless *every* account is above it.
    - **`best`:** candidate headroom − active headroom ≥ `hysteresis_pct`. Order by most
@@ -1892,20 +1915,42 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
    - **Every account above the threshold:** for each pair, pick the recovery axis when both the
      active account and the candidate are within 3 points of headroom, or either one resets
      within 4 h. Otherwise use the headroom axis.
+     - "Within 3 points of headroom" is measured from the ceiling:
+       `headroom − (100 − ceiling) ≤ 3`. *(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.3.)*
      - The recovery axis requires the candidate's binding-window recovery to be ≥ 300 s sooner
        than the active account's.
      - The headroom axis requires ≥ 2 × the active account's headroom.
      - Select the binding window first, then its reset. A past or unknown reset sorts last.
-   - **`at-limit` and `failover`** skip every anti-flap gate.
-9. **Nothing ranked.** With an `at-limit` or `failover` trigger and API-key candidates
-   (step 7), go to step 10 with those. Otherwise:
+   - **`at-limit` and `failover`** skip every anti-flap gate. They rank as follows:
+     - **A soft move** ranks only clear OAuth candidates, most headroom first, ties to the lower
+       position.
+     - **A hard move** ranks every OAuth candidate with room, most headroom first, ties to the
+       lower position: the candidates below the ceiling, then the full ones with room.
+     - **Terms.** A **full** account is at or above the ceiling (headroom ≤ 100 − ceiling). An
+       account is **out** at headroom ≤ 0; every out account is full. It has **room** at
+       headroom > 0. An account is **clear** when its usage is more than 3 points below the
+       ceiling (headroom > 100 − ceiling + 3). A move is **hard** on `failover`, or on `at-limit`
+       when the active account is out, and **soft** on `at-limit` when it is full but not out.
+       At ceiling 100, full and out are the same, and every `at-limit` is hard. A soft move
+       never lands on an account within 3 points of the ceiling, so auto cannot cycle between
+       accounts near it. Unknown headroom is never full.
+     *(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.1, §3.3 and §3.8.)*
+9. **Nothing ranked.** With a hard move and API-key candidates (step 7), go to step 10 with
+   those. A soft move never reaches an API key. *(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md)
+   §3.3.)* Otherwise:
 
    | Situation | Outcome |
    |---|---|
    | No readable candidate | `no-comparison` (BLOCKED) |
    | `consume-first` found nothing | `reset-unknown` or `already-consuming-soonest` (NO_ACTION) |
-   | Candidates not all known to be exhausted | `no-qualifying-candidate` (BLOCKED, normal cadence) |
-   | Every candidate exhausted | `all-exhausted {earliestResetAt}` (BLOCKED); sleep until the earliest recovery + 60 s, capped at 600 s |
+   | Candidates not all known to be full | `no-qualifying-candidate` (BLOCKED, normal cadence); with `proactive` or a soft move and every account above the threshold, its detail is `all-above` |
+   | Every candidate known to be full | `all-exhausted {earliestResetAt}` (BLOCKED); sleep as §11.4 says |
+
+   `earliestResetAt` is when the move this tick wanted could first land: the earliest time a
+   candidate is back, meaning the latest reset among its relevant windows at or above a level.
+   The level is 100% on a hard move, `ceiling − 3` on a soft move and the ceiling on `proactive`.
+   At ceiling 100 these are one level.
+   *(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.3, §3.4 and §3.7.)*
 
 10. **For each ranked target, in order:**
     - Dry-run: emit `switch` with `dryRun: true` and write nothing.
@@ -1918,9 +1963,9 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
       | `Owned` (session-owned) | Try the next target |
       | OK | Perform the switch |
 
-    When every OAuth target has failed and the trigger is `at-limit` or `failover`, the
-    API-key candidates are tried next, in position order. They do not refresh, so freshening
-    passes them.
+    When every OAuth target has failed and the move is hard, the API-key candidates are tried
+    next, in position order. They do not refresh, so freshening passes them. *(Amended by the
+    [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.3.)*
 11. **Perform.** Call `switch` (direct) with the tick's preconditions. The switch re-checks
     them under its locks, before its first write (§9.4 step 1):
     - The live account is still the one this tick decided on. Otherwise: `no-switch` with
@@ -1961,9 +2006,16 @@ A missing departure snapshot lifts the bar.
 
 | Outcome | Delay |
 |---|---|
+| `all-exhausted` with a candidate that has room (full but not out) | as "Anything else": the normal cadence |
 | BLOCKED with a known reset | `min(max(until − now, interval), 600)` |
 | BLOCKED otherwise | `max(interval, 300)` |
 | Anything else | `interval × U(0.9, 1.1)`, shortened (never lengthened) to the active account's `next_poll_at`, floored at 60 s |
+
+Rows apply top down. For `all-exhausted`, the known-reset row applies only when every OAuth
+candidate is out, and `until` is then the earliest time a candidate has room again, plus 60 s.
+With a candidate that is full but has room, a live account that reaches 100% must not wait out a
+long sleep before its hard move.
+*(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.5.)*
 
 A `sleep` event is emitted when the delay is more than 1.5 × `interval`.
 
@@ -2016,13 +2068,22 @@ A proptest harness drives `decide()` through multi-day synthetic traces: 2–6 a
 rates, 5h and 7d resets, 429s, dead tokens, unknown readings, and API-key accounts. It asserts:
 
 - no A→B→A return within a cooldown unless A recovered
+- never landing on a full account, unless the move is hard and no OAuth candidate below the
+  ceiling is viable
 - never landing on an account with headroom ≤ 0
+- never staying on a full live account while a clear OAuth candidate exists
+- a soft move lands only on a clear account
 - never idling at the limit while a viable candidate exists
-- never landing on an API-key account unless the trigger is `at-limit` or `failover` and no
-  OAuth target was viable; a return from an API-key account always lands below the threshold
+- never landing on an API-key account unless the move is hard and no OAuth candidate has room; a
+  return from an API-key account always lands below the threshold
+- `all-exhausted` only when every OAuth candidate is full, with the earliest reset as §11.2
+  step 9 defines it
 - a quarantined active account fails over on the first tick that has a viable candidate
 - `--once` exit codes consistent with the outcome
 - deterministic results for a given seed
+
+The ceiling is drawn from (threshold, 100], with a fixed share at exactly 100.
+*(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §4.)*
 
 The tick itself is tested in the engine against both providers (§15.2). `FakeAgent` names no
 `primary_long_window`, so a `consume-first` setting runs `best` there.

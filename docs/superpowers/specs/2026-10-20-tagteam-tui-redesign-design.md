@@ -921,7 +921,7 @@ The problem sentence before it names the cause: `Needs a new login: its stored l
 | `below-threshold` | `no switch needed (77%, switches at 90%)` |
 | `cooldown` | `waiting 4m after the last switch` |
 | `all-exhausted` | `every account is near its limit; the first frees up at 16:40` |
-| `no-qualifying-candidate` | `no other account has enough headroom` |
+| `no-qualifying-candidate` | `no other account has enough headroom`; with `detail` `all-above` (nothing ranked, every account above the threshold): `every account is above 90%, and none is far enough ahead to switch to`. *(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.7.)* |
 | `no-candidates` | `no other account can be used` |
 | `no-comparison` | `no other account has a reading to compare` |
 | `stale-usage` | `the best account's reading is too old; checking it first` |
@@ -1115,7 +1115,7 @@ their string form.
 | `autoswitch-paused`, `autoswitch-resumed` | the daemon's provider job | the effective `daemon.autoswitch` changes on a settings reload (`provider_job.rs:~1041`); at daemon start, when it differs from the provider's latest stored `autoswitch-*` event | none | `{"at_start": true}` for the start case |
 | `switch-failed` | the auto engine | an attempted switch fails (`auto.rs:~689-707`), unless the provider's latest `switch-failed` names the same target and message within 30 minutes | live, target | `{"message", "transient"}` |
 | `all-exhausted` | the auto engine | the first `AllExhausted` decision after any other decision | live | `{"earliest_reset_at"}` |
-| `switch` (existing), by auto or the daemon | `commit_switch` | as today | as today | new: `{"window", "label", "pct", "threshold"}`, the binding window that triggered it, from the decision |
+| `switch` (existing), by auto or the daemon | `commit_switch` | as today | as today | new: `{"window", "label", "pct", "threshold", "ceiling"}`, the binding window that triggered it, from the decision. *(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.6: `ceiling` is new.)* |
 | `remove` (existing) | lifecycle `remove` and purge | as today | as today | new: `{"label"}` (C-12) |
 
 - **Sources** are R4's `EventSource`, so a pause written by the daemon is `daemon`.
