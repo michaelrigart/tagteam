@@ -184,13 +184,13 @@ fn an_entry_keeps_what_its_value_names_whatever_its_directory_or_conflicts() {
 
     let got = judged(&fx);
     assert_eq!(got[0].problem, Some(MappingProblem::MissingDirectory));
-    assert_eq!(
-        got[0].named,
-        Named::DoesNot {
-            account: None,
-            problem: MappingProblem::Ambiguous
-        }
-    );
+    assert_eq!(got[0].account, None);
+    let Named::Several(ids) = &got[0].named else {
+        panic!("{:?}", got[0].named);
+    };
+    let mut ids = ids.clone();
+    ids.sort();
+    assert_eq!(ids, [one.clone(), AccountId::from_string("same-2")]);
     assert_eq!(got[1].problem, Some(MappingProblem::Conflict));
     assert!(
         matches!(&got[1].named, Named::Applies(row) if row.id == one),

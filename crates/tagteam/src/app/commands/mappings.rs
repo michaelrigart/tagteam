@@ -95,13 +95,7 @@ pub(in crate::app) fn mapping_warnings(
             let now = after.iter().find(|m| {
                 m.entry.written == was.entry.written && m.entry.value == was.entry.value
             })?;
-            let ambiguous = matches!(
-                was.named,
-                Named::DoesNot {
-                    problem: MappingProblem::Ambiguous,
-                    ..
-                }
-            );
+            let ambiguous = matches!(was.named, Named::Several(_));
             let named = match (was.named.account(), now.named.account()) {
                 (Some(a), Some(b)) if a.id == b.id => return None,
                 (Some(a), _) => format!("no longer names {}", who(a)),
@@ -112,6 +106,7 @@ pub(in crate::app) fn mapping_warnings(
             };
             let (names, starts) = match &now.named {
                 Named::Applies(b) => (Some(format!("it now names {}", who(b))), true),
+                Named::Several(_) => (None, false),
                 Named::DoesNot { account, .. } => (
                     account
                         .as_ref()
@@ -395,7 +390,7 @@ mod tests {
                 problem: MappingProblem::ApiKey,
             },
             Names::Nothing => none(MappingProblem::NoAccount),
-            Names::Ambiguous => none(MappingProblem::Ambiguous),
+            Names::Ambiguous => Named::Several(vec![account(1).id, account(2).id]),
         };
         let path = PathBuf::from("/h/x");
         let (dir, problem) = match (&named, present, conflict) {
@@ -405,6 +400,9 @@ mod tests {
             ),
             (_, true, true) => (MappedDir::Found(path), Some(MappingProblem::Conflict)),
             (Named::Applies(_), true, false) => (MappedDir::Found(path), None),
+            (Named::Several(_), true, false) => {
+                (MappedDir::Found(path), Some(MappingProblem::Ambiguous))
+            }
             (Named::DoesNot { problem, .. }, true, false) => {
                 (MappedDir::Found(path), Some(*problem))
             }
