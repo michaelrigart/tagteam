@@ -1131,6 +1131,7 @@ fn auto_config(fx: &Fx) -> tagteam_core::autoswitch::AutoConfig {
     use tagteam_provider::Provider;
     tagteam_core::autoswitch::AutoConfig {
         threshold: 90.0,
+        ceiling: 100.0,
         hysteresis_pct: 10.0,
         cooldown_s: 300,
         interval_s: 60,

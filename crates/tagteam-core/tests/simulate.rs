@@ -166,6 +166,7 @@ fn settings() -> impl Strategy<Value = AutoConfig> {
                 long_window,
             )| AutoConfig {
                 threshold,
+                ceiling: 100.0,
                 hysteresis_pct,
                 cooldown_s,
                 interval_s,
