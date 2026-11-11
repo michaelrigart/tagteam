@@ -228,6 +228,34 @@ fn unmap_takes_the_listed_path_of_a_directory_that_is_gone() {
 }
 
 #[test]
+fn unmap_takes_an_entry_that_names_a_file_through_a_symlink() {
+    // An entry whose path exists but is no directory is kept as written, and `unmap`'s argument
+    // must compare through the same normalisation, however the path resolves.
+    let d = tempfile::tempdir().unwrap();
+    two_accounts(d.path());
+    let (real, _) = dir(d.path(), "real");
+    fs::write(real.join("f"), "").unwrap();
+    symlink(&real, d.path().join("link")).unwrap();
+    let file = d.path().join("link").join("f");
+    let config = write_config(
+        d.path(),
+        &format!(
+            "[provider.claude-code.mappings]\n\"{}\" = \"a@x.co\"\n",
+            file.display()
+        ),
+    );
+    let out = cmd(d.path())
+        .arg("unmap")
+        .arg(&file)
+        .arg("--json")
+        .assert()
+        .success();
+    assert_eq!(json_of(&out.get_output().stdout)["removed"], 1);
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(!text.contains("mappings"), "{text}");
+}
+
+#[test]
 fn map_refuses_a_path_that_is_missing_or_not_a_directory() {
     let d = tempfile::tempdir().unwrap();
     two_accounts(d.path());

@@ -306,14 +306,17 @@ impl Engine {
 
     /// `tagteam unmap`'s write to the file (config-mappings spec §3.4): removes every entry for
     /// `dir` from `provider`'s `mappings` table, or from each provider's when `provider` is
-    /// `None`. A table that leaves empty goes, then its parents, unless one holds a comment, as
-    /// `config unset` does. Returns the number removed; no file, or no match, writes and creates
-    /// nothing.
+    /// `None`. `dir` is the argument as given: absolute and rebuilt from its components, never
+    /// resolved. It is compared as every entry's key is, through [`mapped_dir`], so an entry
+    /// that names a file, kept as written, matches the path it was written with. A table that
+    /// leaves empty goes, then its parents, unless one holds a comment, as `config unset` does.
+    /// Returns the number removed; no file, or no match, writes and creates nothing.
     pub fn remove_config_mappings(
         &self,
         provider: Option<&ProviderId>,
         dir: &Path,
     ) -> Result<usize, EngineError> {
+        let target = mapped_dir(dir);
         let removed = RefCell::new(Vec::<(ProviderId, usize)>::new());
         let changed = self.edit_file(|file| {
             removed.borrow_mut().clear();
@@ -325,7 +328,7 @@ impl Engine {
                 None => provider_ids(&doc),
             };
             for owner in owners {
-                let count = remove_mappings(&mut doc, &owner, &self.env.home, dir)?;
+                let count = remove_mappings(&mut doc, &owner, &self.env.home, target.path())?;
                 if count > 0 {
                     removed.borrow_mut().push((owner, count));
                 }

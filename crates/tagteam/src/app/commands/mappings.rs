@@ -30,18 +30,22 @@ fn canonical_dir(path: Option<PathBuf>) -> Result<String, Failure> {
     stored_path(canonical)
 }
 
-/// `unmap`'s PATH: canonical, as `map` stored it, or, for a directory that is gone, absolute as
-/// given, so the path `map` listed still unmaps.
-fn unmapped_path(path: Option<PathBuf>) -> Result<String, Failure> {
+/// `unmap`'s PATH, twice: as given, made absolute and rebuilt from its components, for the file,
+/// which compares it as it compares its keys; and canonical, as `map` stored it, or, for a
+/// directory that is gone, absolute as given, so the path `map` listed still unmaps, for the
+/// database and the output.
+fn unmapped_path(path: Option<PathBuf>) -> Result<(PathBuf, String), Failure> {
     let given = path.unwrap_or_else(|| PathBuf::from("."));
+    let absolute: PathBuf = std::path::absolute(&given)
+        .map_err(|e| invalid_path(&given, &e.to_string()))?
+        .components()
+        .collect();
     let resolved = match std::fs::canonicalize(&given) {
         Ok(p) => p,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::path::absolute(&given).map_err(|e| invalid_path(&given, &e.to_string()))?
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => absolute.clone(),
         Err(e) => return Err(invalid_path(&given, &e.to_string())),
     };
-    stored_path(resolved)
+    Ok((absolute, stored_path(resolved)?))
 }
 
 /// A path as the store holds it: rebuilt from its components (no trailing `/`), as text.
@@ -246,10 +250,10 @@ impl App<'_, '_> {
     /// the database, only `--provider`'s when it is given. Removing nothing is not an error, and
     /// neither source is created.
     pub(in crate::app) fn unmap(&mut self, path: Option<PathBuf>) -> Result<(), Failure> {
-        let path = unmapped_path(path)?;
+        let (given, path) = unmapped_path(path)?;
         let from_file = self
             .engine
-            .remove_config_mappings(self.provider_flag.as_ref(), Path::new(&path))?;
+            .remove_config_mappings(self.provider_flag.as_ref(), &given)?;
         let from_database = match self.engine.existing_store()? {
             Some(store) => store
                 .remove_mappings(&path, self.provider_flag.as_ref())
