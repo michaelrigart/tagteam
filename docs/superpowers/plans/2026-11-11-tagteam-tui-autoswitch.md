@@ -77,8 +77,9 @@ Line numbers are as of `a356e75d` and will drift.
    (S§6: "the lane's start and stop mechanics").
 2. **The gate is one shared state with two callers.**
    - Every provider job is wrapped (`HostedJob`), and each wrapper looks at the gate before it
-     runs. No provider work starts on a stale look, even for a job overdue behind a long run
-     (the scheduler picks the earliest due, not the first added).
+     runs and before it passes on a settings change. No provider work starts on a stale look,
+     even for a job overdue behind a long run (the scheduler picks the earliest due, not the
+     first added).
    - A gate job, `daemon-gate`, looks every `SLICE_MS`, so a daemon that comes up while the
      scheduler sleeps is seen within a second.
    - A look that flips the gate wakes `provider:`, so every wrapper drops or rebuilds its job at
@@ -298,6 +299,12 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
     - both lock records are `Absent` by the end of the next passes.
   - `a_daemon_live_at_start_keeps_every_provider_job_from_running`: no lock is taken and no
     `mode` event is emitted.
+  - `a_settings_reload_as_a_daemon_appears_takes_no_lock_and_records_nothing`. The provider is
+    paused (`collect`, no lock). One slice hook writes the daemon record and rewrites the
+    setting to `autoswitch = true` with a later mtime. After the next pass:
+    - the lock record is `Absent`;
+    - no `autoswitch-resumed` event is stored;
+    - the board has no provider line.
   - `a_newer_schema_ends_the_run_with_schema_and_frees_the_lock`: at start (store version set
     above `SCHEMA_VERSION`) it ends with `Schema` before any job runs. Midway, after the watch's
     period, it ends with `Schema` and the lock is `Absent`.
@@ -344,14 +351,18 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
   - **Gate job** (`name` `daemon-gate`, `Ran::After(SLICE_MS)` always): one look, then reports
     the board through the shared reporter.
   - **`HostedJob`** (`name` `provider:<id>`), holding `Option<ProviderJob<'e>>`. It starts each
-    run with one look.
+    `run` and each `settings_changed` with one look, because the scheduler calls
+    `settings_changed` on every job before it picks one, and `ProviderJob::settings_changed`
+    writes the store and may take the lock.
     - While the gate stops jobs: drops its inner job (freeing its lock), calls
       `board.remove_provider`, and returns `Ran::After(60_000)`.
     - While jobs run: builds the inner job if it has none, with
       `ProviderJobCtx { board, notices: None, keychain_counts, schema_newer: false }`, and returns
       the inner job's `Ran`.
-    - Either way it then reports the board. `settings_changed` is forwarded to the inner job when
-      there is one.
+    - Either way, `run` then reports the board.
+    - `settings_changed` is forwarded to the inner job only while the gate lets jobs run. While
+      it stops them, the inner job is dropped and its line removed, as in `run`, and nothing is
+      forwarded.
   - **Reporter**: one per run, shared with `Rc`. It calls `on_status` only when
     `snapshot().providers` differs from the last lines it passed.
 
