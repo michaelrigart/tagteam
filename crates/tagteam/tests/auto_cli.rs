@@ -509,6 +509,36 @@ fn auto_names_the_daemon_when_the_daemon_holds_the_engine_lock() {
 }
 
 #[test]
+fn auto_names_a_tagteam_window_when_a_tui_holds_the_engine_lock() {
+    // The engine lock is held, and its record says a TUI holds it. This test process stands in
+    // for the window.
+    let d = tempfile::tempdir().unwrap();
+    staying(d.path());
+    let locks = Env::for_test(d.path()).data_dir().join("locks");
+    fs::create_dir_all(&locks).unwrap();
+    let me = ProcessStamp::current().unwrap();
+    let engine_lock = locks.join("autoswitch-claude-code.lock");
+    let _held = FlockGuard::try_lock(&engine_lock).unwrap().unwrap();
+    fs::write(
+        &engine_lock,
+        format!(
+            "{{\"pid\":{},\"start\":{},\"holder\":\"tui\"}}\n",
+            me.pid, me.start
+        ),
+    )
+    .unwrap();
+    let out = auto(d.path(), &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        text(&out.stderr),
+        format!(
+            "tagteam: auto-switch already runs for Claude Code (a tagteam window, pid {}; press P there to pause it, or quit it)\n",
+            me.pid
+        )
+    );
+}
+
+#[test]
 fn auto_records_its_switch_as_auto_and_a_later_switch_as_cli() {
     // Review refactor §8.7: the source is the command that built the engine.
     let d = tempfile::tempdir().unwrap();

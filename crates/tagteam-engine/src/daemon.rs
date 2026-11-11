@@ -6,7 +6,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use tagteam_provider::{Env, FlockGuard, ProcessStamp, Read};
+use tagteam_provider::{Env, FlockGuard, Liveness, ProcessStamp, Read};
 
 use crate::auto::read_lock_record;
 use crate::error::EngineError;
@@ -80,6 +80,21 @@ pub fn read_daemon_record(path: &Path) -> Read<DaemonRecord> {
             })
         },
     )
+}
+
+/// The pid `daemon.lock`'s record names, when that record is `Present` and its stamp is not
+/// `Liveness::Dead`: a liveness that cannot be told counts as live, as `doctor` counts it.
+pub fn live_daemon_pid(env: &Env) -> Option<u32> {
+    match read_daemon_record(&daemon_lock_path(env)) {
+        Read::Present(r) => {
+            let stamp = ProcessStamp {
+                pid: r.pid,
+                start: r.start,
+            };
+            (stamp.liveness() != Liveness::Dead).then_some(r.pid)
+        }
+        Read::Absent | Read::Unreadable(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +206,32 @@ mod tests {
             }
             _ => panic!("a directory is an unreadable record"),
         }
+    }
+
+    #[test]
+    fn live_daemon_pid_names_only_a_live_record() {
+        let d = tempfile::tempdir().unwrap();
+        let env = Env::for_test(d.path());
+        let path = daemon_lock_path(&env);
+        assert_eq!(live_daemon_pid(&env), None, "no file");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "").unwrap();
+        assert_eq!(live_daemon_pid(&env), None, "an empty file");
+        let me = ProcessStamp::current().unwrap();
+        let record = |start: u64| {
+            format!(
+                "{{\"pid\":{},\"start\":{start},\"version\":\"v\"}}\n",
+                me.pid
+            )
+        };
+        fs::write(&path, record(me.start)).unwrap();
+        assert_eq!(live_daemon_pid(&env), Some(me.pid));
+        fs::write(&path, record(me.start - 1)).unwrap();
+        assert_eq!(
+            live_daemon_pid(&env),
+            None,
+            "the same pid with another start"
+        );
     }
 
     #[test]
