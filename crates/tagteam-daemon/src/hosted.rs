@@ -44,7 +44,7 @@ pub struct HostedOptions {
 pub enum HostedEnd {
     /// The engine's cancel token ended the scheduler. Every lock has been released.
     Signal,
-    /// Nothing ran: inside a `tagteam run` shell, or the store could not be opened.
+    /// Nothing ran: the store could not be opened.
     Off,
     /// The store's schema is newer than this build's, at start or later. Every lock has been
     /// released.
@@ -230,17 +230,25 @@ impl Job for HostedJob<'_, '_> {
 /// Every job is first due now, and a tie runs in the order added. `on_status` is called with
 /// the board whenever its provider lines differ from the last passed: after every provider
 /// job's run and every look of the gate, and with no lines once no provider job runs. It is not
-/// called while the jobs run and no provider job has a line yet. Every event goes to `sink`. The jobs drop, and release their locks, before this returns.
+/// called while the jobs run and no provider job has a line yet. Every event goes to `sink`. The
+/// jobs drop, and release their locks, before this returns.
+///
+/// Inside a `tagteam run` shell the engine refuses to switch (S§3.1), so no job runs but the
+/// schema half of the upgrade watch (S§3.7): `on_off` is called once, at start, and the run
+/// goes on to end `Schema` when the store's schema is newer than this build's, or `Signal` when
+/// the token is set. It takes no lock and calls neither `on_status` nor `sink`.
 pub fn run_hosted(
     engine: &Engine,
     opts: HostedOptions,
     sink: &dyn DaemonSink,
     on_status: &dyn Fn(&StatusSnapshot),
+    on_off: &dyn Fn(),
     sleeper: &dyn Sleeper,
     jitter: &mut dyn FnMut() -> f64,
 ) -> HostedEnd {
     if matches!(engine.run_shell(), RunShell::Inside { .. }) {
-        return HostedEnd::Off;
+        on_off();
+        return schema_watch_alone(engine, sink, sleeper, jitter);
     }
     if schema_newer(engine) {
         return HostedEnd::Schema;
@@ -248,20 +256,7 @@ pub fn run_hosted(
     // Before the first read of the settings the jobs serve with, as the daemon's start does,
     // so a write landing meanwhile is a change at the scheduler's first check.
     let settings_mtime = Settings::mtime(engine.env());
-    let board = StatusBoard::new(
-        DaemonInfo {
-            pid: std::process::id(),
-            version: env!("CARGO_PKG_VERSION").into(),
-            started_at: engine.now_s(),
-            socket: None,
-            log: engine.env().log_file(),
-        },
-        NotifyInfo {
-            enabled: false,
-            backend: None,
-            events: Vec::new(),
-        },
-    );
+    let board = hosted_board(engine);
     let baseline = match StoreBaseline::take(engine) {
         Ok(baseline) => baseline,
         Err(e) => {
@@ -308,6 +303,49 @@ pub fn run_hosted(
         sleeper,
     );
     drop(scheduler);
+    match reason {
+        StopReason::Signal => HostedEnd::Signal,
+        StopReason::Upgrade | StopReason::Schema => HostedEnd::Schema,
+    }
+}
+
+/// The board the jobs report to: this process, with no socket and no notifier.
+fn hosted_board(engine: &Engine) -> Arc<StatusBoard> {
+    StatusBoard::new(
+        DaemonInfo {
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            started_at: engine.now_s(),
+            socket: None,
+            log: engine.env().log_file(),
+        },
+        NotifyInfo {
+            enabled: false,
+            backend: None,
+            events: Vec::new(),
+        },
+    )
+}
+
+/// The only job inside a `tagteam run` shell: the schema half of the upgrade watch, due at
+/// once, so a store already newer ends the run before a sleep.
+fn schema_watch_alone(
+    engine: &Engine,
+    sink: &dyn DaemonSink,
+    sleeper: &dyn Sleeper,
+    jitter: &mut dyn FnMut() -> f64,
+) -> HostedEnd {
+    let board = hosted_board(engine);
+    let mut scheduler = Scheduler::new();
+    scheduler.add(Box::new(UpgradeWatch::schema_only(board)), engine.now_ms());
+    let reason = scheduler.run(
+        &mut JobCx {
+            engine,
+            sink,
+            jitter,
+        },
+        sleeper,
+    );
     match reason {
         StopReason::Signal => HostedEnd::Signal,
         StopReason::Upgrade | StopReason::Schema => HostedEnd::Schema,
@@ -397,7 +435,57 @@ mod tests {
     ) -> HostedEnd {
         let on_status = |s: &StatusSnapshot| calls.borrow_mut().push(s.clone());
         let mut jitter = || 0.0;
-        run_hosted(engine, options(), sink, &on_status, sleeper, &mut jitter)
+        run_hosted(
+            engine,
+            options(),
+            sink,
+            &on_status,
+            &|| panic!("only a run shell is off at start"),
+            sleeper,
+            &mut jitter,
+        )
+    }
+
+    /// Runs the jobs on `engine` as `host` does, and counts how often `on_off` was called.
+    fn host_counting_off(
+        engine: &Engine,
+        sink: &dyn DaemonSink,
+        sleeper: &dyn Sleeper,
+        calls: &Calls,
+        off: &Cell<usize>,
+    ) -> HostedEnd {
+        let on_status = |s: &StatusSnapshot| calls.borrow_mut().push(s.clone());
+        let on_off = || off.set(off.get() + 1);
+        let mut jitter = || 0.0;
+        run_hosted(
+            engine,
+            options(),
+            sink,
+            &on_status,
+            &on_off,
+            sleeper,
+            &mut jitter,
+        )
+    }
+
+    /// `PRAGMA user_version` past this build's, as a newer tagteam's migration leaves it.
+    fn migrate_past(fx: &Fx) {
+        let conn = rusqlite::Connection::open(fx.engine.store_file()).unwrap();
+        conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
+            .unwrap();
+    }
+
+    fn run_shell_fx() -> Fx {
+        let profile = std::path::PathBuf::from("/nonexistent/profile");
+        Fx::with_run_shell(RunShell::Inside {
+            profile: profile.clone(),
+            marker: ProfileMarker {
+                provider: cc(),
+                account_id: AccountId::from_string("a"),
+                config_dir: profile.display().to_string(),
+                outer: json!({}),
+            },
+        })
     }
 
     /// The provider lines of the last `on_status` call.
@@ -662,6 +750,7 @@ mod tests {
             options(),
             &events,
             &on_status,
+            &|| panic!("only a run shell is off at start"),
             &slices,
             &mut jitter,
         );
@@ -919,24 +1008,56 @@ mod tests {
     }
 
     #[test]
-    fn inside_a_run_shell_nothing_runs() {
-        let profile = std::path::PathBuf::from("/nonexistent/profile");
-        let fx = Fx::with_run_shell(RunShell::Inside {
-            profile: profile.clone(),
-            marker: ProfileMarker {
-                provider: cc(),
-                account_id: AccountId::from_string("a"),
-                config_dir: profile.display().to_string(),
-                outer: json!({}),
-            },
+    fn inside_a_run_shell_only_the_schema_check_runs_and_a_newer_store_ends_it() {
+        let fx = run_shell_fx();
+        fx.engine.store().unwrap();
+        let off = Cell::new(0);
+        let events = Emitted::new(&fx.clock);
+        let calls = Calls::default();
+        let held = Cell::new(false);
+        let slices = Slices::new(&fx.clock, |n| {
+            assert_eq!(off.get(), 1, "off is told before the first sleep");
+            held.set(held.get() || !absent(&fx, &cc()));
+            match n {
+                3 => migrate_past(&fx),
+                n if n > 200 => panic!("the schema check never ended the run"),
+                _ => {}
+            }
         });
+        let end = host_counting_off(&fx.engine, &events, &slices, &calls, &off);
+        assert_eq!(end, HostedEnd::Schema);
+        assert_eq!(off.get(), 1);
+        assert!(!held.get(), "no engine lock was taken");
+        assert!(absent(&fx, &cc()));
+        assert!(calls.borrow().is_empty() && events.events().is_empty());
+        let taken = slices.taken.borrow().len();
+        assert!(
+            (4..=4 + 60).contains(&taken),
+            "ended within the watch's period of the migration: {taken} slices"
+        );
+    }
+
+    #[test]
+    fn inside_a_run_shell_a_newer_store_at_start_ends_at_once_and_a_signal_ends_it() {
+        let fx = run_shell_fx();
+        fx.engine.store().unwrap();
+        migrate_past(&fx);
+        let off = Cell::new(0);
         let events = Emitted::new(&fx.clock);
         let calls = Calls::default();
         let slices = Slices::none(&fx.clock);
-        assert_eq!(host(&fx.engine, &events, &slices, &calls), HostedEnd::Off);
-        assert!(calls.borrow().is_empty());
-        assert!(events.events().is_empty());
-        assert!(absent(&fx, &cc()));
+        let end = host_counting_off(&fx.engine, &events, &slices, &calls, &off);
+        assert_eq!((end, off.get()), (HostedEnd::Schema, 1));
+
+        let fx = run_shell_fx();
+        let off = Cell::new(0);
+        let slices = Slices::new(&fx.clock, |n| {
+            if n == 2 {
+                fx.engine.cancel().request(libc::SIGTERM);
+            }
+        });
+        let end = host_counting_off(&fx.engine, &events, &slices, &calls, &off);
+        assert_eq!((end, off.get()), (HostedEnd::Signal, 1));
     }
 
     #[test]

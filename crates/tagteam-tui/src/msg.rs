@@ -128,7 +128,8 @@ pub(crate) enum LaneReport {
     /// The lane's board as `status` encodes it; no `providers` while it runs no job.
     Status(Status),
     Event(Event),
-    /// It runs nothing: inside a run shell, or its engine or store could not be opened.
+    /// It runs no job: inside a run shell (the schema check alone goes on, and may report
+    /// `Upgraded` after this), or its engine or store could not be opened.
     Off,
     /// The store's schema is newer than this build's: stopped until the TUI restarts.
     Upgraded,

@@ -686,6 +686,23 @@ impl LaneHome {
         source: tagteam_engine::EventSource,
         http: std::sync::Arc<dyn tagteam_provider::Http>,
     ) -> tagteam_engine::Engine {
+        self.engine_in(
+            cancel,
+            source,
+            http,
+            std::sync::Arc::new(tagteam_provider::SystemClock),
+            tagteam_provider::RunShell::Outside,
+        )
+    }
+
+    fn engine_in(
+        &self,
+        cancel: tagteam_provider::Cancel,
+        source: tagteam_engine::EventSource,
+        http: std::sync::Arc<dyn tagteam_provider::Http>,
+        clock: std::sync::Arc<dyn tagteam_provider::Clock>,
+        run_shell: tagteam_provider::RunShell,
+    ) -> tagteam_engine::Engine {
         use std::sync::Arc;
 
         use tagteam_engine::vault::{KeychainVault, Vault};
@@ -697,13 +714,13 @@ impl LaneHome {
                 .with(Arc::new(tagteam_fake::FakeAgent::new())),
             vault: Vault::new(Box::new(KeychainVault::new(self.keychain.clone()))),
             oracle: Arc::new(tagteam_engine::oracle::NoOracle),
-            clock: Arc::new(tagteam_provider::SystemClock),
+            clock,
             http,
             default_provider: self.provider(),
             settings: tagteam_engine::settings::Settings::default(),
             process: Arc::new(tagteam_provider::liveness::SystemProcessProbe),
             spawner: Arc::new(tagteam_provider::process::ScriptedSpawner::new()),
-            run_shell: tagteam_provider::RunShell::Outside,
+            run_shell,
             source,
         })
     }
@@ -761,6 +778,41 @@ impl LaneHome {
             ));
             let engine = home
                 .engine_over(cancel, tagteam_engine::EventSource::Auto, http)
+                .with_lock_holder(HolderKind::Tui);
+            Ok(crate::auto_lane::LaneEngine {
+                engine,
+                keychain_counts: Vec::new(),
+            })
+        })
+    }
+
+    /// `factory`, but each engine is inside a `tagteam run` shell and reads `clock`, which the
+    /// test moves.
+    pub(crate) fn in_a_run_shell(
+        self: &std::sync::Arc<Self>,
+        clock: std::sync::Arc<tagteam_provider::FakeClock>,
+    ) -> crate::auto_lane::AutoFactory {
+        let home = std::sync::Arc::clone(self);
+        std::sync::Arc::new(move |cancel| {
+            home.built.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let profile = std::path::PathBuf::from("/nonexistent/profile");
+            let run_shell = tagteam_provider::RunShell::Inside {
+                profile: profile.clone(),
+                marker: tagteam_provider::profile::ProfileMarker {
+                    provider: home.provider(),
+                    account_id: tagteam_core::AccountId::from_string("a"),
+                    config_dir: profile.display().to_string(),
+                    outer: serde_json::json!({}),
+                },
+            };
+            let engine = home
+                .engine_in(
+                    cancel,
+                    tagteam_engine::EventSource::Auto,
+                    std::sync::Arc::new(tagteam_provider::ScriptedHttp::new()),
+                    clock.clone(),
+                    run_shell,
+                )
                 .with_lock_holder(HolderKind::Tui);
             Ok(crate::auto_lane::LaneEngine {
                 engine,
