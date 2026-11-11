@@ -171,8 +171,8 @@ The TUI is an Elm-style loop.
   request has unwound. The shutdown closes the channels and sets the token before it joins the
   engine lanes (§10.2). The live thread and the daemon lane are not joined: they never touch the
   store, so a process exit can leave nothing of theirs half written. The auto lane is joined,
-  because it writes the store: the shutdown sets the lane's own token, which stops its scheduler
-  at once, even from a sleep, and a tick finishes only its critical span (core §14.1). *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
+  because it writes the store: the shutdown sets the lane's own token, which wakes its scheduler at
+  once from a sleep. A job already running finishes first, within its requests' own timeouts, and a tick finishes only its critical span (core §14.1). *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 - **A lane that panics** closes its channel. The UI thread sees the disconnect and ends the TUI
   as an error (§10.4).
 
