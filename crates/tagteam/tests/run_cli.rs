@@ -704,6 +704,78 @@ fn run_launches_the_account_that_is_the_one_expected() {
     assert!(session(&out).is_some(), "the session ran");
 }
 
+/// The first of `shells` that is installed, with its flags and the `shell-init` text it runs.
+fn wrapper_shell() -> (PathBuf, &'static [&'static str], &'static str) {
+    let shells: [(&str, &[&str], &str); 2] =
+        [("bash", &["-c"], "bash"), ("zsh", &["-f", "-c"], "zsh")];
+    for (name, flags, init) in shells {
+        let found = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|d| d.join(name))
+                .find(|p| p.is_file())
+        });
+        if let Some(shell) = found {
+            return (shell, flags, init);
+        }
+    }
+    panic!("neither bash nor zsh is installed; the wrapper test needs one");
+}
+
+#[test]
+fn the_wrapper_in_a_directory_mapped_in_config_toml_starts_a_session() {
+    let home = Home::new();
+    let root = home.root();
+    let work = fs::canonicalize(root.join("work")).unwrap();
+    common::write_config(
+        root,
+        &format!(
+            "[provider.claude-code.mappings]\n\"{}\" = \"a@x.co\"\n",
+            work.display()
+        ),
+    );
+    let (shell, flags, init) = wrapper_shell();
+    let init_text = {
+        let out = std_cmd(root).args(["shell-init", init]).output().unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let tagteam = assert_cmd::cargo::cargo_bin("tagteam");
+    let mut path = root.join("bin").into_os_string();
+    path.push(":");
+    path.push(tagteam.parent().unwrap());
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap());
+    let out = home.out("wrapper");
+    let c = std_cmd(root);
+    let mut shell_cmd = Command::new(&shell);
+    shell_cmd
+        .args(flags)
+        .arg(format!("{init_text}\nclaude x\n"))
+        .env_clear();
+    for (k, v) in c.get_envs() {
+        if let Some(v) = v {
+            shell_cmd.env(k, v);
+        }
+    }
+    let output = shell_cmd
+        .env("PATH", path)
+        .env("FAKE_CLAUDE_OUT", &out)
+        .current_dir(&work)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let call = session(&out).expect("the wrapper started a session");
+    assert!(
+        call.env.contains_key("CLAUDE_CONFIG_DIR"),
+        "plain claude ran: the mapping was not applied"
+    );
+    assert_eq!(
+        call.env.get("CLAUDE_CONFIG_DIR"),
+        Some(&marker_spelling(&home.profile())),
+        "account a's profile, not b's or the plain home"
+    );
+}
+
 // ---- `--json` and the command line (§12.1, Decision 8, B.36) ----
 
 #[test]

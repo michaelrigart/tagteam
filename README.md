@@ -296,6 +296,32 @@ tagteam shell-init fish | source # in ~/.config/fish/config.fish
 With the wrapper, `claude` runs through `tagteam run`. Where no mapping applies, it starts plain
 `claude`.
 
+`tagteam map` writes the mapping to `config.toml`, under `[provider.claude-code.mappings]`, and
+you can edit it there yourself. Each key is a directory, and each value is the alias or email of
+an account:
+
+```toml
+[provider.claude-code.mappings]
+"~/Code/work" = "work"                       # an alias
+"/Volumes/Data/client-x" = "alex@client.com" # an email
+```
+
+A key may start with `~/`, so the same file works on several machines. A mapping follows the
+name, not the account: if you rename the alias or remove the account, the directory runs plain
+`claude` with a warning, and `tagteam alias` and `tagteam remove` tell you which directories are
+affected. `tagteam doctor` reports entries that do not apply. `tagteam map` with no arguments
+lists the mappings, and `tagteam map --json` lists the ones in `config.toml` under
+`configMappings`. Mappings that an older tagteam stored in its database still work, and `map`
+moves one to the file when you map that directory again. So a script that reads `mappings` from
+`map --json` sees an entry leave it when `map` moves it. `map` refuses an API-key account, since
+`run` never starts a session for one.
+
+If a dotfile manager deploys `config.toml`, `map` writes the deployed file. Edit the source
+instead, or add the file to the manager again after `map`.
+
+Only the shell wrapper reads mappings. The IDE extensions and the desktop app do not go through
+it, so they use your default login. The desktop app's Code tab uses its own sign-in.
+
 ### Statusline
 
 `tagteam statusline` prints one line for Claude Code's status bar, such as

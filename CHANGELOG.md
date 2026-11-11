@@ -17,6 +17,14 @@ with the one before, so any release may contain breaking changes. Each section s
   must be above `autoswitch.threshold`: `config set` and `config unset` refuse a write that breaks
   the pair, and a file with a broken pair runs with a ceiling of 100 and a warning, as does
   `tagteam auto --threshold` at or above a provider's ceiling.
+- Directory mappings in `config.toml`, under `[provider.<id>.mappings]`: each key is a directory
+  (`~/…` expands to your home) and each value the alias or email of an account. `tagteam run`
+  looks them up ahead of the database's mappings, so `claude` below a mapped directory starts as
+  that account. A mapping follows the name, not the account.
+- `tagteam doctor` checks the mappings: `mappings.directory`, `mappings.value`,
+  `mappings.conflict` and `mappings.database`.
+- `tagteam alias` and `tagteam remove` warn about each `config.toml` mapping whose account they
+  change. They never edit the file.
 
 ### Changed
 
@@ -30,6 +38,12 @@ with the one before, so any release may contain breaking changes. Each section s
   `tagteam auto` and `tagteam daemon`. For `--json` consumers, the `no-switch` event's `detail` is
   `all-above` in that case.
 - A stored automatic switch's `detail` has a `ceiling` field beside `threshold`.
+- `tagteam map` writes `config.toml`, and moves a mapping the database holds for that directory
+  there. `tagteam unmap` removes the mapping from both.
+- `tagteam map --json` lists the entries of `config.toml` under `configMappings`. `mappings`
+  keeps its fields and lists database rows only, so a script that reads it sees an entry leave
+  it when `map` moves the entry to the file. `map`'s own result adds `"source": "config"`.
+- `tagteam map` refuses an API-key account, since `run` never starts a session for one.
 
 ## [20261031.2215.0] - 2026-10-31
 

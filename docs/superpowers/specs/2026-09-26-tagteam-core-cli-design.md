@@ -508,6 +508,9 @@ CREATE TABLE events (
   detail    TEXT                -- JSON
 );
 
+-- Legacy: read only by `run` and `map`'s listing, and deleted per directory by `map` and
+-- `unmap`. Mappings now live in `config.toml` (§6.4, §12.7). (Amended by the config-mappings
+-- spec.)
 CREATE TABLE mappings (         -- one directory can map to one account per provider
   path       TEXT NOT NULL,     -- canonical absolute directory path
   provider   TEXT NOT NULL,
@@ -745,6 +748,12 @@ keys: `config set` refuses them and the user edits the file. `config list` and `
 report a valid price field as unknown (a model's card fields, `web_search_per_1k`,
 `long_prompt_above`, and the card fields under `long_prompt` and `fast`); any other key under a
 price table is reported, like an unknown key anywhere else.
+
+**Mappings.** `[provider.<id>.mappings]` maps directories to accounts: each key is a directory
+(`~/…` expands to the home) and each value the alias or email of an account. They are read
+forgivingly like the price tables and are not registry keys: `config set` refuses them, and
+`map` and `unmap` edit them. `config list` and `doctor` do not report a key under the table as
+unknown. *(Amended by the [config-mappings spec](2026-11-11-tagteam-config-mappings-design.md).)*
 
 **Commands.**
 - **`config list [--provider P]`** shows every key with its effective value for the provider
@@ -1680,7 +1689,9 @@ Captures the live login.
 
 - **`remove <ACCOUNT>`** deletes, in this order: the vault entries (strict), the account's
   rescue files (§6.3), the session profile, and last the store row, which cascades to the
-  mappings and usage rows. For the profile it deletes the profile's hashed Keychain item
+  mappings (database rows) and usage rows. A `config.toml` entry that named the account by
+  its alias or email is not edited: `remove` warns about each, and those directories run plain
+  `claude` (config-mappings spec §3.6). *(Amended by the [config-mappings spec](2026-11-11-tagteam-config-mappings-design.md).)* For the profile it deletes the profile's hashed Keychain item
   first, named from the spelling its marker records (§12.2), then the directory. The
   directory's links are removed as links; nothing they point to is touched.
   - **The order is what makes a `remove` that stops part-way safe.** The vault goes first, so
@@ -1693,6 +1704,9 @@ Captures the live login.
 - **`alias <ACCOUNT> <NAME>` / `alias <ACCOUNT> --unset` / `alias`** (list).
   - Aliases are lowercase and match `^[a-z0-9_.-]+$`.
   - They cannot be all digits or start with `-`, and they are unique case-insensitively.
+  - Setting, renaming or unsetting an alias warns about each `config.toml` mapping entry that
+    resolves to a different account, or to none, afterwards; it never edits the file
+    (config-mappings spec §3.6). *(Amended by the [config-mappings spec](2026-11-11-tagteam-config-mappings-design.md).)*
 - **`move <ACCOUNT> <POSITION>`.** If the target position is taken, the two accounts swap
   positions.
 - **Guard.** Destructive commands (`remove`, `purge`, `add` over an occupied position, and
@@ -2575,10 +2589,15 @@ destructive operations.
 ### 12.7 Mappings and the shell wrapper
 
 - **`tagteam map [ACCOUNT] [PATH]`** maps a directory for the account's provider. `PATH`
-  defaults to the current directory and is stored as its canonical absolute path. With no
+  defaults to the current directory, and its canonical absolute path is stored (written `~/…`
+  under the home directory). With no
   arguments, `map` lists the mappings. A directory can hold one mapping per provider.
+  Mappings live in `config.toml`, under `[provider.<id>.mappings]`, as a directory and the
+  alias or email of an account. The database's `mappings` table is a legacy source: `run` reads
+  it, `map`'s listing shows it, and `map` moves a row to the file. The lookup, and which source
+  wins, are the config-mappings spec's §3.2. `map` refuses an API-key account. *(Amended by the [config-mappings spec](2026-11-11-tagteam-config-mappings-design.md).)*
 - **`tagteam unmap [PATH] [--provider P]`** removes a mapping (all providers' mappings for that
-  path if `--provider` is omitted).
+  path if `--provider` is omitted), from the file and the database alike. *(Amended by the [config-mappings spec](2026-11-11-tagteam-config-mappings-design.md).)*
 - Subdirectories inherit the nearest mapped ancestor, per provider.
 - **`tagteam shell-init zsh|bash|fish`** prints one wrapper function per registered provider
   that supports sessions (for now, `claude`). The wrapper always runs
