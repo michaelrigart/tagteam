@@ -7,16 +7,20 @@ use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::AutoStrategy;
 use tagteam_daemon::events::{Mode, WaitingFor};
 use tagteam_daemon::protocol::{StatusProvider, Wire};
+use tagteam_engine::auto::HolderKind;
 use tagteam_engine::words::{MISSING, threshold};
 
+use crate::actions::UPGRADED;
+use crate::source::AutoHolder;
 use crate::state::State;
 use crate::theme::Role;
 
 /// §5.2's state for the focus provider, long from 120 columns; each piece with its role.
-/// Nothing while the TUI waits for the daemon's first `status` (T2-11). In live mode, the
-/// provider's job in the last `status`; else why the daemon is not followed: a protocol this
-/// TUI does not speak, the daemon's `stopping`, a `tagteam auto` in another terminal holding the
-/// provider's engine lock (C-16), or no daemon.
+/// Nothing while the TUI waits for the daemon's first `status` (T2-11) or the lane's first
+/// report. In order (Ruling 6): the provider's job in a live daemon's last `status`; the lane
+/// stopped for a newer store; a protocol this TUI does not speak; the daemon's `stopping`; the
+/// lane's own job; a live daemon record with no link; the holder of the provider's engine lock
+/// (C-16); no daemon.
 pub(crate) fn auto_state(state: &State, wide: bool) -> Vec<(String, Role)> {
     let d = &state.daemon;
     if !d.settled() {
@@ -25,8 +29,15 @@ pub(crate) fn auto_state(state: &State, wide: bool) -> Vec<(String, Role)> {
     let provider = super::focus(state);
     if d.live() {
         return match d.job(&provider) {
-            Some(job) => job_state(state, job, &provider, wide),
+            Some(job) => job_state(state, job, &provider, wide, false),
             None => said("○", Role::Muted, "auto off", None),
+        };
+    }
+    if d.upgraded() {
+        return if wide {
+            said("!", Role::Warn, "auto stopped", Some(UPGRADED))
+        } else {
+            said("!", Role::Warn, "restart the TUI", None)
         };
     }
     if d.mismatch().is_some() {
@@ -45,15 +56,49 @@ pub(crate) fn auto_state(state: &State, wide: bool) -> Vec<(String, Role)> {
         };
         return said("!", Role::Warn, &words, None);
     }
-    match state.foreign_auto_pid(&provider) {
-        Some(pid) if wide => said(
+    if let Some(job) = d.hosted_job(&provider) {
+        return job_state(state, job, &provider, wide, true);
+    }
+    match (state.holder_of(&provider), state.daemon_pid()) {
+        (Some(holder), _) => held_by(holder, wide),
+        (None, Some(pid)) if wide => said(
+            "○",
+            Role::Muted,
+            &format!("daemon runs (pid {pid})"),
+            Some("not connected, state unknown"),
+        ),
+        (None, Some(_)) => said("○", Role::Muted, "daemon state unknown", None),
+        (None, None) => said("○", Role::Muted, "auto off", Some("no daemon")),
+    }
+}
+
+/// Where auto runs when `holder` has the provider's engine lock and nothing else says: the
+/// daemon (whose state the TUI cannot read), another tagteam window, or a `tagteam auto`.
+fn held_by(holder: &AutoHolder, wide: bool) -> Vec<(String, Role)> {
+    let pid = holder.pid;
+    match (holder.kind, wide) {
+        (HolderKind::Daemon, true) => said(
+            "●",
+            Role::Accent,
+            &format!("auto runs in the daemon (pid {pid})"),
+            Some("not connected"),
+        ),
+        (HolderKind::Daemon, false) => said("●", Role::Accent, "auto in daemon", None),
+        (HolderKind::Tui, true) => said(
+            "●",
+            Role::Accent,
+            &format!("auto runs in another tagteam window (pid {pid})"),
+            None,
+        ),
+        (HolderKind::Auto, true) => said(
             "●",
             Role::Accent,
             &format!("auto runs in another terminal (pid {pid})"),
             None,
         ),
-        Some(pid) => said("●", Role::Accent, &format!("auto in pid {pid}"), None),
-        None => said("○", Role::Muted, "auto off", Some("no daemon")),
+        (HolderKind::Tui | HolderKind::Auto, false) => {
+            said("●", Role::Accent, &format!("auto in pid {pid}"), None)
+        }
     }
 }
 
@@ -68,11 +113,15 @@ fn said(mark: &str, role: Role, words: &str, rest: Option<&str>) -> Vec<(String,
 
 /// §5.2's table: `job`'s state, with its threshold and strategy from `provider`'s accounts view,
 /// and a keychain backoff's end in the TUI's zone. At 80 columns a backoff replaces the state.
+/// `here`: the job is the auto lane's, so `auto` runs in this window (S§3.3), except under a
+/// keychain backoff, which reads as the daemon's. A job waiting for
+/// the engine lock names its holder as the accounts view knows it.
 fn job_state(
     state: &State,
     job: &StatusProvider,
     provider: &ProviderId,
     wide: bool,
+    here: bool,
 ) -> Vec<(String, Role)> {
     let until = job
         .backoff
@@ -91,7 +140,12 @@ fn job_state(
                 (AutoStrategy::Best, true) => format!("switches at {}", threshold(v.threshold)),
                 (AutoStrategy::Best, false) => format!("at {}", threshold(v.threshold)),
             });
-            said("●", Role::Accent, "auto on", rest.as_deref())
+            let words = if here && wide && until.is_none() {
+                "auto on in this window"
+            } else {
+                "auto on"
+            };
+            said("●", Role::Accent, words, rest.as_deref())
         }
         (Some(Mode::Collect), _) if !job.autoswitch => {
             let words = if wide { "auto paused" } else { "paused" };
@@ -105,11 +159,19 @@ fn job_state(
         ),
         (Some(Mode::Collect), _) => said("○", Role::Muted, "needs 2 usable accounts", None),
         (Some(Mode::Waiting), Some(WaitingFor::EngineLock)) => {
-            let words = match (job.holder_pid, wide) {
-                (Some(pid), true) => format!("auto runs in another terminal (pid {pid})"),
-                (Some(pid), false) => format!("auto in pid {pid}"),
-                (None, true) => "auto runs in another terminal".to_owned(),
-                (None, false) => "auto runs elsewhere".to_owned(),
+            let window = job.holder_pid.is_some_and(|pid| {
+                state
+                    .holder_of(provider)
+                    .is_some_and(|h| h.pid == pid && h.kind == HolderKind::Tui)
+            });
+            let words = match (job.holder_pid, wide, window) {
+                (Some(pid), true, true) => {
+                    format!("auto runs in another tagteam window (pid {pid})")
+                }
+                (Some(pid), true, false) => format!("auto runs in another terminal (pid {pid})"),
+                (Some(pid), false, _) => format!("auto in pid {pid}"),
+                (None, true, _) => "auto runs in another terminal".to_owned(),
+                (None, false, _) => "auto runs elsewhere".to_owned(),
             };
             said("●", Role::Accent, &words, None)
         }
@@ -157,6 +219,8 @@ mod tests {
     use tagteam_daemon::protocol::StatusBackoff;
 
     use super::*;
+    use crate::msg::{LaneReport, Msg};
+    use crate::source::AccountsSnapshot;
     use crate::state::Screen;
     use crate::testutil::*;
 
@@ -274,6 +338,181 @@ mod tests {
                 "{mode}: the backoff replaces the state at 80 columns"
             );
         }
+    }
+
+    /// A state that reads `snap` and has had `report` from the auto lane, if any.
+    fn lane_with(report: Option<LaneReport>, snap: AccountsSnapshot) -> State {
+        let mut state = fresh(Screen::Accounts);
+        if let Some(report) = report {
+            crate::update::update(&mut state, Msg::Lane(report), NOW_MS);
+        }
+        state.accounts.apply(snap);
+        state
+    }
+
+    fn lane_job(mode: &str, autoswitch: bool, lock: Option<u32>) -> LaneReport {
+        let mut job = daemon_job("claude-code", mode, autoswitch);
+        if let Some(pid) = lock {
+            job.waiting_for = Some(Wire::from_wire("engine-lock"));
+            job.holder_pid = Some(pid);
+        }
+        LaneReport::Status(daemon_status(vec![job], vec![]))
+    }
+
+    #[test]
+    fn each_state_of_the_autoswitch_header_table_has_its_words_at_both_widths() {
+        let tui = |pid| held(&[(HolderKind::Tui, pid)], None);
+        let auto = |pid| held(&[(HolderKind::Auto, pid)], None);
+        let window = "● auto runs in another tagteam window (pid 4711)";
+        let terminal = "● auto runs in another terminal (pid 4711)";
+        let mut consume_first = held(&[], None);
+        consume_first.providers[0].strategy = AutoStrategy::ConsumeFirst;
+        let mut backoff = daemon_job("claude-code", "auto", true);
+        backoff.backoff = Some(StatusBackoff {
+            reason: "keychain".into(),
+            until: "2026-09-21T15:05:00Z".into(),
+        });
+        let mut live_waiting = daemon_job("claude-code", "waiting", true);
+        live_waiting.waiting_for = Some(Wire::from_wire("engine-lock"));
+        live_waiting.holder_pid = Some(4711);
+        let live = |job| {
+            let mut state = fresh(Screen::Accounts);
+            go_live(&mut state, daemon_status(vec![job], vec![]));
+            state
+        };
+        let mut live_state = live(live_waiting);
+        live_state.accounts.apply(tui(4711));
+        let mut live_auto = live(daemon_job("claude-code", "auto", true));
+        live_auto.accounts.apply(held(&[], Some(4242)));
+        let daemon = |holders: &[(HolderKind, u32)]| held(holders, Some(4242));
+        let cases: Vec<(&str, State, &str, &str)> = vec![
+            (
+                "lane auto, best",
+                lane_with(Some(lane_job("auto", true, None)), held(&[], None)),
+                "● auto on in this window · switches at 90%",
+                "● auto on · at 90%",
+            ),
+            (
+                "lane auto, consume-first",
+                lane_with(Some(lane_job("auto", true, None)), consume_first),
+                "● auto on in this window · uses the soonest reset first",
+                "● auto on · soonest reset",
+            ),
+            (
+                "lane waiting, holder tui",
+                lane_with(Some(lane_job("waiting", true, Some(4711))), tui(4711)),
+                window,
+                "● auto in pid 4711",
+            ),
+            (
+                "lane waiting, holder auto",
+                lane_with(Some(lane_job("waiting", true, Some(4711))), auto(4711)),
+                terminal,
+                "● auto in pid 4711",
+            ),
+            (
+                "lane collect, paused",
+                lane_with(Some(lane_job("collect", false, None)), held(&[], None)),
+                "‖ auto paused · P resumes",
+                "‖ paused · P resumes",
+            ),
+            (
+                "lane idle",
+                lane_with(Some(lane_job("idle", true, None)), held(&[], None)),
+                "○ auto off · no usable account",
+                "○ no usable account",
+            ),
+            (
+                "lane auto, backoff",
+                lane_with(
+                    Some(LaneReport::Status(daemon_status(vec![backoff], vec![]))),
+                    held(&[], None),
+                ),
+                "● auto on · switches at 90% · keychain locked until 15:05",
+                "! keychain locked 15:05",
+            ),
+            (
+                "live waiting, holder tui",
+                live_state,
+                window,
+                "● auto in pid 4711",
+            ),
+            (
+                "no lane jobs, holder tui",
+                lane_with(Some(LaneReport::Off), tui(4711)),
+                window,
+                "● auto in pid 4711",
+            ),
+            (
+                "upgraded",
+                lane_with(Some(LaneReport::Upgraded), held(&[], None)),
+                "! auto stopped · tagteam was upgraded; restart the TUI",
+                "! restart the TUI",
+            ),
+            (
+                "daemon, no link, held by the daemon",
+                lane_with(None, daemon(&[(HolderKind::Daemon, 4242)])),
+                "● auto runs in the daemon (pid 4242) · not connected",
+                "● auto in daemon",
+            ),
+            (
+                "daemon, no link, held by auto",
+                lane_with(None, daemon(&[(HolderKind::Auto, 4711)])),
+                terminal,
+                "● auto in pid 4711",
+            ),
+            (
+                "daemon, no link, held by tui",
+                lane_with(None, daemon(&[(HolderKind::Tui, 4711)])),
+                window,
+                "● auto in pid 4711",
+            ),
+            (
+                "daemon, no link, not held",
+                lane_with(None, daemon(&[])),
+                "○ daemon runs (pid 4242) · not connected, state unknown",
+                "○ daemon state unknown",
+            ),
+            (
+                "live daemon, auto",
+                live_auto,
+                "● auto on · switches at 90%",
+                "● auto on · at 90%",
+            ),
+            (
+                "lane off, nothing else",
+                lane_with(Some(LaneReport::Off), held(&[], None)),
+                "○ auto off · no daemon",
+                "○ auto off · no daemon",
+            ),
+        ];
+        for (case, state, wide, narrow) in cases {
+            assert_eq!(joined(&auto_state(&state, true)), wide, "{case}");
+            assert_eq!(joined(&auto_state(&state, false)), narrow, "{case}");
+        }
+        assert!(UPGRADED.ends_with("restart the TUI"));
+    }
+
+    #[test]
+    fn a_live_daemon_s_status_outranks_the_lane_and_the_holders() {
+        // Ruling 6: with a live `status`, only it counts, whatever else is held or hosted.
+        let mut state = fresh(Screen::Accounts);
+        crate::update::update(
+            &mut state,
+            Msg::Lane(lane_job("collect", false, None)),
+            NOW_MS,
+        );
+        go_live(
+            &mut state,
+            daemon_status(vec![daemon_job("claude-code", "auto", true)], vec![]),
+        );
+        state
+            .accounts
+            .apply(held(&[(HolderKind::Daemon, 4242)], Some(4242)));
+        assert_eq!(
+            joined(&auto_state(&state, true)),
+            "● auto on · switches at 90%"
+        );
     }
 
     #[test]

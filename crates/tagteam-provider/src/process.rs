@@ -27,9 +27,12 @@ pub struct ProcessStamp {
 
 impl ProcessStamp {
     pub fn current() -> io::Result<Self> {
-        let pid = std::process::id();
-        let start = start_of(pid)?.ok_or_else(|| io::Error::other("own process not found"))?;
-        Ok(Self { pid, start })
+        Self::of(std::process::id())?.ok_or_else(|| io::Error::other("own process not found"))
+    }
+
+    /// `pid`'s stamp; `None` when no process has the pid.
+    pub fn of(pid: u32) -> io::Result<Option<Self>> {
+        Ok(start_of(pid)?.map(|start| Self { pid, start }))
     }
 
     /// Exact pid and start-time match. Anything undeterminable counts as live.
@@ -786,6 +789,15 @@ mod tests {
             }
             .is_live()
         );
+    }
+
+    #[test]
+    fn of_stamps_a_running_process_as_current_does_and_finds_none_for_a_missing_pid() {
+        assert_eq!(
+            ProcessStamp::of(std::process::id()).unwrap(),
+            Some(ProcessStamp::current().unwrap())
+        );
+        assert_eq!(ProcessStamp::of(i32::MAX as u32).unwrap(), None);
     }
 
     #[test]

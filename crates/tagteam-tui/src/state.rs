@@ -15,7 +15,7 @@ use crate::overlay::Overlay;
 use crate::screens::accounts::AccountsState;
 use crate::screens::history::HistoryState;
 use crate::screens::tokens::TokensState;
-use crate::source::CollectSummary;
+use crate::source::{AutoHolder, CollectSummary};
 use crate::theme::Theme;
 
 /// Timer mode re-reads and collects this often (spec §6.2).
@@ -221,14 +221,20 @@ impl State {
             .find(|p| &p.provider == provider)
     }
 
-    /// The pid of a live `tagteam auto` other than the daemon, holding `provider`'s engine lock
-    /// in the last accounts view (C-16).
-    pub(crate) fn foreign_auto_pid(&self, provider: &ProviderId) -> Option<u32> {
+    /// The live process other than this one holding `provider`'s engine lock in the last
+    /// accounts view (C-16, S§3.3).
+    pub(crate) fn holder_of(&self, provider: &ProviderId) -> Option<&AutoHolder> {
         self.accounts
             .snapshot()?
             .auto_holders
             .iter()
-            .find_map(|(p, pid)| (p == provider).then_some(*pid))
+            .find(|h| &h.provider == provider)
+    }
+
+    /// The pid of the daemon whose record is live in the last accounts view, whether or not the
+    /// TUI is linked to it.
+    pub(crate) fn daemon_pid(&self) -> Option<u32> {
+        self.accounts.snapshot()?.daemon_pid
     }
 
     /// The first `Cmd`s: load `accounts` (gen 1), and on Tokens its report. History's timeline

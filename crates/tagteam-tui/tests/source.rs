@@ -13,6 +13,7 @@ use tagteam_cc::ClaudeCode;
 use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::Platform;
 use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Window, WindowKind};
+use tagteam_engine::auto::HolderKind;
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;
@@ -32,7 +33,7 @@ use tagteam_provider::{
     Cancel, Env, FakeClock, FakeKeychain, FlockGuard, Identity, ProcessStamp, ProfileMarker,
     RunShell, ScriptedHttp,
 };
-use tagteam_tui::source::{EngineSource, Source};
+use tagteam_tui::source::{AutoHolder, EngineSource, Source};
 
 /// The fixture clock's start, in ms: every reading below is placed relative to it.
 const NOW_MS: i64 = 1_790_000_000_000;
@@ -262,52 +263,107 @@ fn a_live_login_tagteam_does_not_manage_is_named() {
     assert_eq!(snap.providers[0].active_position, None);
 }
 
+/// A child `sleep 30`, killed and reaped when it drops, whether the test ends or panics.
+struct Sleeper(std::process::Child);
+
+impl Sleeper {
+    fn start() -> Self {
+        Sleeper(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn stamp(&self) -> ProcessStamp {
+        ProcessStamp::of(self.0.id()).unwrap().unwrap()
+    }
+}
+
+impl Drop for Sleeper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
-fn a_live_engine_lock_holder_is_named_and_a_dead_one_is_not() {
-    // C-16, T2-11: another process holds the provider's engine lock when its record names a live
-    // pid with the start time it was written with, and is not the daemon.
+fn the_holders_name_the_daemon_a_tagteam_window_and_auto_and_leave_out_this_process() {
+    // C-16, T2-11, S§3.3: another process holds the provider's engine lock when its record names
+    // a live pid with the start time it was written with; its record says what kind it is, and
+    // `daemon.lock` names the daemon.
     let home = Home::new();
     let locks = home.env.data_dir().join("locks");
     fs::create_dir_all(&locks).unwrap();
-    let write = |name: &str, stamp: ProcessStamp| {
+    let lock = locks.join("autoswitch-claude-code.lock");
+    let write = |holder: Option<&str>, stamp: ProcessStamp| {
+        let holder = holder.map_or(String::new(), |h| format!(",\"holder\":\"{h}\""));
         fs::write(
-            locks.join(name),
-            format!("{{\"pid\":{},\"start\":{}}}\n", stamp.pid, stamp.start),
+            &lock,
+            format!(
+                "{{\"pid\":{},\"start\":{}{holder}}}\n",
+                stamp.pid, stamp.start
+            ),
         )
         .unwrap();
     };
-    let me = ProcessStamp::current().unwrap();
+    let other = Sleeper::start();
+    let child = other.stamp();
     let cc = ProviderId::new(CLAUDE_CODE);
-    let holders = || home.source().accounts(None).unwrap().auto_holders;
-    assert_eq!(holders(), [], "no record, no holder");
-
-    write("autoswitch-claude-code.lock", me);
-    assert_eq!(holders(), [(cc.clone(), me.pid)]);
-
-    let recycled = ProcessStamp {
-        pid: me.pid,
-        start: me.start - 1,
+    let read = || {
+        let snap = home.source().accounts(None).unwrap();
+        (snap.auto_holders, snap.daemon_pid)
     };
-    write("autoswitch-claude-code.lock", recycled);
+    let holder = |kind| AutoHolder {
+        provider: cc.clone(),
+        pid: child.pid,
+        kind,
+    };
+    assert_eq!(read(), (vec![], None), "no record, no holder");
+
+    write(Some("tui"), child);
+    assert_eq!(read(), (vec![holder(HolderKind::Tui)], None));
+
+    write(None, child);
     assert_eq!(
-        holders(),
-        [],
-        "the pid runs, but it started at another time"
+        read(),
+        (vec![holder(HolderKind::Auto)], None),
+        "a record without the field is a `tagteam auto`"
     );
 
-    write("autoswitch-claude-code.lock", me);
     fs::write(
         locks.join("daemon.lock"),
         format!(
             "{{\"pid\":{},\"start\":{},\"version\":\"1.0.0\"}}\n",
-            me.pid, me.start
+            child.pid, child.start
         ),
     )
     .unwrap();
     assert_eq!(
-        holders(),
-        [],
-        "the daemon holding its own job's lock is not another terminal"
+        read(),
+        (vec![holder(HolderKind::Daemon)], Some(child.pid)),
+        "the process `daemon.lock` names is the daemon, whatever its record says"
+    );
+
+    let me = ProcessStamp::current().unwrap();
+    write(Some("tui"), me);
+    assert_eq!(
+        read(),
+        (vec![], Some(child.pid)),
+        "this process's own lock is not another holder"
+    );
+
+    let recycled = ProcessStamp {
+        pid: child.pid,
+        start: child.start - 1,
+    };
+    write(Some("tui"), recycled);
+    fs::remove_file(locks.join("daemon.lock")).unwrap();
+    assert_eq!(
+        read(),
+        (vec![], None),
+        "the pid runs, but it started at another time"
     );
 }
 

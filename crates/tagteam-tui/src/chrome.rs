@@ -557,14 +557,15 @@ mod tests {
     use ratatui::style::{Color, Modifier};
     use tagteam_core::ProviderId;
     use tagteam_core::autoswitch::AutoStrategy;
-    use tagteam_daemon::protocol::{Event, Status, StatusBackoff, Wire};
+    use tagteam_daemon::protocol::{Event, Status, StatusBackoff, StatusProvider, Wire};
+    use tagteam_engine::auto::HolderKind;
     use tagteam_engine::views::{AccountView, UsageStatus};
 
     use super::*;
     use crate::host::{AccountRef, Action};
     use crate::live::Live;
-    use crate::msg::{Cmd, Msg};
-    use crate::source::SourceError;
+    use crate::msg::{Cmd, LaneReport, Msg};
+    use crate::source::{AccountsSnapshot, SourceError};
     use crate::testutil::*;
     use crate::theme::Theme;
     use crate::update::update;
@@ -778,6 +779,116 @@ mod tests {
         let mut state = fresh(Screen::Accounts);
         go_live(&mut state, one_job("auto", true));
         assert!(drawn(&state, 120)[0].ends_with("● auto on   ? keys"));
+    }
+
+    #[test]
+    fn every_autoswitch_header_row_fits_at_120_and_80_columns() {
+        // S§3.3: the rows that name where auto runs, pid 4711. A backoff reads as the daemon's:
+        // "in this window" and the backoff together are 72 columns, 7 more than the header's room.
+        let lane = |job: StatusProvider, snap: AccountsSnapshot| {
+            let mut state = fresh(Screen::Accounts);
+            let status = daemon_status(vec![job], vec![]);
+            update(&mut state, Msg::Lane(LaneReport::Status(status)), NOW_MS);
+            state.accounts.apply(snap);
+            state
+        };
+        let waiting = |pid| {
+            let mut job = daemon_job("claude-code", "waiting", true);
+            job.waiting_for = Some(Wire::from_wire("engine-lock"));
+            job.holder_pid = Some(pid);
+            job
+        };
+        let on = || held(&[], None);
+        let mut backoff = daemon_job("claude-code", "auto", true);
+        backoff.backoff = Some(StatusBackoff {
+            reason: "keychain".into(),
+            until: "2026-09-21T15:05:00Z".into(),
+        });
+        let upgraded = {
+            let mut state = fresh(Screen::Accounts);
+            update(&mut state, Msg::Lane(LaneReport::Upgraded), NOW_MS);
+            state.accounts.apply(on());
+            state
+        };
+        let daemon = |holders: &[(HolderKind, u32)]| {
+            let mut state = fresh(Screen::Accounts);
+            state.accounts.apply(held(holders, Some(4242)));
+            state
+        };
+        let window = "● auto runs in another tagteam window (pid 4711)";
+        let cases: Vec<(&str, State, &str, &str)> = vec![
+            (
+                "lane auto",
+                lane(daemon_job("claude-code", "auto", true), on()),
+                "● auto on in this window · switches at 90%",
+                "● auto on · at 90%",
+            ),
+            (
+                "lane auto, backoff",
+                lane(backoff, on()),
+                "● auto on · switches at 90% · keychain locked until 15:05",
+                "! keychain locked 15:05",
+            ),
+            (
+                "lane waiting, tui",
+                lane(waiting(4711), held(&[(HolderKind::Tui, 4711)], None)),
+                window,
+                "● auto in pid 4711",
+            ),
+            (
+                "lane waiting, auto",
+                lane(waiting(4711), held(&[(HolderKind::Auto, 4711)], None)),
+                "● auto runs in another terminal (pid 4711)",
+                "● auto in pid 4711",
+            ),
+            (
+                "upgraded",
+                upgraded,
+                "! auto stopped · tagteam was upgraded; restart the TUI",
+                "! restart the TUI",
+            ),
+            (
+                "daemon, held by the daemon",
+                daemon(&[(HolderKind::Daemon, 4242)]),
+                "● auto runs in the daemon (pid 4242) · not connected",
+                "● auto in daemon",
+            ),
+            (
+                "daemon, held by a window",
+                daemon(&[(HolderKind::Tui, 4711)]),
+                window,
+                "● auto in pid 4711",
+            ),
+            (
+                "daemon, not held",
+                daemon(&[]),
+                "○ daemon runs (pid 4242) · not connected, state unknown",
+                "○ daemon state unknown",
+            ),
+            (
+                "daemon, not held, a 7-digit pid",
+                {
+                    let mut state = fresh(Screen::Accounts);
+                    state.accounts.apply(held(&[], Some(4_194_304)));
+                    state
+                },
+                "○ daemon runs (pid 4194304) · not connected, state unknown",
+                "○ daemon state unknown",
+            ),
+        ];
+        for (case, state, wide, narrow) in cases {
+            for (w, words) in [(120, wide), (80, narrow)] {
+                let row = &drawn(&state, w)[0];
+                assert!(
+                    row.starts_with(&format!("{TABS_ROW} ")),
+                    "{case} at {w}: {row}"
+                );
+                assert!(
+                    row.ends_with(&format!("{words}   ? keys")),
+                    "{case} at {w}: {row}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1026,7 +1137,11 @@ mod tests {
         // C-16, T2-11: with no daemon, a live `tagteam auto` holding the engine lock is named.
         let held = |provider: ProviderId| {
             let mut snap = snapshot(many(1));
-            snap.auto_holders = vec![(provider, 4711)];
+            snap.auto_holders = vec![crate::source::AutoHolder {
+                provider,
+                pid: 4711,
+                kind: HolderKind::Auto,
+            }];
             snap
         };
         let mut state = fresh(Screen::Accounts);
