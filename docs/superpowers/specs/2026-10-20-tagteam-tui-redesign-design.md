@@ -373,9 +373,10 @@ account's provider, then `? keys`, which is never dropped.
 - **Roles:** `●` accent, `‖` and `!` warn, `○` muted; the words in text; what follows `·` muted.
 - **The threshold and strategy** are the effective `autoswitch.threshold` and
   `autoswitch.strategy` from the accounts view (§12.2), not from an event.
-- **The engine lock** (timer mode only) is read with every `accounts` by `EngineSource`, through
+- **The engine lock's holders** are read with every `accounts` by `EngineSource`, through
   `Engine::engine_holder`, and judged live by an exact pid and start-time match, as `doctor` and
-  the daemon's `collect` mode judge it.
+  the daemon's `collect` mode judge it. The live-mode `waiting` row reads them too, to say who
+  holds the lock. *(Amended by the TUI autoswitch spec, [§3.3](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 - **The rows from "the TUI's own auto lane" down** are the TUI autoswitch spec's. While no daemon
   runs, the TUI's own lane hosts the daemon's provider jobs and the header renders its status
   board as it renders a daemon's `status`. The daemon-without-a-socket rows read the daemon's
