@@ -256,6 +256,31 @@ fn unmap_takes_an_entry_that_names_a_file_through_a_symlink() {
 }
 
 #[test]
+fn unmap_takes_a_path_whose_ancestor_became_a_file() {
+    // `canonicalize` fails with NotADirectory there, not NotFound: the path doctor suggests must
+    // still unmap, as a path that is merely gone does.
+    let d = tempfile::tempdir().unwrap();
+    two_accounts(d.path());
+    let (client, _) = dir(&d.path().join("home"), "work/client");
+    let config = write_config(
+        d.path(),
+        "[provider.claude-code.mappings]\n\"~/work/client\" = \"a@x.co\"\n",
+    );
+    let work = d.path().join("home").join("work");
+    fs::remove_dir_all(&work).unwrap();
+    fs::write(&work, "").unwrap();
+    let out = cmd(d.path())
+        .arg("unmap")
+        .arg(&client)
+        .arg("--json")
+        .assert()
+        .success();
+    assert_eq!(json_of(&out.get_output().stdout)["removed"], 1);
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(!text.contains("mappings"), "{text}");
+}
+
+#[test]
 fn map_refuses_a_path_that_is_missing_or_not_a_directory() {
     let d = tempfile::tempdir().unwrap();
     two_accounts(d.path());
