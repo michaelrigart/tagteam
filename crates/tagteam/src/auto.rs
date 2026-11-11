@@ -804,6 +804,21 @@ mod tests {
     }
 
     #[test]
+    fn an_all_above_line_says_the_threshold_of_its_poll() {
+        let mut p = poll(2, &[(2, Some(23.0))]);
+        if let AutoEvent::Poll { threshold, .. } = &mut p {
+            *threshold = 85.0;
+        }
+        let lines = lines_for(&[p, no_switch_event("no-qualifying-candidate", "all-above")]);
+        assert!(
+            lines.ends_with(
+                "every account is above 85%, and none is far enough ahead to switch to\n"
+            ),
+            "{lines}"
+        );
+    }
+
+    #[test]
     fn all_exhausted_says_when_the_first_frees_up_and_how_long_that_is() {
         let exhausted = |earliest_reset_at| AutoEvent::AllExhausted {
             provider: cc(),
