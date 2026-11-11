@@ -8,7 +8,7 @@ use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::Engine;
 use tagteam_engine::auto::HolderKind;
 use tagteam_engine::collect::{CollectMode, Collected};
-use tagteam_engine::daemon::{daemon_lock_path, live_daemon_pid, read_daemon_record};
+use tagteam_engine::daemon::{DaemonRecord, daemon_record};
 use tagteam_engine::error::EngineError;
 use tagteam_engine::failure::FailureKind;
 use tagteam_engine::settings::Settings;
@@ -57,9 +57,11 @@ pub struct AccountsSnapshot {
     /// The engine clock, in seconds, when this was read.
     pub read_at_s: i64,
     /// Every live engine-lock holder but this process: the daemon's as `HolderKind::Daemon`
-    /// (its record matches `daemon.lock`'s), else the record's kind, `Auto` when it has none.
+    /// (its record matches `daemon.lock`'s), else the record's kind, `Auto` when it has none, as
+    /// a `daemon` claim `daemon.lock` does not back has none.
     pub auto_holders: Vec<AutoHolder>,
-    /// `live_daemon_pid` at this read.
+    /// The pid `daemon.lock`'s record names when its stamp is not dead (`DaemonRecord::live_pid`),
+    /// from the record the holders were judged against.
     pub daemon_pid: Option<u32>,
     /// `config.toml`'s modification time when this was read (`Settings::mtime`): a change from
     /// the one start-up saw clears the start-up warnings (redesign §5.6, T2-21).
@@ -131,7 +133,8 @@ impl Source for EngineSource {
             ShellAccount::Managed(row) => Some(row.id),
             ShellAccount::NotInShell | ShellAccount::Unmanaged => None,
         };
-        let auto_holders = engine_holders(engine, &providers);
+        let daemon = daemon_record(engine.env());
+        let auto_holders = engine_holders(engine, &providers, daemon.as_ref());
         let read_at_ms = engine.now_ms();
         let mut last_auto = Vec::new();
         for p in &providers {
@@ -146,7 +149,7 @@ impl Source for EngineSource {
             in_run_shell: matches!(engine.run_shell(), RunShell::Inside { .. }),
             read_at_s: read_at_ms.div_euclid(1000),
             auto_holders,
-            daemon_pid: live_daemon_pid(engine.env()),
+            daemon_pid: daemon.as_ref().and_then(DaemonRecord::live_pid),
             config_mtime: Settings::mtime(engine.env()),
             last_auto,
         })
@@ -226,13 +229,13 @@ impl Source for EngineSource {
 
 /// Each of `providers` whose engine lock record names a process that runs, judged by an exact pid
 /// and start-time match as `doctor` does (an undeterminable one counts as live), other than this
-/// process. The daemon `daemon.lock` names is a `Daemon`; any other is the kind its record says,
-/// `Auto` when it says none.
-fn engine_holders(engine: &Engine, providers: &[ProviderAccounts]) -> Vec<AutoHolder> {
-    let daemon = match read_daemon_record(&daemon_lock_path(engine.env())) {
-        Read::Present(r) => Some((r.pid, r.start)),
-        Read::Absent | Read::Unreadable(_) => None,
-    };
+/// process. Its kind is `EngineHolder::resolved_kind` against `daemon`, `daemon.lock`'s record
+/// as this read found it: `Auto` when that gives none.
+fn engine_holders(
+    engine: &Engine,
+    providers: &[ProviderAccounts],
+    daemon: Option<&DaemonRecord>,
+) -> Vec<AutoHolder> {
     let me = ProcessStamp::current().ok();
     providers
         .iter()
@@ -240,15 +243,10 @@ fn engine_holders(engine: &Engine, providers: &[ProviderAccounts]) -> Vec<AutoHo
             Read::Present(holder)
                 if holder.liveness() != Liveness::Dead && Some(holder.stamp()) != me =>
             {
-                let kind = if daemon == Some((holder.pid, holder.start)) {
-                    HolderKind::Daemon
-                } else {
-                    holder.kind.unwrap_or(HolderKind::Auto)
-                };
                 Some(AutoHolder {
                     provider: p.provider.clone(),
                     pid: holder.pid,
-                    kind,
+                    kind: holder.resolved_kind(daemon).unwrap_or(HolderKind::Auto),
                 })
             }
             Read::Present(_) | Read::Absent | Read::Unreadable(_) => None,

@@ -10,6 +10,7 @@ use tagteam_provider::doctor::quoted;
 use tagteam_provider::{Check, Liveness, Provider, Read};
 
 use crate::auto::{HolderKind, engine_lock_path, read_holder};
+use crate::daemon::daemon_record;
 use crate::quarantine::QuarantineReason;
 use crate::settings::Settings;
 use crate::store::{
@@ -491,11 +492,8 @@ impl Run<'_> {
         let running = match read_holder(&lock) {
             Read::Absent => Check::ok(Id::AUTO_ENGINE, "auto-switch is not running"),
             Read::Present(holder) => {
-                let kind = if self.held_by_daemon(&holder) {
-                    Some(HolderKind::Daemon)
-                } else {
-                    holder.kind.filter(|k| *k != HolderKind::Daemon)
-                };
+                let daemon = daemon_record(&self.engine.env);
+                let kind = holder.resolved_kind(daemon.as_ref());
                 engine_record_check(holder.pid, holder.liveness(), kind)
             }
             Read::Unreadable(e) => Check::warn(

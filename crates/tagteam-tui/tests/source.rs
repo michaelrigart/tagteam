@@ -332,6 +332,13 @@ fn the_holders_name_the_daemon_a_tagteam_window_and_auto_and_leave_out_this_proc
         "a record without the field is a `tagteam auto`"
     );
 
+    write(Some("daemon"), child);
+    assert_eq!(
+        read(),
+        (vec![holder(HolderKind::Auto)], None),
+        "a `daemon` claim that `daemon.lock` does not back names no kind"
+    );
+
     fs::write(
         locks.join("daemon.lock"),
         format!(
