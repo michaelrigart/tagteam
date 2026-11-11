@@ -30,7 +30,8 @@ updates. The CLI keeps working, unchanged, without the daemon.
    holds across all tagteam processes. Disabled and session-owned accounts are left to `list`'s
    on-demand collection, as today (§8.3).
 2. Auto-switching behaves exactly as `tagteam auto` does (§11), and the two never drive one
-   provider at once.
+   provider at once. The same holds for an open TUI's own auto-switching, which steps aside for
+   the daemon: the engine lock stays the only arbiter. *(Amended by the TUI autoswitch spec, [§3.2](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 3. `statusline` stays within 10 ms p95, and `list` within 50 ms p95 when no fetch is due, while a
    daemon runs (§1.1 criterion 5).
 4. `doctor` still tells which process holds an engine lock (§11.1, §13.6), and also reports the
@@ -473,7 +474,9 @@ Three keys are added to §6.4's registry, with every rule of §6.4 (forgiving re
 - **`daemon.autoswitch`** turns the daemon's auto-switching on or off per provider (D4.3).
   Setting it to false is how auto-switching is paused, from the CLI or from the TUI, through the
   existing `config set` path (§6.4), which works in a run shell too. It persists across
-  restarts. It does not affect `tagteam auto`, which the user starts on purpose.
+  restarts. It does not affect `tagteam auto`, which the user starts on purpose. It pauses the
+  auto-switching of an open TUI too, which runs the same provider jobs while no daemon runs.
+  *(Amended by the TUI autoswitch spec, [§3.4](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 - **The `autoswitch.*` keys** drive the daemon's ticks and `collect` rounds exactly as they drive
   `auto`. The daemon takes no tuning flags: a service has no command line to change, so the
   settings are its interface.
@@ -521,6 +524,9 @@ others are not created.
 `auto` behaves as before (§11.1). Its message for a provider whose engine lock is held now names
 the holder when the holder record matches `daemon.lock`'s: `auto-switch already runs for
 claude-code (the daemon, pid 4242; pause it with tagteam config set daemon.autoswitch false)`.
+For a holder that is a TUI it reads `auto-switch already runs for claude-code (a tagteam window,
+pid N; press P there to pause it, or quit it)`. `auto --once` keeps its `engine-running`
+warning, without the holder. *(Amended by the TUI autoswitch spec, [§3.6](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 
 ## D9. Service units
 

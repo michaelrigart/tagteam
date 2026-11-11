@@ -803,7 +803,8 @@ source}], unknown: [key]}`; `get` returns `{schemaVersion, key, provider, value,
 | `notify.events` | `["switch","quarantine","limit"]` | a list of `switch`, `quarantine` and `limit`; duplicates collapse; `''` is the empty list | yes |
 
 The `daemon.*` and `notify.*` keys are the daemon's (daemon spec D7). `daemon.autoswitch` set
-to false pauses the daemon's auto-switching for a provider. It does not affect `tagteam auto`.
+to false pauses the daemon's auto-switching for a provider, and that of an open TUI too. It does
+not affect `tagteam auto`. *(Amended by the TUI autoswitch spec, [§3.4](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 `ui.accounts_view` is the TUI's, read once when it starts; `v` toggles the view for the session
 (added 2026-11-11 in [#58](https://github.com/michaelrigart/tagteam/pull/58)).
 
@@ -1851,6 +1852,8 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
   - A loop skips a provider whose lock another process holds, with a warning. If it gets no
     provider's lock at all, it exits 1, saying auto-switch already runs for them. When the
     holder is the daemon, the message names it and says how to pause it (daemon spec D8.3).
+    When it is a TUI, the message names a tagteam window and says to press `P` there to pause
+    it, or to quit it. *(Amended by the TUI autoswitch spec, [§3.6](2026-11-11-tagteam-tui-autoswitch-design.md).)*
   - `--once` reports `no-switch` with reason `engine-running` for such a provider (NO_ACTION).
   - `--dry-run` takes no engine lock and writes no auto-switch state: its state lives in
     memory, it releases no quarantine (§11.2 step 1), and it freshens and switches nothing
@@ -1859,12 +1862,15 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
     repairs a switch that has already reached the live store, and decides nothing.
   - The daemon (sub-project 2) takes the same lock, so `auto` and the daemon never both drive
     one provider. When it takes the lock, and when it gives it up (pausing through
-    `daemon.autoswitch`), is daemon spec D4.3.
+    `daemon.autoswitch`), is daemon spec D4.3. An open TUI is a third possible holder: with no
+    daemon running it takes the lock for each provider and runs the daemon's provider job, and it
+    gives the lock up when a daemon comes up or when it stops. *(Amended by the TUI autoswitch spec, [§3.1, §3.2](2026-11-11-tagteam-tui-autoswitch-design.md).)*
   - Once it holds the lock, the engine writes its pid and start time into the lock file, the
     start time taken as for the `switch_journal` holder (§12.6). The record is never used for
     exclusion. `doctor` reads it to tell whether an engine runs, by an exact pid and
     start-time match (§13.6), instead of trying the lock, which an `auto` starting at that
-    instant would then find taken.
+    instant would then find taken. The record also says who holds the lock: `daemon`, `auto` or
+    `tui`. A record without that field reads as before. *(Amended by the TUI autoswitch spec, [§3.6](2026-11-11-tagteam-tui-autoswitch-design.md).)*
   - An engine that ends empties the record before it releases the lock (daemon spec D3 change
     3). A daemon that gives a provider up lives on, and a record left behind would name it as
     that provider's engine. A process killed by SIGKILL still leaves its record, which names a
@@ -3041,7 +3047,9 @@ for a check that is not a provider's, and `fix` is null when there is nothing to
   `tagteam switch --force` as the fix if no tagteam process is running.
 - **Auto-switch** (§11):
   - an engine running → info, with its pid, from the engine lock's record (§11.1); `the
-    daemon (pid N)` when the record matches `daemon.lock`'s (daemon spec D10)
+    daemon (pid N)` when the record matches `daemon.lock`'s (daemon spec D10), and `a tagteam
+    window (pid N)` when the record says a TUI holds it *(Amended by the TUI autoswitch spec,
+    [§3.6](2026-11-11-tagteam-tui-autoswitch-design.md).)*
   - `unhealthy_ticks` above zero → warn
   - a `consume-first` strategy for a provider without a long window (§4.5) → warn
   - `autoswitch.models` naming a model that no account's last reading has → warn, as the

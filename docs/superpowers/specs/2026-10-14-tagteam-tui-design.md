@@ -37,11 +37,15 @@ the same commands the CLI runs.
 3. **The UI thread never waits on I/O** other than the terminal. Store reads, transcript reads,
    the network, the Keychain and the daemon's socket all run on other threads (§4.3).
 4. **Usage requests go only through the collector** and its budget (core §8.3, §8.6). The TUI
-   never fetches on its own schedule. When a daemon runs, the TUI fetches only when a person
-   asks (`r`), or when an action's CLI command does (`switch --strategy best`, for example).
+   never fetches on its own schedule. When a daemon runs, or while the TUI's own auto lane
+   collects for a provider (§4.3), the TUI fetches for that provider only when a person asks
+   (`r`), or when an action's CLI command does (`switch --strategy best`, for example).
+   *(Amended by the TUI autoswitch spec, [§3.5](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 5. **Actions are the CLI's.** Every action runs the CLI's own command path, so its prompts,
    refusals, messages and outcome are identical by construction (§7).
 6. **It works without a daemon**, refreshing on a timer, and updates live when one runs (§6).
+   While it is open and no daemon runs, it also switches accounts itself (§4.3); the daemon
+   covers the hours it is closed. *(Amended by the TUI autoswitch spec, [§1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 7. **The terminal is always restored**: on quit, on a signal, on an error and on a panic.
 8. **The local-state invariant holds** (core §3). The TUI writes nothing of its own to Claude
    Code's files. Its actions write only what their CLI commands write.
@@ -55,7 +59,9 @@ the same commands the CLI runs.
   *(Amended 2026-11-11 in [#58](https://github.com/michaelrigart/tagteam/pull/58): one `ui.*`
   key, `ui.accounts_view`, names the view the Accounts screen opens in; core §6.4.)*
 - **Notifications.** They are the daemon's.
-- **Controlling a foreground `tagteam auto`.** Only the daemon's loop can be paused (§7.4).
+- **Controlling a foreground `tagteam auto`.** Only the daemon's loop and the TUI's own auto
+  lane can be paused (§7.4). A foreground `tagteam auto` is refused while a TUI switches, and the
+  refusal says how to free it. *(Amended by the TUI autoswitch spec, [§2, §3.6](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 - **A `watch` command.** `tui` covers cswap's `tui` and `watch` alike (§12.1).
 - **Windows,** as in core §1.2.
 
@@ -131,7 +137,7 @@ The TUI is an Elm-style loop.
   and on a waker the UI thread uses to pause, resume or stop it, so it makes no wake-up while idle
   and acknowledges a pause at once (§7.3). *(Amended by the TUI redesign spec §14, PERF-R-9.)*
   *(Amended by the [input reader spec](2026-10-31-tagteam-tui-input-reader-design.md) §3: the thread reads the terminal itself and decodes it with crossterm's vendored decoder.)*
-- **Five lanes.** The four engine lanes each own an `Engine` that the binary's factory builds
+- **Six lanes.** The five engine lanes each own an `Engine` that the binary's factory builds
   from the same `Context`, so `Engine` never needs to be `Sync`. Each lane's engine takes the shutdown token
   as its cancel token, never the signal token (§2). A Ctrl-C meant for a foreground action
   (§7.3) therefore never interrupts a lane.
@@ -143,9 +149,13 @@ The TUI is an Elm-style loop.
   | index | `refresh_tokens`: the transcript catch-up, which can run for minutes on a cold index |
   | actions | the collector and every `Host` action, one at a time |
   | daemon | the daemon's `status`, over a short-lived connection of its own (§8); no engine |
+  | auto | the daemon's provider jobs on a scheduler, while no daemon runs; its engine is built in the thread with the `Auto` event source (autoswitch spec §3.1) |
 
   The index has its own lane so that report queries never wait behind a catch-up (§5.3). The
-  daemon lane keeps a slow `status` reply (up to 2 s, D5.7) off the views lane.
+  daemon lane keeps a slow `status` reply (up to 2 s, D5.7) off the views lane. The auto lane
+  stops its jobs and releases the engine locks whenever a live daemon record appears, and
+  starts them again 30 s after the record goes dead. *(Amended by the TUI autoswitch spec, [§3.1,
+  §3.2](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 
 - **Coalescing.** A lane merges a queued request with an identical one still queued. Each
   request carries the generation of the state that asked for it, and `update` drops a result
@@ -156,7 +166,9 @@ The TUI is an Elm-style loop.
 - **Joining.** An engine lane returns once its request channel is closed and its current
   request has unwound. The shutdown closes the channels and sets the token before it joins the
   engine lanes (§10.2). The live thread and the daemon lane are not joined: they never touch the
-  store, so a process exit can leave nothing of theirs half written.
+  store, so a process exit can leave nothing of theirs half written. The auto lane is joined,
+  because it writes the store: the shutdown token stops its scheduler within one 1 s slice, and a
+  tick finishes only its critical span (core §14.1). *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 - **A lane that panics** closes its channel. The UI thread sees the disconnect and ends the TUI
   as an error (§10.4).
 
@@ -523,7 +535,7 @@ timer mode, since nothing else collects for it.
 | `A` | Add the current login | `add` | — |
 | `R` | Run a session on the account | `tagteam run <ref>`, as a child process | Always suspended (§7.3) |
 | `D` | Doctor | `doctor`, `doctor --online` | Panel (§5.5) |
-| `P` | Pause or resume auto-switch | `config set provider.<id>.daemon.autoswitch false\|true` | Confirm dialog; live mode only (§7.4) |
+| `P` | Pause or resume auto-switch | `config set provider.<id>.daemon.autoswitch false\|true` | Confirm dialog; live mode, or while the TUI's own auto lane runs (§7.4) |
 | `r` | Refresh | `collect_due` (§6.2), or `refresh_tokens` on Tokens | — |
 
 ### 7.2 Running an action
@@ -576,18 +588,31 @@ runs (core §12.5):
   without waiting for Enter.
 - **Lanes and the live thread are untouched.** Lanes watch only the shutdown token (§4.3), and
   the live thread watches no token, so background work and the daemon connection carry on across
-  a suspension.
+  a suspension. The auto lane carries on too, and keeps switching while the action runs. It
+  judges whether a daemon runs inside the lane, so that works while the UI thread waits.
+  *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
+
+**Ctrl-Z.** Before the TUI stops its process, it stops the auto lane and joins it, so a stopped
+process holds no engine lock. A stopped process reads as live, and would otherwise block a daemon
+or `tagteam auto` for as long as it stays stopped. On resume the lane starts again by its usual
+rule (autoswitch spec §3.2). *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 
 ### 7.4 Pause and resume auto
 
 Pausing is the daemon's persistent setting `provider.<id>.daemon.autoswitch` (§8), so it
-survives a daemon restart.
+survives a daemon restart. The same setting pauses the TUI's own auto lane.
 - **In live mode,** `P` asks `Pause auto for <display name>?` (or `Resume…`), from the
   effective `autoswitch` in the daemon's `status`. *(Amended by the TUI redesign spec §9.4.)* A
   yes runs `config set provider.<id>.daemon.autoswitch false` (or `true`) through `Host`,
   exactly as the CLI runs it. Two seconds later the TUI re-fetches `status`: the daemon applies
   a settings change within about a second (D4.2), and a pause need not change the mode, so no
   event may follow (one switchable account is `collect` either way).
+- **While the auto lane runs,** `P` asks and toggles exactly as in live mode, and the lane's own
+  status board stands in for the daemon's `status`. The header renders from it, and the lane's
+  events reach the auto line and History's re-reads as the socket's do. *(Amended by the TUI autoswitch spec, [§3.3, §3.4](2026-11-11-tagteam-tui-autoswitch-design.md).)*
+- **With a live daemon and no socket link,** `P` changes nothing and says `the TUI isn't
+  connected to the daemon, so it can't show its state; tagteam daemon status says more`. The
+  TUI changes no setting whose effect it cannot show. *(Amended by the TUI autoswitch spec, [§3.4](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 - **The header** shows each provider's state from the latest `status` reply (D4.3, D5.4).
   Events never set it directly (§8). Its words, glyphs and 80-column forms are the redesign spec's
   §5.2 table. *(Amended by the TUI redesign spec §5.2.)*
@@ -595,7 +620,8 @@ survives a daemon restart.
   With several providers, the header shows the state of the selected account's provider.
 - **In timer mode,** `P` behaves as the redesign spec's §10 says: without a daemon it says how to
   install one, and the TUI does not change a setting whose effect it cannot show. *(Amended by
-  the TUI redesign spec §10.)*
+  the TUI redesign spec §10.)* It says so only where the auto lane cannot run either: inside a
+  run shell, or after a newer store schema. *(Amended by the TUI autoswitch spec, [§3.4](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 - **With several providers,** `P` acts on the selected account's provider.
 
 ## 8. Daemon socket client

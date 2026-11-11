@@ -181,7 +181,11 @@ collection waiting on a request) finishes first, within its requests' own timeou
   | lane stopped for a newer store schema | `! auto stopped · tagteam was upgraded; restart the TUI` | `! restart the TUI` |
   | a live daemon record, no socket link, the provider's engine lock held by the daemon (§3.6) | `● auto runs in the daemon (pid N) · not connected` | `● auto in daemon` |
   | the same, the lock held by another process | that holder's row, as above or C-16's | as above |
-  | the same, the lock not held (the daemon paused, idle or waiting) | `○ the daemon runs (pid N) · not connected, so its state is unknown` | `○ daemon state unknown` |
+  | the same, the lock not held (the daemon paused, idle or waiting) | `○ daemon runs (pid N) · not connected, state unknown` | `○ daemon state unknown` |
+
+  The 120-column words of the last row are shorter than first drafted (`○ the daemon runs (pid N)
+  · not connected, so its state is unknown`), because those did not fit the 120-column header;
+  §6 allows the change.
 
   With a live daemon and a link, the header is the daemon's, as today. The lane has no jobs
   then. The last three rows replace today's false `○ auto off · no daemon` for a daemon that
