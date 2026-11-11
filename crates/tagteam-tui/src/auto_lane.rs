@@ -2,7 +2,8 @@
 //! daemon runs, and says what they do as the daemon's protocol encodes it, so the state machine
 //! reads it as it reads a socket's. Its engine is built inside the thread by the binary's
 //! factory, under a cancel token of the lane's own: Ctrl-Z and the shutdown set it, and the
-//! scheduler returns at once, even from a sleep, releasing every lock.
+//! scheduler wakes at once from a sleep and returns once the job running, if any, has finished,
+//! releasing every lock.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -211,6 +212,7 @@ fn serve(
         opts,
         &sink,
         &on_status,
+        &|| report(LaneReport::Off),
         &ParkSleeper,
         &mut uniform_jitter,
     );
@@ -264,8 +266,10 @@ mod tests {
     use tagteam_daemon::protocol::Event;
     use tagteam_daemon::status::{DaemonInfo, NotifyInfo, ProviderStatus};
     use tagteam_engine::auto::AutoEvent;
+    use tagteam_provider::FakeClock;
 
     use super::*;
+    use crate::testutil::LaneHome;
 
     fn fake() -> ProviderId {
         ProviderId::new("fake-agent")
@@ -300,6 +304,36 @@ mod tests {
             jobs: vec![],
             subscribers: 0,
         }
+    }
+
+    #[test]
+    fn a_lane_in_a_run_shell_says_off_and_then_upgraded_when_the_store_turns_newer() {
+        let home = Arc::new(LaneHome::new());
+        let clock = Arc::new(FakeClock::new(1_790_000_000_000));
+        let (tx, rx) = mpsc::channel();
+        let upgraded = Arc::new(AtomicBool::new(false));
+        let lane = AutoLane::spawn(
+            home.in_a_run_shell(Arc::clone(&clock)),
+            None,
+            &tx,
+            Arc::clone(&upgraded),
+        );
+        let first = rx.recv_timeout(Duration::from_secs(5));
+        assert!(
+            matches!(first, Ok(Msg::Lane(LaneReport::Off))),
+            "the lane did not say off first"
+        );
+        assert!(!upgraded.load(Ordering::SeqCst));
+        // A newer tagteam migrates the store, and the watch's period passes on the lane's clock.
+        home.newer_store();
+        clock.advance_ms(61_000);
+        let second = rx.recv_timeout(Duration::from_secs(5));
+        assert!(
+            matches!(second, Ok(Msg::Lane(LaneReport::Upgraded))),
+            "the lane did not say upgraded after off"
+        );
+        assert!(upgraded.load(Ordering::SeqCst));
+        assert!(lane.join().is_ok());
     }
 
     fn switch() -> DaemonEvent {

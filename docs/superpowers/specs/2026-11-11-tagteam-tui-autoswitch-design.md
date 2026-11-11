@@ -128,7 +128,7 @@ that reason (daemon spec, lines 63-67).
   reads as live, which would block a daemon or `tagteam auto` for as long as it stays stopped.
   On resume, the lane starts again by §3.2's rule. *(My call, from the builder check.)*
 - **Inside a `tagteam run` shell** the engine refuses (`engine/src/auto.rs:362-374`). The lane
-  then starts nothing, and the header stays as it is today.
+  then runs no job but the schema check (§3.7), and the header stays as it is today.
 
 ### 3.2 When the lane runs
 
@@ -261,7 +261,8 @@ schema-checked again (`engine.rs:288-303`). The check now exists, so the TUI use
   - a settings change reaches the lane's engine;
   - quit releases the lock (the lane is joined);
   - Ctrl-Z releases the lock before the process stops, and resume takes it again;
-  - inside a run shell: no lane.
+  - inside a run shell: the lane reports `Off`, takes no lock, and a store migrated past this
+    build's schema ends it `Upgraded`.
 - **Hand-over:** during a foreground action the lane keeps ticking, and it still stops for a
   daemon that comes up meanwhile.
 - **Two TUIs:** the second's job waits on `engine-lock`, and its header names "another tagteam
