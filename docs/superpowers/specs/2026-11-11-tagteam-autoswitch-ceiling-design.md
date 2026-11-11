@@ -1,6 +1,6 @@
 # tagteam — `autoswitch.ceiling`: a usage level auto treats as full
 
-**Status:** Approved
+**Status:** In progress
 **Date:** 2026-11-11
 **Issue:** https://github.com/michaelrigart/tagteam/issues/56
 **Scope:** The auto-switch decision (`crates/tagteam-core/src/autoswitch.rs`, `rank.rs`), one new
