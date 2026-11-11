@@ -20,6 +20,7 @@ use tagteam_provider::{Env, LockError};
 use toml_edit::{DocumentMut, Item, TableLike};
 
 pub const DEFAULT_THRESHOLD: f64 = 90.0;
+pub const DEFAULT_CEILING: f64 = 100.0;
 pub const DEFAULT_INTERVAL_SECONDS: i64 = 60;
 pub const DEFAULT_COOLDOWN_SECONDS: i64 = 300;
 pub const DEFAULT_HYSTERESIS_PCT: f64 = 10.0;
@@ -32,6 +33,7 @@ pub const DEFAULT_STATUSLINE_FORMAT: &str = "{account} · 5h {5h}% · 7d {7d}%{s
 /// the default, with a warning; a CLI flag is clamped into it. The registry's bounds ([`KEYS`])
 /// are these, and the `u32` fields' ranges lie within `u32` (see `whole`).
 pub const THRESHOLD_RANGE: RangeInclusive<f64> = 50.0..=99.9;
+pub const CEILING_RANGE: RangeInclusive<f64> = 50.0..=100.0;
 pub const INTERVAL_SECONDS_RANGE: RangeInclusive<i64> = 15..=3600;
 pub const COOLDOWN_SECONDS_RANGE: RangeInclusive<i64> = 0..=86_400;
 pub const HYSTERESIS_PCT_RANGE: RangeInclusive<f64> = 0.0..=50.0;
@@ -204,6 +206,7 @@ pub enum KeyKind {
 pub(crate) enum KeyId {
     DefaultProvider,
     Threshold,
+    Ceiling,
     IntervalSeconds,
     CooldownSeconds,
     HysteresisPct,
@@ -248,6 +251,12 @@ pub const KEYS: &[Key] = &[
         id: KeyId::Threshold,
         name: "autoswitch.threshold",
         kind: KeyKind::Float(&THRESHOLD_RANGE),
+        per_provider: true,
+    },
+    Key {
+        id: KeyId::Ceiling,
+        name: "autoswitch.ceiling",
+        kind: KeyKind::Float(&CEILING_RANGE),
         per_provider: true,
     },
     Key {
@@ -891,6 +900,9 @@ pub struct Settings {
     pub default_provider: Option<ProviderId>,
     /// `autoswitch.threshold`, in [`THRESHOLD_RANGE`]. The provider's own table first.
     pub threshold: f64,
+    /// `autoswitch.ceiling`, in [`CEILING_RANGE`], above `threshold`. The provider's own table
+    /// first.
+    pub ceiling: f64,
     /// `autoswitch.interval_seconds`, in [`INTERVAL_SECONDS_RANGE`]. The provider's own table
     /// first.
     pub interval_seconds: i64,
@@ -944,6 +956,7 @@ impl Default for Settings {
         Settings {
             default_provider: None,
             threshold: DEFAULT_THRESHOLD,
+            ceiling: DEFAULT_CEILING,
             interval_seconds: DEFAULT_INTERVAL_SECONDS,
             cooldown_seconds: DEFAULT_COOLDOWN_SECONDS,
             hysteresis_pct: DEFAULT_HYSTERESIS_PCT,
@@ -994,6 +1007,7 @@ impl Settings {
                     .map_or_else(String::new, ToString::to_string),
             ),
             KeyId::Threshold => Value::Float(self.threshold),
+            KeyId::Ceiling => Value::Float(self.ceiling),
             KeyId::IntervalSeconds => Value::Int(self.interval_seconds),
             KeyId::CooldownSeconds => Value::Int(self.cooldown_seconds),
             KeyId::HysteresisPct => Value::Float(self.hysteresis_pct),
@@ -1026,6 +1040,7 @@ impl Settings {
                 self.default_provider = Some(ProviderId::new(value.into_string()))
             }
             KeyId::Threshold => self.threshold = value.into_float(),
+            KeyId::Ceiling => self.ceiling = value.into_float(),
             KeyId::IntervalSeconds => self.interval_seconds = value.into_int(),
             KeyId::CooldownSeconds => self.cooldown_seconds = value.into_int(),
             KeyId::HysteresisPct => self.hysteresis_pct = value.into_float(),
@@ -1059,6 +1074,12 @@ impl Settings {
             }
         }
     }
+}
+
+/// Whether a provider's `threshold` and `ceiling` are a valid pair: the threshold is below the
+/// ceiling, so a provider is never full before it is over the threshold.
+pub fn pair_holds(threshold: f64, ceiling: f64) -> bool {
+    threshold < ceiling
 }
 
 /// An `Int` key's value as a `u32` field holds it: [`UNHEALTHY_TICKS_RANGE`],
@@ -1144,6 +1165,31 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
             read.settings.apply(key, value);
             *source = from;
         }
+    }
+    let slot = |id: KeyId| {
+        KEYS.iter()
+            .position(|k| k.id == id)
+            .expect("KEYS names every id")
+    };
+    let (threshold_at, ceiling_at) = (slot(KeyId::Threshold), slot(KeyId::Ceiling));
+    let (threshold, ceiling) = (read.settings.threshold, read.settings.ceiling);
+    if !pair_holds(threshold, ceiling) {
+        let dotted = |at: usize| {
+            let leaf = KEYS[at].leaf();
+            match read.sources[at] {
+                Source::Provider => format!("provider.{provider}.autoswitch.{leaf}"),
+                _ => format!("autoswitch.{leaf}"),
+            }
+        };
+        reader.warn(format!(
+            "{shown}: `{}` ({}) must be above `{}` ({}); using a ceiling of 100",
+            dotted(ceiling_at),
+            Value::Float(ceiling).display(),
+            dotted(threshold_at),
+            Value::Float(threshold).display(),
+        ));
+        read.settings.ceiling = DEFAULT_CEILING;
+        read.sources[ceiling_at] = Source::Default;
     }
     read.settings.prices = reader.read_prices();
     read.warnings = reader.warnings;
