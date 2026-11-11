@@ -11,6 +11,12 @@ with the one before, so any release may contain breaking changes. Each section s
 
 - `ui.accounts_view` sets the view `tagteam tui`'s Accounts screen opens in: `list` (the
   default) or `compact`.
+- `autoswitch.ceiling`, per provider, default 100: the usage at which auto treats an account as
+  full. At or above it, auto leaves the account at once, without a cooldown, for an account more
+  than 3 points below it, and never moves onto a full account or an API key because of it. It
+  must be above `autoswitch.threshold`: `config set` and `config unset` refuse a write that breaks
+  the pair, and a file with a broken pair runs with a ceiling of 100 and a warning, as does
+  `tagteam auto --threshold` at or above a provider's ceiling.
 
 ### Changed
 
@@ -19,6 +25,11 @@ with the one before, so any release may contain breaking changes. Each section s
   `v` still switches between the two.
 - Checked against Claude Code 2.1.322, now the newest version tagteam is known to work with.
   `tagteam doctor` no longer warns about Claude Code versions up to 2.1.322.
+- Auto's `no switch` line says `every account is above 90%, and none is far enough ahead to
+  switch to` when every account is above the threshold and nothing qualifies, in `tagteam tui`,
+  `tagteam auto` and `tagteam daemon`. For `--json` consumers, the `no-switch` event's `detail` is
+  `all-above` in that case.
+- A stored automatic switch's `detail` has a `ceiling` field beside `threshold`.
 
 ## [20261031.2215.0] - 2026-10-31
 
