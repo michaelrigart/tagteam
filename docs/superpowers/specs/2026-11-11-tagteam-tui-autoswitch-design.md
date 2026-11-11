@@ -179,9 +179,9 @@ collection waiting on a request) finishes first, within its requests' own timeou
   | State | ≥ 120 columns | 80 columns |
   |---|---|---|
   | lane stopped for a newer store schema | `! auto stopped · tagteam was upgraded; restart the TUI` | `! restart the TUI` |
-  | a live daemon record, no socket link, the provider's engine lock held by the daemon (§3.6) | `● auto runs in the daemon (pid N) · its socket is down` | `● auto in daemon` |
+  | a live daemon record, no socket link, the provider's engine lock held by the daemon (§3.6) | `● auto runs in the daemon (pid N) · not connected` | `● auto in daemon` |
   | the same, the lock held by another process | that holder's row, as above or C-16's | as above |
-  | the same, the lock not held (the daemon paused, idle or waiting) | `○ the daemon runs (pid N) · its socket is down, so its state is unknown` | `○ daemon state unknown` |
+  | the same, the lock not held (the daemon paused, idle or waiting) | `○ the daemon runs (pid N) · not connected, so its state is unknown` | `○ daemon state unknown` |
 
   With a live daemon and a link, the header is the daemon's, as today. The lane has no jobs
   then. The last three rows replace today's false `○ auto off · no daemon` for a daemon that
@@ -202,8 +202,8 @@ change, and the job drops to `collect` and records `autoswitch-paused`.
 
 - **The toast for "no daemon runs"** now appears only when the lane cannot run either: inside a
   run shell, or after a newer store schema.
-- **A daemon without its socket:** `P` changes nothing and says "the daemon's socket is down, so
-  the TUI can't show its state; `tagteam daemon status` says more". The TUI changes no setting
+- **A daemon without its socket:** `P` changes nothing and says "the TUI isn't connected to the
+  daemon, so it can't show its state; `tagteam daemon status` says more". The TUI changes no setting
   whose effect it cannot show (T2-16).
 - **A protocol mismatch:** `P` behaves as today.
 

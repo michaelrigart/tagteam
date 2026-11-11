@@ -114,9 +114,12 @@ Line numbers are as of `a356e75d` and will drift.
 12. **`purge`'s refusal is unchanged**: it names a pid only, and S§3.6 lists `auto` and `doctor`.
 13. **The lane runs every registered provider** (G1). `--provider` only chooses whose settings
     tables its engine reads (Decision 3), as for the other lanes.
-14. **A daemon that has just come up reads as "its socket is down"** until the live thread's next
-    try, at most 30 s (TUI §8's backoff). This is accepted, and reported to tagteam-8f with the
-    plan.
+14. **The no-link rows say "not connected", not "its socket is down"**, and so does `P`'s
+    message. A daemon that has just come up is not linked until the live thread's next try, at
+    most 30 s (TUI §8's backoff), and "not connected" is true then as well as while the socket is
+    down. This was decided by tagteam-8f after planning (S§6 leaves the words to the builder,
+    within §3.3's meaning). S§3.3's two rows and S§3.4's message were changed to these words in
+    the same commit as this ruling.
 15. **The lane's engine takes a cancel token of its own**, which the shutdown also sets
     (`Lanes::close`). S§3.1 gives it "the shutdown token", but Ctrl-Z must stop and join the lane
     while every other lane runs on, and setting the shutdown token would stop them too. Every quit
@@ -537,7 +540,7 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
     ```
   - `State::holder_of(&self, &ProviderId) -> Option<&AutoHolder>` (replaces `foreign_auto_pid`)
     and `State::daemon_pid(&self) -> Option<u32>`.
-  - `pub const SOCKET_DOWN: &str = "the daemon's socket is down, so the TUI can't show its state; `tagteam daemon status` says more";`
+  - `pub const NOT_CONNECTED: &str = "the TUI isn't connected to the daemon, so it can't show its state; `tagteam daemon status` says more";`
     in `actions.rs`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -557,10 +560,10 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
     | live daemon `waiting`/`engine-lock`, holder `tui` 4711 (Ruling 7) | `● auto runs in another tagteam window (pid 4711)` | `● auto in pid 4711` |
     | no lane jobs, holder `tui` 4711 (C-16) | `● auto runs in another tagteam window (pid 4711)` | `● auto in pid 4711` |
     | upgraded | `! auto stopped · tagteam was upgraded; restart the TUI` | `! restart the TUI` |
-    | daemon 4242, no link, lock held by the daemon | `● auto runs in the daemon (pid 4242) · its socket is down` | `● auto in daemon` |
+    | daemon 4242, no link, lock held by the daemon | `● auto runs in the daemon (pid 4242) · not connected` | `● auto in daemon` |
     | daemon 4242, no link, lock held by `auto` 4711 | `● auto runs in another terminal (pid 4711)` | `● auto in pid 4711` |
     | daemon 4242, no link, lock held by `tui` 4711 | `● auto runs in another tagteam window (pid 4711)` | `● auto in pid 4711` |
-    | daemon 4242, no link, lock not held | `○ the daemon runs (pid 4242) · its socket is down, so its state is unknown` | `○ daemon state unknown` |
+    | daemon 4242, no link, lock not held | `○ the daemon runs (pid 4242) · not connected, so its state is unknown` | `○ daemon state unknown` |
     | live daemon `auto` (unchanged) | `● auto on · switches at 90%` | `● auto on · at 90%` |
     | lane `Off`, nothing else | `○ auto off · no daemon` | `○ auto off · no daemon` |
 
@@ -573,7 +576,7 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
       paused gives `Resume auto for Claude Code?`.
     - `p_with_a_daemon_without_its_socket_changes_nothing_and_says_so`: with `daemon_pid` set and
       no link, for the lock held by the daemon, held by `auto`, and not held, `P` opens nothing,
-      returns no `Cmd`, and toasts `SOCKET_DOWN`.
+      returns no `Cmd`, and toasts `NOT_CONNECTED`.
     - `p_says_no_daemon_runs_only_when_the_lane_cannot_run`: after `Off` (a run shell) and after
       `Upgraded`, `P` toasts `NO_DAEMON_RUNNING`. The existing
       `p_without_a_daemon_says_so_and_changes_nothing` passes as it is.
@@ -600,7 +603,7 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
     - live daemon → today;
     - `hosted_job` → today's dialog;
     - mismatch → today;
-    - `daemon_pid` without a link → `SOCKET_DOWN`;
+    - `daemon_pid` without a link → `NOT_CONNECTED`;
     - otherwise → `NO_DAEMON_RUNNING`.
   - In `source.rs`, `engine_holders` replaces `foreign_engine_holders`.
 
