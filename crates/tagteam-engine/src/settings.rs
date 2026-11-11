@@ -1198,6 +1198,27 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
     read
 }
 
+/// `provider`'s effective `(threshold, ceiling)` in `doc`, as [`read_file`] takes each value
+/// (the provider's table, then the global one, then the default; an invalid value skipped), before
+/// the pair rule. Its warnings are dropped.
+pub(crate) fn autoswitch_pair(doc: &DocumentMut, provider: &ProviderId) -> (f64, f64) {
+    let mut reader = Reader {
+        doc,
+        path: "",
+        warnings: Vec::new(),
+    };
+    let mut settings = Settings::default();
+    for key in KEYS
+        .iter()
+        .filter(|k| matches!(k.id, KeyId::Threshold | KeyId::Ceiling))
+    {
+        if let Some((value, _)) = reader.read_key(key, provider) {
+            settings.apply(key, value);
+        }
+    }
+    (settings.threshold, settings.ceiling)
+}
+
 struct Reader<'a> {
     doc: &'a DocumentMut,
     /// The settings file's full path, which every warning starts with.
