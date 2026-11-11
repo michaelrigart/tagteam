@@ -594,6 +594,9 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
         // handed it over leaves nothing behind.
         if let Some(why) = refusal(&self.lanes.upgraded, action.writes_store()) {
             let outcome = refused_outcome(why);
+            // The terminal was never handed over, so the outcome is not "above in your
+            // terminal's scrollback": the refusal is shown in its own words.
+            self.state.on_terminal = false;
             self.deliver(Msg::ActionDone { action, outcome });
             return;
         }
@@ -658,6 +661,11 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
         // A stopped process keeps its locks and reads as live: the auto lane lets go of them
         // first (S§3.1).
         self.lanes.suspend_auto();
+        // A signal recorded while the lane was stopping ends the TUI: the process is not
+        // stopped for it.
+        if self.shutting_down() {
+            return;
+        }
         match self.tty.stop() {
             Ok(()) => {
                 // A signal that came while the process was stopped comes first (R17).
@@ -719,7 +727,7 @@ mod tests {
     use crate::live::StatusError;
     use crate::live::{LIVE_QUEUE, Live, LiveQueue};
     use crate::source::{AccountsSnapshot, CollectSummary, Source, SourceError};
-    use crate::state::BannerKind;
+    use crate::state::{BannerKind, ToastKind};
     use crate::term::repaint;
     use crate::testutil::{CC_NAMES, LaneHome};
     use crate::theme::Background;
@@ -2780,25 +2788,63 @@ mod tests {
             ui.start();
             fx.log.take();
             fx.lanes.upgraded.store(true, Ordering::SeqCst);
-            // As the keychain-locked dialog leaves the state before it suspends (proceed.rs).
-            let run = Action::Run(account_a());
-            ui.state.running = Some(run.clone());
-            ui.state.on_terminal = true;
-            ui.execute(vec![Cmd::Suspend(run)]);
-            assert_eq!(
-                fx.log.take(),
-                Vec::<&str>::new(),
-                "the terminal and the keys stayed"
-            );
-            assert!(
-                ui.state.running.is_none(),
-                "it ended as a finished action does"
-            );
-            assert!(!ui.state.on_terminal);
-            assert!(ui.ending.is_none());
+            // `R`, and a switch the keychain-locked dialog hands the terminal to: each reaches
+            // `Cmd::Suspend` with `on_terminal` set (`start`, proceed.rs).
+            for action in [Action::Run(account_a()), Action::Switch(account_a())] {
+                ui.state.toast = None;
+                ui.state.running = Some(action.clone());
+                ui.state.on_terminal = true;
+                ui.execute(vec![Cmd::Suspend(action.clone())]);
+                assert_eq!(
+                    fx.log.take(),
+                    Vec::<&str>::new(),
+                    "{action:?}: the terminal and the keys stayed"
+                );
+                assert!(
+                    ui.state.running.is_none(),
+                    "{action:?}: it ended as a finished action does"
+                );
+                assert!(!ui.state.on_terminal);
+                assert!(ui.ending.is_none());
+                let toast = ui.state.toast.as_ref().expect("the refusal is said");
+                assert_eq!(
+                    (toast.kind, toast.text.as_str()),
+                    (ToastKind::Failed, crate::actions::UPGRADED),
+                    "{action:?}: in the header's words, not the terminal's"
+                );
+            }
             fx.key('q');
             ui.run()
         };
         assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    #[test]
+    fn a_sigterm_that_arrives_while_ctrl_z_stops_the_lane_ends_the_tui_without_stopping() {
+        let home = Arc::new(LaneHome::new());
+        let signal = Cancel::new();
+        let opts = TuiOptions {
+            signal: signal.clone(),
+            auto: Some(home.signalling(signal)),
+            ..options()
+        };
+        let fx = Fixture::with(opts, quick(), |_| idle());
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            assert!(lock_within(&home, true), "the lane never took the lock");
+            fx.log.take();
+            // The lane's engine records SIGTERM as the lane ends, inside `suspend_auto`.
+            ui.execute(vec![Cmd::Stop]);
+            assert_eq!(
+                fx.log.take(),
+                ["pause", "pause", "release"],
+                "Ctrl-Z's pause, then the signal's hand-back, and no `stop`"
+            );
+            ui.run()
+        };
+        let exit = fx.finish(ending);
+        assert_eq!((exit.code, exit.report), (143, None));
+        assert_eq!(home.built(), 1, "no run began again");
     }
 }

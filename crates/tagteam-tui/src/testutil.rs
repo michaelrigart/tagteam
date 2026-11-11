@@ -676,6 +676,16 @@ impl LaneHome {
         cancel: tagteam_provider::Cancel,
         source: tagteam_engine::EventSource,
     ) -> tagteam_engine::Engine {
+        let http = std::sync::Arc::new(tagteam_provider::ScriptedHttp::new());
+        self.engine_over(cancel, source, http)
+    }
+
+    fn engine_over(
+        &self,
+        cancel: tagteam_provider::Cancel,
+        source: tagteam_engine::EventSource,
+        http: std::sync::Arc<dyn tagteam_provider::Http>,
+    ) -> tagteam_engine::Engine {
         use std::sync::Arc;
 
         use tagteam_engine::vault::{KeychainVault, Vault};
@@ -688,7 +698,7 @@ impl LaneHome {
             vault: Vault::new(Box::new(KeychainVault::new(self.keychain.clone()))),
             oracle: Arc::new(tagteam_engine::oracle::NoOracle),
             clock: Arc::new(tagteam_provider::SystemClock),
-            http: Arc::new(tagteam_provider::ScriptedHttp::new()),
+            http,
             default_provider: self.provider(),
             settings: tagteam_engine::settings::Settings::default(),
             process: Arc::new(tagteam_provider::liveness::SystemProcessProbe),
@@ -711,6 +721,49 @@ impl LaneHome {
         std::sync::Arc::new(move |cancel| {
             Ok(crate::auto_lane::LaneEngine {
                 engine: home.lane_engine(cancel),
+                keychain_counts: Vec::new(),
+            })
+        })
+    }
+
+    /// `factory`, but each engine records SIGTERM in `signal` as it is dropped: at the end of
+    /// the lane's run, before its thread can be joined. A signal that arrives while the lane is
+    /// being stopped, at a moment no timing decides.
+    pub(crate) fn signalling(
+        self: &std::sync::Arc<Self>,
+        signal: tagteam_provider::Cancel,
+    ) -> crate::auto_lane::AutoFactory {
+        /// Answers nothing, as `ScriptedHttp` does, and signals when the engine lets it go.
+        struct SignalsOnDrop(tagteam_provider::ScriptedHttp, tagteam_provider::Cancel);
+
+        impl tagteam_provider::Http for SignalsOnDrop {
+            fn send(
+                &self,
+                req: &tagteam_provider::http::HttpRequest,
+            ) -> Result<tagteam_provider::http::HttpResponse, tagteam_provider::http::HttpError>
+            {
+                self.0.send(req)
+            }
+        }
+
+        impl Drop for SignalsOnDrop {
+            fn drop(&mut self) {
+                self.1.request(libc::SIGTERM);
+            }
+        }
+
+        let home = std::sync::Arc::clone(self);
+        std::sync::Arc::new(move |cancel| {
+            home.built.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let http = std::sync::Arc::new(SignalsOnDrop(
+                tagteam_provider::ScriptedHttp::new(),
+                signal.clone(),
+            ));
+            let engine = home
+                .engine_over(cancel, tagteam_engine::EventSource::Auto, http)
+                .with_lock_holder(HolderKind::Tui);
+            Ok(crate::auto_lane::LaneEngine {
+                engine,
                 keychain_counts: Vec::new(),
             })
         })
