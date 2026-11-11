@@ -2552,6 +2552,19 @@ fn an_engine_lock_held_by_the_daemon_names_the_daemon() {
         one(&doctor(&fx), "auto.engine").message,
         format!("auto-switch runs as pid {}", me.pid)
     );
+    // A record that says `daemon` which `daemon.lock` does not back names no kind either.
+    fs::write(
+        &engine_lock,
+        format!(
+            "{{\"pid\":{},\"start\":{},\"holder\":\"daemon\"}}\n",
+            me.pid, me.start
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        one(&doctor(&fx), "auto.engine").message,
+        format!("auto-switch runs as pid {}", me.pid)
+    );
 }
 
 #[test]

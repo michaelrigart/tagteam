@@ -22,6 +22,7 @@ use tagteam_provider::{
 };
 
 use crate::collect::{CollectMode, CollectReport};
+use crate::daemon::DaemonRecord;
 use crate::engine::{Engine, GuardRequest};
 use crate::error::EngineError;
 use crate::event::{AUTO_LINE_KINDS, EventKind};
@@ -305,6 +306,17 @@ impl EngineHolder {
     /// Whether the process the record names runs, by an exact pid and start-time match.
     pub fn liveness(&self) -> Liveness {
         self.stamp().liveness()
+    }
+
+    /// Who holds the lock, as D10 and S§3.6 name it, for every caller that says so. `Daemon`
+    /// exactly when this record's pid and start are those of `daemon` (`daemon.lock`'s record,
+    /// when it has one); else the record's own kind, where a `daemon` claim that `daemon.lock`
+    /// does not back counts as none.
+    pub fn resolved_kind(&self, daemon: Option<&DaemonRecord>) -> Option<HolderKind> {
+        if daemon.is_some_and(|d| d.pid == self.pid && d.start == self.start) {
+            return Some(HolderKind::Daemon);
+        }
+        self.kind.filter(|k| *k != HolderKind::Daemon)
     }
 }
 
@@ -1335,6 +1347,49 @@ mod tests {
                     if h == EngineHolder { pid: 1, start: 2, kind }),
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn a_holder_is_the_daemon_exactly_when_daemon_lock_names_its_pid_and_start() {
+        // D10, S§3.6: the one rule doctor, `auto`'s refusal and the TUI share. A `daemon` claim
+        // that `daemon.lock` does not back is no holder's kind at all.
+        let daemon = |pid, start| DaemonRecord {
+            pid,
+            start,
+            version: "test".into(),
+        };
+        let backing = daemon(7, 70);
+        let other_pid = daemon(8, 70);
+        let other_start = daemon(7, 71);
+        let none: Option<&DaemonRecord> = None;
+        for (said, kind) in [
+            (None, None),
+            (Some(HolderKind::Auto), Some(HolderKind::Auto)),
+            (Some(HolderKind::Tui), Some(HolderKind::Tui)),
+            (Some(HolderKind::Daemon), None),
+        ] {
+            let holder = EngineHolder {
+                pid: 7,
+                start: 70,
+                kind: said,
+            };
+            assert_eq!(
+                holder.resolved_kind(Some(&backing)),
+                Some(HolderKind::Daemon),
+                "{said:?}, daemon.lock matches"
+            );
+            for (case, record) in [
+                ("another pid", Some(&other_pid)),
+                ("another start", Some(&other_start)),
+                ("absent", none),
+            ] {
+                assert_eq!(
+                    holder.resolved_kind(record),
+                    kind,
+                    "{said:?}, daemon.lock {case}"
+                );
+            }
         }
     }
 

@@ -130,7 +130,8 @@ pub struct Engine {
     /// The `source` this engine's events are recorded under.
     source: EventSource,
     /// The kind of holder this engine's lock records name (§11.1): its source's, unless
-    /// `with_lock_holder` says otherwise.
+    /// `with_lock_holder` says otherwise. A `Cli` engine reads as `Auto`: it takes the lock for
+    /// `tagteam auto` and, briefly, `purge`, and is neither the daemon nor a window.
     lock_holder: HolderKind,
     store: Mutex<Option<Arc<Store>>>,
     #[cfg(feature = "test-hooks")]

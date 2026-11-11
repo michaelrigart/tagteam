@@ -82,19 +82,31 @@ pub fn read_daemon_record(path: &Path) -> Read<DaemonRecord> {
     )
 }
 
-/// The pid `daemon.lock`'s record names, when that record is `Present` and its stamp is not
-/// `Liveness::Dead`: a liveness that cannot be told counts as live, as `doctor` counts it.
-pub fn live_daemon_pid(env: &Env) -> Option<u32> {
+/// The record `daemon.lock` holds, when it is `Present`: `Absent` and `Unreadable` read as none.
+/// Never proof that the daemon runs: `DaemonRecord::live_pid` judges that.
+pub fn daemon_record(env: &Env) -> Option<DaemonRecord> {
     match read_daemon_record(&daemon_lock_path(env)) {
-        Read::Present(r) => {
-            let stamp = ProcessStamp {
-                pid: r.pid,
-                start: r.start,
-            };
-            (stamp.liveness() != Liveness::Dead).then_some(r.pid)
-        }
+        Read::Present(r) => Some(r),
         Read::Absent | Read::Unreadable(_) => None,
     }
+}
+
+impl DaemonRecord {
+    /// The record's pid, when its stamp is not `Liveness::Dead`: a liveness that cannot be told
+    /// counts as live, as `doctor` counts it.
+    pub fn live_pid(&self) -> Option<u32> {
+        let stamp = ProcessStamp {
+            pid: self.pid,
+            start: self.start,
+        };
+        (stamp.liveness() != Liveness::Dead).then_some(self.pid)
+    }
+}
+
+/// The pid `daemon.lock`'s record names, when that record is `Present` and its stamp is not
+/// `Liveness::Dead`.
+pub fn live_daemon_pid(env: &Env) -> Option<u32> {
+    daemon_record(env)?.live_pid()
 }
 
 #[cfg(test)]

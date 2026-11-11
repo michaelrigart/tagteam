@@ -10,7 +10,7 @@ use tagteam_daemon::service::{self as daemon_service, InstallError, MANAGER_TIME
 use tagteam_daemon::watch::{ProgramStamp, UPGRADE_WATCH_MS};
 use tagteam_engine::Engine;
 use tagteam_engine::auto::HolderKind;
-use tagteam_engine::daemon::{daemon_lock_path, read_daemon_record};
+use tagteam_engine::daemon::daemon_record;
 use tagteam_engine::service::{recorded_env, render_unit, service_state, unit_path};
 use tagteam_engine::settings::parse_bool;
 use tagteam_provider::{Platform, Read};
@@ -124,21 +124,17 @@ fn install_failure(e: InstallError) -> Failure {
     Failure::Message(kind, message)
 }
 
-/// D8.3: who holds `provider`'s engine lock, when `auto`'s refusal names it: the daemon, when
-/// the record matches the process `daemon.lock` names by pid and start time, or a tagteam
-/// window, when the record says so. `None` for any other holder, or a record that cannot be
-/// read.
+/// D8.3: who holds `provider`'s engine lock, when `auto`'s refusal names it, by the one rule
+/// every caller shares (`EngineHolder::resolved_kind`). `None` for a record that cannot be read
+/// or names no kind.
 fn engine_lock_holder(engine: &Engine, provider: &ProviderId) -> Option<(HolderKind, u32)> {
     let Read::Present(holder) = engine.engine_holder(provider) else {
         return None;
     };
-    match read_daemon_record(&daemon_lock_path(engine.env())) {
-        Read::Present(d) if d.pid == holder.pid && d.start == holder.start => {
-            return Some((HolderKind::Daemon, d.pid));
-        }
-        _ => {}
-    }
-    (holder.kind == Some(HolderKind::Tui)).then_some((HolderKind::Tui, holder.pid))
+    let daemon = daemon_record(engine.env());
+    holder
+        .resolved_kind(daemon.as_ref())
+        .map(|kind| (kind, holder.pid))
 }
 
 impl App<'_, '_> {
