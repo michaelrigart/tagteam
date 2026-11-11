@@ -297,7 +297,7 @@ fn removing_an_account_warns_about_config_mappings_that_named_it() {
     let out = cmd(d.path()).args(["remove", "1"]).assert().success();
     let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(err.contains("~/x"), "{err}");
-    assert!(err.contains("a@x.co"), "{err}");
+    assert!(err.contains("\"a@x.co\""), "{err}");
     assert!(err.contains(&config.display().to_string()), "{err}");
     assert_eq!(fs::read(&config).unwrap(), before);
 }
@@ -332,6 +332,10 @@ fn unsetting_or_renaming_an_alias_warns_about_config_mappings_that_used_it() {
 fn an_alias_change_no_entry_used_says_nothing() {
     let d = tempfile::tempdir().unwrap();
     two_accounts(d.path());
+    cmd(d.path())
+        .args(["alias", "1", "work"])
+        .assert()
+        .success();
     write_config(
         d.path(),
         "[provider.claude-code.mappings]\n\"~/x\" = \"work\"\n",
