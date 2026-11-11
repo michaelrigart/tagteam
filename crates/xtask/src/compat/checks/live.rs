@@ -122,29 +122,34 @@ pub fn fresh_global_config(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     }))
 }
 
-/// How long tagteam holds the config lock while CC's start-up is watched: well past the 1.5 s
-/// CC retries it for, and past a slow start, yet inside CC's 30 s start-up phase, so a CC that
-/// is slow to start still writes under the held lock and is not read as having waited it out.
-const START_UP_WINDOW: Duration = Duration::from_secs(15);
+/// How long tagteam holds the config lock while `claude mcp add` is watched: past the 1.5 s
+/// after which CC's start-up saved without the lock before 2.1.318, and past its full backoff
+/// of about 10 s, so a save that skips the lock lands inside the window.
+const LOCK_HELD_WINDOW: Duration = Duration::from_secs(15);
 
-/// §9.1 and Appendix A.7 (*2.1.292*): for its first 30 s, until its interactive UI is up, CC
-/// retries `<global config>.lock` for only 1.5 s and then writes the global config without it,
-/// unless every key it changes is one of its own counters or caches. So `claude mcp add --scope
-/// user` (a new process, in its start-up, changing `mcpServers`) must write while tagteam still
-/// holds the lock: that is the expectation. A write only after tagteam released the lock means
-/// CC waited it out, which contradicts A.7, and fails the check; no write at all is a harness
-/// error. The seconds, the window and whether the write landed inside it are notes. The lock
-/// excludes only a CC process past its start-up (for its full retry window, about 10 s); that
-/// half is not tested (see the note it records).
+/// Whether `config` (the global config's bytes) holds the probe server in `mcpServers`.
+fn has_probe_server(config: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(config)
+        .ok()
+        .is_some_and(|v| v["mcpServers"].get(MCP_SERVER).is_some())
+}
+
+/// §9.1 and Appendix A.7 (*2.1.318*): `claude mcp add --scope user` never saves the global config
+/// without `<global config>.lock`; it waits for the lock. So while tagteam holds the lock, the
+/// server must not appear in `mcpServers`, and once tagteam releases it, `mcp add` saves the
+/// server and exits 0. `CLAUDE_CODE_CONFIG_LOCK_WAIT_MS` makes it keep retrying for that long,
+/// so it is still waiting at the end of the window and not racing its own backoff (which ends
+/// in exit 1 after about 15 s). The server entry is what is watched, not the file's bytes: CC's
+/// own start-up writes (migrations) may still land under the held lock after 1.5 s (A.7), and
+/// they do not add the server. Those writes are not tested.
 pub fn config_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    config_lock_within(ctx, START_UP_WINDOW)
+    config_lock_within(ctx, LOCK_HELD_WINDOW)
 }
 
 fn config_lock_within(ctx: &mut Ctx, window: Duration) -> Result<Outcome, HarnessError> {
     Ok(Probe::run(|p| {
         let live = ctx.live();
         let paths = ctx.paths(&live);
-        let before = fs::read(&paths.global_config)?;
         let lock = acquire_config(&paths, CONFIG_ACQUIRE_TIMEOUT, &Cancel::new())
             .map_err(|e| harness(format!("CC's config lock: {e}")))?;
         let started = Instant::now();
@@ -161,56 +166,52 @@ fn config_lock_within(ctx: &mut Ctx, window: Duration) -> Result<Outcome, Harnes
                     "/usr/bin/true",
                 ],
             )
+            .var("CLAUDE_CODE_CONFIG_LOCK_WAIT_MS", "60000")
             .spawn(&ctx.roots)?;
-        let wrote = wait_until(window, || {
-            fs::read(&paths.global_config).is_ok_and(|now| now != before)
+        let saved_under_lock = wait_until(window, || {
+            fs::read(&paths.global_config).is_ok_and(|now| has_probe_server(&now))
         });
         let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
         let finished_early = running.finished();
         drop(lock);
         let ran = running.wait()?;
-        let after = fs::read(&paths.global_config)?;
+        let added = has_probe_server(&fs::read(&paths.global_config)?);
         p.expect(
-            "start-up: CC's write of the global config landed while tagteam still held .claude.json.lock (2.1.292, A.7)",
-            wrote,
-            json!(if wrote {
-                "written under the held lock"
-            } else if after != before {
-                "written only after tagteam released it: CC waited the lock out"
+            "claude mcp add did not save while tagteam held .claude.json.lock (2.1.318, A.7)",
+            !saved_under_lock,
+            json!(if saved_under_lock {
+                "saved under the held lock"
             } else {
-                "not written"
+                "not saved while the lock was held"
             }),
         );
-        p.note(
-            "start-up: when CC's write landed",
-            json!({"seconds": seconds, "window": window.as_secs(), "insideWindow": wrote}),
+        p.expect(
+            "it waited for the lock and saved once it was released (2.1.318, CLAUDE_CODE_CONFIG_LOCK_WAIT_MS)",
+            added && ran.success(),
+            ran.summary(),
         );
         p.note(
-            "claude mcp add had finished while it was held",
+            "when the server first appeared while the lock was held (seconds after the spawn)",
+            json!(saved_under_lock.then_some(seconds)),
+        );
+        p.note(
+            "claude mcp add had exited while the lock was held",
             json!(finished_early),
         );
-        if after == before {
-            return Err(harness(format!(
-                "claude mcp add wrote nothing to the global config, with the lock held or after: {}",
-                ran.summary()
-            )));
-        }
-        let added = serde_json::from_slice::<Value>(&after)
-            .ok()
-            .is_some_and(|v| v["mcpServers"].get(MCP_SERVER).is_some());
-        p.expect("the server was added", added, ran.summary());
         p.note(
-            "exclusion by the lock past CC's start-up",
+            "CC's own start-up writes",
             json!(
-                "not tested: it holds only for a CC process more than 30 s old or with its interactive UI up, and compat drives no entry point there that makes a chosen change of the global config (mcp add and remove, and -p, end within their start-up or write only as they exit; an interactive session's own writes are CC's)"
+                "not tested: they may still land under the held lock after 1.5 s (A.7), and they do not add the server"
             ),
         );
-        let removed = ctx
-            .claude(&live, &["mcp", "remove", "--scope", "user", MCP_SERVER])
-            .run(&ctx.roots)?;
-        p.note("claude mcp remove", removed.summary());
+        if added {
+            let removed = ctx
+                .claude(&live, &["mcp", "remove", "--scope", "user", MCP_SERVER])
+                .run(&ctx.roots)?;
+            p.note("claude mcp remove", removed.summary());
+        }
         Ok(
-            "CC's start-up wrote the global config under tagteam's held lock, as 2.1.292's Appendix A.7 records",
+            "claude mcp add waited for tagteam's held lock and saved after its release, as 2.1.318's Appendix A.7 records",
         )
     }))
 }
@@ -839,14 +840,37 @@ mod tests {
         (ctx, scratch)
     }
 
-    const ADDS_AT_ONCE: &str = r#"case "$1 $2" in
-"mcp add") printf '{"mcpServers":{"tagteam-compat-probe":{}}}' > "$home/.claude.json" ;;
-esac"#;
-
+    /// Like CC 2.1.318 with `CLAUDE_CODE_CONFIG_LOCK_WAIT_MS` set: waits for the lock to go, then
+    /// saves the server. Without that variable at 60000 it gives up, as CC does when its backoff
+    /// runs out.
     const WAITS_FOR_THE_LOCK: &str = r#"case "$1 $2" in
 "mcp add")
+    [ "$CLAUDE_CODE_CONFIG_LOCK_WAIT_MS" = 60000 ] || exit 1
     while [ -d "$home/.claude.json.lock" ]; do sleep 0.1; done
     printf '{"mcpServers":{"tagteam-compat-probe":{}}}' > "$home/.claude.json" ;;
+"mcp remove") : > "$home/removed" ;;
+esac"#;
+
+    /// The 2.1.292 behaviour the check no longer accepts: the save lands under the held lock.
+    const SAVES_AT_ONCE: &str = r#"case "$1 $2" in
+"mcp add") printf '{"mcpServers":{"tagteam-compat-probe":{}}}' > "$home/.claude.json" ;;
+"mcp remove") : > "$home/removed" ;;
+esac"#;
+
+    /// CC's own start-up write lands under the held lock, then `mcp add` waits for the lock.
+    const STARTS_UP_THEN_WAITS_FOR_THE_LOCK: &str = r#"case "$1 $2" in
+"mcp add")
+    printf '{"numStartups":1}' > "$home/.claude.json"
+    [ "$CLAUDE_CODE_CONFIG_LOCK_WAIT_MS" = 60000 ] || exit 1
+    while [ -d "$home/.claude.json.lock" ]; do sleep 0.1; done
+    printf '{"numStartups":1,"mcpServers":{"tagteam-compat-probe":{}}}' > "$home/.claude.json" ;;
+"mcp remove") : > "$home/removed" ;;
+esac"#;
+
+    /// `mcp add` whose backoff ran out: it saves nothing and exits 1.
+    const GIVES_UP: &str = r#"case "$1 $2" in
+"mcp add") echo "add the server again" >&2; exit 1 ;;
+"mcp remove") : > "$home/removed" ;;
 esac"#;
 
     fn label<'o>(o: &'o Outcome, text: &str) -> &'o crate::compat::report::Evidence {
@@ -856,24 +880,40 @@ esac"#;
             .unwrap_or_else(|| panic!("no evidence line {text:?} in {:?}", o.evidence))
     }
 
+    const NOT_SAVED_UNDER_LOCK: &str = "claude mcp add did not save while tagteam held";
+    const SAVED_AFTER_RELEASE: &str = "it waited for the lock and saved once it was released";
+
+    fn removed(ctx: &Ctx) -> bool {
+        ctx.paths(&ctx.live())
+            .global_config
+            .with_file_name("removed")
+            .exists()
+    }
+
     #[test]
-    fn a_start_up_that_writes_past_the_held_lock_is_the_expected_behaviour() {
+    fn an_mcp_add_that_waits_for_the_lock_and_saves_after_its_release_passes() {
         let _serial = crate::compat::sys::serial();
-        let (mut ctx, scratch) = ctx_with_claude(ADDS_AT_ONCE);
-        let out = config_lock_within(&mut ctx, Duration::from_secs(5)).unwrap();
+        let (mut ctx, scratch) = ctx_with_claude(WAITS_FOR_THE_LOCK);
+        let out = config_lock_within(&mut ctx, Duration::from_millis(800)).unwrap();
         assert_eq!(out.status, Status::Pass, "{:?}", out.evidence);
+        let held = label(&out, NOT_SAVED_UNDER_LOCK);
         assert_eq!(
-            label(&out, "start-up: CC's write of the global config landed").ok,
-            Some(true)
+            (held.ok, &held.value),
+            (Some(true), &json!("not saved while the lock was held"))
+        );
+        assert_eq!(label(&out, SAVED_AFTER_RELEASE).ok, Some(true));
+        assert_eq!(
+            label(&out, "when the server first appeared").value,
+            json!(null)
         );
         assert_eq!(
-            label(&out, "start-up: when CC's write landed").value["insideWindow"],
-            json!(true)
+            label(&out, "claude mcp add had exited while the lock was held").value,
+            json!(false)
         );
-        assert_eq!(label(&out, "the server was added").ok, Some(true));
-        let note = label(&out, "exclusion by the lock past CC's start-up");
-        assert_eq!(note.ok, None, "a note, not an expectation");
-        assert!(note.value.to_string().contains("not tested"));
+        let untested = label(&out, "CC's own start-up writes");
+        assert_eq!(untested.ok, None, "a note, not an expectation");
+        assert!(untested.value.to_string().contains("not tested"));
+        assert!(removed(&ctx), "the probe server was removed");
         assert!(
             !ctx.paths(&ctx.live()).config_lock.exists(),
             "the lock is released"
@@ -882,31 +922,58 @@ esac"#;
     }
 
     #[test]
-    fn a_write_only_after_the_release_means_cc_waited_the_lock_out_and_fails() {
+    fn an_mcp_add_that_saves_under_the_held_lock_fails_the_first_expectation() {
         let _serial = crate::compat::sys::serial();
-        let (mut ctx, scratch) = ctx_with_claude(WAITS_FOR_THE_LOCK);
-        let out = config_lock_within(&mut ctx, Duration::from_millis(800)).unwrap();
+        let (mut ctx, scratch) = ctx_with_claude(SAVES_AT_ONCE);
+        let out = config_lock_within(&mut ctx, Duration::from_secs(2)).unwrap();
         assert_eq!(out.status, Status::Fail, "{:?}", out.evidence);
-        let landed = label(&out, "start-up: CC's write of the global config landed");
-        assert_eq!(landed.ok, Some(false));
-        assert!(landed.value.to_string().contains("waited the lock out"));
-        let when = label(&out, "start-up: when CC's write landed");
+        let held = label(&out, NOT_SAVED_UNDER_LOCK);
         assert_eq!(
-            (when.ok, &when.value["insideWindow"]),
-            (None, &json!(false))
+            (held.ok, &held.value),
+            (Some(false), &json!("saved under the held lock"))
         );
+        assert!(
+            label(&out, "when the server first appeared")
+                .value
+                .is_number()
+        );
+        assert!(removed(&ctx), "an added server is removed even on failure");
+        assert!(!ctx.paths(&ctx.live()).config_lock.exists());
         fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
-    fn no_write_at_all_is_a_harness_error_that_keeps_the_evidence() {
+    fn a_start_up_write_under_the_held_lock_is_not_mcp_add_s_save() {
         let _serial = crate::compat::sys::serial();
-        let (mut ctx, scratch) = ctx_with_claude("exit 0");
+        let (mut ctx, scratch) = ctx_with_claude(STARTS_UP_THEN_WAITS_FOR_THE_LOCK);
+        let out = config_lock_within(&mut ctx, Duration::from_millis(800)).unwrap();
+        assert_eq!(out.status, Status::Pass, "{:?}", out.evidence);
+        assert_eq!(label(&out, NOT_SAVED_UNDER_LOCK).ok, Some(true));
+        assert_eq!(label(&out, SAVED_AFTER_RELEASE).ok, Some(true));
+        assert!(!ctx.paths(&ctx.live()).config_lock.exists());
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn an_mcp_add_that_exits_1_without_saving_fails_the_second_expectation_and_is_no_harness_error()
+    {
+        let _serial = crate::compat::sys::serial();
+        let (mut ctx, scratch) = ctx_with_claude(GIVES_UP);
         let out = config_lock_within(&mut ctx, Duration::from_millis(300)).unwrap();
-        assert_eq!(out.status, Status::Error, "{:?}", out.evidence);
-        assert!(out.summary.contains("wrote nothing"), "{}", out.summary);
-        let landed = label(&out, "start-up: CC's write of the global config landed");
-        assert_eq!(landed.ok, Some(false));
+        assert_eq!(out.status, Status::Fail, "{:?}", out.evidence);
+        assert_eq!(label(&out, NOT_SAVED_UNDER_LOCK).ok, Some(true));
+        let waited = label(&out, SAVED_AFTER_RELEASE);
+        assert_eq!(waited.ok, Some(false));
+        assert!(
+            waited.value.to_string().contains("add the server again"),
+            "{}",
+            waited.value
+        );
+        assert_eq!(
+            label(&out, "claude mcp add had exited while the lock was held").value,
+            json!(true)
+        );
+        assert!(!removed(&ctx), "nothing was added, so nothing is removed");
         assert!(!ctx.paths(&ctx.live()).config_lock.exists());
         fs::remove_dir_all(&scratch).unwrap();
     }
