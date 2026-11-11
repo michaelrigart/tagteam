@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use tagteam_engine::EngineError;
-use tagteam_engine::store::{Mapping, StoreError};
+use tagteam_engine::store::{AccountRow, Mapping};
 
 use crate::SCHEMA_VERSION;
 use crate::{displaced_cmd, render};
@@ -58,8 +58,8 @@ fn invalid_path(path: &Path, why: &str) -> Failure {
 }
 
 impl App<'_, '_> {
-    /// §12.7: `map` with no arguments lists the mappings, only `--provider`'s when it is given.
-    /// It never creates the store (§5).
+    /// §12.7: `map` with no arguments lists the mappings of both sources, only `--provider`'s
+    /// when it is given (config-mappings spec §3.4). It never creates the store (§5).
     pub(in crate::app) fn list_mappings(&mut self) -> Result<(), Failure> {
         let mut rows = Vec::new();
         if let Some(store) = self.engine.existing_store()? {
@@ -77,59 +77,116 @@ impl App<'_, '_> {
                 }
             }
         }
-        self.print(&render::mappings_human(&rows), render::mappings_json(&rows));
+        let providers = match &self.provider_flag {
+            Some(p) => vec![p.clone()],
+            None => self.engine.provider_ids(),
+        };
+        let mut config = Vec::new();
+        for provider in &providers {
+            config.extend(self.engine.config_mappings(provider)?);
+        }
+        self.print(
+            &render::mappings_human(&rows, &config),
+            render::mappings_json(&rows, &config),
+        );
         Ok(())
     }
 
-    /// §12.7: maps PATH (default: the current directory), stored canonical, for the account's
-    /// own provider, replacing the mapping PATH held for that provider.
+    /// §12.7, config-mappings spec §3.3: maps PATH (default: the current directory), canonical,
+    /// for the account's own provider, in `config.toml`, replacing every entry for that
+    /// directory and the database row, if any. The value is the account's alias, else its
+    /// email, and must name this account alone.
     pub(in crate::app) fn map(
         &mut self,
         account: &str,
         path: Option<PathBuf>,
     ) -> Result<(), Failure> {
         let row = self.resolve(account)?;
+        let dir = canonical_dir(path)?;
+        let provider = self.engine.provider(&row.provider)?;
+        if provider.kind_traits(&row.kind).managed_key_axis {
+            return Err(Failure::Message(
+                KIND_INVALID_INPUT,
+                format!(
+                    "{} is an API-key account, which has no session to map a directory to",
+                    render::name(&row)
+                ),
+            ));
+        }
+        let value = self.mapping_value(&row)?;
         let mapping = Mapping {
-            path: canonical_dir(path)?,
+            path: dir,
             provider: row.provider.clone(),
             account_id: row.id.clone(),
             added_at: self.engine.now_ms(),
         };
-        self.engine
-            .store()?
-            .set_mapping(
-                &mapping.path,
-                &mapping.provider,
-                &mapping.account_id,
-                mapping.added_at,
-            )
-            .map_err(|e| match e {
-                // A `remove` raced this command.
-                StoreError::NoSuchAccount => EngineError::NoSuchAccount(account.to_owned()),
-                e => e.into(),
-            })?;
+        let write = self
+            .engine
+            .write_mapping(&row.provider, Path::new(&mapping.path), &value)?;
+        // The file is now the only source for this directory.
+        if let Some(store) = self.engine.existing_store()? {
+            store
+                .remove_mappings(&mapping.path, Some(&row.provider))
+                .map_err(EngineError::from)?;
+        }
         let human = format!(
-            "Mapped {} to {} (position {}).\n",
-            mapping.path,
+            "Mapped {} to {} (position {}) in {}.\n",
+            write.written,
             render::name(&row),
-            row.position
+            row.position,
+            write.path.display()
         );
-        let mapping = render::mapping_json(&mapping, &row);
-        let json = json!({"schemaVersion": SCHEMA_VERSION, "ok": true, "mapping": mapping});
+        let mut mapped = render::mapping_json(&mapping, &row);
+        mapped["source"] = json!("config");
+        let json = json!({"schemaVersion": SCHEMA_VERSION, "ok": true, "mapping": mapped});
         self.print(&human, json);
         Ok(())
     }
 
-    /// §12.7: removes PATH's mappings (default: the current directory), only `--provider`'s
-    /// when it is given. Removing nothing is not an error, and the store is never created.
+    /// What `map` writes for `row`: its alias, else its email, when that names this account and
+    /// no other. Anything else is refused, saying to give the account an alias.
+    fn mapping_value(&self, row: &AccountRow) -> Result<String, Failure> {
+        let refuse = |why: String| {
+            Failure::Message(
+                KIND_INVALID_INPUT,
+                format!(
+                    "{why}; give it an alias first (`tagteam alias {} NAME`)",
+                    row.position
+                ),
+            )
+        };
+        let Some(value) = row.alias.clone().or_else(|| row.email.clone()) else {
+            return Err(refuse(format!(
+                "{} has no alias or email to map by",
+                render::name(row)
+            )));
+        };
+        let (named, _) = self.engine.judge_value(&row.provider, &value)?;
+        if named.is_some_and(|n| n.id == row.id) {
+            Ok(value)
+        } else {
+            Err(refuse(format!(
+                "\"{value}\" does not name {} alone",
+                render::name(row)
+            )))
+        }
+    }
+
+    /// §12.7: removes PATH's mappings (default: the current directory) from `config.toml` and
+    /// the database, only `--provider`'s when it is given. Removing nothing is not an error, and
+    /// neither source is created.
     pub(in crate::app) fn unmap(&mut self, path: Option<PathBuf>) -> Result<(), Failure> {
         let path = unmapped_path(path)?;
-        let removed = match self.engine.existing_store()? {
+        let from_file = self
+            .engine
+            .remove_config_mappings(self.provider_flag.as_ref(), Path::new(&path))?;
+        let from_database = match self.engine.existing_store()? {
             Some(store) => store
                 .remove_mappings(&path, self.provider_flag.as_ref())
                 .map_err(EngineError::from)?,
             None => 0,
         };
+        let removed = from_file + from_database;
         let human = if removed == 0 {
             format!("No mapping for {path}.\n")
         } else {

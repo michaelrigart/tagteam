@@ -912,8 +912,8 @@ fn a_target_that_became_the_live_login_during_the_launch_runs_plain_claude_after
 #[test]
 fn a_mapped_target_removed_before_the_launch_reads_it_runs_plain_claude_after_one_more_plan() {
     // Decision 14, B.47: a `remove` that lands after `plan_run`, before the launch's first read
-    // of the account, is `TargetChanged`; the mapping went with the account (Decision 7), so the
-    // second plan runs plain `claude`.
+    // of the account, is `TargetChanged`. `config.toml`'s entry stays, but names no account any
+    // more, so the second plan runs plain `claude` and warns that it names none.
     let home = Home::new();
     let out = home.out("removed");
     cmd(home.root())
@@ -936,8 +936,9 @@ fn a_mapped_target_removed_before_the_launch_reads_it_runs_plain_claude_after_on
     let output = finish(child, LONG);
 
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("was removed"),
+    assert_eq!(
+        stderr(&output).matches("names no account").count(),
+        1,
         "warned once: {}",
         stderr(&output)
     );

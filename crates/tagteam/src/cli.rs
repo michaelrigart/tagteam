@@ -204,14 +204,19 @@ pub enum Command {
     /// Map PATH (default: here) to ACCOUNT for its provider; with no arguments, list mappings
     ///
     /// `tagteam run` in PATH or below it, and so the `shell-init` wrapper, launches ACCOUNT
-    /// there. PATH is stored canonical, and a directory holds one mapping per provider. --json
-    /// prints {schemaVersion, ok, mapping: {path, provider, number, id, email, alias?,
-    /// addedAt}}, and the list {schemaVersion, mappings: [...]}, with times in ISO 8601 UTC.
+    /// there. The mapping is written to config.toml (`tagteam config path`) by ACCOUNT's alias,
+    /// else its email, and replaces the directory's other entries and database mapping. PATH is
+    /// canonical, and a directory holds one mapping per provider. --json prints {schemaVersion,
+    /// ok, mapping: {path, provider, number, id, email, alias?, addedAt, source: "config"}}, and
+    /// the list {schemaVersion, mappings: [...], configMappings: [{path, written, value,
+    /// provider, account?, problem?}]}: the database's mappings, then the file's, with times in
+    /// ISO 8601 UTC.
     Map {
         account: Option<String>,
         path: Option<PathBuf>,
     },
-    /// Remove PATH's mappings (default: here): every provider's, or only --provider's
+    /// Remove PATH's mappings (default: here) from config.toml and the database: every
+    /// provider's, or only --provider's
     ///
     /// --json prints {schemaVersion, ok, path, removed}.
     Unmap { path: Option<PathBuf> },

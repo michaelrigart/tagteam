@@ -5,19 +5,10 @@
 mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use common::cmd;
+use common::{cmd, write_config};
 use serde_json::{Value, json};
-
-/// Writes `text` as the `config.toml` of `root`'s fixture HOME, and returns its path.
-fn write_config(root: &Path, text: &str) -> PathBuf {
-    let dir = root.join("home/.config/tagteam");
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("config.toml");
-    fs::write(&path, text).unwrap();
-    path
-}
 
 /// A successful command's stdout and stderr.
 fn ok(root: &Path, args: &[&str]) -> (String, String) {

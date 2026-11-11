@@ -153,6 +153,30 @@ pub fn two_fresh_accounts(root: &Path) -> (String, String) {
     )
 }
 
+/// Seeds a database mapping of `path` to account `id`, as a version before `map` wrote
+/// `config.toml` left it. `map` itself no longer makes one.
+pub fn legacy_mapping(root: &Path, path: &str, id: &str) {
+    let store = Store::open_existing(&Env::for_test(root).data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap();
+    store
+        .set_mapping(
+            path,
+            &ProviderId::new(CLAUDE_CODE),
+            &AccountId::from_string(id),
+            1,
+        )
+        .unwrap();
+}
+
+/// Writes `text` as the `config.toml` of `root`'s fixture HOME, and returns its path.
+pub fn write_config(root: &Path, text: &str) -> PathBuf {
+    let path = Env::for_test(root).config_dir().join("config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, text).unwrap();
+    path
+}
+
 /// A window as a provider reports it, without provider detail.
 pub fn usage_window(
     key: &str,
