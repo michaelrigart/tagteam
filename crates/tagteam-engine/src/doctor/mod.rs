@@ -25,6 +25,7 @@ use crate::store::{AccountRow, Store};
 mod accounts;
 mod daemon;
 mod files;
+mod mappings;
 mod online;
 mod profiles;
 mod recovery;
@@ -157,6 +158,7 @@ impl Engine {
             run.journal(p.as_ref());
             run.auto(p.as_ref());
             run.sessions(p.as_ref());
+            run.mappings(p.as_ref());
             self.check_cancel()?;
             let id = p.id();
             for check in p.doctor_checks(&self.env, self.spawner.as_ref(), self.cancel()) {
@@ -327,6 +329,10 @@ impl Id {
     const KEYCHAIN_LOCKED: &str = "keychain.locked";
     const LOG_FILE: &str = "log.file";
     const LOG_WRITABLE: &str = "log.writable";
+    const MAPPINGS_CONFLICT: &str = "mappings.conflict";
+    const MAPPINGS_DATABASE: &str = "mappings.database";
+    const MAPPINGS_DIRECTORY: &str = "mappings.directory";
+    const MAPPINGS_VALUE: &str = "mappings.value";
     const ONLINE_REACH: &str = "online.reach";
     const PENDING_DISPLACED: &str = "pending.displaced";
     const PENDING_DISPLACED_MISSING: &str = "pending.displaced-missing";

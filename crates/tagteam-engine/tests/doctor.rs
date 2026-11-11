@@ -3305,3 +3305,70 @@ fn the_daemon_checks_change_no_byte_take_no_lock_and_never_connect() {
     );
     drop(held);
 }
+
+#[test]
+fn doctor_reports_config_mappings_that_do_not_apply() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let root = fx.dir.path().join("maps");
+    for d in ["known", "plain", "both"] {
+        fs::create_dir_all(root.join(d)).unwrap();
+    }
+    let r = root.display();
+    let path = fx.env.config_dir().join("config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        format!(
+            "[provider.claude-code.mappings]\n\"{r}/gone\" = \"a\"\n\"{r}/known\" = \"nobody\"\n\"{r}/plain\" = \"2\"\n\"{r}/both\" = \"x\"\n\"{r}/both/\" = \"y\"\n"
+        ),
+    )
+    .unwrap();
+    let store = fx.engine.store().unwrap();
+    store
+        .set_mapping(&format!("{r}/old"), &cc(), &a, 0)
+        .unwrap();
+
+    let report = doctor(&fx);
+    let mine: Vec<&Check> = report
+        .checks
+        .iter()
+        .filter(|(p, c)| p.as_ref() == Some(&cc()) && c.id.starts_with("mappings."))
+        .map(|(_, c)| c)
+        .collect();
+    let with = |id: &str| mine.iter().filter(|c| c.id == id).collect::<Vec<_>>();
+    assert_eq!(mine.len(), 5, "{mine:#?}");
+    let missing = with("mappings.directory");
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0].status, CheckStatus::Info);
+    assert!(
+        missing[0].message.contains("gone"),
+        "{}",
+        missing[0].message
+    );
+    let values = with("mappings.value");
+    assert_eq!(values.len(), 2);
+    assert!(values.iter().all(|c| c.status == CheckStatus::Warn));
+    let conflicts = with("mappings.conflict");
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].status, CheckStatus::Warn);
+    let database = with("mappings.database");
+    assert_eq!(database.len(), 1);
+    assert_eq!(database[0].status, CheckStatus::Info);
+    assert!(database[0].message.contains('1'), "{}", database[0].message);
+    for c in &mine {
+        assert!(c.fix.as_deref().is_some_and(|f| !f.is_empty()), "{c:#?}");
+    }
+
+    fs::write(&path, "").unwrap();
+    store.remove_mappings(&format!("{r}/old"), None).unwrap();
+    let report = doctor(&fx);
+    assert!(
+        report
+            .checks
+            .iter()
+            .all(|(_, c)| !c.id.starts_with("mappings.")),
+        "{:#?}",
+        report.checks
+    );
+}
