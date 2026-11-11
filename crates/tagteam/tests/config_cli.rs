@@ -120,6 +120,7 @@ fn config_list_shows_every_key_with_its_value_and_source_then_the_unknown_ones()
             "KEY                                  SOURCE    VALUE\n",
             "default_provider                     default   claude-code\n",
             "autoswitch.threshold                 global    80\n",
+            "autoswitch.ceiling                   default   100\n",
             "autoswitch.interval_seconds          default   60\n",
             "autoswitch.cooldown_seconds          default   300\n",
             "autoswitch.hysteresis_pct            default   10\n",
@@ -159,6 +160,7 @@ fn config_list_json_is_the_specs_shape() {
             "keys": [
                 row("default_provider", json!("claude-code"), json!("claude-code"), "default"),
                 row("autoswitch.threshold", json!(80.0), json!(90.0), "global"),
+                row("autoswitch.ceiling", json!(100.0), json!(100.0), "default"),
                 row("autoswitch.interval_seconds", json!(60), json!(60), "default"),
                 row("autoswitch.cooldown_seconds", json!(300), json!(300), "default"),
                 row("autoswitch.hysteresis_pct", json!(10.0), json!(10.0), "default"),

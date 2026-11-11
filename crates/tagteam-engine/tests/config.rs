@@ -550,7 +550,12 @@ fn every_key_set_through_the_registry_reads_back_without_a_warning() {
     // global table and from a provider's.
     let fx = Fx::new();
     for key in KEYS {
-        let raw = sample(&key.kind);
+        // The bottom of the ceiling's range is never above a threshold, so the reader refuses it.
+        let raw = if key.name == "autoswitch.ceiling" {
+            "100".to_owned()
+        } else {
+            sample(&key.kind)
+        };
         set(&fx, key.name, &raw);
         if key.per_provider {
             fx.engine

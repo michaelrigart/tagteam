@@ -7,11 +7,11 @@ use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::AutoStrategy;
 use tagteam_core::tokens::{CardOverride, PriceOverride};
 use tagteam_engine::settings::{
-    self, AccountsView, COOLDOWN_SECONDS_RANGE, Choices, ColorMode, HISTORY_RETENTION_DAYS_RANGE,
-    HYSTERESIS_PCT_RANGE, INTERVAL_SECONDS_RANGE, Inspection, KEYS, Key, KeyKind, KeyState,
-    NotifyEvent, STATUSLINE_PLACEHOLDERS, Settings, SettingsError, Source, THRESHOLD_RANGE,
-    TOKENS_RETENTION_DAYS_RANGE, UNHEALTHY_TICKS_RANGE, Value, inspect, is_statusline_placeholder,
-    parse_bool, resolve,
+    self, AccountsView, CEILING_RANGE, COOLDOWN_SECONDS_RANGE, Choices, ColorMode,
+    HISTORY_RETENTION_DAYS_RANGE, HYSTERESIS_PCT_RANGE, INTERVAL_SECONDS_RANGE, Inspection, KEYS,
+    Key, KeyKind, KeyState, NotifyEvent, STATUSLINE_PLACEHOLDERS, Settings, SettingsError, Source,
+    THRESHOLD_RANGE, TOKENS_RETENTION_DAYS_RANGE, UNHEALTHY_TICKS_RANGE, Value, inspect,
+    is_statusline_placeholder, parse_bool, resolve,
 };
 use tagteam_provider::Env;
 
@@ -39,6 +39,7 @@ fn the_defaults_are_the_specs_table() {
     let d = Settings::default();
     assert_eq!(d.default_provider, None);
     assert_eq!(d.threshold, 90.0);
+    assert_eq!(d.ceiling, 100.0);
     assert_eq!(d.interval_seconds, 60);
     assert_eq!(d.cooldown_seconds, 300);
     assert_eq!(d.hysteresis_pct, 10.0);
@@ -130,6 +131,7 @@ events = ["limit", "switch"]
         Settings {
             default_provider: Some(ProviderId::new("fake-agent")),
             threshold: 75.5,
+            ceiling: 100.0,
             interval_seconds: 120,
             cooldown_seconds: 0,
             hysteresis_pct: 12.5,
@@ -304,6 +306,98 @@ fn a_providers_own_threshold_overrides_the_global_one() {
     assert_eq!(settings.threshold, 70.0);
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(load_as(text, "fake-agent").0.threshold, 80.0);
+}
+
+#[test]
+fn the_ceiling_reads_from_the_provider_table_first() {
+    let text = "[autoswitch]\nceiling = 97\n[provider.claude-code.autoswitch]\nceiling = 95\n";
+    let (settings, warnings) = load(text);
+    assert_eq!(settings.ceiling, 95.0);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let (settings, warnings) = load_as(text, "fake-agent");
+    assert_eq!(settings.ceiling, 97.0);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn an_invalid_ceiling_falls_back_to_100_with_one_warning() {
+    for text in ["49", "100.5"] {
+        let (settings, warnings) = load(&format!("[autoswitch]\nceiling = {text}\n"));
+        assert_eq!(settings.ceiling, 100.0, "{text}");
+        assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
+        assert!(
+            warnings[0].ends_with("`autoswitch.ceiling` must be a number from 50 to 100 (ignored)"),
+            "{warnings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_threshold_at_or_above_the_ceiling_runs_with_a_ceiling_of_100() {
+    let provider_table =
+        "[autoswitch]\nthreshold = 92\n[provider.claude-code.autoswitch]\nceiling = 90\n";
+    let cases = [
+        (
+            "[autoswitch]\nthreshold = 95\nceiling = 95\n",
+            PROVIDER,
+            95.0,
+            100.0,
+            Some(("`autoswitch.ceiling` (95)", "`autoswitch.threshold` (95)")),
+        ),
+        (
+            provider_table,
+            PROVIDER,
+            92.0,
+            100.0,
+            Some((
+                "`provider.claude-code.autoswitch.ceiling` (90)",
+                "`autoswitch.threshold` (92)",
+            )),
+        ),
+        (
+            "[autoswitch]\nceiling = 85\n",
+            PROVIDER,
+            90.0,
+            100.0,
+            Some(("`autoswitch.ceiling` (85)", "`autoswitch.threshold` (90)")),
+        ),
+        (
+            "[autoswitch]\nthreshold = 90\nceiling = 95.5\n",
+            PROVIDER,
+            90.0,
+            95.5,
+            None,
+        ),
+        (provider_table, "fake-agent", 92.0, 100.0, None),
+    ];
+    for (text, provider, threshold, ceiling, warning) in cases {
+        let (settings, warnings) = load_as(text, provider);
+        assert_eq!(settings.threshold, threshold, "{text}");
+        assert_eq!(settings.ceiling, ceiling, "{text}");
+        match warning {
+            None => assert!(warnings.is_empty(), "{text}: {warnings:?}"),
+            Some((c, t)) => {
+                assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
+                assert!(
+                    warnings[0].contains(&format!("{c} must be above {t}; using a ceiling of 100")),
+                    "{warnings:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_broken_pair_shows_the_default_ceiling_from_the_default() {
+    let i = inspect_as("[autoswitch]\nceiling = 85\n", PROVIDER);
+    let ceiling = state(&i, "autoswitch.ceiling");
+    assert_eq!(ceiling.value, Value::Float(100.0));
+    assert_eq!(ceiling.source, Source::Default);
+    assert!(
+        i.warnings.iter().any(|w| w.contains("must be above")),
+        "{:?}",
+        i.warnings
+    );
 }
 
 #[test]
@@ -1071,6 +1165,7 @@ fn the_registry_is_section_six_four_s_table_in_order() {
         vec![
             ("default_provider", Shape::Other(KeyKind::Provider), false),
             ("autoswitch.threshold", Shape::Float(50.0, 99.9), true),
+            ("autoswitch.ceiling", Shape::Float(50.0, 100.0), true),
             ("autoswitch.interval_seconds", Shape::Int(15, 3600), true),
             ("autoswitch.cooldown_seconds", Shape::Int(0, 86_400), true),
             ("autoswitch.hysteresis_pct", Shape::Float(0.0, 50.0), true),
@@ -1141,6 +1236,7 @@ fn every_numeric_key_reads_its_declared_range() {
         kind("autoswitch.threshold"),
         KeyKind::Float(&THRESHOLD_RANGE)
     );
+    assert_eq!(kind("autoswitch.ceiling"), KeyKind::Float(&CEILING_RANGE));
     assert_eq!(
         kind("autoswitch.interval_seconds"),
         KeyKind::Int(&INTERVAL_SECONDS_RANGE)
@@ -1210,6 +1306,7 @@ fn every_key_reads_back_its_default_from_the_settings() {
         vec![
             ("default_provider", Value::Str(String::new())),
             ("autoswitch.threshold", Value::Float(90.0)),
+            ("autoswitch.ceiling", Value::Float(100.0)),
             ("autoswitch.interval_seconds", Value::Int(60)),
             ("autoswitch.cooldown_seconds", Value::Int(300)),
             ("autoswitch.hysteresis_pct", Value::Float(10.0)),
@@ -1342,6 +1439,10 @@ fn every_numeric_key_reads_its_bounds_and_defaults_just_outside_them() {
         numeric += 1;
         let text = |v: &str| format!("[{}]\n{} = {v}\n", key.table().unwrap(), key.leaf());
         for v in &inside {
+            if key.name == "autoswitch.ceiling" && v == "50.0" {
+                // Valid alone, but no valid threshold is below it: the pair rule refuses it.
+                continue;
+            }
             let i = inspect_as(&text(v), PROVIDER);
             let s = state(&i, key.name);
             assert_eq!(
@@ -1371,8 +1472,8 @@ fn every_numeric_key_reads_its_bounds_and_defaults_just_outside_them() {
         }
     }
     assert_eq!(
-        numeric, 7,
-        "threshold, three seconds and ticks, hysteresis, two retentions"
+        numeric, 8,
+        "threshold, ceiling, three seconds and ticks, hysteresis, two retentions"
     );
 }
 
@@ -1872,9 +1973,10 @@ fn every_refusal_says_what_the_value_must_be() {
 }
 
 /// One command-line sample per registry key, in the registry's order.
-const SAMPLES: [(&str, &str); 18] = [
+const SAMPLES: [(&str, &str); 19] = [
     ("default_provider", "fake-agent"),
     ("autoswitch.threshold", "75.5"),
+    ("autoswitch.ceiling", "97.5"),
     ("autoswitch.interval_seconds", "120"),
     ("autoswitch.cooldown_seconds", "0"),
     ("autoswitch.hysteresis_pct", "12.25"),
