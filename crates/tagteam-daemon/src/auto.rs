@@ -870,7 +870,8 @@ mod tests {
     fn the_threshold_flag_warning_comes_at_start_and_after_each_reload_that_keeps_it() {
         // The file's ceiling is 95, which `--threshold 96` reaches: a warning at start naming
         // (95). The first sleep's write raises it to 96, still reached (a warning naming (96)),
-        // and the second's to 98, which the flag no longer reaches (none).
+        // and the second's to 98, which the flag no longer reaches (none). The second write also
+        // gives an interval out of range, whose warning shows that reload ran.
         let fx = Fx::new();
         let (a, b) = two(&fx);
         fx.read(&a, 10.0, 10.0, T0, T0 + 300);
@@ -883,7 +884,7 @@ mod tests {
                 fx.settings("[autoswitch]\nceiling = 96\n", 2);
             }
             if clock.now_ms() > (T0 + 70) * 1000 && !second_written.replace(true) {
-                fx.settings("[autoswitch]\nceiling = 98\n", 3);
+                fx.settings("[autoswitch]\nceiling = 98\ninterval_seconds = 5\n", 3);
             }
             if clock.now_ms() > (T0 + 140) * 1000 {
                 cancel.request(libc::SIGTERM);
@@ -915,7 +916,11 @@ mod tests {
                 "--threshold 96 is at or above `autoswitch.ceiling` ({ceiling}); using a ceiling of 100"
             )
         };
-        assert_eq!(warnings(&sink), [warning("95"), warning("96")]);
+        let interval = format!(
+            "{}: `autoswitch.interval_seconds` must be a whole number of seconds from 15 to 3600 (ignored)",
+            fx.env.config_dir().join("config.toml").display()
+        );
+        assert_eq!(warnings(&sink), [warning("95"), warning("96"), interval]);
 
         let fx = Fx::new();
         two(&fx);
