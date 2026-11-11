@@ -78,7 +78,7 @@ impl MappingProblem {
             MappingProblem::ApiKey => "names an API-key account, which never starts a session",
             MappingProblem::Position => "is a position, which a mapping never names",
             MappingProblem::Conflict => {
-                "shares its directory with another entry that names a different account"
+                "shares its directory with another entry that has a different value"
             }
         }
     }

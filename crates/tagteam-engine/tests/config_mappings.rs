@@ -3,11 +3,9 @@ mod common;
 use std::fs;
 use std::path::PathBuf;
 
-use common::{Fx, cc, identity};
-use tagteam_core::AccountId;
+use common::{Fx, add_same_email, cc};
 use tagteam_engine::mappings::{ConfigMapping, MappedDir, MappingProblem};
 use tagteam_engine::settings::config_path;
-use tagteam_engine::store::NewAccount;
 
 fn write_mappings(fx: &Fx, entries: &[(&str, &str)]) {
     let mut body = String::from("[provider.claude-code.mappings]\n");
@@ -27,29 +25,6 @@ fn mkdir(fx: &Fx, name: &str) -> PathBuf {
 
 fn judged(fx: &Fx) -> Vec<ConfigMapping> {
     fx.engine.config_mappings(&cc()).unwrap()
-}
-
-/// Two accounts sharing `email` in one provider, told apart only by their identity keys, as
-/// Claude Code's email-and-org identity makes them.
-fn add_same_email(fx: &Fx, email: &str) {
-    let store = fx.engine.store().unwrap();
-    for (n, org) in [(1, "org-1"), (2, "org-2")] {
-        let id = AccountId::from_string(format!("same-{n}"));
-        let key = format!("{email}\n{org}");
-        store
-            .insert_account(&NewAccount {
-                id: &id,
-                provider: &cc(),
-                position: n,
-                identity_key: &key,
-                identity: &identity(email),
-                kind: "oauth",
-                alias: None,
-                login_expires_at: None,
-                added_at: 1,
-            })
-            .unwrap();
-    }
 }
 
 #[test]
@@ -157,6 +132,25 @@ fn equivalent_entries_conflict_only_when_their_values_differ() {
     let got = judged(&fx);
     assert_eq!(got.len(), 2);
     assert!(got.iter().all(|m| m.problem.is_none()));
+}
+
+#[test]
+fn conflict_takes_precedence_over_the_value_s_problem() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.engine.set_alias(&a, Some("work")).unwrap();
+    let w = mkdir(&fx, "w");
+    write_mappings(&fx, &[("~/w", "2"), (w.to_str().unwrap(), "work")]);
+
+    let got = judged(&fx);
+    assert_eq!(got.len(), 2);
+    assert!(
+        got.iter()
+            .all(|m| m.problem == Some(MappingProblem::Conflict)),
+        "{:?}",
+        got.iter().map(|m| m.problem).collect::<Vec<_>>()
+    );
 }
 
 #[test]

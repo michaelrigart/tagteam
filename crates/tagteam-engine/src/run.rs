@@ -14,7 +14,9 @@ use tagteam_provider::profile::RunShell;
 
 use crate::engine::Engine;
 use crate::error::EngineError;
-use crate::store::AccountRow;
+use crate::mappings::{MappedDir, MappingProblem, mapped_dir, resolve_value};
+use crate::settings::{self, MappingEntry, Settings};
+use crate::store::{AccountRow, Store};
 
 #[derive(Debug, Clone)]
 /// `account` is resolved by the CLI (§10.4, with its ambiguity prompt) before planning;
@@ -44,7 +46,7 @@ pub enum RunPlan {
     },
 }
 
-/// What a directory's mapping names (§12.7).
+/// What a directory's mapping names (§12.7; config-mappings spec §3.2).
 #[allow(clippy::large_enum_variant)] // one value per command
 enum Mapped {
     Nothing,
@@ -52,7 +54,38 @@ enum Mapped {
     Gone {
         path: String,
     },
+    /// The winning `config.toml` entry does not apply here (no account, several, an API-key
+    /// account, a position, or entries for one directory that disagree). `why` names it and
+    /// the file.
+    NotHere {
+        why: String,
+    },
     Account(AccountRow),
+}
+
+/// The entries of `config.toml` whose directory exists here and holds `dir`, nearest first: the
+/// deepest such directory's entries, with its component count. Entries that canonicalise to one
+/// directory form one group.
+fn nearest_entries<'a>(
+    entries: &'a [MappingEntry],
+    dir: &Path,
+) -> Option<(usize, Vec<&'a MappingEntry>)> {
+    let mut best: Option<(usize, Vec<&MappingEntry>)> = None;
+    for entry in entries {
+        let MappedDir::Found(mapped) = mapped_dir(&entry.dir) else {
+            continue;
+        };
+        if !dir.starts_with(&mapped) {
+            continue;
+        }
+        let depth = mapped.components().count();
+        match &mut best {
+            Some((deepest, group)) if depth == *deepest => group.push(entry),
+            Some((deepest, _)) if depth < *deepest => {}
+            _ => best = Some((depth, vec![entry])),
+        }
+    }
+    best
 }
 
 /// `run` for a provider without sessions (§4.5 "Capabilities are explicit").
@@ -67,15 +100,18 @@ pub(crate) fn no_sessions(p: &dyn Provider) -> EngineError {
 type EnvChanges = (Vec<(OsString, OsString)>, Vec<OsString>);
 
 impl Engine {
-    /// §12.1. It only reads: no lock, no write, and with no store none is created (§5).
+    /// §12.1 (config-mappings spec §3.2). It only reads: no lock, no write, and with no store
+    /// none is created (§5).
     ///
     /// The named account is resolved first, since its provider is the one whose launch command
     /// runs. That command is looked up next, on the `PATH` the CLI captured into `Env.vars`, before
     /// any mapping or live login is read, so a missing one changes nothing. Then the target: the
-    /// named account, or the nearest mapping of `cwd`'s canonical path for the provider. An
-    /// API-key account is refused. Plain `claude` runs when nothing is mapped, when the mapped
-    /// account went away (with a warning), or when the target is the default home's live login;
-    /// under `--require-session` each of those refuses instead.
+    /// named account, or the nearest mapping of `cwd`'s canonical path for the provider, in
+    /// `config.toml` or the database. An API-key account is refused, unless a `config.toml` entry
+    /// names it. Plain `claude` runs when nothing is mapped, when the mapped account went away or
+    /// the winning `config.toml` entry does not apply here (each with a warning), or when the
+    /// target is the default home's live login; under `--require-session` each of those refuses
+    /// instead.
     pub fn plan_run(&self, req: &RunRequest) -> Result<RunPlan, EngineError> {
         // §12.8: under an unreadable marker the outer home is unknown, so nothing is planned
         // against the engine's own `env`, which is still the run shell's.
@@ -119,6 +155,10 @@ impl Engine {
                     let warning = format!("{why}; running plain {command}");
                     return self.plain(req, launch, why, Some(warning));
                 }
+                Mapped::NotHere { why } => {
+                    let warning = format!("{why}; running plain {command}");
+                    return self.plain(req, launch, why, Some(warning));
+                }
             },
         };
         if p.kind_traits(&target.kind).managed_key_axis {
@@ -159,17 +199,35 @@ impl Engine {
         row.ok_or_else(|| EngineError::NoSuchAccount(id.to_string()))
     }
 
-    /// §12.7: the mapping of `cwd`'s canonical path, or of its nearest mapped ancestor, for
-    /// `provider`. `map` stores `fs::canonicalize`'s result rebuilt from its components, and
+    /// §12.7 (config-mappings spec §3.2): the mapping of `cwd`'s canonical path, or of its nearest
+    /// mapped ancestor, for `provider`, across `config.toml`'s entries and the database's rows.
+    /// `map` stores `fs::canonicalize`'s result rebuilt from its components, and
     /// `nearest_mapping` rebuilds the same way, so a `cwd` reached through a symlink, a `.` or a
     /// trailing `/` finds what `map` stored. A directory that cannot be resolved is looked up as
     /// given.
+    ///
+    /// The file is read afresh on every call, never from the engine's settings snapshot, and its
+    /// warnings are dropped: the command's own load printed them. The file wins a directory both
+    /// sources map. Only the winning group's value is resolved, so the lookup does no network or
+    /// Keychain work and creates nothing.
     fn mapped_account(&self, provider: &ProviderId, cwd: &Path) -> Result<Mapped, EngineError> {
-        let Some(store) = self.existing_store()? else {
-            return Ok(Mapped::Nothing);
-        };
         let dir = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        let Some(mapping) = store.nearest_mapping(&dir, provider)? else {
+        let entries = Settings::load(&self.env, provider).0.mappings;
+        let store = self.existing_store()?;
+        let database = match &store {
+            Some(store) => store.nearest_mapping(&dir, provider)?,
+            None => None,
+        };
+        let from_file = nearest_entries(&entries, &dir);
+        let database_depth = database
+            .as_ref()
+            .map_or(0, |m| Path::new(&m.path).components().count());
+        if let Some((depth, group)) = from_file
+            && depth >= database_depth
+        {
+            return self.file_mapping(store.as_deref(), provider, &group);
+        }
+        let (Some(store), Some(mapping)) = (store, database) else {
             return Ok(Mapped::Nothing);
         };
         // Decision 7: a mapping goes with its account (ON DELETE CASCADE), so a row missing
@@ -177,6 +235,44 @@ impl Engine {
         Ok(match store.account(&mapping.account_id)? {
             Some(row) => Mapped::Account(row),
             None => Mapped::Gone { path: mapping.path },
+        })
+    }
+
+    /// What the entries `group`, which map one directory, name (config-mappings spec §3.2).
+    fn file_mapping(
+        &self,
+        store: Option<&Store>,
+        provider: &ProviderId,
+        group: &[&MappingEntry],
+    ) -> Result<Mapped, EngineError> {
+        let file = settings::config_path(&self.env);
+        let keys = group
+            .iter()
+            .map(|e| format!("{:?}", e.written))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let value = &group[0].value;
+        if group.iter().any(|e| &e.value != value) {
+            return Ok(Mapped::NotHere {
+                why: format!(
+                    "the mappings {keys} in {} share a directory and have different values",
+                    file.display()
+                ),
+            });
+        }
+        let p = self.provider(provider)?;
+        Ok(match resolve_value(store, &*p, value)? {
+            (Some(row), None) => Mapped::Account(row),
+            (_, problem) => {
+                let problem = problem.unwrap_or(MappingProblem::NoAccount);
+                Mapped::NotHere {
+                    why: format!(
+                        "the mapping {keys} in {} {}",
+                        file.display(),
+                        problem.describe()
+                    ),
+                }
+            }
         })
     }
 
