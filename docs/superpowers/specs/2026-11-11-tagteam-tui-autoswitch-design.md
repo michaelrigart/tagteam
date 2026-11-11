@@ -1,6 +1,6 @@
 # tagteam — The TUI switches accounts while it is open
 
-**Status:** Approved
+**Status:** In progress
 **Date:** 2026-11-11
 **Scope:**
 - The TUI (`crates/tagteam-tui`) runs auto-switching itself while it is open and no daemon runs,
@@ -172,7 +172,7 @@ collection waiting on a request) finishes first, within its requests' own timeou
   |---|---|---|
   | hosted `auto` | `● auto on in this window · switches at 90%` | `● auto on · at 90%` |
   | hosted `waiting` for `engine-lock`, holder a TUI | `● auto runs in another tagteam window (pid N)` | `● auto in pid N` |
-  | `waiting` for `engine-lock`, holder this TUI itself (a daemon started beside it, still waiting for its first look at the lock) | `● auto moving to the daemon` | `● auto → daemon` |
+  | `waiting` for `engine-lock`, holder this TUI itself (a daemon started beside it, still waiting for its next look at the lock) | `● auto moving to the daemon` | `● auto → daemon` |
   | no daemon, holder a TUI (C-16's case, lane not started) | as above | as above |
 
   `consume-first` keeps C-17's words after "in this window". `paused`, `idle` and the keychain
