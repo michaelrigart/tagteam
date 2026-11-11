@@ -325,6 +325,7 @@ pub(crate) fn no_switch(reason: NoSwitchReason) -> Decision {
         outcome: reason.outcome(),
         detail: String::new(),
         earliest_reset: None,
+        exhausted: None,
     }
 }
 

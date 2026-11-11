@@ -16,7 +16,7 @@ use common::{
 use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::autoswitch::{
-    AutoConfig, AutoState, AutoStrategy, Decision, NoSwitchReason, Outcome, Trigger,
+    AutoConfig, AutoState, AutoStrategy, Decision, Exhausted, NoSwitchReason, Outcome, Trigger,
 };
 use tagteam_core::{AccountId, ProviderId, Window, WindowKind};
 use tagteam_engine::auto::{AutoEvent, EventSink, TickOutcome};
@@ -161,6 +161,7 @@ fn a_tick_below_the_threshold_polls_and_stays() {
                 outcome: Outcome::NoAction,
                 detail: String::new(),
                 earliest_reset: None,
+                exhausted: None,
             }
         );
         assert_eq!(
@@ -890,6 +891,9 @@ fn every_candidate_exhausted_is_blocked_until_the_earliest_recovery() {
             outcome: Outcome::Blocked,
             detail: "2h40m".into(),
             earliest_reset: Some(SHORT_RESETS),
+            exhausted: Some(Exhausted::AllOut {
+                wake_at: Some(SHORT_RESETS),
+            }),
         }
     );
     assert_eq!(
@@ -1828,6 +1832,7 @@ fn a_cooldown_found_under_the_lock_is_no_switch_cooldown() {
             outcome: Outcome::NoAction,
             detail: "4m".into(),
             earliest_reset: None,
+            exhausted: None,
         }
     );
     assert_eq!(

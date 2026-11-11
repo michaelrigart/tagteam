@@ -246,6 +246,19 @@ impl NoSwitchReason {
     }
 }
 
+/// Ceiling spec §3.7: the detail of a `no-qualifying-candidate` where every account is above the
+/// threshold.
+pub const ALL_ABOVE: &str = "all-above";
+
+/// Ceiling spec §3.5: why every OAuth candidate is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exhausted {
+    /// Every one is out; `wake_at` is when the first has room again (§3.4's wake time), if known.
+    AllOut { wake_at: Option<i64> },
+    /// One is full and has room left.
+    RoomLeft,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
     NoSwitch {
@@ -254,8 +267,11 @@ pub enum Decision {
         /// `"2/3"` for active-usage-unknown, the time left for cooldown (`4m`), the time until
         /// the earliest recovery for all-exhausted; `""` otherwise.
         detail: String,
-        /// all-exhausted: the earliest recovery (`earliestResetAt`).
+        /// all-exhausted: when the move this tick wanted could first land (`earliestResetAt`,
+        /// ceiling spec §3.4).
         earliest_reset: Option<i64>,
+        /// all-exhausted only: which case it is.
+        exhausted: Option<Exhausted>,
     },
     Switch {
         trigger: Trigger,
@@ -301,7 +317,7 @@ const RECHECK_FRESH_S: i64 = 180;
 const RECOVERED_PTS: f64 = 3.0;
 /// §11.2 step 8 and §11.3: a recovery this much sooner counts.
 const RECOVERY_HYSTERESIS_S: i64 = 300;
-/// §11.2 step 8: headroom within this many points of none is spent.
+/// §11.2 step 8: headroom within this many points of the ceiling's is spent.
 const SPENT_HEADROOM_PCT: f64 = 3.0;
 /// §11.2 step 8: a recovery within this horizon makes the recovery axis useful.
 const RECOVERY_HORIZON_S: i64 = 14_400;
@@ -319,8 +335,6 @@ struct Rated<'s> {
     recovery_at: Option<i64>,
     /// When `cfg.long_window` resets (consume-first); `None` when unknown or already past.
     long_reset: Option<i64>,
-    /// When every relevant window at its limit has reset (`rank::blocked_until` at 100).
-    back_at: Option<i64>,
 }
 
 impl<'s> Rated<'s> {
@@ -341,8 +355,13 @@ impl<'s> Rated<'s> {
                     .and_then(|w| w.resets_at),
             ),
             long_reset: future(long.and_then(|w| w.resets_at)),
-            back_at: windows.and_then(|w| blocked_until(w, &cfg.models, 100.0)),
         }
+    }
+
+    /// When every relevant window at `level` percent or more has reset (`rank::blocked_until`).
+    fn back_at(&self, models: &[String], level: f64) -> Option<i64> {
+        let windows = self.account.windows.as_deref()?;
+        blocked_until(windows, models, level)
     }
 }
 
@@ -394,8 +413,16 @@ fn is_candidate(
         && (!a.api_key || (cfg.include_api_key_accounts && trigger != Trigger::ConsumeFirst))
 }
 
-/// §11.2 step 9: every candidate is known to be at its limit (and there is one).
-fn every_candidate_exhausted(oauth: &[Rated]) -> bool {
+/// §11.2 step 9: every candidate is known to be full (and there is one).
+fn every_candidate_full(oauth: &[Rated], ceiling: f64) -> bool {
+    !oauth.is_empty()
+        && oauth
+            .iter()
+            .all(|c| c.headroom.is_some_and(|h| full(h, ceiling)))
+}
+
+/// Every candidate is known to be at its limit (and there is one).
+fn every_candidate_out(oauth: &[Rated]) -> bool {
     !oauth.is_empty() && oauth.iter().all(|c| c.headroom.is_some_and(at_limit))
 }
 
@@ -529,6 +556,7 @@ fn no_switch(reason: NoSwitchReason, detail: String, unhealthy_ticks: u32) -> De
             outcome: reason.outcome(),
             detail,
             earliest_reset: None,
+            exhausted: None,
         },
         unhealthy_ticks,
     }
@@ -639,9 +667,7 @@ fn gated(r: &Ranking, oauth: &[Rated], bar: Option<&AccountId>) -> Vec<AccountId
     let Some(active_h) = r.active_h() else {
         return Vec::new();
     };
-    // Step 4: a way back from an API key lands below the threshold whatever the others show.
-    let all_above =
-        !r.active.account.api_key && every_account_above(Some(active_h), oauth, r.cfg.threshold);
+    let all_above = all_above(r, oauth);
     let passing = oauth.iter().filter(|c| {
         let Some(h) = c.headroom else {
             return false;
@@ -707,13 +733,19 @@ fn soonest_recovery(a: &Rated, b: &Rated) -> Ordering {
     key(a).cmp(&key(b)).then_with(|| most_headroom(a, b))
 }
 
+/// §11.2 step 8's exception: every account is above the threshold. Step 4: a way back from an API
+/// key lands below the threshold whatever the others show.
+fn all_above(r: &Ranking, oauth: &[Rated]) -> bool {
+    !r.active.account.api_key && every_account_above(r.active_h(), oauth, r.cfg.threshold)
+}
+
 /// §11.2 step 9: why nothing ranked.
-fn nothing_ranked(t: &Triggered, active: &Rated, oauth: &[Rated], now: i64) -> Decided {
+fn nothing_ranked(r: &Ranking, t: &Triggered, oauth: &[Rated]) -> Decided {
     let n = t.unhealthy_ticks;
     if t.trigger == Trigger::ConsumeFirst {
         // The active account is healthy and below the threshold: never BLOCKED.
         let comparable =
-            active.long_reset.is_some() && oauth.iter().any(|c| c.long_reset.is_some());
+            r.active.long_reset.is_some() && oauth.iter().any(|c| c.long_reset.is_some());
         let reason = if comparable {
             NoSwitchReason::AlreadyConsumingSoonest
         } else {
@@ -724,16 +756,43 @@ fn nothing_ranked(t: &Triggered, active: &Rated, oauth: &[Rated], now: i64) -> D
     if oauth.iter().all(|c| c.headroom.is_none()) {
         return no_switch(NoSwitchReason::NoComparison, String::new(), n);
     }
-    if !every_candidate_exhausted(oauth) {
-        return no_switch(NoSwitchReason::NoQualifyingCandidate, String::new(), n);
+    if !every_candidate_full(oauth, r.cfg.ceiling) {
+        let detail = if !r.hard() && all_above(r, oauth) {
+            ALL_ABOVE
+        } else {
+            ""
+        };
+        return no_switch(NoSwitchReason::NoQualifyingCandidate, detail.into(), n);
     }
-    let earliest = oauth.iter().filter_map(|c| c.back_at).min();
+    // Ceiling spec §3.4: the level of the move this tick wanted.
+    let level = if r.hard() {
+        100.0
+    } else if r.trigger == Trigger::AtLimit {
+        r.cfg.ceiling - RECOVERED_PTS
+    } else {
+        r.cfg.ceiling
+    };
+    let earliest_at = |level| {
+        oauth
+            .iter()
+            .filter_map(|c| c.back_at(&r.cfg.models, level))
+            .min()
+    };
+    let earliest = earliest_at(level);
+    let exhausted = if every_candidate_out(oauth) {
+        Exhausted::AllOut {
+            wake_at: earliest_at(100.0),
+        }
+    } else {
+        Exhausted::RoomLeft
+    };
     Decided {
         decision: Decision::NoSwitch {
             reason: NoSwitchReason::AllExhausted,
             outcome: Outcome::Blocked,
-            detail: earliest.map_or_else(String::new, |at| span(at - now)),
+            detail: earliest.map_or_else(String::new, |at| span(at - r.now)),
             earliest_reset: earliest,
+            exhausted: Some(exhausted),
         },
         unhealthy_ticks: n,
     }
@@ -797,7 +856,7 @@ pub fn decide(s: &Snapshot, st: &AutoState, cfg: &AutoConfig, phase: Phase) -> D
         targets.extend(keys.into_iter().map(|a| a.id.clone()));
     }
     if targets.is_empty() {
-        return nothing_ranked(&t, &active, &oauth, s.now);
+        return nothing_ranked(&ranking, &t, &oauth);
     }
     // Decision 2: after its re-check, a consume-first switch tries only freshly read targets. A
     // stale first target is `stale-usage`; a stale later one is dropped. A trigger the re-check
@@ -839,11 +898,13 @@ pub fn departure(s: &Snapshot, cfg: &AutoConfig, from: &AccountId, trigger: Trig
 }
 
 /// §11.4 loop delay, seconds. `jitter` in [-1, 1] maps to U(0.9, 1.1).
-/// - `all-exhausted` with an `earliest_reset` t: `min(max(t + 60 − now, interval), 600)`;
-/// - any other BLOCKED outcome except `no-qualifying-candidate` (normal cadence, §11.2 step 9):
-///   `max(interval, 300)`;
-/// - everything else (switched, NO_ACTION, error, `no-qualifying-candidate`): the jittered
-///   interval, shortened to `active_next_poll_at − now` when sooner, floored at 60.
+/// - `all-exhausted` with every candidate out and a known wake time t:
+///   `min(max(t + 60 − now, interval), 600)`;
+/// - any other BLOCKED outcome except `no-qualifying-candidate` (normal cadence, §11.2 step 9)
+///   and `all-exhausted` with a candidate left that has room: `max(interval, 300)`;
+/// - everything else (switched, NO_ACTION, error, `no-qualifying-candidate`, `all-exhausted` with
+///   room left): the jittered interval, shortened to `active_next_poll_at − now` when sooner,
+///   floored at 60.
 ///
 /// The 60 s floor bounds only the poll plan's shortening, so a sleep is never lengthened
 /// (Appendix B #27): an interval below 60 s stays as it is.
@@ -857,8 +918,7 @@ pub fn next_delay(
     let interval = cfg.interval_s.max(1);
     match d {
         Decision::NoSwitch {
-            reason: NoSwitchReason::AllExhausted,
-            earliest_reset: Some(at),
+            exhausted: Some(Exhausted::AllOut { wake_at: Some(at) }),
             ..
         } => at
             .saturating_add(RESET_SLACK_S)
@@ -868,8 +928,13 @@ pub fn next_delay(
         Decision::NoSwitch {
             outcome: Outcome::Blocked,
             reason,
+            exhausted,
             ..
-        } if *reason != NoSwitchReason::NoQualifyingCandidate => interval.max(BLOCKED_SLEEP_S),
+        } if *reason != NoSwitchReason::NoQualifyingCandidate
+            && *exhausted != Some(Exhausted::RoomLeft) =>
+        {
+            interval.max(BLOCKED_SLEEP_S)
+        }
         _ => {
             let delay = jittered(interval, jitter, JITTER_FRAC).max(1);
             match active_next_poll_at {
@@ -1573,7 +1638,7 @@ mod tests {
             stopped(&run(&s, &AutoState::default(), &cfg())),
             (NoQualifyingCandidate, Outcome::Blocked, "")
         );
-        assert!(!every_candidate_exhausted(&[]));
+        assert!(!every_candidate_full(&[], 100.0));
     }
 
     #[test]
@@ -1593,6 +1658,9 @@ mod tests {
                 outcome: Outcome::Blocked,
                 detail: "2h00m".into(),
                 earliest_reset: Some(NOW + 7_200),
+                exhausted: Some(Exhausted::AllOut {
+                    wake_at: Some(NOW + 7_200)
+                }),
             }
         );
         let no_reset = reset(at(2, 100.0), "7d", None);
@@ -1608,6 +1676,7 @@ mod tests {
                 outcome: Outcome::Blocked,
                 detail: String::new(),
                 earliest_reset: None,
+                exhausted: Some(Exhausted::AllOut { wake_at: None }),
             }
         );
     }
@@ -1701,7 +1770,7 @@ mod tests {
         assert_eq!(plain.headroom, Some(40.0));
         assert_eq!(plain.recovery_at, Some(NOW + 86_400), "the 7d binds");
         assert_eq!(plain.long_reset, Some(NOW + 86_400));
-        assert_eq!(plain.back_at, None, "spend never counts");
+        assert_eq!(plain.back_at(&[], 100.0), None, "spend never counts");
         let fable = AutoConfig {
             models: vec!["fable".into()],
             ..cfg()
@@ -1722,15 +1791,27 @@ mod tests {
             outcome: Outcome::NoAction,
             detail: String::new(),
             earliest_reset: None,
+            exhausted: None,
         }
     }
 
-    fn blocked(reason: NoSwitchReason, earliest_reset: Option<i64>) -> Decision {
+    fn blocked(reason: NoSwitchReason) -> Decision {
         Decision::NoSwitch {
             reason,
             outcome: Outcome::Blocked,
             detail: String::new(),
-            earliest_reset,
+            earliest_reset: None,
+            exhausted: None,
+        }
+    }
+
+    fn all_out(wake_at: Option<i64>) -> Decision {
+        Decision::NoSwitch {
+            reason: AllExhausted,
+            outcome: Outcome::Blocked,
+            detail: String::new(),
+            earliest_reset: wake_at,
+            exhausted: Some(Exhausted::AllOut { wake_at }),
         }
     }
 
@@ -1745,7 +1826,7 @@ mod tests {
     #[test]
     fn all_exhausted_sleeps_until_a_minute_after_the_earliest_recovery_at_most_600_s() {
         let c = cfg();
-        let exhausted = |at| blocked(AllExhausted, Some(at));
+        let exhausted = |at| all_out(Some(at));
         assert_eq!(next_delay(&exhausted(NOW + 100), &c, NOW, None, 0.0), 160);
         assert_eq!(next_delay(&exhausted(NOW + 7_200), &c, NOW, None, 0.0), 600);
         assert_eq!(
@@ -1778,13 +1859,13 @@ mod tests {
             NoViableTarget,
         ] {
             assert_eq!(
-                next_delay(&blocked(reason, None), &cfg(), NOW, Some(NOW + 10), 1.0),
+                next_delay(&blocked(reason), &cfg(), NOW, Some(NOW + 10), 1.0),
                 300,
                 "{reason:?}"
             );
         }
         assert_eq!(
-            next_delay(&blocked(AllExhausted, None), &cfg(), NOW, None, 0.0),
+            next_delay(&all_out(None), &cfg(), NOW, None, 0.0),
             300,
             "no known reset"
         );
@@ -1793,7 +1874,7 @@ mod tests {
             ..cfg()
         };
         assert_eq!(
-            next_delay(&blocked(NoCandidates, None), &slow, NOW, None, 0.0),
+            next_delay(&blocked(NoCandidates), &slow, NOW, None, 0.0),
             900
         );
     }
@@ -1804,7 +1885,7 @@ mod tests {
             a_switch(),
             no_action(BelowThreshold),
             no_action(LiveChanged),
-            blocked(NoQualifyingCandidate, None),
+            blocked(NoQualifyingCandidate),
         ] {
             assert_eq!(next_delay(&d, &cfg(), NOW, None, 0.0), 60, "{d:?}");
             assert_eq!(next_delay(&d, &cfg(), NOW, None, 1.0), 66, "{d:?}");
@@ -2030,7 +2111,7 @@ mod tests {
         );
         assert_eq!(
             stopped(&run(&s(NOW + 86_101), &st, &cfg())),
-            (NoQualifyingCandidate, Outcome::Blocked, "")
+            (NoQualifyingCandidate, Outcome::Blocked, ALL_ABOVE)
         );
     }
 
@@ -2453,6 +2534,9 @@ mod tests {
                     outcome: Outcome::Blocked,
                     detail: span(NOW + day - now),
                     earliest_reset: Some(NOW + day),
+                    exhausted: Some(Exhausted::AllOut {
+                        wake_at: Some(NOW + day)
+                    }),
                 },
                 "no switch between exhausted accounts"
             );
@@ -2498,7 +2582,7 @@ mod tests {
             NoViableTarget,
             InterruptedSwitch,
         ] {
-            assert_eq!(once_exit_code(&blocked(reason, None)), 3, "{reason:?}");
+            assert_eq!(once_exit_code(&blocked(reason)), 3, "{reason:?}");
         }
     }
 
@@ -2708,5 +2792,149 @@ mod tests {
         };
         assert_eq!(switched(&on(97.3)), (Trigger::AtLimit, vec![1]));
         assert_eq!(switched(&on(97.2)), (Trigger::Proactive, vec![1]));
+    }
+
+    fn room_left(earliest: i64, detail: &str) -> Decision {
+        Decision::NoSwitch {
+            reason: AllExhausted,
+            outcome: Outcome::Blocked,
+            detail: detail.into(),
+            earliest_reset: Some(earliest),
+            exhausted: Some(Exhausted::RoomLeft),
+        }
+    }
+
+    #[test]
+    fn a_soft_move_with_every_candidate_full_is_all_exhausted_at_the_normal_cadence() {
+        let candidates = || vec![oauth(1, 97.0, 93.0), at(2, 99.0)];
+        let on = |live: f64| {
+            let mut accounts = candidates();
+            accounts.push(at(3, live));
+            run(&snap(3, accounts), &AutoState::default(), &ceiling(95.0))
+        };
+        let soft = on(96.0);
+        assert_eq!(
+            soft.decision,
+            room_left(NOW + 86_400, "1d00h"),
+            "level 92: 1's 7d still binds"
+        );
+        assert_eq!(
+            next_delay(&soft.decision, &ceiling(95.0), NOW, None, 0.0),
+            60,
+            "a candidate with room is no reason to sleep"
+        );
+        assert_eq!(
+            on(92.0).decision,
+            room_left(NOW + 3_600, "1h00m"),
+            "proactive, level 95: 1's 5h alone binds"
+        );
+    }
+
+    #[test]
+    fn every_candidate_out_sleeps_toward_the_first_room_whatever_it_reports() {
+        let one = || {
+            let mut a = oauth(1, 100.0, 97.0);
+            a.windows.as_mut().unwrap()[0].resets_at = Some(NOW + 120);
+            a.windows.as_mut().unwrap()[1].resets_at = Some(NOW + 259_200);
+            a
+        };
+        let c = ceiling(95.0);
+        let wake = Some(Exhausted::AllOut {
+            wake_at: Some(NOW + 120),
+        });
+        for (live, reported) in [(100.0, NOW + 120), (96.0, NOW + 259_200)] {
+            let d = run(
+                &snap(2, vec![one(), at(2, live)]),
+                &AutoState::default(),
+                &c,
+            );
+            let Decision::NoSwitch {
+                reason,
+                earliest_reset,
+                exhausted,
+                ..
+            } = &d.decision
+            else {
+                panic!("expected a no-switch, got {d:?}");
+            };
+            assert_eq!(*reason, AllExhausted, "live at {live}");
+            assert_eq!(*earliest_reset, Some(reported), "live at {live}");
+            assert_eq!(*exhausted, wake, "live at {live}");
+            assert_eq!(next_delay(&d.decision, &c, NOW, None, 0.0), 180);
+        }
+    }
+
+    #[test]
+    fn every_candidate_out_with_no_known_reset_waits_as_any_blocked_tick() {
+        let c = ceiling(95.0);
+        let d = run(
+            &snap(2, vec![reset(at(1, 100.0), "7d", None), at(2, 96.0)]),
+            &AutoState::default(),
+            &c,
+        );
+        assert_eq!(
+            d.decision,
+            Decision::NoSwitch {
+                reason: AllExhausted,
+                outcome: Outcome::Blocked,
+                detail: String::new(),
+                earliest_reset: None,
+                exhausted: Some(Exhausted::AllOut { wake_at: None }),
+            }
+        );
+        assert_eq!(next_delay(&d.decision, &c, NOW, None, 0.0), 300);
+    }
+
+    #[test]
+    fn full_oauth_candidates_and_a_key_never_draw_a_soft_move() {
+        let keys = AutoConfig {
+            ceiling: 95.0,
+            ..with_keys()
+        };
+        let s = snap(2, vec![at(1, 97.0), at(2, 95.0), api_key(3)]);
+        let d = run(&s, &AutoState::default(), &keys);
+        assert_eq!(
+            d.decision,
+            room_left(NOW + 86_400, "1d00h"),
+            "the key is no candidate of a soft move"
+        );
+    }
+
+    #[test]
+    fn an_unknown_candidate_is_never_full() {
+        let s = snap(3, vec![at(1, 97.0), unknown(2), at(3, 96.0)]);
+        assert_eq!(
+            stopped(&run(&s, &AutoState::default(), &ceiling(95.0))),
+            (NoQualifyingCandidate, Outcome::Blocked, ALL_ABOVE),
+            "an unknown candidate does not count against every account above"
+        );
+    }
+
+    #[test]
+    fn no_qualifying_candidate_says_when_every_account_is_above_the_threshold() {
+        for c in [95.0, 100.0] {
+            let s = snap(2, vec![at(1, 93.0), at(2, 95.0)]);
+            assert_eq!(
+                stopped(&run(&s, &AutoState::default(), &ceiling(c))),
+                (NoQualifyingCandidate, Outcome::Blocked, ALL_ABOVE),
+                "ceiling {c}"
+            );
+        }
+        let below = snap(2, vec![at(1, 85.0), at(2, 92.0)]);
+        assert_eq!(
+            stopped(&run(&below, &AutoState::default(), &cfg())),
+            (NoQualifyingCandidate, Outcome::Blocked, ""),
+            "a candidate below the threshold, not far enough ahead"
+        );
+        let quarantined = AccountSnapshot {
+            quarantined: true,
+            ..at(2, 95.0)
+        };
+        let hard = snap(2, vec![at(1, 100.0), quarantined, unknown(3)]);
+        assert_eq!(
+            stopped(&run(&hard, &AutoState::default(), &cfg())),
+            (NoQualifyingCandidate, Outcome::Blocked, ""),
+            "a hard move is never 'not far enough ahead'"
+        );
     }
 }
