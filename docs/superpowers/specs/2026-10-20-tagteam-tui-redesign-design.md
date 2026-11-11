@@ -921,7 +921,7 @@ The problem sentence before it names the cause: `Needs a new login: its stored l
 | `below-threshold` | `no switch needed (77%, switches at 90%)` |
 | `cooldown` | `waiting 4m after the last switch` |
 | `all-exhausted` | `every account is near its limit; the first frees up at 16:40` |
-| `no-qualifying-candidate` | `no other account has enough headroom`; with `detail` `all-above` (nothing ranked, every account above the threshold): `every account is above 90%, and none is far enough ahead to switch to`. *(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.7.)* |
+| `no-qualifying-candidate` | `no other account has enough headroom`; with `detail` `all-above` (nothing ranked, every account above the threshold, the live account not an API key): `every account is above 90%, and none is far enough ahead to switch to`. *(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.7.)* |
 | `no-candidates` | `no other account can be used` |
 | `no-comparison` | `no other account has a reading to compare` |
 | `stale-usage` | `the best account's reading is too old; checking it first` |

@@ -187,16 +187,17 @@ seconds and waits 300 seconds between automatic switches. Change these with flag
 `autoswitch.strategy`, for example `tagteam config set autoswitch.threshold 85`. To switch in
 the background, without a terminal, use the [daemon](#daemon), which reads the same settings.
 
-Usage can reach an account from places tagteam cannot see, such as the web app or another
-machine, and tagteam reads it once per check. To keep auto from running an account to the limit,
-set `autoswitch.ceiling`, for example `tagteam config set autoswitch.ceiling 95`. At or above the
-ceiling, auto leaves the account at once, without waiting for the cooldown, for an account more
-than 3 points below the ceiling. It never moves onto an account at or above the ceiling, or onto
-an API key, because of it. The ceiling must be above `autoswitch.threshold`: `config set` refuses
-a pair that breaks this, and a file that has one runs with a ceiling of 100 and a warning. The
-default is 100, which keeps the behaviour above. tagteam picks the account, but it cannot stop
-usage that reaches the ceiling from elsewhere between two checks, so a ceiling below 100 is a
-margin, not a guarantee.
+Usage can reach an account from places tagteam cannot see, such as the web app or another machine,
+and tagteam reads usage only at intervals, so a reading can already be out of date. To keep auto
+from running an account to the limit, set `autoswitch.ceiling`, for example
+`tagteam config set autoswitch.ceiling 95`. At or above the ceiling, auto leaves the account at
+once, without waiting for the cooldown, for an account more than 3 points below the ceiling. It
+never moves onto an account at or above the ceiling, or onto an API key, because of it. The
+ceiling must be above `autoswitch.threshold`: `config set` and `config unset` refuse a change that
+breaks this. A file that already breaks it, by hand, blocks no write and runs with a ceiling of
+100 and a warning. The default is 100, which keeps the behaviour above. tagteam picks the account,
+but it cannot stop usage that reaches the ceiling from elsewhere between two checks, so a ceiling
+below 100 is a margin, not a guarantee.
 
 ### Daemon
 
