@@ -12,8 +12,9 @@ nothing twice and says truthfully where auto runs.
 
 **Architecture:** The engine lock's holder record gains `"holder": "daemon" | "auto" | "tui"`.
 `tagteam-daemon` gains `hosted`: `run_hosted` runs the daemon's settings job, store watch, the
-schema half of the upgrade watch, and one provider job per provider behind a *daemon gate*, a job
-that reads `daemon.lock` every second and drops or rebuilds the provider jobs. `tagteam-tui`
+schema half of the upgrade watch, and one provider job per provider behind a *daemon gate*. The
+gate reads `daemon.lock` before every provider job's run and every second while the scheduler is
+idle, and drops or rebuilds the provider jobs. `tagteam-tui`
 runs `run_hosted` on a new `auto` lane thread built from a factory the binary supplies. The lane's
 board and events reach the state machine through the protocol's own encoding, as `Msg::Lane`, and
 the state machine treats them as it treats a live daemon's `status` and events.
@@ -37,8 +38,9 @@ Line numbers are as of `a356e75d` and will drift.
   `EventSource::Auto`, the lane's own cancel token and the counted Keychain, and holds its locks
   as `HolderKind::Tui` (S§3.1, S§3.6).
 - Gate: `daemon.lock`'s record is live when `read_daemon_record` gives `Present` and its stamp is
-  not `Liveness::Dead`. Checked every `SLICE_MS` (1 000 ms). Grace after a record dies:
-  `GRACE_MS = 30_000`, on the engine clock (S§3.2).
+  not `Liveness::Dead`. It is checked before every provider job's run, and at least every
+  `SLICE_MS` (1 000 ms) while the scheduler sleeps. Grace after a record dies:
+  `GRACE_MS = 30_000` of forward time on the engine clock (S§3.2).
 - Header words are S§3.3's, character for character. Shorten one only if a width check forces it
   (S§6), and record that as a ruling.
 - Out of scope: a schema check inside every store write (S§3.7; Michael, 2026-11-11).
@@ -52,8 +54,9 @@ Line numbers are as of `a356e75d` and will drift.
 
 ## Review Focus
 
-1. **The wall clock set back during the 30 s grace** must not stretch the grace past 30 s, as
-   D4.2 rules for every wait. Task 2, `a_clock_set_back_during_the_grace_never_stretches_it`.
+1. **The wall clock set back during the 30 s grace** must not stretch the grace past 30 s of
+   time that actually passed, as D4.2 rules for every wait. Task 2,
+   `a_clock_set_back_during_the_grace_never_stretches_it`.
 2. **A second TUI takes over when the first quits**, at its next re-evaluation (60 s or less), as
    a daemon does. Task 2, `two_runs_on_one_home_the_second_waits_and_takes_over`.
 3. **Ctrl-Z while a tick is in flight** stops the process once that job returns: the lane's token
@@ -72,11 +75,15 @@ Line numbers are as of `a356e75d` and will drift.
 1. **Hosting lives in `tagteam-daemon`** (`hosted.rs`). It reuses the daemon's private
    `SettingsJob` and its test fixture (`Fx`, `Slices`, `Emitted`). The TUI only threads it
    (S§6: "the lane's start and stop mechanics").
-2. **The gate is a job**, `daemon-gate`, added first so it wins ties, and due every
-   `SLICE_MS`. It runs at every pass in which the scheduler would otherwise sleep, and between
-   jobs. Provider jobs are wrapped (`HostedJob`), dropped and rebuilt in place, and the scheduler
-   lives as long as the lane. A gate flip wakes `provider:` so every wrapper acts at the next
-   passes.
+2. **The gate is one shared state with two callers.**
+   - Every provider job is wrapped (`HostedJob`), and each wrapper looks at the gate before it
+     runs. No provider work starts on a stale look, even for a job overdue behind a long run
+     (the scheduler picks the earliest due, not the first added).
+   - A gate job, `daemon-gate`, looks every `SLICE_MS`, so a daemon that comes up while the
+     scheduler sleeps is seen within a second.
+   - A look that flips the gate wakes `provider:`, so every wrapper drops or rebuilds its job at
+     the next passes.
+   - The scheduler lives as long as the lane.
 3. **Status and events cross through the protocol's own encoding**: `status_json` →
    `serde_json::from_value::<Status>`, and `daemon_event_json` → `parse_event`. The header
    therefore reads exactly what a socket would give (S§3.3).
@@ -86,6 +93,11 @@ Line numbers are as of `a356e75d` and will drift.
 5. **Writers under §3.7**: every `Action` but `Doctor` and `Autoswitch` (`R` included, since a
    session's launch writes the store). The token index lives in the store, so its refreshes (the
    first, the Tokens timers, `r` on Tokens) stop too ("the TUI as a whole stops writing").
+   - The refusal happens twice. The state machine refuses before submitting (Task 4).
+   - A shared flag, set by the auto lane before it reports `Upgraded`, also refuses a writer that
+     a lane takes off its queue, or that the UI thread is about to suspend for, after detection
+     (Task 6).
+   - Only work already started when the flag is set finishes (S§3.7).
 6. **Header precedence**: live daemon → upgraded → mismatch → stopping → hosted job → daemon
    record without link → lock holder (C-16) → `○ auto off · no daemon`.
 7. **A TUI holder is named wherever the TUI shows a waiting-for-engine-lock state**, live or
@@ -253,12 +265,14 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
 
 - [ ] **Step 1: Write the failing tests** (in `hosted.rs`, on `Fx`, `Slices`, `Emitted`, `read_two`-style readings; `fx.tui_engine()` is the lane's engine)
 
-  - `gate_rule`, a table over the pure gate (`Gate::at_start(daemon_live)`,
-    `Gate::step(daemon_live, now_ms) -> bool` for "changed"):
+  - `gate_rule`, a table over the pure gate (`Gate::at_start(daemon_live, now_ms)`,
+    `Gate::step(&mut self, daemon_live, now_ms) -> bool` for "changed", `Gate::runs(&self)`):
     - started at once with no daemon;
     - stopped at start with a daemon, and still stopped 29 999 ms after the record died;
     - started at 30 000 ms;
-    - stopped again at once when a record comes back during the grace, and the grace restarts.
+    - stopped again at once when a record comes back during the grace, and the grace restarts;
+    - with the record dead 20 000 ms, a step an hour earlier adds nothing. The gate starts once
+      10 000 ms more have passed after that step, not 30 000.
   - `with_no_daemon_the_jobs_take_the_lock_and_store_a_switch_as_auto`: with `read_two(95.0)`,
     the first pass holds the lock, its record names `tui`, and the tick switches 2 → 1. The stored
     `switch` event's source is `auto`, and `on_status` got a line in `auto`.
@@ -273,8 +287,15 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
     the next tick.
   - `the_jobs_start_again_30_s_after_the_record_dies_and_not_before`: the record is emptied at
     `T0 + 5 s`. The lock is `Absent` at `T0 + 34.9 s`, and `Present` (`tui`) by `T0 + 36 s`.
-  - `a_clock_set_back_during_the_grace_never_stretches_it`: the record dies, the clock jumps back
-    an hour, and the jobs start no later than 30 s of slices after the record died.
+  - `a_clock_set_back_during_the_grace_never_stretches_it`: the record dies, 20 s of slices pass,
+    then the clock jumps back an hour. The lock is `Absent` 9 s of slices after the jump, and
+    `Present` by 11 s.
+  - `an_overdue_provider_never_starts_work_after_a_daemon_appears`. Claude Code and FakeAgent each
+    have two accounts in `auto`. Claude Code's usage request goes through a test `Http`, which
+    writes the daemon record and advances the fake clock past FakeAgent's next tick before it
+    returns. After that request:
+    - no usage request is sent for either provider;
+    - both lock records are `Absent` by the end of the next passes.
   - `a_daemon_live_at_start_keeps_every_provider_job_from_running`: no lock is taken and no
     `mode` event is emitted.
   - `a_newer_schema_ends_the_run_with_schema_and_frees_the_lock`: at start (store version set
@@ -313,12 +334,17 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
   6. Run. `StopReason::Schema` (or `Upgrade`, never expected) → `Schema`, else `Signal`. Drop the
      scheduler before returning.
 
-  - **Gate job** (`name` `daemon-gate`, `Ran::After(SLICE_MS)` always):
-    - Reads `live_daemon_pid(engine.env())` and steps a shared `Rc<Cell<bool>>` "jobs run".
-    - Wakes `JOB_PREFIX` when that flips, then reports the board through the shared reporter.
-    - Grace: a `now_ms` earlier than the time the record died resets that time to `now_ms`
-      (Review Focus 1).
-  - **`HostedJob`** (`name` `provider:<id>`), holding `Option<ProviderJob<'e>>`:
+  - **`Gate`**, pure. It keeps whether jobs run and the forward time the record has been dead.
+    - A step adds `max(0, now_ms - last_ms)` only when this look and the one before both found no
+      live record. A clock set back adds nothing (Review Focus 1).
+    - A live record stops the jobs and zeroes that time.
+  - **One look** (`look(engine, gate, wake) -> bool`, "jobs run"): reads
+    `live_daemon_pid(engine.env())`, steps the shared `Rc<RefCell<Gate>>`, and wakes `JOB_PREFIX`
+    when the gate flips. The gate job and every `HostedJob` call it.
+  - **Gate job** (`name` `daemon-gate`, `Ran::After(SLICE_MS)` always): one look, then reports
+    the board through the shared reporter.
+  - **`HostedJob`** (`name` `provider:<id>`), holding `Option<ProviderJob<'e>>`. It starts each
+    run with one look.
     - While the gate stops jobs: drops its inner job (freeing its lock), calls
       `board.remove_provider`, and returns `Ran::After(60_000)`.
     - While jobs run: builds the inner job if it has none, with
@@ -578,20 +604,22 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
 
 ### Task 6: The auto lane thread, Ctrl-Z, quit, and the binary's factory (S§3.1)
 
-**Depends on:** Tasks 2, 5.
+**Depends on:** Tasks 2, 4, 5.
 
 **Files:**
 - Create: `crates/tagteam-tui/src/auto_lane.rs`
 - Modify: `crates/tagteam-tui/src/lib.rs` (`pub mod auto_lane`),
-  `crates/tagteam-tui/src/lanes.rs:226-352` (`Lanes.auto`, `spawn`, `close`, `join`),
-  `crates/tagteam-tui/src/runtime.rs:43-73,96-124,272-318,633-662` (`TuiOptions.auto`, spawn,
-  `await_lane`, `Ui::stop`), `crates/tagteam-tui/src/testutil.rs` (a `LaneHome` fixture),
+  `crates/tagteam-tui/src/lanes.rs:226-352` (`Lanes.auto`, `Lanes.upgraded`, the actions and
+  index lanes, `spawn`, `close`, `join`),
+  `crates/tagteam-tui/src/runtime.rs:43-73,96-124,272-318,578-620,633-662` (`TuiOptions.auto`,
+  spawn, `await_lane`, `Ui::suspend`, `Ui::stop`), `crates/tagteam-tui/src/testutil.rs` (a `LaneHome` fixture),
   `crates/tagteam/src/tui_cmd.rs` (`auto_engines`, `TuiOptions.auto`)
-- Test: `crates/tagteam-tui/src/auto_lane.rs` tests, `runtime.rs` tests, `tui_cmd.rs` tests
+- Test: `crates/tagteam-tui/src/auto_lane.rs` tests, `lanes.rs` tests, `runtime.rs` tests,
+  `tui_cmd.rs` tests
 
 **Interfaces:**
 - Consumes: `run_hosted`, `HostedOptions`, `HostedEnd` (Task 2); `LaneReport`, `await_lane`
-  (Task 3).
+  (Task 3); `UPGRADED`, `Action::writes_store` (Task 4).
 - Produces, in `tagteam_tui::auto_lane`:
   ```rust
   pub struct LaneEngine { pub engine: Engine, pub keychain_counts: Vec<Arc<ReadCounts>> }
@@ -599,8 +627,13 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
   pub type AutoFactory = Arc<dyn Fn(Cancel) -> Result<LaneEngine, SourceError> + Send + Sync>;
   pub(crate) struct AutoLane { /* factory, provider, tx, the run's token and handle, upgraded flag */ }
   impl AutoLane {
-      /// Starts the first run.
-      pub(crate) fn spawn(factory: AutoFactory, provider: Option<ProviderId>, tx: &Sender<Msg>) -> AutoLane;
+      /// Starts the first run. `upgraded` is `Lanes.upgraded`.
+      pub(crate) fn spawn(
+          factory: AutoFactory,
+          provider: Option<ProviderId>,
+          tx: &Sender<Msg>,
+          upgraded: Arc<AtomicBool>,
+      ) -> AutoLane;
       /// A new run with a fresh token, unless one runs or a run ended `Schema`.
       pub(crate) fn resume(&self);
       /// Sets the run's token and joins its thread (Ctrl-Z).
@@ -615,6 +648,17 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
   - `TuiOptions.auto: Option<AutoFactory>`; the runtime tests' `options()` sets `None`.
   - `Lanes::spawn(.., auto: Option<AutoFactory>)`, `Lanes::suspend_auto(&self)` and
     `Lanes::resume_auto(&self)`, which do nothing without a lane.
+  - `Lanes.upgraded: Arc<AtomicBool>` (Ruling 5). The auto lane sets it before it sends
+    `LaneReport::Upgraded`. Once it is set, a writer is refused at the moment it would start:
+    - the actions lane answers a dequeued `Collect` with
+      `Msg::Collected { result: Err(SourceError { kind: "store", message: UPGRADED }) }`;
+    - it answers a dequeued `Act` whose `action.writes_store()` with
+      `Msg::ActionDone { outcome: ActionOutcome::Done { exit: 1, out: "", err: UPGRADED } }`;
+    - the index lane answers a dequeued `Refresh` with `Msg::Refreshed { result: Err(..) }`, the
+      same error;
+    - `Ui::suspend` delivers that `ActionDone` for a writer, without handing the terminal over.
+
+    None of them calls the source or the host.
   - In the binary, `fn auto_engines(ctx: Context, provider: Option<ProviderId>) -> AutoFactory`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -639,6 +683,17 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
     - `a_lane_that_ended_for_a_newer_store_is_not_started_again_after_ctrl_z`: the home's store
       schema is set above `SCHEMA_VERSION`, so the state sees `Upgraded`. After Ctrl-Z and the
       resume, the factory has been called once in all.
+  - `lanes.rs` tests: `a_store_write_queued_when_the_store_turns_newer_never_starts`. The actions
+    lane's source blocks its first `collect_due` on a gate; behind it are queued a second
+    `Collect` and an `Act(Switch)`. `upgraded` is set, then the gate opens.
+    - The second `Collect` is answered `Err` with `UPGRADED`, and the `Act` with exit 1 and
+      `UPGRADED`.
+    - `collect_due` ran once, and the host's `act` never ran.
+    - An `Act(Doctor)` queued the same way still runs.
+    - A queued index `Refresh` is answered `Err`, and `refresh_tokens` never ran.
+  - `runtime.rs` tests: `a_writer_handed_the_terminal_after_the_store_turns_newer_never_runs`:
+    with `upgraded` set, `Cmd::Suspend(Run(..))` never calls `act_foreground`, never releases the
+    terminal, and delivers the exit-1 `UPGRADED` outcome.
   - `tui_cmd.rs`: `the_auto_lane_s_engines_record_auto_and_hold_as_a_tui_under_the_lane_s_token`.
     A `Context` over a temp home goes through `auto_engines(ctx, None)(token)`:
     - `engine.source()` is `Auto`;
@@ -661,6 +716,11 @@ sp-standard for every task; escalate to sp-architect after a failed attempt.
     - `Off` → `LaneReport::Off`; `Schema` → set the upgraded flag, then `LaneReport::Upgraded`.
     - A guard sends `Msg::LaneDied { lane: "auto" }` if the thread unwinds.
   - **`Lanes`**: `close` calls `auto.close()`, and `join` pushes `"auto"` when its join fails.
+    `upgraded` is created in `Lanes::spawn` and shared with the auto lane, the actions lane and
+    the index lane.
+  - **The refusal at start** is one function, used by both lanes and `Ui::suspend`. It checks
+    `upgraded` (`Ordering::SeqCst`) as each request is taken, before the source or host is
+    called.
   - **`run_with`**: spawns the lane when `opts.auto` is set, and `Ui::new` calls
     `state.daemon.await_lane(now)` then.
   - **`Ui::stop`**: after `paused(None)` succeeds, `lanes.suspend_auto()` runs before
