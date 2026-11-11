@@ -2,7 +2,7 @@
 //! (spec §4.2, §4.3).
 
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_daemon::protocol::Status;
+use tagteam_daemon::protocol::{Event, Status};
 use tagteam_engine::timeline::{Scope, TimelineView};
 use tagteam_engine::tokens::{IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport};
 
@@ -121,6 +121,21 @@ impl Coalesce for ActionsReq {
     }
 }
 
+/// What the auto lane reports (TUI autoswitch spec §3.3): its board and events as the daemon's
+/// protocol encodes them, so the state machine reads them as it reads a socket's.
+// Task 6's lane thread constructs these; drop the allow there.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) enum LaneReport {
+    /// The lane's board as `status` encodes it; no `providers` while it runs no job.
+    Status(Status),
+    Event(Event),
+    /// It runs nothing: inside a run shell, or its engine or store could not be opened.
+    Off,
+    /// The store's schema is newer than this build's: stopped until the TUI restarts.
+    Upgraded,
+}
+
 /// One input to `update`. The data variants are large, as the engine's views are, and a
 /// message is moved once, so they are not boxed.
 #[allow(clippy::large_enum_variant)]
@@ -181,6 +196,9 @@ pub enum Msg {
         link: u64,
         result: Result<Status, StatusError>,
     },
+    /// What the auto lane reported (TUI autoswitch spec §3.3).
+    #[allow(dead_code)]
+    Lane(LaneReport),
     /// The runtime began the shutdown (spec §10.2 step 1); it exits with `code`.
     ShutdownBegan {
         code: i32,
