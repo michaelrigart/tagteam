@@ -15,10 +15,15 @@ use std::time::{Duration, Instant};
 
 use common::pty::{Finished, Pty, Screen};
 use common::{
-    FakeCall, Guarded, cmd, fake_claude, fake_claude_calls, live_email, login, now_epoch_s,
-    path_with, seed_home, short_tempdir, std_cmd, turn, two_fresh_accounts, write_transcript,
+    FakeCall, Guarded, USAGE, cmd, fake_claude, fake_claude_calls, live_email, login, now_epoch_s,
+    path_with, record_reading, seed_home, sent_with, short_tempdir, std_cmd, turn, two_bearers,
+    two_fresh_accounts, usage_reply, usage_window, write_transcript,
 };
-use tagteam_core::AccountId;
+use serde_json::json;
+use tagteam_cc::CLAUDE_CODE;
+use tagteam_core::{AccountId, ProviderId, WindowKind};
+use tagteam_engine::store::Store;
+use tagteam_provider::mock_server::{MockReply, MockServer};
 use tagteam_provider::{Env, FileKeychain, MARKER_FILE, profile_path};
 
 /// How long one step may take before it counts as stuck.
@@ -52,6 +57,17 @@ impl Home {
 
     fn in_dir(dir: tempfile::TempDir) -> Home {
         let (a, _b) = two_fresh_accounts(dir.path());
+        Home::around(dir, a)
+    }
+
+    /// `in_dir`, with accounts that have an access token each (`two_bearers`), so that a usage
+    /// server's log tells them apart.
+    fn with_bearers(dir: tempfile::TempDir) -> Home {
+        let (a, _b) = two_bearers(dir.path());
+        Home::around(dir, a.as_str().to_owned())
+    }
+
+    fn around(dir: tempfile::TempDir, a: String) -> Home {
         fake_claude(dir.path());
         fs::create_dir_all(dir.path().join("work")).unwrap();
         Home { dir, a }
@@ -1261,4 +1277,95 @@ fn a_daemon_that_stops_leaves_the_tui_on_its_timer_until_the_next_one_answers() 
     let f = tui.finish(LONG);
     assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
     stop(daemon);
+}
+
+#[test]
+fn with_no_daemon_the_tui_switches_an_account_at_its_limit() {
+    // Auto-switching spec §4: with no daemon, the open TUI's lane collects the account with no
+    // reading, finds it at its limit, and switches to the one below the threshold. The binary
+    // registers Claude Code only, so this runs it with the fake `claude` and a mock usage
+    // server.
+    let home = Home::with_bearers(short_tempdir());
+    let root = home.root();
+    cmd(root)
+        .args(["config", "set", "notify.enabled", "false"])
+        .assert()
+        .success();
+    let env = Env::for_test(root);
+    let open_store = || {
+        Store::open_existing(&env.data_dir().join("tagteam.db"))
+            .unwrap()
+            .unwrap()
+    };
+    let rows = open_store()
+        .accounts(&ProviderId::new(CLAUDE_CODE))
+        .unwrap();
+    let now = now_epoch_s();
+    record_reading(
+        root,
+        rows[0].id.as_str(),
+        now,
+        &[
+            usage_window(
+                "5h",
+                "5h",
+                WindowKind::Short,
+                10.0,
+                Some(now + 9_630),
+                Some(18_000),
+            ),
+            usage_window(
+                "7d",
+                "7d",
+                WindowKind::Long,
+                10.0,
+                Some(now + 291_630),
+                Some(604_800),
+            ),
+        ],
+    );
+    let server = MockServer::start();
+    let MockReply::Json { status, mut body } = usage_reply(now) else {
+        unreachable!("usage_reply answers with JSON")
+    };
+    body["five_hour"]["utilization"] = json!(100.0);
+    server.on("GET", USAGE, MockReply::Json { status, body });
+    assert_eq!(live_email(root), "b@x.co");
+
+    let mut c = home.command(&["tui"]);
+    c.env("TAGTEAM_TEST_API_BASE", server.base_url());
+    let mut tui = Pty::spawn(c, true);
+    tui.wait_for(LONG, "the lane switching", |s| {
+        accounts(s) && s.contains("● auto on in this window")
+    });
+    tui.wait_until(LONG, "the switch to a", || live_email(root) == "a@x.co");
+    let lock = env.data_dir().join("locks/autoswitch-claude-code.lock");
+    tui.wait_until(LONG, "the engine lock naming the TUI", || {
+        fs::read_to_string(&lock).is_ok_and(|r| r.contains(r#""holder":"tui""#))
+    });
+    let switches: Vec<_> = open_store()
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind.as_str() == "switch")
+        .collect();
+    assert_eq!(switches.len(), 1, "{switches:?}");
+    assert_eq!(switches[0].source.as_str(), "auto", "{switches:?}");
+    assert_eq!(
+        switches[0].to_id.as_ref(),
+        Some(&rows[0].id),
+        "{switches:?}"
+    );
+    assert_eq!(sent_with(&server, "at-b"), 1, "b was collected once");
+    assert_eq!(sent_with(&server, "at-a"), 0, "a's reading was fresh");
+
+    tui.type_keys(b"q");
+    let f = tui.finish(LONG);
+    assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+    assert_restored(&f);
+    assert_eq!(
+        fs::read_to_string(&lock).unwrap(),
+        "",
+        "the lane released the engine lock on quit"
+    );
 }

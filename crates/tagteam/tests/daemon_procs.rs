@@ -16,25 +16,23 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{
-    Guarded, cmd, login_with_token, now_epoch_s, record_reading, seed_home, short_tempdir, std_cmd,
-    two_fresh_accounts, usage_window,
+    Guarded, USAGE, cmd, now_epoch_s, record_reading, sent_with, short_tempdir, std_cmd,
+    two_bearers, two_fresh_accounts, usage_reply, usage_window,
 };
 use serde_json::{Value, json};
 use tagteam_cc::CLAUDE_CODE;
-use tagteam_cc::usage::format_iso8601;
 use tagteam_core::{AccountId, PollBudget, ProviderId, Window, WindowKind};
 use tagteam_daemon::client::{Client, Connect, connect_at};
 use tagteam_daemon::protocol::{Event, Status, Wire};
 use tagteam_engine::daemon::{daemon_lock_path, daemon_socket_path, read_daemon_record};
 use tagteam_engine::store::{Eligibility, Reserve, SendGrant, Store};
-use tagteam_provider::mock_server::{MockReply, MockServer};
-use tagteam_provider::{Env, FileKeychain, FlockGuard, Read};
+use tagteam_provider::mock_server::MockServer;
+use tagteam_provider::{Env, FlockGuard, Read};
 
 /// How long a binary may take to reach a state: a debug build, with tests in parallel.
 const START: Duration = Duration::from_secs(20);
 /// How long a stop may take: the scheduler's next slice, then the socket and the locks.
 const STOP: Duration = Duration::from_secs(10);
-const USAGE: &str = "/api/oauth/usage";
 
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
@@ -467,34 +465,6 @@ fn a_cli_switch_while_the_daemon_runs_reaches_a_subscriber_as_changed() {
     assert_eq!(daemon.finish(STOP).status.code(), Some(0));
 }
 
-/// The recorded usage reply, its windows' resets moved to fixed distances from `now` (as
-/// usage_cli.rs's).
-fn usage_reply(now: i64) -> MockReply {
-    let recorded: Value = serde_json::from_str(include_str!(
-        "../../tagteam-cc/tests/fixtures/endpoints/usage-200.json"
-    ))
-    .unwrap();
-    let mut body = recorded["body"].clone();
-    body["five_hour"]["resets_at"] = json!(format_iso8601(now + 9_630));
-    body["seven_day"]["resets_at"] = json!(format_iso8601(now + 291_630));
-    body["limits"][2]["resets_at"] = json!(format_iso8601(now + 291_630));
-    MockReply::Json { status: 200, body }
-}
-
-/// `a@x.co` at position 1 and `b@x.co` at position 2 (live), each with its own access token, so
-/// the server's log tells their identities apart. Neither has a reading.
-fn two_bearers(root: &Path) -> (AccountId, AccountId) {
-    let env = Env::for_test(root);
-    let kc = FileKeychain::new(root.join("keychain"));
-    seed_home(&env);
-    login_with_token(&env, &kc, "a@x.co", "", "at-a", "rt-a");
-    cmd(root).arg("add").assert().success();
-    login_with_token(&env, &kc, "b@x.co", "", "at-b", "rt-b");
-    cmd(root).arg("add").assert().success();
-    let rows = store(root).accounts(&cc()).unwrap();
-    (rows[0].id.clone(), rows[1].id.clone())
-}
-
 /// Spends `n` of `id`'s identity's hourly slots (§8.6) at `at_s`, as fetches that never
 /// recorded would: one reservation, then `n − 1` further sends under it. With `at_s` more
 /// than 90 s ago, its lease has lapsed, so only the budget stands between the account and a
@@ -523,21 +493,6 @@ fn spend(root: &Path, id: &AccountId, n: u32, at_s: i64) {
             "a slot was refused: {grant:?}"
         );
     }
-}
-
-/// The usage requests the server logged with `Bearer <at>`, from any process.
-fn sent_with(server: &MockServer, at: &str) -> usize {
-    let bearer = format!("Bearer {at}");
-    server
-        .requests()
-        .iter()
-        .filter(|r| {
-            r.path.starts_with(USAGE)
-                && r.headers
-                    .iter()
-                    .any(|(k, v)| k == "authorization" && *v == bearer)
-        })
-        .count()
 }
 
 #[test]
