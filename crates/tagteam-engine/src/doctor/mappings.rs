@@ -75,10 +75,11 @@ impl Run<'_> {
                     Check::warn(
                         Id::MAPPINGS_VALUE,
                         format!(
-                            "{} maps `{key}` to `{}`, which {}; `claude` runs plain there",
+                            "{}: the mapping `{key}` = `{}` {}; `{}` runs plain there",
                             file.display(),
                             m.entry.value,
-                            problem.describe()
+                            problem.describe(),
+                            p.launch_command()
                         ),
                     )
                     .fix(format!(
