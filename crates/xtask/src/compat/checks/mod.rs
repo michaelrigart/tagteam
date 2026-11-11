@@ -154,7 +154,7 @@ pub const CHECKS: &[Check] = &[
     ),
     check(
         "config-lock",
-        "CC's start-up writes the global config without its lock after 1.5 s (§9.1, Appendix A.7); exclusion past start-up is not tested",
+        "`claude mcp add` never saves the global config under tagteam's held lock; it waits for it (2.1.318, §9.1, Appendix A.7); CC's start-up writes are not tested",
         Phase::Live,
         false,
         None,
