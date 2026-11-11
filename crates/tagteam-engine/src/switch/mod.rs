@@ -96,16 +96,18 @@ pub struct SwitchCause {
     pub label: String,
     pub pct: f64,
     pub threshold: f64,
+    pub ceiling: f64,
 }
 
 impl SwitchCause {
-    /// `{"window", "label", "pct", "threshold"}`.
+    /// `{"window", "label", "pct", "threshold", "ceiling"}`.
     pub fn detail(&self) -> Value {
         json!({
             "window": self.window,
             "label": self.label,
             "pct": self.pct,
             "threshold": self.threshold,
+            "ceiling": self.ceiling,
         })
     }
 }

@@ -17,6 +17,7 @@ use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::autoswitch::{
     AutoConfig, AutoState, AutoStrategy, Decision, Exhausted, NoSwitchReason, Outcome, Trigger,
+    next_delay,
 };
 use tagteam_core::{AccountId, ProviderId, Window, WindowKind};
 use tagteam_engine::auto::{AutoEvent, EventSink, TickOutcome};
@@ -253,7 +254,7 @@ fn a_proactive_tick_switches_and_records_its_departure() {
 }
 
 /// §12.4, T4-23: an automatic switch's `switch` event records the live account's binding
-/// window, its label and `pct`, and the threshold it was judged by.
+/// window, its label and `pct`, and the threshold and ceiling it was judged by.
 #[test]
 fn an_automatic_switch_records_the_window_that_triggered_it() {
     for fake in [false, true] {
@@ -271,10 +272,99 @@ fn an_automatic_switch_records_the_window_that_triggered_it() {
         assert_eq!(last.kind.as_str(), "switch", "fake={fake}");
         assert_eq!(
             last.detail,
-            Some(json!({"window": window, "label": window, "pct": 95.0, "threshold": 90.0})),
+            Some(json!({
+                "window": window, "label": window, "pct": 95.0, "threshold": 90.0, "ceiling": 100.0
+            })),
             "fake={fake}"
         );
     }
+}
+
+/// S§3.5, S§3.6: with a ceiling of 95, an account at 95 % of its long window is full: the tick
+/// moves off it to the account with room, as `at-limit`, and the stored switch records the
+/// ceiling it was judged by.
+#[test]
+fn a_ceiling_below_100_moves_a_full_account_and_records_the_ceiling() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    read(&fx.engine, &a, &reading(false, 10.0, 50.0));
+    read(&fx.engine, &b, &reading(false, 20.0, 95.0));
+    let cfg = AutoConfig {
+        ceiling: 95.0,
+        ..cfg(fx.cc.as_ref())
+    };
+    let auto = fx.engine_as(EventSource::Auto);
+    let mut engine = auto.auto(&fx.provider(), cfg, false).unwrap().unwrap();
+    let (outcome, _) = engine.tick(&Recorded::default()).unwrap();
+    assert_eq!(outcome, TickOutcome::Switched);
+    let last = fx.engine.store().unwrap().events().unwrap().pop().unwrap();
+    assert_eq!(
+        (
+            last.kind.as_str(),
+            last.trigger.as_deref(),
+            last.from_id.as_ref(),
+            last.to_id.as_ref()
+        ),
+        ("switch", Some("at-limit"), Some(&b), Some(&a))
+    );
+    assert_eq!(
+        last.detail,
+        Some(json!({
+            "window": "7d", "label": "7d", "pct": 95.0, "threshold": 90.0, "ceiling": 95.0
+        }))
+    );
+}
+
+/// S§3.5: with a ceiling of 95 and every account full but one still with room, the tick is
+/// blocked and reports `all-exhausted`, and the loop keeps its normal cadence, not a wait for a
+/// reset that would not free anything.
+#[test]
+fn a_ceiling_below_100_blocks_on_full_accounts_at_the_normal_cadence() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    read(&fx.engine, &a, &reading(false, 97.0, 40.0));
+    read(&fx.engine, &b, &reading(false, 96.0, 40.0));
+    let cfg = AutoConfig {
+        ceiling: 95.0,
+        ..cfg(fx.cc.as_ref())
+    };
+    let auto = fx.engine_as(EventSource::Auto);
+    let sink = Recorded::default();
+    let mut engine = auto
+        .auto(&fx.provider(), cfg.clone(), false)
+        .unwrap()
+        .unwrap();
+    let (outcome, decision) = engine.tick(&sink).unwrap();
+    assert_eq!(outcome, TickOutcome::Blocked);
+    assert_eq!(
+        decision,
+        Decision::NoSwitch {
+            reason: NoSwitchReason::AllExhausted,
+            outcome: Outcome::Blocked,
+            detail: "2h40m".into(),
+            earliest_reset: Some(SHORT_RESETS),
+            exhausted: Some(Exhausted::RoomLeft),
+        }
+    );
+    assert_eq!(
+        sink.take()[1..],
+        [
+            no_switch(&fx.provider(), "all-exhausted", "2h40m"),
+            AutoEvent::AllExhausted {
+                provider: fx.provider(),
+                earliest_reset_at: Some(SHORT_RESETS),
+            },
+        ]
+    );
+    let exhausted = stored(&fx, EventKind::AllExhausted);
+    assert_eq!(exhausted.len(), 1, "{exhausted:?}");
+    assert_eq!(
+        exhausted[0].detail,
+        Some(json!({"earliest_reset_at": SHORT_RESETS}))
+    );
+    assert_eq!(next_delay(&decision, &cfg, T0, None, 0.0), 60);
 }
 
 /// Review Focus 5: a live login tagteam does not manage is never acted on, and the tick writes
