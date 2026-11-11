@@ -5,8 +5,8 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed, TestCaseError, TestRunner};
 use tagteam_core::autoswitch::{
-    self, AccountSnapshot, AutoConfig, AutoState, Decision, Live, NoSwitchReason, Outcome, Phase,
-    Snapshot, Trigger, decide, departure, most_severe, next_delay, once_exit_code,
+    self, AccountSnapshot, AutoConfig, AutoState, Decision, Exhausted, Live, NoSwitchReason,
+    Outcome, Phase, Snapshot, Trigger, decide, departure, most_severe, next_delay, once_exit_code,
 };
 use tagteam_core::{AccountId, Window, WindowKind};
 
@@ -139,10 +139,12 @@ fn incidents(n: usize) -> impl Strategy<Value = Vec<Incident>> {
     proptest::collection::vec(incident, 0..8)
 }
 
-/// Settings across their valid ranges (§6.4), and a provider with or without a long window.
+/// Settings across their valid ranges (§6.4), and a provider with or without a long window. The
+/// ceiling is exactly 100 one time in three, otherwise in (threshold, 100].
 fn settings() -> impl Strategy<Value = AutoConfig> {
     (
         prop_oneof![2 => Just(90.0), 1 => 50.0..99.9f64],
+        prop_oneof![1 => Just(None), 2 => (0.0..0.999f64).prop_map(Some)],
         prop_oneof![Just(0.0), Just(10.0), 0.0..50.0f64],
         prop_oneof![Just(0i64), Just(300), Just(900), Just(3_600)],
         prop_oneof![Just(15i64), Just(60), Just(300)],
@@ -157,6 +159,7 @@ fn settings() -> impl Strategy<Value = AutoConfig> {
         .prop_map(
             |(
                 threshold,
+                below_ceiling,
                 hysteresis_pct,
                 cooldown_s,
                 interval_s,
@@ -166,7 +169,7 @@ fn settings() -> impl Strategy<Value = AutoConfig> {
                 long_window,
             )| AutoConfig {
                 threshold,
-                ceiling: 100.0,
+                ceiling: below_ceiling.map_or(100.0, |u| 100.0 - u * (100.0 - threshold)),
                 hysteresis_pct,
                 cooldown_s,
                 interval_s,
@@ -449,12 +452,28 @@ fn binding_reset(a: &AccountSnapshot, now: i64) -> Option<i64> {
     binding.resets_at.filter(|&at| at > now)
 }
 
-/// When an exhausted account is back: the latest reset among its windows at 100%.
-fn back_at(a: &AccountSnapshot) -> Option<i64> {
+/// §3.1: usage at or above the ceiling. A window at exactly the ceiling is full too.
+fn is_full(h: f64, ceiling: f64) -> bool {
+    h <= 100.0 - ceiling
+}
+
+/// §3.1: usage more than the 3-point margin below the ceiling.
+fn is_clear(h: f64, ceiling: f64) -> bool {
+    h > 100.0 - ceiling + 3.0
+}
+
+/// §8.2: at the limit.
+fn is_out(h: f64) -> bool {
+    h <= 0.0
+}
+
+/// §3.4: when an account is back at `level`: the latest reset among its windows at `level`
+/// percent or more.
+fn back_at(a: &AccountSnapshot, level: f64) -> Option<i64> {
     a.windows
         .as_ref()?
         .iter()
-        .filter(|w| w.pct >= 100.0)
+        .filter(|w| w.pct >= level)
         .filter_map(|w| w.resets_at)
         .max()
 }
@@ -524,8 +543,13 @@ fn check(
                 && (!a.api_key || cfg.include_api_key_accounts)
         })
         .collect();
+    let ceiling = cfg.ceiling;
     let has_room = |a: &AccountSnapshot| headroom(a).is_some_and(|h| h > 0.0);
     let viable = candidates.iter().any(|c| c.api_key || has_room(c));
+    let oauth: Vec<&AccountSnapshot> = candidates.iter().copied().filter(|c| !c.api_key).collect();
+    let full = |a: &AccountSnapshot| headroom(a).is_some_and(|h| is_full(h, ceiling));
+    let not_full = |a: &AccountSnapshot| headroom(a).is_some_and(|h| !is_full(h, ceiling));
+    let clear = |a: &AccountSnapshot| headroom(a).is_some_and(|h| is_clear(h, ceiling));
 
     // `--once` exit codes are consistent with the outcome.
     let code = match d {
@@ -555,7 +579,7 @@ fn check(
         );
     }
     // Never idling at the limit while a viable candidate exists.
-    if !live.api_key && !live.quarantined && headroom(live).is_some_and(|h| h <= 0.0) && viable {
+    if !live.api_key && !live.quarantined && headroom(live).is_some_and(is_out) && viable {
         prop_assert!(
             matches!(
                 d,
@@ -569,11 +593,23 @@ fn check(
             d
         );
     }
+    // A full live OAuth account moves off whenever a clear OAuth candidate exists.
+    if !live.api_key && !live.quarantined && full(live) && oauth.iter().any(|c| clear(c)) {
+        prop_assert!(
+            matches!(d, Decision::Switch { .. }),
+            "full at {} with a clear candidate: {:?}",
+            s.now,
+            d
+        );
+    }
     match d {
         Decision::Switch {
             trigger, targets, ..
         } => {
             let to = find(&targets[0]);
+            // §3.1: a hard move is a failover, or an at-limit with the live account out.
+            let hard = *trigger == Trigger::Failover
+                || (*trigger == Trigger::AtLimit && headroom(live).is_some_and(is_out));
             // Never landing on an account with headroom ≤ 0.
             prop_assert!(
                 to.api_key || has_room(to),
@@ -581,10 +617,36 @@ fn check(
                 to,
                 s.now
             );
-            // Never landing on an API key unless at-limit or failover had no OAuth target.
+            // Never landing on a full account unless the move is hard and no OAuth candidate is
+            // below the ceiling.
+            if !to.api_key && full(to) {
+                prop_assert!(
+                    hard,
+                    "soft {:?} landed on full {:?} at {}",
+                    trigger,
+                    to,
+                    s.now
+                );
+                prop_assert!(
+                    !oauth.iter().any(|c| not_full(c)),
+                    "landed on full {:?} at {} past a candidate below the ceiling",
+                    to,
+                    s.now
+                );
+            }
+            // A soft move lands on a clear OAuth account.
+            if *trigger == Trigger::AtLimit && !hard {
+                prop_assert!(
+                    !to.api_key && clear(to),
+                    "soft move landed on {:?} at {}",
+                    to,
+                    s.now
+                );
+            }
+            // Never landing on an API key unless the move is hard and no OAuth candidate has room.
             if to.api_key {
-                prop_assert!(matches!(trigger, Trigger::AtLimit | Trigger::Failover));
-                prop_assert!(!candidates.iter().any(|c| !c.api_key && has_room(c)));
+                prop_assert!(hard, "{:?} landed on a key at {}", trigger, s.now);
+                prop_assert!(!oauth.iter().any(|c| has_room(c)));
             }
             // A return from an API key always lands below the threshold.
             if live.api_key {
@@ -611,15 +673,33 @@ fn check(
         Decision::NoSwitch {
             reason: NoSwitchReason::AllExhausted,
             earliest_reset,
+            exhausted,
             ..
         } => {
-            // Every candidate is known to be exhausted, and the earliest recovery is reported.
-            let oauth: Vec<&&AccountSnapshot> = candidates.iter().filter(|c| !c.api_key).collect();
-            prop_assert!(oauth.iter().all(|c| headroom(c).is_some_and(|h| h <= 0.0)));
-            prop_assert_eq!(
-                *earliest_reset,
-                oauth.iter().filter_map(|c| back_at(c)).min()
-            );
+            // Every OAuth candidate is known to be full.
+            prop_assert!(!oauth.is_empty() && oauth.iter().all(|c| full(c)));
+            // §3.4: the earliest back time is at the level of the move the live account wanted,
+            // judged in `triggered()`'s order.
+            let level = match headroom(live) {
+                _ if live.api_key => ceiling,
+                _ if live.quarantined => 100.0,
+                None => 100.0,
+                Some(h) if is_out(h) => 100.0,
+                Some(h) if is_full(h, ceiling) => ceiling - 3.0,
+                Some(_) => ceiling,
+            };
+            let earliest_at = |level: f64| oauth.iter().filter_map(|c| back_at(c, level)).min();
+            prop_assert_eq!(*earliest_reset, earliest_at(level), "level {}", level);
+            // §3.5: every candidate out is the wake-up case; one with room left is not.
+            let every_out = oauth.iter().all(|c| headroom(c).is_some_and(is_out));
+            let expected = if every_out {
+                Exhausted::AllOut {
+                    wake_at: earliest_at(100.0),
+                }
+            } else {
+                Exhausted::RoomLeft
+            };
+            prop_assert_eq!(*exhausted, Some(expected));
         }
         Decision::NoSwitch { .. } => {}
     }
@@ -631,15 +711,17 @@ fn check_delay(d: &Decision, cfg: &AutoConfig, delay: i64) -> Result<(), TestCas
     let interval = cfg.interval_s;
     match d {
         Decision::NoSwitch {
-            reason: NoSwitchReason::AllExhausted,
-            earliest_reset: Some(_),
+            exhausted: Some(Exhausted::AllOut { wake_at: Some(_) }),
             ..
         } => prop_assert!((interval.min(600)..=600).contains(&delay), "{}", delay),
         Decision::NoSwitch {
             outcome: Outcome::Blocked,
             reason,
+            exhausted,
             ..
-        } if *reason != NoSwitchReason::NoQualifyingCandidate => {
+        } if *reason != NoSwitchReason::NoQualifyingCandidate
+            && *exhausted != Some(Exhausted::RoomLeft) =>
+        {
             prop_assert_eq!(delay, interval.max(300))
         }
         // A sleep may be shortened by the poll plan, never lengthened (Appendix B #27).
