@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use tagteam_core::ProviderId;
 use tagteam_engine::EngineError;
-use tagteam_engine::mappings::{ConfigMapping, Named};
+use tagteam_engine::mappings::{ConfigMapping, MappingProblem, Named};
 use tagteam_engine::store::{AccountRow, Mapping};
 
 use crate::SCHEMA_VERSION;
@@ -64,8 +64,10 @@ fn invalid_path(path: &Path, why: &str) -> Failure {
 }
 
 /// Warnings for the file entries that named an account in `before` and name another, or none,
-/// in `after` (config-mappings spec §3.6). Entries are matched by key and value, as written.
-/// `launch` is the provider's launch command, which runs plain where an entry names none.
+/// in `after`, and for those that named more than one and now name one (config-mappings spec
+/// §3.6): an ambiguous entry ran plain, and no longer does. Entries are matched by key and
+/// value, as written. `launch` is the provider's launch command, which runs plain where an entry
+/// names none.
 pub(in crate::app) fn mapping_warnings(
     before: &[ConfigMapping],
     after: &[ConfigMapping],
@@ -75,28 +77,42 @@ pub(in crate::app) fn mapping_warnings(
     before
         .iter()
         .filter_map(|was| {
-            let named = was.account.as_ref()?;
             let now = after
                 .iter()
                 .find(|m| m.entry.written == was.entry.written && m.entry.value == was.entry.value)
                 .and_then(|m| m.account.as_ref());
-            let outcome = match now {
-                Some(a) if a.id == named.id => return None,
-                Some(a) => format!(
-                    "it now names {} (position {})",
-                    render::name(a),
-                    a.position
+            let names_now = |a: &AccountRow| {
+                format!("it now names {} (position {})", render::name(a), a.position)
+            };
+            let (was_named, outcome) = match (&was.account, now) {
+                (Some(named), Some(a)) if a.id == named.id => return None,
+                (Some(named), Some(a)) => (
+                    format!(
+                        "no longer names {} (position {})",
+                        render::name(named),
+                        named.position
+                    ),
+                    names_now(a),
                 ),
-                None => format!("`{launch}` runs plain there, with a warning"),
+                (Some(named), None) => (
+                    format!(
+                        "no longer names {} (position {})",
+                        render::name(named),
+                        named.position
+                    ),
+                    format!("`{launch}` runs plain there, with a warning"),
+                ),
+                (None, Some(a)) if was.problem == Some(MappingProblem::Ambiguous) => {
+                    ("named more than one account".to_owned(), names_now(a))
+                }
+                (None, _) => return None,
             };
             Some(format!(
-                "{}: provider.{}.mappings \"{}\" = \"{}\" no longer names {} (position {}); {outcome}",
+                "{}: provider.{}.mappings \"{}\" = \"{}\" {was_named}; {outcome}",
                 file.display(),
                 was.provider,
                 was.entry.written,
                 was.entry.value,
-                render::name(named),
-                named.position
             ))
         })
         .collect()

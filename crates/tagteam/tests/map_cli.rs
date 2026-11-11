@@ -333,6 +333,28 @@ fn removing_an_account_warns_about_config_mappings_that_named_it() {
 }
 
 #[test]
+fn removing_an_account_warns_when_an_ambiguous_entry_now_names_the_other() {
+    // Two accounts share an email, so the entry ran plain; once one goes, it names the other.
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let kc = FileKeychain::new(d.path().join("keychain"));
+    seed_home(&env);
+    login(&env, &kc, "a@x.co", "o1", "rt-1");
+    cmd(d.path()).arg("add").assert().success();
+    login(&env, &kc, "a@x.co", "o2", "rt-2");
+    cmd(d.path()).arg("add").assert().success();
+    fs::create_dir_all(d.path().join("home").join("client")).unwrap();
+    write_config(
+        d.path(),
+        "[provider.claude-code.mappings]\n\"~/client\" = \"a@x.co\"\n",
+    );
+    let out = cmd(d.path()).args(["remove", "1"]).assert().success();
+    let err = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("~/client"), "{err}");
+    assert!(err.contains("it now names a@x.co (position 2)"), "{err}");
+}
+
+#[test]
 fn unsetting_or_renaming_an_alias_warns_about_config_mappings_that_used_it() {
     let d = tempfile::tempdir().unwrap();
     two_accounts(d.path());
