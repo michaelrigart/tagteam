@@ -115,7 +115,8 @@ that reason (daemon spec, lines 63-67).
 - **Not hosted:** the program half of the upgrade watch (the TUI is not restarted for an
   upgrade), and the token jobs.
 - **Joining:** the lane is joined at shutdown, unlike the daemon lane, because it writes the
-  store. On quit the shutdown token stops the scheduler within one 1 s slice. A tick finishes
+  store. On quit the shutdown sets the lane's token, and the lane's sleep wakes on it, so the scheduler
+  stops at once and not at the end of a 1 s slice. A tick finishes
   only its critical span (core §14.1).
 - **Hand-overs keep it running.** A foreground action, such as an `R` session, runs on the UI
   thread for as long as it lasts (`runtime.rs:578-583`). The lane carries on through it, as
@@ -171,6 +172,7 @@ collection waiting on a request) finishes first, within its requests' own timeou
   |---|---|---|
   | hosted `auto` | `● auto on in this window · switches at 90%` | `● auto on · at 90%` |
   | hosted `waiting` for `engine-lock`, holder a TUI | `● auto runs in another tagteam window (pid N)` | `● auto in pid N` |
+  | `waiting` for `engine-lock`, holder this TUI itself (a daemon started beside it, still waiting for its first look at the lock) | `● auto moving to the daemon` | `● auto → daemon` |
   | no daemon, holder a TUI (C-16's case, lane not started) | as above | as above |
 
   `consume-first` keeps C-17's words after "in this window". `paused`, `idle` and the keychain

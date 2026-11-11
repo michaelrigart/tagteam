@@ -37,8 +37,8 @@ the same commands the CLI runs.
 3. **The UI thread never waits on I/O** other than the terminal. Store reads, transcript reads,
    the network, the Keychain and the daemon's socket all run on other threads (§4.3).
 4. **Usage requests go only through the collector** and its budget (core §8.3, §8.6). The TUI
-   never fetches on its own schedule, apart from the timer's collection without a daemon (§6.2)
-   and the auto lane's jobs, which collect as the daemon's do. When a daemon runs, or while the
+   never fetches on its own schedule, apart from the timer's collection for the providers nothing
+   else collects for (§6.2, §6.3) and the auto lane's jobs, which collect as the daemon's do. When a daemon runs, or while the
    auto lane's job collects for a provider (§6.2, §6.3), the TUI fetches for that provider only
    when a person asks (`r`), or when an action's CLI command does (`switch --strategy best`, for
    example). *(Amended by the TUI autoswitch spec, [§3.5](2026-11-11-tagteam-tui-autoswitch-design.md).)*
@@ -77,7 +77,7 @@ the same commands the CLI runs.
 | Live mode | Connected to the daemon's socket: its events drive refreshes (§6.3) |
 | Suspended | The TUI has handed the terminal back for a foreground action (§7.3) |
 | Signal token | The process's cancel token (core §14.1), in which the CLI's handler records SIGINT, SIGTERM and SIGHUP. Only the UI thread and a foreground action read it |
-| Shutdown token | A second `Cancel`, which the UI thread sets only when the TUI shuts down (§10.2). Every engine lane and the bridge's `Ask` watch it |
+| Shutdown token | A second `Cancel`, which the UI thread sets only when the TUI shuts down (§10.2). Every engine lane but the auto lane, and the bridge's `Ask`, watch it. The auto lane has a token of its own, which the shutdown and Ctrl-Z set (§4.3). *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)* |
 
 ## 3. Command
 
@@ -172,7 +172,7 @@ The TUI is an Elm-style loop.
   engine lanes (§10.2). The live thread and the daemon lane are not joined: they never touch the
   store, so a process exit can leave nothing of theirs half written. The auto lane is joined,
   because it writes the store: the shutdown sets the lane's own token, which stops its scheduler
-  within one 1 s slice, and a tick finishes only its critical span (core §14.1). *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
+  at once, even from a sleep, and a tick finishes only its critical span (core §14.1). *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 - **A lane that panics** closes its channel. The UI thread sees the disconnect and ends the TUI
   as an error (§10.4).
 
@@ -498,8 +498,7 @@ timer mode, since nothing else collects for it.
   except on the auto line (§8). *(Amended by the TUI redesign spec §5.3.)*
 - A 60 s timer still re-reads `accounts` and re-fetches the daemon's `status`, so a missed
   event, or a setting changed elsewhere, costs at most a minute.
-- Which providers `collect_due` skips is decided from the latest `status` reply (§8), or, for a
-  provider the auto lane runs, from its own job's mode. *(Amended by the TUI autoswitch spec, [§3.5](2026-11-11-tagteam-tui-autoswitch-design.md).)*
+- Which providers `collect_due` skips is decided from the latest `status` reply (§8).
 - `r` still runs `collect_due`, exactly as `list` would.
 
 ### 6.4 Token index
@@ -769,7 +768,8 @@ persisting its successor. So every way out goes through one shutdown sequence.
 **The sequence:**
 
 1. **Set the shutdown token,** with the triggering signal, or SIGINT for the other triggers.
-   Every lane unwinds at its next cancellation point, and critical spans run to completion.
+   Every lane but the auto lane unwinds at its next cancellation point, and critical spans run
+   to completion. The auto lane is stopped by its own token, which step 2 sets. *(Amended by the TUI autoswitch spec, [§3.1](2026-11-11-tagteam-tui-autoswitch-design.md).)*
 2. **Close the lanes.** The TUI stops submitting requests, drops every queued request that has
    not started, and closes every lane's request channel. An idle lane, blocked waiting for a
    request, wakes and returns.

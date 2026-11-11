@@ -1,6 +1,6 @@
 //! What the auto line says (redesign §5.3, T4-30): the store's last auto-line event, which the
 //! accounts read carries (§12.2), in the words History's list gives it; auto's other decisions
-//! from this link's events in live mode, or `status.lastOutcome` until one arrives; and, with
+//! from this link's events in live mode or the lane's, or `status.lastOutcome` until one arrives; and, with
 //! nothing stored in the last 30 days, that there were no switches, in both modes (M-7 lifted).
 
 use jiff::Timestamp;
@@ -42,14 +42,15 @@ pub(crate) struct Said {
     pub(crate) text: String,
     /// Rank 4's `text` is muted.
     pub(crate) muted: bool,
-    /// `next check HH:MM`: from 120 columns, in live mode with the provider's job in `auto`.
+    /// `next check HH:MM`: from 120 columns, with the provider's job (a live daemon's or the
+    /// auto lane's) in `auto`.
     pub(crate) next: Option<String>,
     /// Ranks 1 and 3: the event `w` opens (T4-15).
     pub(crate) pin: Option<(i64, EventKind)>,
 }
 
 /// What the line says for the focus provider (`daemon::focus`), first match (§5.3): its stored
-/// event of the last 30 minutes; in live mode, the daemon's latest decision; its stored event of
+/// event of the last 30 minutes; the latest decision of a live daemon or the auto lane; its stored event of
 /// the last 30 days, a switch as the last one; else that there was none. Nothing before the
 /// first accounts read.
 pub(crate) fn said(state: &State, width: u16, now_ms: i64) -> Option<Said> {
@@ -142,8 +143,8 @@ pub(crate) fn named(view: Option<&ProviderAccounts>, position: u32) -> String {
         )
 }
 
-/// The daemon's latest decision for `provider` in live mode: this link's, or `status`'s
-/// `lastOutcome`, the newer winning (T2-7).
+/// The latest decision for `provider` of a live daemon or the auto lane: this link's or the
+/// lane's events, or `status`'s `lastOutcome`, the newer winning (T2-7).
 fn decision(state: &State, provider: &ProviderId, job: Option<&StatusProvider>) -> Option<Noted> {
     let outcome = job?.last_outcome.as_ref().and_then(outcome);
     match (state.daemon.noted(provider.as_str()).cloned(), outcome) {
