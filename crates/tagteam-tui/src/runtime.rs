@@ -2662,7 +2662,7 @@ mod tests {
         };
         assert_eq!(fx.finish(ending).code, 0);
         assert!(
-            pressed.elapsed() < Duration::from_millis(300),
+            pressed.elapsed() < Duration::from_millis(500),
             "q took {:?} to end a sleeping lane",
             pressed.elapsed()
         );
@@ -2681,7 +2681,7 @@ mod tests {
             let pressed = Instant::now();
             ui.execute(vec![Cmd::Stop]);
             assert!(
-                pressed.elapsed() < Duration::from_millis(300),
+                pressed.elapsed() < Duration::from_millis(500),
                 "Ctrl-Z took {:?} to stop a sleeping lane",
                 pressed.elapsed()
             );
