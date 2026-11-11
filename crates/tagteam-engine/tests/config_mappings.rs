@@ -4,7 +4,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use common::{Fx, add_same_email, cc};
-use tagteam_engine::mappings::{ConfigMapping, MappedDir, MappingProblem};
+use tagteam_core::AccountId;
+use tagteam_engine::mappings::{ConfigMapping, MappedDir, MappingProblem, Named};
 use tagteam_engine::settings::config_path;
 
 fn write_mappings(fx: &Fx, entries: &[(&str, &str)]) {
@@ -163,4 +164,45 @@ fn with_no_store_nothing_resolves_and_nothing_is_created() {
     assert_eq!(got[0].account, None);
     assert_eq!(got[0].problem, Some(MappingProblem::NoAccount));
     assert!(!fx.env.data_dir().exists());
+}
+
+#[test]
+fn an_entry_keeps_what_its_value_names_whatever_its_directory_or_conflicts() {
+    let fx = Fx::new();
+    add_same_email(&fx, "a@x.co");
+    let one = AccountId::from_string("same-1");
+    fx.engine.set_alias(&one, Some("work")).unwrap();
+    let w = mkdir(&fx, "w");
+    write_mappings(
+        &fx,
+        &[
+            ("~/gone", "a@x.co"),
+            ("~/w", "work"),
+            (w.to_str().unwrap(), "2"),
+        ],
+    );
+
+    let got = judged(&fx);
+    assert_eq!(got[0].problem, Some(MappingProblem::MissingDirectory));
+    assert_eq!(
+        got[0].named,
+        Named::DoesNot {
+            account: None,
+            problem: MappingProblem::Ambiguous
+        }
+    );
+    assert_eq!(got[1].problem, Some(MappingProblem::Conflict));
+    assert!(
+        matches!(&got[1].named, Named::Applies(row) if row.id == one),
+        "{:?}",
+        got[1].named
+    );
+    assert_eq!(got[2].problem, Some(MappingProblem::Conflict));
+    assert_eq!(
+        got[2].named,
+        Named::DoesNot {
+            account: None,
+            problem: MappingProblem::Position
+        }
+    );
 }

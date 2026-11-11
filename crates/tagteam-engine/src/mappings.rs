@@ -91,6 +91,9 @@ pub struct ConfigMapping {
     pub provider: ProviderId,
     pub entry: MappingEntry,
     pub dir: MappedDir,
+    /// What the value alone names (§3.1), whether or not the directory exists here or another
+    /// entry shares it. `problem` puts a missing directory, then a conflict, before it.
+    pub named: Named,
     /// Set whenever the value names exactly one account, whatever the problem.
     pub account: Option<AccountRow>,
     /// `None` when the entry applies.
@@ -116,23 +119,21 @@ pub(crate) fn judge(
         .iter()
         .zip(dirs)
         .map(|(entry, dir)| {
-            let (account, named) = match resolve_value(store, p, &entry.value)? {
-                Named::Applies(row) => (Some(row), None),
-                Named::DoesNot { account, problem } => (account, Some(problem)),
-            };
+            let named = resolve_value(store, p, &entry.value)?;
             let conflict = matches!(&dir, MappedDir::Found(path) if values[path].len() > 1);
             let problem = if matches!(dir, MappedDir::Missing(_)) {
                 Some(MappingProblem::MissingDirectory)
             } else if conflict {
                 Some(MappingProblem::Conflict)
             } else {
-                named
+                named.problem()
             };
             Ok(ConfigMapping {
                 provider: provider.clone(),
                 entry: entry.clone(),
                 dir,
-                account,
+                account: named.account().cloned(),
+                named,
                 problem,
             })
         })
@@ -157,6 +158,22 @@ impl Named {
         Named::DoesNot {
             account: None,
             problem,
+        }
+    }
+
+    /// The one account the value names, whether or not it applies.
+    pub fn account(&self) -> Option<&AccountRow> {
+        match self {
+            Named::Applies(row) => Some(row),
+            Named::DoesNot { account, .. } => account.as_ref(),
+        }
+    }
+
+    /// Why the value does not apply, or `None` when it does.
+    fn problem(&self) -> Option<MappingProblem> {
+        match self {
+            Named::Applies(_) => None,
+            Named::DoesNot { problem, .. } => Some(*problem),
         }
     }
 }
