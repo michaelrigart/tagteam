@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use tagteam_core::ProviderId;
 use tagteam_engine::EngineError;
-use tagteam_engine::mappings::ConfigMapping;
+use tagteam_engine::mappings::{ConfigMapping, Named};
 use tagteam_engine::store::{AccountRow, Mapping};
 
 use crate::SCHEMA_VERSION;
@@ -231,8 +231,8 @@ impl App<'_, '_> {
                 render::name(row)
             )));
         };
-        let (named, _) = self.engine.judge_value(&row.provider, &value)?;
-        if named.is_some_and(|n| n.id == row.id) {
+        let named = self.engine.judge_value(&row.provider, &value)?;
+        if matches!(named, Named::Applies(n) if n.id == row.id) {
             Ok(value)
         } else {
             Err(refuse(format!(
