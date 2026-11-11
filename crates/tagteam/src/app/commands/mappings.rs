@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
+use tagteam_core::ProviderId;
 use tagteam_engine::EngineError;
+use tagteam_engine::mappings::ConfigMapping;
 use tagteam_engine::store::{AccountRow, Mapping};
 
 use crate::SCHEMA_VERSION;
@@ -57,7 +59,67 @@ fn invalid_path(path: &Path, why: &str) -> Failure {
     Failure::Message(KIND_INVALID_INPUT, format!("{}: {why}", path.display()))
 }
 
+/// Warnings for the file entries that named an account in `before` and name another, or none,
+/// in `after` (config-mappings spec §3.6). Entries are matched by key and value, as written.
+pub(in crate::app) fn mapping_warnings(
+    before: &[ConfigMapping],
+    after: &[ConfigMapping],
+    file: &Path,
+) -> Vec<String> {
+    before
+        .iter()
+        .filter_map(|was| {
+            let named = was.account.as_ref()?;
+            let now = after
+                .iter()
+                .find(|m| m.entry.written == was.entry.written && m.entry.value == was.entry.value)
+                .and_then(|m| m.account.as_ref());
+            let outcome = match now {
+                Some(a) if a.id == named.id => return None,
+                Some(a) => format!(
+                    "it now names {} (position {})",
+                    render::name(a),
+                    a.position
+                ),
+                None => "`claude` runs plain there, with a warning".to_owned(),
+            };
+            Some(format!(
+                "{}: provider.{}.mappings \"{}\" = \"{}\" no longer names {} (position {}); {outcome}",
+                file.display(),
+                was.provider,
+                was.entry.written,
+                was.entry.value,
+                render::name(named),
+                named.position
+            ))
+        })
+        .collect()
+}
+
 impl App<'_, '_> {
+    /// `provider`'s file entries as they stand, for `alias` and `remove` to compare. Best-effort:
+    /// a failed read gives none, and the command goes on.
+    pub(in crate::app) fn mappings_snapshot(&self, provider: &ProviderId) -> Vec<ConfigMapping> {
+        self.engine.config_mappings(provider).unwrap_or_default()
+    }
+
+    /// Reads `provider`'s entries again and warns about each in `before` that now names another
+    /// account, or none (config-mappings spec §3.6).
+    pub(in crate::app) fn warn_changed_mappings(
+        &mut self,
+        provider: &ProviderId,
+        before: &[ConfigMapping],
+    ) {
+        if before.is_empty() {
+            return;
+        }
+        let after = self.mappings_snapshot(provider);
+        let file = tagteam_engine::settings::config_path(self.engine.env());
+        for w in mapping_warnings(before, &after, &file) {
+            self.io.warn(&w);
+        }
+    }
+
     /// §12.7: `map` with no arguments lists the mappings of both sources, only `--provider`'s
     /// when it is given (config-mappings spec §3.4). It never creates the store (§5).
     pub(in crate::app) fn list_mappings(&mut self) -> Result<(), Failure> {
