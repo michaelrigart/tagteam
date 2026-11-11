@@ -1651,6 +1651,10 @@ fn a_mapping_write_logs_its_key_and_never_the_directory_or_value() {
     // Core §14.2: the log records `provider.<id>.mappings` and an action, nothing more.
     let fx = Fx::new();
     let dir = home_dir(&fx, "secret-project");
+    let private = |logs: &[String]| {
+        logs.iter()
+            .all(|l| !l.contains("secret-project") && !l.contains("me@example.com"))
+    };
 
     let (_, logs) = capture_logs(|| map(&fx, &dir, "me@example.com"));
     let info: Vec<&String> = logs.iter().filter(|l| l.contains("INFO")).collect();
@@ -1658,20 +1662,61 @@ fn a_mapping_write_logs_its_key_and_never_the_directory_or_value() {
     assert!(
         info[0].contains("settings written")
             && info[0].contains("provider.claude-code.mappings")
-            && info[0].contains("map"),
+            && info[0].contains("action=\"map\""),
         "{info:?}"
     );
+    assert!(private(&logs), "{logs:?}");
 
     let (_, logs) = capture_logs(|| fx.engine.remove_config_mappings(None, &dir).unwrap());
+    let info: Vec<&String> = logs.iter().filter(|l| l.contains("INFO")).collect();
+    assert_eq!(info.len(), 1, "{logs:?}");
     assert!(
-        logs.iter().any(|l| l.contains("INFO")
-            && l.contains("unmap")
-            && l.contains("provider.claude-code.mappings")),
-        "{logs:?}"
+        info[0].contains("settings written")
+            && info[0].contains("provider.claude-code.mappings")
+            && info[0].contains("action=\"unmap\""),
+        "{info:?}"
     );
-    assert!(
-        logs.iter()
-            .all(|l| !l.contains("secret-project") && !l.contains("me@example.com")),
-        "{logs:?}"
+    assert!(private(&logs), "{logs:?}");
+}
+
+#[test]
+fn unmapping_the_last_entry_of_an_inline_table_keeps_the_space_before_the_brace() {
+    let fx = Fx::new();
+    let y = home_dir(&fx, "y");
+    let text = "[provider.claude-code]\nmappings = { \"~/x\" = \"a\", \"~/y\" = \"b\" }\n";
+    write_config(&fx, text);
+
+    assert_eq!(
+        fx.engine.remove_config_mappings(Some(&cc()), &y).unwrap(),
+        1
+    );
+
+    assert_eq!(
+        config_text(&fx),
+        "[provider.claude-code]\nmappings = { \"~/x\" = \"a\" }\n"
+    );
+}
+
+#[test]
+fn map_removes_a_later_equivalent_entry_even_when_the_first_holds_the_value() {
+    // The value is already there, but a second spelling of the directory is not: the write
+    // drops it and reports the change, under the first entry's key.
+    let fx = Fx::new();
+    let dir = home_dir(&fx, "w");
+    write_config(
+        &fx,
+        &format!(
+            "[provider.claude-code.mappings]\n\"~/w\" = \"a\"\n\"{}/w\" = \"b\"\n",
+            fs::canonicalize(&fx.env.home).unwrap().display()
+        ),
+    );
+
+    let written = map(&fx, &dir, "a");
+
+    assert!(written.changed);
+    assert_eq!(written.written, "~/w");
+    assert_eq!(
+        config_text(&fx),
+        "[provider.claude-code.mappings]\n\"~/w\" = \"a\"\n"
     );
 }
