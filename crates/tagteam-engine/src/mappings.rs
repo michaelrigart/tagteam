@@ -69,7 +69,8 @@ impl MappingProblem {
         }
     }
 
-    /// A phrase that completes "the mapping …", for the run warning, the listing and doctor.
+    /// A phrase that completes "the mapping …", for `run`'s warning (when the value does not
+    /// apply), the listing and doctor.
     pub fn describe(self) -> &'static str {
         match self {
             MappingProblem::MissingDirectory => "names a directory that does not exist here",
@@ -115,7 +116,10 @@ pub(crate) fn judge(
         .iter()
         .zip(dirs)
         .map(|(entry, dir)| {
-            let (account, named) = resolve_value(store, p, &entry.value)?;
+            let (account, named) = match resolve_value(store, p, &entry.value)? {
+                Named::Applies(row) => (Some(row), None),
+                Named::DoesNot { account, problem } => (account, Some(problem)),
+            };
             let conflict = matches!(&dir, MappedDir::Found(path) if values[path].len() > 1);
             let problem = if matches!(dir, MappedDir::Missing(_)) {
                 Some(MappingProblem::MissingDirectory)
@@ -135,33 +139,58 @@ pub(crate) fn judge(
         .collect()
 }
 
-/// What `value` names for `p` (config-mappings spec §3.1): an account when it names exactly one,
-/// and the problem when it does not apply. A position is never resolved, so it reads no store.
+/// What a mapping's value names for a provider (config-mappings spec §3.1).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Named {
+    /// Exactly one account, which a session can start for.
+    Applies(AccountRow),
+    /// The entry does not apply. `account` is the one account the value names, when it names
+    /// exactly one (an API-key account).
+    DoesNot {
+        account: Option<AccountRow>,
+        problem: MappingProblem,
+    },
+}
+
+impl Named {
+    fn none(problem: MappingProblem) -> Self {
+        Named::DoesNot {
+            account: None,
+            problem,
+        }
+    }
+}
+
+/// What `value` names for `p` (config-mappings spec §3.1). A position is never resolved, so it
+/// reads no store.
 pub(crate) fn resolve_value(
     store: Option<&Store>,
     p: &dyn Provider,
     value: &str,
-) -> Result<(Option<AccountRow>, Option<MappingProblem>), StoreError> {
+) -> Result<Named, StoreError> {
     let text = match parse_account_ref(value) {
-        Some(AccountRefInput::Position(_)) => return Ok((None, Some(MappingProblem::Position))),
+        Some(AccountRefInput::Position(_)) => return Ok(Named::none(MappingProblem::Position)),
         Some(AccountRefInput::Text(text)) => text,
-        None => return Ok((None, Some(MappingProblem::NoAccount))),
+        None => return Ok(Named::none(MappingProblem::NoAccount)),
     };
     let Some(store) = store else {
-        return Ok((None, Some(MappingProblem::NoAccount)));
+        return Ok(Named::none(MappingProblem::NoAccount));
     };
     let mut found = text_candidates(store, &text, Some(&p.id()))?;
     Ok(match found.len() {
-        0 => (None, Some(MappingProblem::NoAccount)),
+        0 => Named::none(MappingProblem::NoAccount),
         1 => {
             let row = found.remove(0);
-            let problem = p
-                .kind_traits(&row.kind)
-                .managed_key_axis
-                .then_some(MappingProblem::ApiKey);
-            (Some(row), problem)
+            if p.kind_traits(&row.kind).managed_key_axis {
+                Named::DoesNot {
+                    account: Some(row),
+                    problem: MappingProblem::ApiKey,
+                }
+            } else {
+                Named::Applies(row)
+            }
         }
-        _ => (None, Some(MappingProblem::Ambiguous)),
+        _ => Named::none(MappingProblem::Ambiguous),
     })
 }
 
@@ -181,11 +210,7 @@ impl Engine {
 
     /// What `value` would name for `provider`, for `map` to check before it writes
     /// (config-mappings spec §3.3). Never creates a store.
-    pub fn judge_value(
-        &self,
-        provider: &ProviderId,
-        value: &str,
-    ) -> Result<(Option<AccountRow>, Option<MappingProblem>), EngineError> {
+    pub fn judge_value(&self, provider: &ProviderId, value: &str) -> Result<Named, EngineError> {
         let p = self.provider(provider)?;
         let store = self.existing_store()?;
         Ok(resolve_value(store.as_deref(), &*p, value)?)

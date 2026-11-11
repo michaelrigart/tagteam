@@ -14,7 +14,7 @@ use tagteam_provider::profile::RunShell;
 
 use crate::engine::Engine;
 use crate::error::EngineError;
-use crate::mappings::{MappedDir, MappingProblem, mapped_dir, resolve_value};
+use crate::mappings::{MappedDir, Named, mapped_dir, resolve_value};
 use crate::settings::{self, MappingEntry, Settings};
 use crate::store::{AccountRow, Store};
 
@@ -63,8 +63,8 @@ enum Mapped {
     Account(AccountRow),
 }
 
-/// The entries of `config.toml` whose directory exists here and holds `dir`, nearest first: the
-/// deepest such directory's entries, with its component count. Entries that canonicalise to one
+/// The entries of `config.toml` whose directory exists here and holds `dir`: the deepest such
+/// directory's entries, with its component count. Entries that canonicalise to one
 /// directory form one group.
 fn nearest_entries<'a>(
     entries: &'a [MappingEntry],
@@ -144,7 +144,7 @@ impl Engine {
         })?;
         let target = match named {
             Some(row) => row,
-            None => match self.mapped_account(&provider, &req.cwd)? {
+            None => match self.mapped_account(p, &req.cwd)? {
                 Mapped::Account(row) => row,
                 Mapped::Nothing => {
                     let why = format!("no mapping applies to {}", req.cwd.display());
@@ -210,7 +210,8 @@ impl Engine {
     /// warnings are dropped: the command's own load printed them. The file wins a directory both
     /// sources map. Only the winning group's value is resolved, so the lookup does no network or
     /// Keychain work and creates nothing.
-    fn mapped_account(&self, provider: &ProviderId, cwd: &Path) -> Result<Mapped, EngineError> {
+    fn mapped_account(&self, p: &dyn Provider, cwd: &Path) -> Result<Mapped, EngineError> {
+        let provider = &p.id();
         let dir = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let entries = Settings::load(&self.env, provider).0.mappings;
         let store = self.existing_store()?;
@@ -225,7 +226,7 @@ impl Engine {
         if let Some((depth, group)) = from_file
             && depth >= database_depth
         {
-            return self.file_mapping(store.as_deref(), provider, &group);
+            return self.file_mapping(store.as_deref(), p, &group);
         }
         let (Some(store), Some(mapping)) = (store, database) else {
             return Ok(Mapped::Nothing);
@@ -242,7 +243,7 @@ impl Engine {
     fn file_mapping(
         &self,
         store: Option<&Store>,
-        provider: &ProviderId,
+        p: &dyn Provider,
         group: &[&MappingEntry],
     ) -> Result<Mapped, EngineError> {
         let file = settings::config_path(&self.env);
@@ -260,19 +261,15 @@ impl Engine {
                 ),
             });
         }
-        let p = self.provider(provider)?;
-        Ok(match resolve_value(store, &*p, value)? {
-            (Some(row), None) => Mapped::Account(row),
-            (_, problem) => {
-                let problem = problem.unwrap_or(MappingProblem::NoAccount);
-                Mapped::NotHere {
-                    why: format!(
-                        "the mapping {keys} in {} {}",
-                        file.display(),
-                        problem.describe()
-                    ),
-                }
-            }
+        Ok(match resolve_value(store, p, value)? {
+            Named::Applies(row) => Mapped::Account(row),
+            Named::DoesNot { problem, .. } => Mapped::NotHere {
+                why: format!(
+                    "the mapping {keys} in {} {}",
+                    file.display(),
+                    problem.describe()
+                ),
+            },
         })
     }
 
