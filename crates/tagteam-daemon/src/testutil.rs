@@ -13,6 +13,7 @@ use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::{ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Window, WindowKind};
+use tagteam_engine::auto::HolderKind;
 use tagteam_engine::lifecycle::AddOptions;
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
@@ -25,7 +26,7 @@ use tagteam_provider::liveness::SystemProcessProbe;
 use tagteam_provider::process::ScriptedSpawner;
 use tagteam_provider::profile::RunShell;
 use tagteam_provider::splice::replace_top_level;
-use tagteam_provider::{Clock, Env, FakeClock, FakeKeychain, ScriptedHttp};
+use tagteam_provider::{Clock, Env, FakeClock, FakeKeychain, Http, ScriptedHttp};
 
 use crate::events::{DaemonEvent, DaemonSink, Mode, WaitingFor};
 use crate::notify::Notice;
@@ -71,16 +72,18 @@ pub(crate) fn windows(short: f64, long: f64) -> Vec<Window> {
 }
 
 /// An engine on `env` with Claude Code and FakeAgent registered, spawning through `spawner`
-/// (which never starts a process, §15.1), inside or outside a run shell. Claude Code's live
+/// (which never starts a process, §15.1), inside or outside a run shell, recording its events
+/// under `source`. Claude Code's live
 /// Keychain reads are retried without a wait (Appendix A.3), so a locked keychain costs a test
 /// no time.
 fn engine_on(
     env: &Env,
     kc: &Arc<FakeKeychain>,
     clock: &Arc<FakeClock>,
-    http: &Arc<ScriptedHttp>,
+    http: Arc<dyn Http>,
     spawner: &Arc<ScriptedSpawner>,
     run_shell: RunShell,
+    source: EventSource,
 ) -> Engine {
     let claude = ClaudeCode::with_store(
         LiveStore::new(kc.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO),
@@ -93,13 +96,13 @@ fn engine_on(
         vault: Vault::new(Box::new(KeychainVault::new(kc.clone()))),
         oracle: Arc::new(NoOracle),
         clock: clock.clone(),
-        http: http.clone(),
+        http,
         default_provider: cc(),
         settings: Settings::default(),
         process: Arc::new(SystemProcessProbe),
         spawner: spawner.clone(),
         run_shell,
-        source: EventSource::Daemon,
+        source,
     })
 }
 
@@ -141,7 +144,15 @@ impl Fx {
         let clock = Arc::new(FakeClock::new(T0 * 1000));
         let http = Arc::new(ScriptedHttp::new());
         let spawner = Arc::new(ScriptedSpawner::new());
-        let engine = engine_on(&env, &kc, &clock, &http, &spawner, run_shell);
+        let engine = engine_on(
+            &env,
+            &kc,
+            &clock,
+            http.clone(),
+            &spawner,
+            run_shell,
+            EventSource::Daemon,
+        );
         Fx {
             _dir: dir,
             env,
@@ -412,10 +423,31 @@ impl Fx {
             &self.env,
             &self.kc,
             &self.clock,
-            &self.http,
+            self.http.clone(),
             &self.spawner,
             RunShell::Outside,
+            EventSource::Daemon,
         )
+    }
+
+    /// The engine of a TUI hosting the daemon's jobs: another process on the same home, with
+    /// events recorded as `auto`'s and its locks held as a TUI's.
+    pub(crate) fn tui_engine(&self) -> Engine {
+        self.tui_engine_on(self.http.clone())
+    }
+
+    /// `tui_engine`, over `http`: a port that can act while a request is held open.
+    pub(crate) fn tui_engine_on(&self, http: Arc<dyn Http>) -> Engine {
+        engine_on(
+            &self.env,
+            &self.kc,
+            &self.clock,
+            http,
+            &self.spawner,
+            RunShell::Outside,
+            EventSource::Auto,
+        )
+        .with_lock_holder(HolderKind::Tui)
     }
 
     /// `claude /login` as `email`, then `tagteam add` through `engine`.

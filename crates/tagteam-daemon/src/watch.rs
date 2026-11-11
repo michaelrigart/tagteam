@@ -273,8 +273,9 @@ impl ProgramStamp {
 /// store past this build's schema while the daemon ran. Either stops the scheduler, so the
 /// daemon exits 75 and a service restarts it on the new binary (D9).
 pub struct UpgradeWatch {
-    /// The program path, and the file it resolved to at the stamp (Decision 17).
-    program: ProgramStamp,
+    /// The program path, and the file it resolved to at the stamp (Decision 17); `None` for a
+    /// watch that follows the store's schema alone.
+    program: Option<ProgramStamp>,
     /// D4.1 step 4: a store already newer at start-up waits for the binary instead.
     schema_newer_at_start: bool,
     board: Arc<StatusBoard>,
@@ -290,8 +291,20 @@ impl UpgradeWatch {
         board: Arc<StatusBoard>,
     ) -> Self {
         UpgradeWatch {
-            program,
+            program: Some(program),
             schema_newer_at_start,
+            board,
+            period_ms: UPGRADE_WATCH_MS,
+        }
+    }
+
+    /// A watch of the store's schema alone, for a process that is not restarted for an
+    /// upgrade: no program check, and a store already newer at start is the caller's to have
+    /// refused.
+    pub fn schema_only(board: Arc<StatusBoard>) -> Self {
+        UpgradeWatch {
+            program: None,
+            schema_newer_at_start: false,
             board,
             period_ms: UPGRADE_WATCH_MS,
         }
@@ -305,7 +318,9 @@ impl UpgradeWatch {
     /// Why the daemon must restart, if it must. A program file whose metadata cannot be read
     /// is the error, and no reason to restart.
     fn check(&self, engine: &Engine) -> io::Result<Option<StopReason>> {
-        if file_stamp(&self.program.path)? != self.program.start {
+        if let Some(program) = &self.program
+            && file_stamp(&program.path)? != program.start
+        {
             return Ok(Some(StopReason::Upgrade));
         }
         if !self.schema_newer_at_start && schema_newer(engine) {
@@ -326,7 +341,11 @@ impl Job for UpgradeWatch {
             Ok(stop) => (stop, None),
             Err(e) => {
                 tracing::warn!(kind = %e.kind(), "the upgrade watch could not read the program file");
-                (None, Some(format!("{}: {e}", self.program.path.display())))
+                let path = self
+                    .program
+                    .as_ref()
+                    .map_or(PathBuf::new(), |p| p.path.clone());
+                (None, Some(format!("{}: {e}", path.display())))
             }
         };
         self.board.set_job(JobStatus {

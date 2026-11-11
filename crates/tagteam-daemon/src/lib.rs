@@ -9,6 +9,7 @@ pub mod backoff;
 pub mod client;
 pub mod daemon;
 pub mod events;
+pub mod hosted;
 pub mod notify;
 pub mod protocol;
 pub mod provider_job;
