@@ -8,7 +8,9 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use common::{cc_profile, cmd, legacy_mapping, login, seed_home, two_accounts, write_config};
+use common::{
+    cc_profile, cmd, installed, legacy_mapping, login, seed_home, two_accounts, write_config,
+};
 use serde_json::{Value, json};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::store::{NewAccount, Store};
@@ -581,13 +583,6 @@ fn recorder(bin: &Path, name: &str) {
 fn recorded(bin: &Path, name: &str) -> Option<Vec<String>> {
     let text = fs::read_to_string(bin.join(format!("{name}.args"))).ok()?;
     Some(text.lines().map(str::to_owned).collect())
-}
-
-/// The first `name` on this test's `PATH`: the shell, if it is installed.
-fn installed(name: &str) -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join(name))
-        .find(|p| p.is_file())
 }
 
 /// What `tagteam shell-init <shell>` prints.

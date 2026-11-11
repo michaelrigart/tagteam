@@ -19,12 +19,14 @@ with the one before, so any release may contain breaking changes. Each section s
   `tagteam auto --threshold` at or above a provider's ceiling.
 - Directory mappings in `config.toml`, under `[provider.<id>.mappings]`: each key is a directory
   (`~/…` expands to your home) and each value the alias or email of an account. `tagteam run`
-  looks them up ahead of the database's mappings, so `claude` below a mapped directory starts as
-  that account. A mapping follows the name, not the account.
+  takes the nearest mapped directory from either source, and where both map the same directory,
+  `config.toml` wins. An entry that names no account here warns and runs plain `claude`. A
+  mapping follows the name, not the account.
 - `tagteam doctor` checks the mappings: `mappings.directory`, `mappings.value`,
   `mappings.conflict` and `mappings.database`.
-- `tagteam alias` and `tagteam remove` warn about each `config.toml` mapping whose account they
-  change. They never edit the file.
+- `tagteam remove` warns about each `config.toml` mapping that named the removed account, and
+  `tagteam alias` about each that resolved to an account before and resolves to another account,
+  or to none, after. They never edit the file.
 
 ### Changed
 
@@ -44,6 +46,8 @@ with the one before, so any release may contain breaking changes. Each section s
   keeps its fields and lists database rows only, so a script that reads it sees an entry leave
   it when `map` moves the entry to the file. `map`'s own result adds `"source": "config"`.
 - `tagteam map` refuses an API-key account, since `run` never starts a session for one.
+- `tagteam map` refuses an account that has no alias and whose email names more than one
+  account, and says to give it an alias first.
 
 ## [20261031.2215.0] - 2026-10-31
 

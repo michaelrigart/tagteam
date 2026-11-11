@@ -508,9 +508,7 @@ CREATE TABLE events (
   detail    TEXT                -- JSON
 );
 
--- Legacy: read only by `run` and `map`'s listing, and deleted per directory by `map` and
--- `unmap`. Mappings now live in `config.toml` (§6.4, §12.7). (Amended by the config-mappings
--- spec.)
+-- Legacy: mappings now live in `config.toml` (§6.4, §12.7).
 CREATE TABLE mappings (         -- one directory can map to one account per provider
   path       TEXT NOT NULL,     -- canonical absolute directory path
   provider   TEXT NOT NULL,
@@ -533,6 +531,10 @@ CREATE TABLE live_identity_cache (   -- speeds up statusline and list; the file 
   path TEXT, mtime_ns INTEGER, size INTEGER, identity_key TEXT, label TEXT, account_uuid TEXT
 );
 ```
+
+**Mappings.** The `mappings` table is legacy: `run`, `map`'s listing and `doctor` read it, and
+`map` and `unmap` delete its rows per directory. Mappings now live in `config.toml` (§6.4,
+§12.7). *(Amended by the [config-mappings spec](2026-11-11-tagteam-config-mappings-design.md).)*
 
 **Event kinds.** `switch-failed` is written by the auto engine when an attempted switch fails,
 with `detail` `{"message", "transient"}`; `all-exhausted` by the auto engine on the first
@@ -1689,9 +1691,7 @@ Captures the live login.
 
 - **`remove <ACCOUNT>`** deletes, in this order: the vault entries (strict), the account's
   rescue files (§6.3), the session profile, and last the store row, which cascades to the
-  mappings (database rows) and usage rows. A `config.toml` entry that named the account by
-  its alias or email is not edited: `remove` warns about each, and those directories run plain
-  `claude` (config-mappings spec §3.6). *(Amended by the [config-mappings spec](2026-11-11-tagteam-config-mappings-design.md).)* For the profile it deletes the profile's hashed Keychain item
+  mappings (database rows) and usage rows. For the profile it deletes the profile's hashed Keychain item
   first, named from the spelling its marker records (§12.2), then the directory. The
   directory's links are removed as links; nothing they point to is touched.
   - **The order is what makes a `remove` that stops part-way safe.** The vault goes first, so
@@ -1699,13 +1699,17 @@ Captures the live login.
     without a vault credential is never switched to, refreshed or launched (§7.3 step 3,
     §9.3, §12.3). The row goes last, so the account stays listed, and running `remove` again
     finishes, since every delete treats an absent item as done.
+  - **`config.toml` entries are not edited.** `remove` warns about each entry whose value named
+    the removed account, and those directories run plain `claude` (config-mappings spec §3.6).
+    *(Amended by the [config-mappings spec](2026-11-11-tagteam-config-mappings-design.md).)*
 - **`disable` / `enable <ACCOUNT>`** hold an account out of automatic selection. It stays a
   valid explicit `switch` target.
 - **`alias <ACCOUNT> <NAME>` / `alias <ACCOUNT> --unset` / `alias`** (list).
   - Aliases are lowercase and match `^[a-z0-9_.-]+$`.
   - They cannot be all digits or start with `-`, and they are unique case-insensitively.
   - Setting, renaming or unsetting an alias warns about each `config.toml` mapping entry that
-    resolves to a different account, or to none, afterwards; it never edits the file
+    resolved to an account before and resolves to a different account, or to none, afterwards;
+    it never edits the file
     (config-mappings spec §3.6). *(Amended by the [config-mappings spec](2026-11-11-tagteam-config-mappings-design.md).)*
 - **`move <ACCOUNT> <POSITION>`.** If the target position is taken, the two accounts swap
   positions.
