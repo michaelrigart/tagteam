@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 use tagteam_core::time::format_iso8601;
 use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind, printable};
+use tagteam_engine::mappings::ConfigMapping;
 use tagteam_engine::store::{AccountRow, Mapping};
 use tagteam_engine::switch::SwitchOutcome;
 use tagteam_engine::views::{
@@ -543,26 +544,76 @@ pub fn mapping_json(m: &Mapping, account: &AccountRow) -> Value {
     o
 }
 
-/// `map`'s list.
-pub fn mappings_json(rows: &[(Mapping, AccountRow)]) -> Value {
-    let mappings: Vec<Value> = rows.iter().map(|(m, a)| mapping_json(m, a)).collect();
-    json!({"schemaVersion": SCHEMA_VERSION, "mappings": mappings})
+/// One file entry of `config.toml` (config-mappings spec §3.4), judged on this machine: where it
+/// points, what it says, the account it names when it names exactly one, and why it does not
+/// apply when it does not.
+pub fn config_mapping_json(c: &ConfigMapping) -> Value {
+    let mut o = json!({
+        "path": c.dir.path().display().to_string(),
+        "written": c.entry.written,
+        "value": c.entry.value,
+        "provider": c.provider.as_str(),
+    });
+    if let Some(a) = &c.account {
+        let mut account = json!({"number": a.position, "id": a.id.as_str(), "email": email(a)});
+        if let Some(alias) = &a.alias {
+            account["alias"] = json!(alias);
+        }
+        o["account"] = account;
+    }
+    if let Some(problem) = c.problem {
+        o["problem"] = json!(problem.as_str());
+    }
+    o
 }
 
-/// `map`'s list in text: one line per mapping, in path order. The provider shows only when the
-/// mappings span more than one, so a single provider looks as it would without providers
-/// (§13.1).
-pub fn mappings_human(rows: &[(Mapping, AccountRow)]) -> String {
-    let Some((first, _)) = rows.first() else {
+/// `map`'s list: the database rows, as they always were, and the file's entries beside them.
+pub fn mappings_json(rows: &[(Mapping, AccountRow)], config: &[ConfigMapping]) -> Value {
+    let mappings: Vec<Value> = rows.iter().map(|(m, a)| mapping_json(m, a)).collect();
+    let config_mappings: Vec<Value> = config.iter().map(config_mapping_json).collect();
+    json!({
+        "schemaVersion": SCHEMA_VERSION,
+        "mappings": mappings,
+        "configMappings": config_mappings,
+    })
+}
+
+/// `map`'s list in text: one line per entry of either source, in path order, then provider.
+/// The provider shows only when the entries span more than one, so a single provider looks as
+/// it would without providers (§13.1).
+pub fn mappings_human(rows: &[(Mapping, AccountRow)], config: &[ConfigMapping]) -> String {
+    // (path, provider, what follows them)
+    let mut lines: Vec<(String, &ProviderId, String)> = Vec::new();
+    for (m, a) in rows {
+        let said = format!(
+            "{}  {}  (database; `tagteam map` moves it to the file)",
+            a.position,
+            name(a)
+        );
+        lines.push((m.path.clone(), &m.provider, said));
+    }
+    for c in config {
+        let mut said = match &c.account {
+            Some(a) => format!("{}  {}", a.position, name(a)),
+            None => format!("-  \"{}\"", c.entry.value),
+        };
+        if let Some(problem) = c.problem {
+            said.push_str(&format!("  ({})", problem.describe()));
+        }
+        lines.push((c.dir.path().display().to_string(), &c.provider, said));
+    }
+    let Some((_, first, _)) = lines.first() else {
         return NO_MAPPINGS.to_owned();
     };
-    let several = rows.iter().any(|(m, _)| m.provider != first.provider);
-    rows.iter()
-        .map(|(m, a)| {
+    let several = lines.iter().any(|(_, p, _)| p != first);
+    lines.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    lines
+        .iter()
+        .map(|(path, provider, said)| {
             if several {
-                format!("{}  {}  {}  {}\n", m.path, m.provider, a.position, name(a))
+                format!("{path}  {provider}  {said}\n")
             } else {
-                format!("{}  {}  {}\n", m.path, a.position, name(a))
+                format!("{path}  {said}\n")
             }
         })
         .collect()
@@ -738,6 +789,8 @@ mod tests {
     use std::path::PathBuf;
 
     use tagteam_cc::CLAUDE_CODE;
+    use tagteam_engine::mappings::{MappedDir, MappingProblem};
+    use tagteam_engine::settings::MappingEntry;
     use tagteam_engine::switch::{LiveLogin, SwitchReason};
     use tagteam_engine::views::{NO_DATA, forecast_of};
 
@@ -1624,6 +1677,8 @@ mod tests {
         );
     }
 
+    const MOVES: &str = "(database; `tagteam map` moves it to the file)";
+
     #[test]
     fn a_mapping_line_names_the_provider_only_when_several_are_mapped() {
         let row = |position, email: &str| {
@@ -1640,7 +1695,10 @@ mod tests {
             (mapping("/w", &a), a.clone()),
             (mapping("/x", &b), b.clone()),
         ];
-        assert_eq!(mappings_human(&one), "/w  1  a@x.co\n/x  2  b@x.co\n");
+        assert_eq!(
+            mappings_human(&one, &[]),
+            format!("/w  1  a@x.co  {MOVES}\n/x  2  b@x.co  {MOVES}\n")
+        );
         let mut f = row(1, "f@x.co");
         f.provider = ProviderId::new("fake-agent");
         let two = [
@@ -1648,10 +1706,112 @@ mod tests {
             (mapping("/w", &f), f.clone()),
         ];
         assert_eq!(
-            mappings_human(&two),
-            "/w  claude-code  1  a@x.co\n/w  fake-agent  1  f@x.co\n"
+            mappings_human(&two, &[]),
+            format!("/w  claude-code  1  a@x.co  {MOVES}\n/w  fake-agent  1  f@x.co  {MOVES}\n")
         );
-        assert_eq!(mappings_human(&[]), NO_MAPPINGS);
+        assert_eq!(mappings_human(&[], &[]), NO_MAPPINGS);
+    }
+
+    /// A file entry for `value` at `dir`, written as `~/<dir minus the slash>`.
+    fn entry(
+        provider: &str,
+        dir: &str,
+        value: &str,
+        account: Option<AccountRow>,
+        problem: Option<MappingProblem>,
+    ) -> ConfigMapping {
+        ConfigMapping {
+            provider: ProviderId::new(provider),
+            entry: MappingEntry {
+                written: format!("~{dir}"),
+                dir: dir.into(),
+                value: value.into(),
+            },
+            dir: MappedDir::Found(dir.into()),
+            account,
+            problem,
+        }
+    }
+
+    #[test]
+    fn the_listing_merges_both_sources_by_path_and_says_what_each_entry_lacks() {
+        let a = view(1, "a@x.co", OAUTH, unread(UsageStatus::Ok, None, None)).row;
+        let moved = Mapping {
+            path: "/m".into(),
+            provider: a.provider.clone(),
+            account_id: a.id.clone(),
+            added_at: NOW * 1000,
+        };
+        let file = [
+            entry("claude-code", "/z", "a@x.co", Some(a.clone()), None),
+            entry(
+                "claude-code",
+                "/b",
+                "nobody",
+                None,
+                Some(MappingProblem::NoAccount),
+            ),
+            entry(
+                "claude-code",
+                "/c",
+                "a@x.co",
+                Some(a.clone()),
+                Some(MappingProblem::Conflict),
+            ),
+        ];
+        assert_eq!(
+            mappings_human(&[(moved, a)], &file),
+            format!(
+                "/b  -  \"nobody\"  (names no account here)\n\
+                 /c  1  a@x.co  (shares its directory with another entry that has a different value)\n\
+                 /m  1  a@x.co  {MOVES}\n\
+                 /z  1  a@x.co\n"
+            )
+        );
+    }
+
+    #[test]
+    fn the_listing_names_the_provider_when_the_file_adds_a_second_one() {
+        let a = view(1, "a@x.co", OAUTH, unread(UsageStatus::Ok, None, None)).row;
+        let file = [
+            entry(
+                "fake-agent",
+                "/w",
+                "f",
+                None,
+                Some(MappingProblem::NoAccount),
+            ),
+            entry("claude-code", "/w", "a@x.co", Some(a), None),
+        ];
+        assert_eq!(
+            mappings_human(&[], &file),
+            "/w  claude-code  1  a@x.co\n/w  fake-agent  -  \"f\"  (names no account here)\n"
+        );
+    }
+
+    #[test]
+    fn a_file_entry_s_json_names_its_account_and_why_it_does_not_apply() {
+        let mut a = view(1, "a@x.co", OAUTH, unread(UsageStatus::Ok, None, None)).row;
+        a.alias = Some("work".into());
+        let named = entry("claude-code", "/w", "work", Some(a), None);
+        assert_eq!(
+            config_mapping_json(&named),
+            json!({"path": "/w", "written": "~/w", "value": "work", "provider": "claude-code",
+                   "account": {"number": 1, "id": "id-1", "email": "a@x.co", "alias": "work"}})
+        );
+        let mut gone = entry(
+            "claude-code",
+            "/g",
+            "x",
+            None,
+            Some(MappingProblem::MissingDirectory),
+        );
+        gone.dir = MappedDir::Missing("/g".into());
+        assert_eq!(
+            config_mapping_json(&gone),
+            json!({"path": "/g", "written": "~/g", "value": "x", "provider": "claude-code",
+                   "problem": "missing-directory"})
+        );
     }
 
     #[test]
@@ -1670,9 +1830,17 @@ mod tests {
         let mut aliased = expected.clone();
         aliased["alias"] = json!("work");
         assert_eq!(mapping_json(&m, &a), aliased);
+        let gone = entry(
+            "claude-code",
+            "/g",
+            "x",
+            None,
+            Some(MappingProblem::NoAccount),
+        );
         assert_eq!(
-            mappings_json(&[(m, a)]),
-            json!({"schemaVersion": 1, "mappings": [aliased]})
+            mappings_json(&[(m, a)], std::slice::from_ref(&gone)),
+            json!({"schemaVersion": 1, "mappings": [aliased],
+                   "configMappings": [config_mapping_json(&gone)]})
         );
     }
 }

@@ -8,9 +8,11 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use common::{cc_profile, cmd, two_accounts};
+use common::{cc_profile, cmd, legacy_mapping, login, seed_home, two_accounts, write_config};
 use serde_json::{Value, json};
-use tagteam_provider::{Env, MARKER_FILE};
+use tagteam_core::{AccountId, ProviderId};
+use tagteam_engine::store::{NewAccount, Store};
+use tagteam_provider::{Env, FileKeychain, Identity, MARKER_FILE};
 
 fn json_of(out: &[u8]) -> Value {
     serde_json::from_slice(out).unwrap()
@@ -31,6 +33,20 @@ fn listed(root: &Path) -> Vec<Value> {
         .as_array()
         .unwrap()
         .clone()
+}
+
+/// `map --json`'s file entries.
+fn config_listed(root: &Path) -> Vec<Value> {
+    let out = cmd(root).args(["map", "--json"]).assert().success();
+    json_of(&out.get_output().stdout)["configMappings"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// Where `map` writes: the settings file of `root`'s fixture HOME.
+fn config_file(root: &Path) -> PathBuf {
+    Env::for_test(root).config_dir().join("config.toml")
 }
 
 /// `map --json`'s rows without `addedAt`, once each is checked to be ISO 8601 UTC.
@@ -64,54 +80,59 @@ fn map_stores_the_canonical_path_even_through_a_symlink() {
     assert_eq!(v["mapping"]["path"], real.as_str());
     assert_eq!(v["mapping"]["id"], a.as_str());
     assert_eq!(v["mapping"]["number"], 1);
-    assert_eq!(listed(d.path()).len(), 1);
+    assert_eq!(v["mapping"]["source"], "config");
+    assert!(listed(d.path()).is_empty(), "the database holds nothing");
+    let files = config_listed(d.path());
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], real.as_str());
 }
 
 #[test]
 fn map_defaults_to_the_current_directory_and_a_new_mapping_replaces_the_old() {
-    // §12.7: one mapping per provider per path.
+    // §12.7: one mapping per provider per path. The directory is under HOME, so its key is
+    // `~/…`.
     let d = tempfile::tempdir().unwrap();
     let (_, b) = two_accounts(d.path());
-    let (app, real) = dir(d.path(), "work/app");
+    let (app, _) = dir(&d.path().join("home"), "work/app");
+    let config = config_file(d.path());
     cmd(d.path())
         .current_dir(&app)
         .args(["map", "1"])
         .assert()
         .success()
-        .stdout(format!("Mapped {real} to a@x.co (position 1).\n"));
+        .stdout(format!(
+            "Mapped ~/work/app to a@x.co (position 1) in {}.\n",
+            config.display()
+        ));
     cmd(d.path())
         .current_dir(&app)
         .args(["map", "b@x.co"])
         .assert()
         .success();
-    assert_eq!(
-        listed_shapes(d.path()),
-        vec![
-            json!({"path": real, "provider": "claude-code", "number": 2, "id": b, "email": "b@x.co"})
-        ]
-    );
+    let files = config_listed(d.path());
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(files[0]["value"], "b@x.co");
+    assert_eq!(files[0]["written"], "~/work/app");
+    assert_eq!(files[0]["account"]["id"], b.as_str());
 }
 
 #[test]
 fn map_lists_every_mapping_in_path_order() {
     let d = tempfile::tempdir().unwrap();
-    let (a, b) = two_accounts(d.path());
-    let (x, x_real) = dir(d.path(), "x");
+    let (a, _) = two_accounts(d.path());
+    let (_, x_real) = dir(d.path(), "x");
     let (y, y_real) = dir(d.path(), "y");
+    legacy_mapping(d.path(), &x_real, &a);
     cmd(d.path()).args(["map", "2"]).arg(&y).assert().success();
-    cmd(d.path()).args(["map", "1"]).arg(&x).assert().success();
     assert_eq!(
         listed_shapes(d.path()),
         vec![
-            json!({"path": x_real, "provider": "claude-code", "number": 1, "id": a, "email": "a@x.co"}),
-            json!({"path": y_real, "provider": "claude-code", "number": 2, "id": b, "email": "b@x.co"}),
+            json!({"path": x_real, "provider": "claude-code", "number": 1, "id": a, "email": "a@x.co"})
         ]
     );
-    cmd(d.path())
-        .arg("map")
-        .assert()
-        .success()
-        .stdout(format!("{x_real}  1  a@x.co\n{y_real}  2  b@x.co\n"));
+    cmd(d.path()).arg("map").assert().success().stdout(format!(
+        "{x_real}  1  a@x.co  (database; `tagteam map` moves it to the file)\n{y_real}  2  b@x.co\n"
+    ));
 }
 
 #[test]
@@ -130,7 +151,7 @@ fn unmap_removes_a_path_s_mappings_for_one_provider_or_all() {
         json_of(&out.get_output().stdout),
         json!({"schemaVersion": 1, "ok": true, "path": real, "removed": 1})
     );
-    assert!(listed(d.path()).is_empty());
+    assert!(config_listed(d.path()).is_empty());
     cmd(d.path()).args(["map", "1"]).arg(&x).assert().success();
     cmd(d.path())
         .current_dir(&x)
@@ -147,22 +168,61 @@ fn unmap_removes_a_path_s_mappings_for_one_provider_or_all() {
 }
 
 #[test]
-fn unmap_takes_the_listed_path_of_a_directory_that_is_gone() {
+fn unmap_removes_from_both_sources_and_counts_both() {
     let d = tempfile::tempdir().unwrap();
-    two_accounts(d.path());
-    let (gone, real) = dir(d.path(), "gone");
-    cmd(d.path())
-        .args(["map", "1"])
-        .arg(&gone)
-        .assert()
-        .success();
-    fs::remove_dir(&gone).unwrap();
-    let out = cmd(d.path())
-        .args(["unmap", &real, "--json"])
-        .assert()
-        .success();
-    assert_eq!(json_of(&out.get_output().stdout)["removed"], 1);
-    assert!(listed(d.path()).is_empty());
+    let (a, _) = two_accounts(d.path());
+    let (x, real) = dir(d.path(), "x");
+    for flags in [&[][..], &["--provider", "claude-code"]] {
+        cmd(d.path()).args(["map", "1"]).arg(&x).assert().success();
+        legacy_mapping(d.path(), &real, &a);
+        let out = cmd(d.path())
+            .arg("unmap")
+            .arg(&x)
+            .args(flags)
+            .arg("--json")
+            .assert()
+            .success();
+        assert_eq!(json_of(&out.get_output().stdout)["removed"], 2, "{flags:?}");
+        assert!(listed(d.path()).is_empty() && config_listed(d.path()).is_empty());
+        let text = fs::read_to_string(config_file(d.path())).unwrap_or_default();
+        assert!(!text.contains("mappings"), "{text}");
+    }
+}
+
+#[test]
+fn unmap_takes_the_listed_path_of_a_directory_that_is_gone() {
+    // Outside HOME the key is absolute. Under it the key is `~/…`, which expands through HOME
+    // as spelled, so a gone directory's path must not be canonicalised around HOME. Either way
+    // the path `map` lists is the path that unmaps.
+    let d = tempfile::tempdir().unwrap();
+    let (a, _) = two_accounts(d.path());
+    let (outside, outside_real) = dir(d.path(), "gone");
+    let (inside, inside_real) = dir(&d.path().join("home"), "gone");
+    for (gone, real, also_in_database) in
+        [(outside, outside_real, true), (inside, inside_real, false)]
+    {
+        cmd(d.path())
+            .args(["map", "1"])
+            .arg(&gone)
+            .assert()
+            .success();
+        if also_in_database {
+            legacy_mapping(d.path(), &real, &a);
+        }
+        fs::remove_dir(&gone).unwrap();
+        let files = config_listed(d.path());
+        let listed_path = files[0]["path"].as_str().unwrap().to_owned();
+        let out = cmd(d.path())
+            .args(["unmap", &listed_path, "--json"])
+            .assert()
+            .success();
+        assert_eq!(
+            json_of(&out.get_output().stdout)["removed"],
+            1 + u64::from(also_in_database),
+            "{listed_path}"
+        );
+        assert!(listed(d.path()).is_empty() && config_listed(d.path()).is_empty());
+    }
 }
 
 #[test]
@@ -212,11 +272,11 @@ fn map_needs_an_account_that_exists() {
 #[test]
 fn removing_an_account_removes_its_mappings() {
     let d = tempfile::tempdir().unwrap();
-    two_accounts(d.path());
-    let (x, _) = dir(d.path(), "x");
-    let (y, y_real) = dir(d.path(), "y");
-    cmd(d.path()).args(["map", "1"]).arg(&x).assert().success();
-    cmd(d.path()).args(["map", "2"]).arg(&y).assert().success();
+    let (a, b) = two_accounts(d.path());
+    let (_, x_real) = dir(d.path(), "x");
+    let (_, y_real) = dir(d.path(), "y");
+    legacy_mapping(d.path(), &x_real, &a);
+    legacy_mapping(d.path(), &y_real, &b);
     cmd(d.path()).args(["remove", "1"]).assert().success();
     let left: Vec<Value> = listed(d.path())
         .into_iter()
@@ -233,7 +293,7 @@ fn on_a_fresh_machine_map_and_unmap_create_nothing() {
     let out = cmd(d.path()).args(["map", "--json"]).assert().success();
     assert_eq!(
         json_of(&out.get_output().stdout),
-        json!({"schemaVersion": 1, "mappings": []})
+        json!({"schemaVersion": 1, "mappings": [], "configMappings": []})
     );
     cmd(d.path())
         .arg("map")
@@ -248,7 +308,17 @@ fn on_a_fresh_machine_map_and_unmap_create_nothing() {
         json_of(&out.get_output().stdout),
         json!({"schemaVersion": 1, "ok": true, "path": "/nowhere", "removed": 0})
     );
+    let out = cmd(d.path())
+        .args(["map", "1", "/x", "--json"])
+        .assert()
+        .code(1);
+    assert_eq!(
+        json_of(&out.get_output().stdout)["error"]["type"],
+        "no-such-account"
+    );
     assert!(!Env::for_test(d.path()).data_dir().exists());
+    assert!(!config_file(d.path()).exists());
+    assert!(!d.path().join("home/.config").exists());
 }
 
 #[test]
@@ -265,11 +335,168 @@ fn map_works_inside_a_run_shell_against_the_outer_home_s_store() {
         .arg(&x)
         .assert()
         .success();
-    let rows = listed(d.path());
+    let rows = config_listed(d.path());
     assert_eq!(rows.len(), 1);
     assert_eq!(
-        (&rows[0]["path"], &rows[0]["number"]),
+        (&rows[0]["path"], &rows[0]["account"]["number"]),
         (&json!(real), &json!(2))
+    );
+    // The outer home's file, not the run shell's profile.
+    let text = fs::read_to_string(config_file(d.path())).unwrap();
+    assert!(text.contains("b@x.co"), "{text}");
+}
+
+#[test]
+fn map_writes_the_alias_else_the_email() {
+    let d = tempfile::tempdir().unwrap();
+    two_accounts(d.path());
+    let home = d.path().join("home");
+    let (x, _) = dir(&home, "x");
+    let (y, _) = dir(&home, "y");
+    cmd(d.path())
+        .args(["alias", "1", "work"])
+        .assert()
+        .success();
+    cmd(d.path()).args(["map", "1"]).arg(&x).assert().success();
+    cmd(d.path()).args(["map", "2"]).arg(&y).assert().success();
+    let text = fs::read_to_string(config_file(d.path())).unwrap();
+    assert!(text.contains("\"~/x\" = \"work\""), "{text}");
+    assert!(text.contains("\"~/y\" = \"b@x.co\""), "{text}");
+}
+
+#[test]
+fn map_refuses_an_api_key_account_an_ambiguous_email_and_an_account_with_neither() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let kc = FileKeychain::new(d.path().join("keychain"));
+    seed_home(&env);
+    login(&env, &kc, "a@x.co", "o1", "rt-1");
+    cmd(d.path()).arg("add").assert().success();
+    login(&env, &kc, "a@x.co", "o2", "rt-2");
+    cmd(d.path()).arg("add").assert().success();
+    cmd(d.path())
+        .args(["add-token", "sk-ant-api03-key"])
+        .assert()
+        .success();
+    Store::open_existing(&env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap()
+        .insert_account(&NewAccount {
+            id: &AccountId::from_string("0192-nameless"),
+            provider: &ProviderId::new("claude-code"),
+            position: 4,
+            identity_key: "nameless\n",
+            identity: &Identity {
+                label: "nameless".into(),
+                email: None,
+                org_uuid: String::new(),
+                org_name: None,
+                account_uuid: None,
+                raw: json!({}),
+            },
+            kind: "oauth",
+            alias: None,
+            login_expires_at: None,
+            added_at: 1,
+        })
+        .unwrap();
+    let before = "[ui]\ncolor = \"never\"\n";
+    let config = write_config(d.path(), before);
+    let (x, _) = dir(d.path(), "x");
+    for (position, says) in [
+        ("1", "alias"),
+        ("2", "alias"),
+        ("3", "API-key"),
+        ("4", "alias"),
+    ] {
+        let out = cmd(d.path())
+            .args(["map", position])
+            .arg(&x)
+            .arg("--json")
+            .assert()
+            .code(1);
+        let v = json_of(&out.get_output().stdout);
+        assert_eq!(v["error"]["type"], "invalid-input", "{position}: {v}");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(message.contains(says), "{position}: {message}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), before, "{position}");
+    }
+}
+
+#[test]
+fn map_deletes_the_database_row_for_the_directory() {
+    // The file is the only source for a directory `map` has written.
+    let d = tempfile::tempdir().unwrap();
+    let (a, _) = two_accounts(d.path());
+    let (x, x_real) = dir(d.path(), "x");
+    legacy_mapping(d.path(), &x_real, &a);
+    cmd(d.path()).args(["map", "2"]).arg(&x).assert().success();
+    assert!(listed(d.path()).is_empty());
+    assert_eq!(config_listed(d.path()).len(), 1);
+}
+
+#[test]
+fn the_listing_reports_every_problem() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let kc = FileKeychain::new(d.path().join("keychain"));
+    seed_home(&env);
+    // 1 and 2 share an email, 3 is alone, 4 is an API key.
+    login(&env, &kc, "a@x.co", "o1", "rt-1");
+    cmd(d.path()).arg("add").assert().success();
+    login(&env, &kc, "a@x.co", "o2", "rt-2");
+    cmd(d.path()).arg("add").assert().success();
+    login(&env, &kc, "b@x.co", "", "rt-3");
+    cmd(d.path()).arg("add").assert().success();
+    cmd(d.path())
+        .args(["add-token", "sk-ant-api03-key"])
+        .assert()
+        .success();
+    cmd(d.path())
+        .args(["alias", "4", "keyed"])
+        .assert()
+        .success();
+    for name in ["noacct", "amb", "api", "pos", "conf", "fine"] {
+        fs::create_dir_all(d.path().join("home").join(name)).unwrap();
+    }
+    write_config(
+        d.path(),
+        "[provider.claude-code.mappings]\n\
+         \"/no/such/dir\" = \"b@x.co\"\n\
+         \"~/noacct\" = \"nobody\"\n\
+         \"~/amb\" = \"a@x.co\"\n\
+         \"~/api\" = \"keyed\"\n\
+         \"~/pos\" = \"2\"\n\
+         \"~/conf\" = \"b@x.co\"\n\
+         \"~/conf/\" = \"keyed\"\n\
+         \"~/fine\" = \"b@x.co\"\n",
+    );
+    let files = config_listed(d.path());
+    let problems: std::collections::BTreeSet<&str> =
+        files.iter().filter_map(|f| f["problem"].as_str()).collect();
+    assert_eq!(
+        problems,
+        [
+            "missing-directory",
+            "no-account",
+            "ambiguous",
+            "api-key",
+            "position",
+            "conflict"
+        ]
+        .into_iter()
+        .collect()
+    );
+    let fine = files.iter().find(|f| f["written"] == "~/fine").unwrap();
+    assert!(
+        fine.get("problem").is_none() && fine["account"]["number"] == 3,
+        "{fine}"
+    );
+    let human = cmd(d.path()).arg("map").assert().success();
+    let human = String::from_utf8(human.get_output().stdout.clone()).unwrap();
+    assert!(
+        human.contains("-  \"nobody\"  (names no account here)"),
+        "{human}"
     );
 }
 
