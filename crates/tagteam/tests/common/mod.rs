@@ -743,7 +743,6 @@ pub fn install_script(path: &Path, body: &str) {
     fs::remove_file(&scratch).unwrap();
 }
 
-/// `bin`, then this test process's own `PATH`: what puts the fake `claude` first.
 /// The first `name` on this test's `PATH`: the shell, if it is installed.
 pub fn installed(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
@@ -751,6 +750,7 @@ pub fn installed(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// `bin`, then this test process's own `PATH`: what puts the fake `claude` first.
 pub fn path_with(bin: &Path) -> OsString {
     let mut path = bin.as_os_str().to_owned();
     if let Some(rest) = std::env::var_os("PATH") {
