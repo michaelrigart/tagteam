@@ -9,6 +9,7 @@ use tagteam_daemon::scheduler::{ThreadSleeper, uniform_jitter};
 use tagteam_daemon::service::{self as daemon_service, InstallError, MANAGER_TIMEOUT};
 use tagteam_daemon::watch::{ProgramStamp, UPGRADE_WATCH_MS};
 use tagteam_engine::Engine;
+use tagteam_engine::auto::HolderKind;
 use tagteam_engine::daemon::{daemon_lock_path, read_daemon_record};
 use tagteam_engine::service::{recorded_env, render_unit, service_state, unit_path};
 use tagteam_engine::settings::parse_bool;
@@ -63,24 +64,29 @@ pub(in crate::app) fn auto_flags(
 }
 
 /// How `auto` fails as a command, each provider named by `name`. A provider whose engine is the
-/// daemon's (`daemon` gives its pid) is named with the daemon and how to pause it (D8.3).
+/// daemon's or a tagteam window's (`holder` gives its kind and pid) is named with that holder and
+/// how to pause it (D8.3).
 /// Consume-first named for a provider without a long window is a usage error, exit 2, as every
 /// bad flag value is (§4.5).
 fn auto_failure(
     e: AutoError,
     name: &dyn Fn(&ProviderId) -> String,
-    daemon: &dyn Fn(&ProviderId) -> Option<u32>,
+    holder: &dyn Fn(&ProviderId) -> Option<(HolderKind, u32)>,
 ) -> Failure {
     match e {
         AutoError::AlreadyRuns(providers) => {
             let names: Vec<String> = providers
                 .iter()
-                .map(|p| match daemon(p) {
-                    Some(pid) => format!(
+                .map(|p| match holder(p) {
+                    Some((HolderKind::Daemon, pid)) => format!(
                         "{} (the daemon, pid {pid}; pause it with tagteam config set daemon.autoswitch false)",
                         name(p)
                     ),
-                    None => name(p),
+                    Some((HolderKind::Tui, pid)) => format!(
+                        "{} (a tagteam window, pid {pid}; press P there to pause it, or quit it)",
+                        name(p)
+                    ),
+                    Some((HolderKind::Auto, _)) | None => name(p),
                 })
                 .collect();
             Failure::Message(
@@ -118,16 +124,21 @@ fn install_failure(e: InstallError) -> Failure {
     Failure::Message(kind, message)
 }
 
-/// D8.3: the daemon's pid when `provider`'s engine lock record names the process `daemon.lock`
-/// names, by pid and start time; `None` for any other holder, or a record that cannot be read.
-fn daemon_engine(engine: &Engine, provider: &ProviderId) -> Option<u32> {
+/// D8.3: who holds `provider`'s engine lock, when `auto`'s refusal names it: the daemon, when
+/// the record matches the process `daemon.lock` names by pid and start time, or a tagteam
+/// window, when the record says so. `None` for any other holder, or a record that cannot be
+/// read.
+fn engine_lock_holder(engine: &Engine, provider: &ProviderId) -> Option<(HolderKind, u32)> {
     let Read::Present(holder) = engine.engine_holder(provider) else {
         return None;
     };
     match read_daemon_record(&daemon_lock_path(engine.env())) {
-        Read::Present(d) if d.pid == holder.pid && d.start == holder.start => Some(d.pid),
-        _ => None,
+        Read::Present(d) if d.pid == holder.pid && d.start == holder.start => {
+            return Some((HolderKind::Daemon, d.pid));
+        }
+        _ => {}
     }
+    (holder.kind == Some(HolderKind::Tui)).then_some((HolderKind::Tui, holder.pid))
 }
 
 impl App<'_, '_> {
@@ -157,7 +168,7 @@ impl App<'_, '_> {
         let engine = &self.engine;
         let now_ms = || engine.now_ms();
         let names = |p: &ProviderId| display_name(engine, p);
-        let daemon = |p: &ProviderId| daemon_engine(engine, p);
+        let holder = |p: &ProviderId| engine_lock_holder(engine, p);
         let Io { out, err, .. } = &mut *self.io;
         let ended = if self.json {
             let sink = JsonSink::new(&mut **out, &now_ms).stopping(engine.cancel());
@@ -167,7 +178,7 @@ impl App<'_, '_> {
                 .stopping(engine.cancel());
             auto::run_loop(engine, &run, &sink, &ThreadSleeper, &mut uniform_jitter)
         };
-        ended.map_err(|e| auto_failure(e, &names, &daemon))
+        ended.map_err(|e| auto_failure(e, &names, &holder))
     }
 
     /// D8, D9: `daemon install`, `uninstall` and `status`. `tagteam daemon` with no action is
@@ -326,6 +337,7 @@ impl App<'_, '_> {
 #[cfg(test)]
 mod tests {
     use tagteam_cc::CLAUDE_CODE;
+    use tagteam_engine::auto::HolderKind;
     use tagteam_engine::settings::{
         COOLDOWN_SECONDS_RANGE, INTERVAL_SECONDS_RANGE, Settings, THRESHOLD_RANGE,
     };
@@ -425,10 +437,10 @@ mod tests {
         // how to pause it.
         let cc = ProviderId::new(CLAUDE_CODE);
         let name = |_: &ProviderId| "Claude Code".to_owned();
-        let refusal = |daemon: Option<u32>| match auto_failure(
+        let refusal = |holder: Option<(HolderKind, u32)>| match auto_failure(
             AutoError::AlreadyRuns(vec![cc.clone()]),
             &name,
-            &|_| daemon,
+            &|_| holder,
         ) {
             Failure::Message(kind, message) => {
                 assert_eq!(kind, KIND_ENGINE_RUNNING);
@@ -437,9 +449,27 @@ mod tests {
             _ => panic!("not engine-running"),
         };
         assert_eq!(
-            refusal(Some(4242)),
+            refusal(Some((HolderKind::Daemon, 4242))),
             "auto-switch already runs for Claude Code (the daemon, pid 4242; pause it with tagteam config set daemon.autoswitch false)"
         );
         assert_eq!(refusal(None), "auto-switch already runs for Claude Code");
+    }
+
+    #[test]
+    fn auto_s_refusal_names_a_tagteam_window() {
+        let cc = ProviderId::new(CLAUDE_CODE);
+        let name = |_: &ProviderId| "Claude Code".to_owned();
+        let Failure::Message(kind, message) =
+            auto_failure(AutoError::AlreadyRuns(vec![cc]), &name, &|_| {
+                Some((HolderKind::Tui, 4711))
+            })
+        else {
+            panic!("not engine-running");
+        };
+        assert_eq!(kind, KIND_ENGINE_RUNNING);
+        assert_eq!(
+            message,
+            "auto-switch already runs for Claude Code (a tagteam window, pid 4711; press P there to pause it, or quit it)"
+        );
     }
 }

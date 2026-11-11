@@ -8,6 +8,7 @@ use tagteam_provider::doctor::quoted;
 use tagteam_provider::process::current_uid;
 use tagteam_provider::{Check, Liveness, ProcessStamp, Read};
 
+use crate::auto::EngineHolder;
 use crate::daemon::{
     DaemonRecord, MAX_SOCKET_PATH, daemon_lock_path, daemon_socket_path, find_on_path,
     read_daemon_record,
@@ -167,7 +168,7 @@ impl Run<'_> {
 
     /// Whether `holder`, an engine lock's record, names the process `daemon.lock` names, by pid
     /// and start time (D10).
-    pub(super) fn held_by_daemon(&self, holder: &ProcessStamp) -> bool {
+    pub(super) fn held_by_daemon(&self, holder: &EngineHolder) -> bool {
         matches!(
             read_daemon_record(&daemon_lock_path(&self.engine.env)),
             Read::Present(r) if r.pid == holder.pid && r.start == holder.start

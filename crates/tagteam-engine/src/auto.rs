@@ -16,8 +16,10 @@ use tagteam_core::fmt::span;
 use tagteam_core::rank::binding_window;
 use tagteam_core::time::ms_to_s_ceil;
 use tagteam_core::usage::headroom;
-use tagteam_core::{AccountId, Fingerprint, ProviderId, Window, WindowKind};
-use tagteam_provider::{Env, FlockGuard, LockError, ProcessStamp, Provider, Read, ReadError};
+use tagteam_core::{AccountId, Fingerprint, ProviderId, Window, WindowKind, str_enum};
+use tagteam_provider::{
+    Env, FlockGuard, Liveness, LockError, ProcessStamp, Provider, Read, ReadError,
+};
 
 use crate::collect::{CollectMode, CollectReport};
 use crate::engine::{Engine, GuardRequest};
@@ -271,14 +273,57 @@ pub struct AutoEngine<'e> {
     exhausted: Option<bool>,
 }
 
-/// Replaces the held engine lock file's whole content with this process's pid and start time,
-/// one JSON line, through a second descriptor: the lock stays on the first. M5's `doctor` reads
-/// it; nothing reads it for exclusion.
-fn write_holder(path: &Path) -> Result<(), EngineError> {
+str_enum! {
+    /// Which kind of process holds an engine lock, as its record names it: the daemon, a
+    /// `tagteam auto`, or a TUI running the engine in its own window.
+    pub enum HolderKind {
+        Daemon => "daemon",
+        Auto => "auto",
+        Tui => "tui",
+    }
+}
+
+/// An engine lock's record (§11.1): the process that wrote it, and the kind of process it says
+/// that is. `kind` is `None` for a record written before the field existed, or one naming a
+/// kind this build does not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineHolder {
+    pub pid: u32,
+    pub start: u64,
+    pub kind: Option<HolderKind>,
+}
+
+impl EngineHolder {
+    /// The process the record names, as `ProcessStamp` judges it.
+    pub fn stamp(&self) -> ProcessStamp {
+        ProcessStamp {
+            pid: self.pid,
+            start: self.start,
+        }
+    }
+
+    /// Whether the process the record names runs, by an exact pid and start-time match.
+    pub fn liveness(&self) -> Liveness {
+        self.stamp().liveness()
+    }
+}
+
+/// Replaces the held engine lock file's whole content with this process's pid and start time
+/// and the kind of holder it is, one JSON line, through a second descriptor: the lock stays on
+/// the first. M5's `doctor` reads it; nothing reads it for exclusion.
+fn write_holder(path: &Path, kind: HolderKind) -> Result<(), EngineError> {
     let stamp = ProcessStamp::current()?;
     let mut file = OpenOptions::new().write(true).open(path)?;
     file.set_len(0)?;
-    file.write_all(format!("{{\"pid\":{},\"start\":{}}}\n", stamp.pid, stamp.start).as_bytes())?;
+    file.write_all(
+        format!(
+            "{{\"pid\":{},\"start\":{},\"holder\":\"{}\"}}\n",
+            stamp.pid,
+            stamp.start,
+            kind.as_str()
+        )
+        .as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -317,9 +362,13 @@ pub(crate) fn lock_file_name(id: &str, plain_prefix: &str, hashed_prefix: &str) 
 /// lock, which an `auto` starting at that instant would then find taken (§13.6): the holder
 /// an engine named, never proof that it still holds the lock. `Absent` when
 /// there is no file, or an empty one: no engine has written its record there yet.
-pub(crate) fn read_holder(path: &Path) -> Read<ProcessStamp> {
-    read_lock_record(path, "it is not a pid and a start time", |stamp, _| {
-        Some(stamp)
+pub(crate) fn read_holder(path: &Path) -> Read<EngineHolder> {
+    read_lock_record(path, "it is not a pid and a start time", |stamp, v| {
+        Some(EngineHolder {
+            pid: stamp.pid,
+            start: stamp.start,
+            kind: v["holder"].as_str().and_then(HolderKind::parse),
+        })
     })
 }
 
@@ -376,7 +425,7 @@ impl Engine {
             let Some(lock) = FlockGuard::try_lock(&path)? else {
                 return Ok(None);
             };
-            write_holder(lock.path())?;
+            write_holder(lock.path(), self.lock_holder())?;
             Some(lock)
         };
         Ok(Some(AutoEngine {
@@ -400,7 +449,7 @@ impl Engine {
     /// `auto` fail (D4.3). `Absent` with no record: no engine has run, or the last one let the
     /// lock go (Decision 5). Never proof that the holder runs: judge that by an exact pid and
     /// start-time match (`ProcessStamp::liveness`).
-    pub fn engine_holder(&self, provider: &ProviderId) -> Read<ProcessStamp> {
+    pub fn engine_holder(&self, provider: &ProviderId) -> Read<EngineHolder> {
         read_holder(&engine_lock_path(&self.env, provider))
     }
 
@@ -1256,13 +1305,34 @@ mod tests {
         assert!(matches!(read_holder(&path), Read::Absent));
         std::fs::write(&path, "{\"pid\":1,\"start\":2}\n").unwrap();
         assert!(
-            matches!(read_holder(&path), Read::Present(s) if s == ProcessStamp { pid: 1, start: 2 })
+            matches!(read_holder(&path), Read::Present(h) if h.stamp() == ProcessStamp { pid: 1, start: 2 })
         );
         for text in ["garbage", "{\"pid\":4294967296,\"start\":2}", "{\"pid\":1}"] {
             std::fs::write(&path, text).unwrap();
             assert!(
                 matches!(read_holder(&path), Read::Unreadable(e)
                     if e.detail == "it is not a pid and a start time"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_without_the_holder_field_reads_as_before() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("autoswitch-p.lock");
+        for (text, kind) in [
+            ("{\"pid\":1,\"start\":2}\n", None),
+            (
+                "{\"pid\":1,\"start\":2,\"holder\":\"tui\"}\n",
+                Some(HolderKind::Tui),
+            ),
+            ("{\"pid\":1,\"start\":2,\"holder\":\"robot\"}\n", None),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert!(
+                matches!(read_holder(&path), Read::Present(h)
+                    if h == EngineHolder { pid: 1, start: 2, kind }),
                 "{text}"
             );
         }

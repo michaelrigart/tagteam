@@ -13,7 +13,7 @@ use common::{
 use serde_json::{Value, json};
 use tagteam_core::autoswitch::{AutoConfig, AutoState, AutoStrategy, Decision, NoSwitchReason};
 use tagteam_core::{AccountId, ProviderId, Window, WindowKind};
-use tagteam_engine::auto::{AutoEvent, QuarantineWatch, TickOutcome};
+use tagteam_engine::auto::{AutoEvent, HolderKind, QuarantineWatch, TickOutcome};
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::{EngineError, EventKind, EventSource};
 use tagteam_provider::{FlockGuard, ProcessStamp, Provider, Read};
@@ -78,7 +78,7 @@ fn a_second_engine_for_one_provider_gets_none_while_the_first_lives() {
 #[test]
 fn the_engine_lock_records_its_holder_as_one_json_line() {
     // M5's amendment (`86882e3`): pid and start time, the start taken as for the journal's
-    // holder (§12.6). A longer record left by a dead engine is replaced whole.
+    // holder (§12.6), and the kind of holder it is. A longer record left by a dead engine is replaced whole.
     let fx = Fx::new();
     let path = lock_path(&fx, &fx.provider());
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -96,7 +96,10 @@ fn the_engine_lock_records_its_holder_as_one_json_line() {
     let bytes = fs::read(&path).unwrap();
     assert_eq!(
         String::from_utf8(bytes.clone()).unwrap(),
-        format!("{{\"pid\":{},\"start\":{}}}\n", me.pid, me.start)
+        format!(
+            "{{\"pid\":{},\"start\":{},\"holder\":\"auto\"}}\n",
+            me.pid, me.start
+        )
     );
     let record: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(record["pid"].as_u64(), Some(u64::from(me.pid)));
@@ -402,7 +405,7 @@ fn a_dropped_engine_leaves_its_lock_file_empty_and_free() {
         .unwrap()
         .unwrap();
     let me = ProcessStamp::current().unwrap();
-    assert!(matches!(fx.engine.engine_holder(&provider), Read::Present(s) if s == me));
+    assert!(matches!(fx.engine.engine_holder(&provider), Read::Present(h) if h.stamp() == me));
     drop(engine);
     assert_eq!(
         fs::read(&path).unwrap(),
@@ -414,6 +417,45 @@ fn a_dropped_engine_leaves_its_lock_file_empty_and_free() {
         FlockGuard::try_lock(&path).unwrap().is_some(),
         "and the lock is free"
     );
+}
+
+#[test]
+fn each_engine_names_its_holder_in_its_lock_record() {
+    // The record says which kind of process holds the lock, as the engine's source and
+    // `with_lock_holder` name it; the file is empty again once the engine drops.
+    let fx = Fx::new();
+    let provider = fx.provider();
+    let path = lock_path(&fx, &provider);
+    let me = ProcessStamp::current().unwrap();
+    let daemon = fx.engine_as(EventSource::Daemon);
+    let auto = fx.engine_as(EventSource::Auto);
+    let tui = fx
+        .engine_as(EventSource::Auto)
+        .with_lock_holder(HolderKind::Tui);
+    for (engine, kind, word) in [
+        (&daemon, HolderKind::Daemon, "daemon"),
+        (&auto, HolderKind::Auto, "auto"),
+        (&tui, HolderKind::Tui, "tui"),
+    ] {
+        assert_eq!(engine.lock_holder(), kind);
+        let held = engine
+            .auto(&provider, cfg(fx.cc.as_ref()), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!(
+                "{{\"pid\":{},\"start\":{},\"holder\":\"{word}\"}}\n",
+                me.pid, me.start
+            )
+        );
+        assert!(matches!(
+            engine.engine_holder(&provider),
+            Read::Present(h) if h.stamp() == me && h.kind == Some(kind)
+        ));
+        drop(held);
+        assert_eq!(fs::read(&path).unwrap(), b"");
+    }
 }
 
 #[test]
@@ -434,10 +476,7 @@ fn a_dry_run_engine_s_drop_touches_no_lock_file() {
     assert_eq!(fs::read_to_string(&path).unwrap(), record);
     assert!(matches!(
         fx.engine.engine_holder(&provider),
-        Read::Present(ProcessStamp {
-            pid: 4242,
-            start: 1
-        })
+        Read::Present(h) if h.stamp() == ProcessStamp { pid: 4242, start: 1 }
     ));
     fs::write(&path, "garbage").unwrap();
     assert!(matches!(

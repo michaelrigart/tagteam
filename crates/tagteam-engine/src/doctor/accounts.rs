@@ -9,7 +9,7 @@ use tagteam_core::usage::WindowKind;
 use tagteam_provider::doctor::quoted;
 use tagteam_provider::{Check, Liveness, Provider, Read};
 
-use crate::auto::{engine_lock_path, read_holder};
+use crate::auto::{HolderKind, engine_lock_path, read_holder};
 use crate::quarantine::QuarantineReason;
 use crate::settings::Settings;
 use crate::store::{
@@ -25,16 +25,17 @@ use super::{Id, Run, Secrets, command};
 const EXPIRY_NOTICE_MS: i64 = 7 * 86_400_000;
 
 /// `auto.engine` for an engine lock record naming `pid`: an undetermined liveness is an input
-/// doctor could not read, so a warning, as for `switch.interrupted`. `daemon`
-/// means the record matches `daemon.lock`'s, so the engine is the daemon's (D10).
-fn engine_record_check(pid: u32, liveness: Liveness, daemon: bool) -> Check {
-    let who = if daemon {
-        format!("the daemon (pid {pid})")
-    } else {
-        format!("pid {pid}")
+/// doctor could not read, so a warning, as for `switch.interrupted`. `kind` is who holds the
+/// lock: the daemon when the record matches `daemon.lock`'s (D10), else the kind the record
+/// names.
+fn engine_record_check(pid: u32, liveness: Liveness, kind: Option<HolderKind>) -> Check {
+    let who = match kind {
+        Some(HolderKind::Daemon) => format!("the daemon (pid {pid})"),
+        Some(HolderKind::Tui) => format!("a tagteam window (pid {pid})"),
+        Some(HolderKind::Auto) | None => format!("pid {pid}"),
     };
     match liveness {
-        Liveness::Live if daemon => {
+        Liveness::Live if matches!(kind, Some(HolderKind::Daemon | HolderKind::Tui)) => {
             Check::info(Id::AUTO_ENGINE, format!("auto-switch runs in {who}"))
         }
         Liveness::Live => Check::info(Id::AUTO_ENGINE, format!("auto-switch runs as {who}")),
@@ -50,7 +51,11 @@ fn engine_record_check(pid: u32, liveness: Liveness, daemon: bool) -> Check {
         )
         .fix(format!(
             "check whether pid {pid} is still running a `tagteam {}`, then `tagteam doctor` again",
-            if daemon { "daemon" } else { "auto" }
+            match kind {
+                Some(HolderKind::Daemon) => "daemon",
+                Some(HolderKind::Tui) => "tui",
+                Some(HolderKind::Auto) | None => "auto",
+            }
         )),
     }
 }
@@ -485,8 +490,13 @@ impl Run<'_> {
         let lock = engine_lock_path(&self.engine.env, &id);
         let running = match read_holder(&lock) {
             Read::Absent => Check::ok(Id::AUTO_ENGINE, "auto-switch is not running"),
-            Read::Present(stamp) => {
-                engine_record_check(stamp.pid, stamp.liveness(), self.held_by_daemon(&stamp))
+            Read::Present(holder) => {
+                let kind = if self.held_by_daemon(&holder) {
+                    Some(HolderKind::Daemon)
+                } else {
+                    holder.kind.filter(|k| *k != HolderKind::Daemon)
+                };
+                engine_record_check(holder.pid, holder.liveness(), kind)
             }
             Read::Unreadable(e) => Check::warn(
                 Id::AUTO_ENGINE,
@@ -633,25 +643,29 @@ mod tests {
 
     #[test]
     fn an_engine_whose_liveness_cannot_be_told_is_a_warning_with_a_fix() {
-        let c = engine_record_check(4242, Liveness::Unknown("permission denied".into()), false);
+        let c = engine_record_check(4242, Liveness::Unknown("permission denied".into()), None);
         assert_eq!(c.id, "auto.engine");
         assert_eq!(c.status, CheckStatus::Warn);
         assert!(c.message.contains("4242") && c.message.contains("permission denied"));
         assert!(c.fix.as_deref().is_some_and(|f| f.contains("pid 4242")));
         assert_eq!(
-            engine_record_check(4242, Liveness::Live, false).status,
+            engine_record_check(4242, Liveness::Live, None).status,
             CheckStatus::Info
         );
         assert_eq!(
-            engine_record_check(4242, Liveness::Dead, false).status,
+            engine_record_check(4242, Liveness::Dead, None).status,
             CheckStatus::Ok
         );
         // D10: a record that is daemon.lock's names the daemon.
         assert_eq!(
-            engine_record_check(4242, Liveness::Live, true).message,
+            engine_record_check(4242, Liveness::Live, Some(HolderKind::Daemon)).message,
             "auto-switch runs in the daemon (pid 4242)"
         );
-        let c = engine_record_check(4242, Liveness::Unknown("permission denied".into()), true);
+        let c = engine_record_check(
+            4242,
+            Liveness::Unknown("permission denied".into()),
+            Some(HolderKind::Daemon),
+        );
         assert_eq!(
             c.message,
             "whether auto-switch runs as the daemon (pid 4242) cannot be told: the process's start time cannot be read (permission denied)"
@@ -660,6 +674,21 @@ mod tests {
             c.fix.as_deref(),
             Some(
                 "check whether pid 4242 is still running a `tagteam daemon`, then `tagteam doctor` again"
+            )
+        );
+        let c = engine_record_check(
+            4242,
+            Liveness::Unknown("permission denied".into()),
+            Some(HolderKind::Tui),
+        );
+        assert_eq!(
+            c.message,
+            "whether auto-switch runs as a tagteam window (pid 4242) cannot be told: the process's start time cannot be read (permission denied)"
+        );
+        assert_eq!(
+            c.fix.as_deref(),
+            Some(
+                "check whether pid 4242 is still running a `tagteam tui`, then `tagteam doctor` again"
             )
         );
     }

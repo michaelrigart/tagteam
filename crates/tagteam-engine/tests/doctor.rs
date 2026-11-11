@@ -2555,6 +2555,49 @@ fn an_engine_lock_held_by_the_daemon_names_the_daemon() {
 }
 
 #[test]
+fn doctor_names_a_tagteam_window_holding_the_engine_lock() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let me = ProcessStamp::current().unwrap();
+    let engine_lock = fx.env.data_dir().join("locks/autoswitch-claude-code.lock");
+    fs::create_dir_all(engine_lock.parent().unwrap()).unwrap();
+    let record = |start: u64| {
+        format!(
+            "{{\"pid\":{},\"start\":{start},\"holder\":\"tui\"}}\n",
+            me.pid
+        )
+    };
+    fs::write(&engine_lock, record(me.start)).unwrap();
+    let c = one(&doctor(&fx), "auto.engine").clone();
+    assert_eq!(
+        (c.status, c.message),
+        (
+            CheckStatus::Info,
+            format!("auto-switch runs in a tagteam window (pid {})", me.pid)
+        )
+    );
+    fs::write(&engine_lock, record(me.start + 1)).unwrap();
+    let c = one(&doctor(&fx), "auto.engine").clone();
+    assert_eq!(
+        (c.status, c.message),
+        (
+            CheckStatus::Ok,
+            format!(
+                "auto-switch is not running (its last engine, a tagteam window (pid {}), has exited)",
+                me.pid
+            )
+        )
+    );
+    // The daemon's own record wins over the holder field.
+    fs::write(&engine_lock, record(me.start)).unwrap();
+    daemon_lock_record(&fx, me, env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        one(&doctor(&fx), "auto.engine").message,
+        format!("auto-switch runs in the daemon (pid {})", me.pid)
+    );
+}
+
+#[test]
 fn the_service_unit_is_reported_with_what_its_manager_says() {
     for kind in [ServiceKind::Launchd, ServiceKind::Systemd] {
         let (_short, fx) = daemon_fx(|_| {});

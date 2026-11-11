@@ -11,6 +11,7 @@ use tagteam_provider::profile::RunShell;
 use tagteam_provider::{Cancel, Clock, Env, Http, MutationGuard, Provider, ProviderError, Read};
 
 use crate::account_lock::AccountLock;
+use crate::auto::HolderKind;
 use crate::error::EngineError;
 use crate::event::EventSource;
 use crate::hooks;
@@ -128,6 +129,9 @@ pub struct Engine {
     pub(crate) run_shell: RunShell,
     /// The `source` this engine's events are recorded under.
     source: EventSource,
+    /// The kind of holder this engine's lock records name (§11.1): its source's, unless
+    /// `with_lock_holder` says otherwise.
+    lock_holder: HolderKind,
     store: Mutex<Option<Arc<Store>>>,
     #[cfg(feature = "test-hooks")]
     pub(crate) fail_at: Mutex<Option<&'static str>>,
@@ -151,6 +155,10 @@ impl Engine {
             spawner: cfg.spawner,
             run_shell: cfg.run_shell,
             source: cfg.source,
+            lock_holder: match cfg.source {
+                EventSource::Daemon => HolderKind::Daemon,
+                EventSource::Cli | EventSource::Auto => HolderKind::Auto,
+            },
             store: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
             fail_at: Mutex::new(None),
@@ -166,6 +174,19 @@ impl Engine {
     /// Who raised the events this engine records (review refactor §8.7).
     pub fn source(&self) -> EventSource {
         self.source
+    }
+
+    /// This engine holding its locks as `kind` (a TUI's engine records `EventSource::Auto` events but
+    /// is not a `tagteam auto`).
+    #[must_use]
+    pub fn with_lock_holder(mut self, kind: HolderKind) -> Self {
+        self.lock_holder = kind;
+        self
+    }
+
+    /// The kind of holder this engine's engine lock records name.
+    pub fn lock_holder(&self) -> HolderKind {
+        self.lock_holder
     }
 
     /// The cancel token every cancellation point checks (§4.2, §14.1). It is the Env's, so
