@@ -21,6 +21,7 @@ pub mod launch;
 pub mod lazy_http;
 pub mod lifecycle;
 mod live_guard;
+pub mod mappings;
 pub mod net;
 pub mod oracle;
 pub mod profiles;

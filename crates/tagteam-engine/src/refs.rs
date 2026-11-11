@@ -3,7 +3,7 @@ use tagteam_core::validate::{AccountRefInput, normalize_alias, parse_account_ref
 
 use crate::engine::Engine;
 use crate::error::EngineError;
-use crate::store::AccountRow;
+use crate::store::{AccountRow, Store, StoreError};
 
 impl Engine {
     /// §10.4: a position (within `provider`, else the default provider), then an alias
@@ -22,15 +22,7 @@ impl Engine {
                 let provider = provider.unwrap_or(&self.default_provider);
                 Ok(store.find_by_position(provider, p)?.into_iter().collect())
             }
-            Some(AccountRefInput::Text(t)) => {
-                if let Ok(alias) = normalize_alias(&t)
-                    && let Some(row) = store.find_by_alias(&alias)?
-                {
-                    let wrong_provider = provider.is_some_and(|p| p != &row.provider);
-                    return Ok(if wrong_provider { vec![] } else { vec![row] });
-                }
-                Ok(store.find_by_email(&t, provider)?)
-            }
+            Some(AccountRefInput::Text(t)) => Ok(text_candidates(&store, &t, provider)?),
         }
     }
 
@@ -61,4 +53,21 @@ impl Engine {
             }),
         }
     }
+}
+
+/// §10.4's text branch: an alias (unique across providers, so one in another provider than
+/// `provider` matches nothing), then an exact email (within `provider` if given). A position
+/// is not text; callers that accept one parse it first.
+pub(crate) fn text_candidates(
+    store: &Store,
+    text: &str,
+    provider: Option<&ProviderId>,
+) -> Result<Vec<AccountRow>, StoreError> {
+    if let Ok(alias) = normalize_alias(text)
+        && let Some(row) = store.find_by_alias(&alias)?
+    {
+        let wrong_provider = provider.is_some_and(|p| p != &row.provider);
+        return Ok(if wrong_provider { vec![] } else { vec![row] });
+    }
+    store.find_by_email(text, provider)
 }
