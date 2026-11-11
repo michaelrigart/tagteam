@@ -59,11 +59,12 @@ fn invalid_path(path: &Path, why: &str) -> Failure {
     Failure::Message(KIND_INVALID_INPUT, format!("{}: {why}", path.display()))
 }
 
-/// Warnings for the file entries that named an account in `before` and name another, or none,
-/// in `after`, and for those that named more than one and now name one (config-mappings spec
-/// §3.6): an ambiguous entry ran plain, and no longer does. Entries are matched by key and
-/// value, as written. `launch` is the provider's launch command, which runs plain where an entry
-/// names none.
+/// Warnings for the file entries that named an account in `before` and apply to another, or to
+/// none, in `after`, and for those that named more than one and now apply to one (config-mappings
+/// spec §3.6): an ambiguous entry ran plain, and no longer does. An entry applies to an account
+/// only when it has no problem, so one that now names an API-key account runs plain, as one that
+/// names none does. Entries are matched by key and value, as written. `launch` is the provider's
+/// launch command, which runs plain where an entry does not apply.
 pub(in crate::app) fn mapping_warnings(
     before: &[ConfigMapping],
     after: &[ConfigMapping],
@@ -73,15 +74,22 @@ pub(in crate::app) fn mapping_warnings(
     before
         .iter()
         .filter_map(|was| {
-            let now = after
+            let matched = after
                 .iter()
-                .find(|m| m.entry.written == was.entry.written && m.entry.value == was.entry.value)
+                .find(|m| m.entry.written == was.entry.written && m.entry.value == was.entry.value);
+            let unchanged = |named: &AccountRow| {
+                matched
+                    .and_then(|m| m.account.as_ref())
+                    .is_some_and(|a| a.id == named.id)
+            };
+            let now = matched
+                .filter(|m| m.problem.is_none())
                 .and_then(|m| m.account.as_ref());
             let names_now = |a: &AccountRow| {
                 format!("it now names {} (position {})", render::name(a), a.position)
             };
             let (was_named, outcome) = match (&was.account, now) {
-                (Some(named), Some(a)) if a.id == named.id => return None,
+                (Some(named), _) if unchanged(named) => return None,
                 (Some(named), Some(a)) => (
                     format!(
                         "no longer names {} (position {})",
@@ -380,6 +388,30 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn an_entry_whose_new_account_is_an_api_key_runs_plain_rather_than_naming_it() {
+        let mut keyed = entry(2, "b@x.co");
+        keyed.problem = Some(MappingProblem::ApiKey);
+        let warnings = mapping_warnings(
+            &[entry(1, "a@x.co")],
+            std::slice::from_ref(&keyed),
+            Path::new("/c/config.toml"),
+            "fakeagent",
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("`fakeagent` runs plain there, with a warning"),
+            "{warnings:?}"
+        );
+        assert!(!warnings[0].contains("now names"), "{warnings:?}");
+
+        // It ran plain before, and still does: nothing changed.
+        let mut ambiguous = entry(1, "a@x.co");
+        ambiguous.account = None;
+        ambiguous.problem = Some(MappingProblem::Ambiguous);
+        assert!(mapping_warnings(&[ambiguous], &[keyed], Path::new("/c"), "fakeagent").is_empty());
     }
 
     #[test]
