@@ -337,6 +337,7 @@ mod tests {
 
     use super::*;
     use crate::host::ActionOutcome;
+    use crate::msg::LaneReport;
     use crate::source::{CollectSummary, SourceError};
     use crate::state::{GUARD_MS, Startup};
     use crate::testutil::*;
@@ -770,6 +771,26 @@ mod tests {
                 ] if *scope == Scope::All
             ),
             "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn after_an_upgrade_the_timer_and_the_first_frame_collect_nothing_but_still_read() {
+        let mut state = fresh(Screen::Accounts);
+        state.start();
+        update(&mut state, accounts_msg(1, 2), NOW_MS);
+        update(&mut state, Msg::Lane(LaneReport::Upgraded), NOW_MS);
+        assert!(
+            drawn(&mut state)
+                .iter()
+                .all(|c| !matches!(c, Cmd::CollectDue { .. })),
+            "the first frame asks for no collection"
+        );
+        assert_eq!(state.gens.collect, 0);
+        assert_eq!(
+            update(&mut state, Msg::Tick, NOW_MS + 30_000),
+            [Cmd::LoadAccounts { r#gen: 2 }],
+            "the views are read, nothing is collected"
         );
     }
 

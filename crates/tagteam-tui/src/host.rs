@@ -178,6 +178,13 @@ impl Action {
         }
     }
 
+    /// Whether the command writes the store. Every action but `Doctor` does, `Run` included (its
+    /// launch records a switch); `Autoswitch` changes the config file, not the store. Once the
+    /// store is newer than this build the TUI starts none that does (spec S§3.7).
+    pub fn writes_store(&self) -> bool {
+        !matches!(self, Action::Doctor { .. } | Action::Autoswitch { .. })
+    }
+
     /// `Run` only: it always runs suspended (spec §7.3).
     pub fn needs_terminal(&self) -> bool {
         matches!(self, Action::Run(_))
@@ -473,6 +480,51 @@ mod tests {
             },
         ] {
             assert!(!action.needs_terminal(), "{action:?}");
+        }
+    }
+
+    /// A store newer than this build stops every TUI write (S§3.7): `Run` writes too, since a
+    /// session's launch records its switch. Only `doctor` and the daemon's `config` change leave
+    /// the store alone.
+    #[test]
+    fn only_doctor_and_autoswitch_leave_the_store_alone() {
+        let a = || account(1);
+        for action in [
+            Action::Switch(a()),
+            Action::SwitchBy {
+                provider: provider(),
+                strategy: UsageStrategy::Best,
+            },
+            Action::Enable(a()),
+            Action::Disable(a()),
+            Action::SetAlias {
+                account: a(),
+                alias: "w".into(),
+            },
+            Action::ClearAlias(a()),
+            Action::Move {
+                account: a(),
+                position: 2,
+            },
+            Action::Remove(a()),
+            Action::AddLive {
+                provider: provider(),
+            },
+            Action::Run(a()),
+        ] {
+            assert!(action.writes_store(), "{action:?}");
+        }
+        for action in [
+            Action::Doctor {
+                provider: None,
+                online: true,
+            },
+            Action::Autoswitch {
+                provider: provider(),
+                on: false,
+            },
+        ] {
+            assert!(!action.writes_store(), "{action:?}");
         }
     }
 }

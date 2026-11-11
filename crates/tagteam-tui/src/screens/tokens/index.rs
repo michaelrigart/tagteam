@@ -119,8 +119,12 @@ impl IndexWatch {
     }
 }
 
-/// A refresh of the index on the index lane (spec §6.4).
+/// A refresh of the index on the index lane (spec §6.4). None once the store is newer than this
+/// build: the index lives in it (S§3.7).
 fn refresh(state: &mut State) -> Vec<Cmd> {
+    if state.daemon.upgraded() {
+        return vec![];
+    }
     let watch = &mut state.tokens.watch;
     watch.started = true;
     watch.refreshing = Some(IndexProgress::default());
@@ -427,7 +431,7 @@ mod tests {
 
     use super::*;
     use crate::live::Live;
-    use crate::msg::Msg;
+    use crate::msg::{LaneReport, Msg};
     use crate::testutil::*;
     use crate::update::{drawn, update};
 
@@ -527,6 +531,28 @@ mod tests {
         let mut quitting = fresh(Screen::Accounts);
         quitting.quitting = Some(0);
         assert!(drawn(&mut quitting).is_empty());
+    }
+
+    #[test]
+    fn after_an_upgrade_the_token_index_is_never_refreshed() {
+        let mut state = fresh(Screen::Tokens);
+        state.start();
+        update(&mut state, Msg::Lane(LaneReport::Upgraded), NOW_MS);
+        let refresh = Cmd::RefreshIndex { provider: cc() };
+        assert!(!drawn(&mut state).contains(&refresh), "the first refresh");
+        assert!(!state.tokens.watch.started);
+        assert!(!refresh_now(&mut state, NOW_MS).contains(&refresh), "`r`");
+        assert!(state.tokens.watch().refreshing().is_none());
+        assert!(!tick(&mut state, NOW_MS + 70_000).contains(&refresh));
+        update(
+            &mut state,
+            Msg::Refreshed { result: done() },
+            NOW_MS + 71_000,
+        );
+        update(&mut state, ch('1'), NOW_MS + 71_000);
+        update(&mut state, ch('2'), NOW_MS + 200_000);
+        assert!(!tick(&mut state, NOW_MS + 200_250).contains(&refresh));
+        assert!(!tick(&mut state, NOW_MS + 400_000).contains(&refresh));
     }
 
     #[test]
