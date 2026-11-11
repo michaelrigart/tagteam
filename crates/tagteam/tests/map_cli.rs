@@ -500,6 +500,46 @@ fn map_deletes_the_database_row_for_the_directory() {
 }
 
 #[test]
+fn map_deletes_only_the_database_row_of_the_accounts_own_provider() {
+    // The store does not check the registry, so a row for another provider can be seeded.
+    let d = tempfile::tempdir().unwrap();
+    let (a, _) = two_accounts(d.path());
+    let (x, x_real) = dir(d.path(), "x");
+    legacy_mapping(d.path(), &x_real, &a);
+    let store = Store::open_existing(&Env::for_test(d.path()).data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap();
+    let other = ProviderId::new("fake-agent");
+    let other_id = AccountId::from_string("0192-other");
+    store
+        .insert_account(&NewAccount {
+            id: &other_id,
+            provider: &other,
+            position: 1,
+            identity_key: "other\n",
+            identity: &Identity {
+                label: "other".into(),
+                email: None,
+                org_uuid: String::new(),
+                org_name: None,
+                account_uuid: None,
+                raw: json!({}),
+            },
+            kind: "oauth",
+            alias: None,
+            login_expires_at: None,
+            added_at: 1,
+        })
+        .unwrap();
+    store.set_mapping(&x_real, &other, &other_id, 1).unwrap();
+    cmd(d.path()).args(["map", "2"]).arg(&x).assert().success();
+    let left = store.mappings().unwrap();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].provider, other);
+    assert_eq!(left[0].path, x_real);
+}
+
+#[test]
 fn the_listing_reports_every_problem() {
     let d = tempfile::tempdir().unwrap();
     let env = Env::for_test(d.path());
