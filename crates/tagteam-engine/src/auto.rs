@@ -1213,8 +1213,8 @@ fn recheck_ids(snap: &Snapshot, live: &AccountId) -> Vec<AccountId> {
 }
 
 /// T4-23: what an automatic switch away from `live` rests on, its binding window over
-/// `cfg.models` (§8.2) with the threshold it was judged by; `None` without a decision-grade
-/// reading or a relevant window.
+/// `cfg.models` (§8.2) with the threshold and ceiling it was judged by; `None` without a
+/// decision-grade reading or a relevant window.
 fn cause(snap: &Snapshot, cfg: &AutoConfig, live: &AccountId) -> Option<SwitchCause> {
     let account = snap.accounts.iter().find(|a| &a.id == live)?;
     let window = binding_window(account.windows.as_deref()?, &cfg.models)?;
@@ -1223,6 +1223,7 @@ fn cause(snap: &Snapshot, cfg: &AutoConfig, live: &AccountId) -> Option<SwitchCa
         label: window.label.clone(),
         pct: window.pct,
         threshold: cfg.threshold,
+        ceiling: cfg.ceiling,
     })
 }
 

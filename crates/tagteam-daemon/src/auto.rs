@@ -14,7 +14,7 @@ use tagteam_core::autoswitch::{
 use tagteam_engine::auto::{AutoEngine, AutoEvent, EventSink, TickOutcome};
 use tagteam_engine::settings::{
     COOLDOWN_SECONDS_RANGE, DEFAULT_CEILING, INTERVAL_SECONDS_RANGE, Settings, THRESHOLD_RANGE,
-    pair_holds,
+    Value, pair_holds,
 };
 use tagteam_engine::{Engine, EngineError};
 
@@ -64,6 +64,19 @@ pub fn auto_config(s: &Settings, flags: &AutoFlags, long_window: Option<&str>) -
         models: flags.models.clone().unwrap_or_else(|| s.models.clone()),
         long_window: long_window.map(str::to_owned),
     }
+}
+
+/// The `config-warning` for a `--threshold` that reaches the provider's ceiling setting, so the
+/// provider runs with a ceiling of 100 (S§3.2). Only a flag can cause it: a pair the settings
+/// themselves break is reset when they are read.
+pub fn threshold_flag_warning(s: &Settings, cfg: &AutoConfig) -> Option<String> {
+    (cfg.ceiling != s.ceiling).then(|| {
+        format!(
+            "--threshold {} is at or above `autoswitch.ceiling` ({}); using a ceiling of 100",
+            Value::Float(cfg.threshold).display(),
+            Value::Float(s.ceiling).display(),
+        )
+    })
 }
 
 /// `v` clamped into `range`, as §6.4 clamps a flag.
@@ -160,7 +173,7 @@ pub fn run_loop(
     let mut driving = 0;
     let mut held = Vec::new();
     for provider in providers {
-        let (cfg, long_window) = configured(engine, &provider, &run.flags)?;
+        let (cfg, long_window) = configured(engine, &provider, &run.flags, sink)?;
         match engine.auto(&provider, cfg.clone(), run.dry_run)? {
             Some(auto) => {
                 let job = AutoJob {
@@ -237,7 +250,8 @@ impl Job for AutoJob<'_> {
     }
 
     /// §6.4, §11.4: the provider's settings read again, with the flags applied over them, since
-    /// they still win. Each warning the read gives is a `config-warning`.
+    /// they still win. Each warning the read gives is a `config-warning`, and so is a
+    /// `--threshold` that still reaches the ceiling.
     fn settings_changed(&mut self, cx: &mut JobCx<'_>) {
         let (settings, warnings) = Settings::load(cx.engine.env(), &self.provider);
         for message in warnings {
@@ -247,6 +261,12 @@ impl Job for AutoJob<'_> {
             }));
         }
         self.cfg = auto_config(&settings, &self.flags, self.long_window.as_deref());
+        if let Some(message) = threshold_flag_warning(&settings, &self.cfg) {
+            cx.sink.emit(&DaemonEvent::Auto(AutoEvent::ConfigWarning {
+                provider: self.provider.clone(),
+                message,
+            }));
+        }
         self.auto.set_config(self.cfg.clone());
     }
 }
@@ -262,7 +282,7 @@ fn once(
 ) -> Result<i32, AutoError> {
     let mut codes = Vec::new();
     for provider in providers {
-        let (cfg, _) = configured(engine, provider, &run.flags)?;
+        let (cfg, _) = configured(engine, provider, &run.flags, sink)?;
         let code = match engine.auto(provider, cfg, run.dry_run)? {
             Some(mut auto) => settle(provider, auto.tick(sink), sink)?.0,
             None => {
@@ -276,21 +296,27 @@ fn once(
 }
 
 /// A provider's settings, flags over them, and its long window. The command printed the
-/// settings file's warnings when it started, so they are not repeated here.
+/// settings file's warnings when it started, so they are not repeated here; a `--threshold`
+/// that reaches the ceiling is a `config-warning` on `sink`.
 fn configured(
     engine: &Engine,
     provider: &ProviderId,
     flags: &AutoFlags,
+    sink: &dyn EventSink,
 ) -> Result<(AutoConfig, Option<String>), EngineError> {
     let long_window = engine
         .provider(provider)?
         .primary_long_window()
         .map(str::to_owned);
     let (settings, _) = Settings::load(engine.env(), provider);
-    Ok((
-        auto_config(&settings, flags, long_window.as_deref()),
-        long_window,
-    ))
+    let cfg = auto_config(&settings, flags, long_window.as_deref());
+    if let Some(message) = threshold_flag_warning(&settings, &cfg) {
+        sink.emit(&AutoEvent::ConfigWarning {
+            provider: provider.clone(),
+            message,
+        });
+    }
+    Ok((cfg, long_window))
 }
 
 /// A tick's `--once` code and the decision its delay follows. `Err` only for an interruption.
@@ -410,32 +436,43 @@ mod tests {
     }
 
     #[test]
-    fn the_ceiling_is_the_setting_unless_the_threshold_reaches_it() {
+    fn a_threshold_flag_at_or_above_the_ceiling_runs_with_a_ceiling_of_100() {
         let settings = Settings {
             threshold: 90.0,
             ceiling: 95.0,
             ..Settings::default()
         };
-        let ceiling = |settings: &Settings, threshold: Option<f64>| {
+        let run = |settings: &Settings, threshold: Option<f64>| {
             let flags = AutoFlags {
                 threshold,
                 ..AutoFlags::default()
             };
-            auto_config(settings, &flags, None).ceiling
+            let cfg = auto_config(settings, &flags, None);
+            let warning = threshold_flag_warning(settings, &cfg);
+            (cfg.threshold, cfg.ceiling, warning)
         };
-        assert_eq!(ceiling(&settings, None), 95.0);
-        assert_eq!(ceiling(&settings, Some(94.0)), 95.0);
-        assert_eq!(ceiling(&settings, Some(95.0)), 100.0, "a flag reaches it");
+        assert_eq!(run(&settings, None), (90.0, 95.0, None));
+        assert_eq!(run(&settings, Some(94.5)), (94.5, 95.0, None));
+        let reaches =
+            "--threshold 95 is at or above `autoswitch.ceiling` (95); using a ceiling of 100";
         assert_eq!(
-            ceiling(&settings, Some(120.0)),
-            100.0,
+            run(&settings, Some(95.0)),
+            (95.0, 100.0, Some(reaches.into())),
+            "a flag reaches it"
+        );
+        let clamped =
+            "--threshold 99.9 is at or above `autoswitch.ceiling` (95); using a ceiling of 100";
+        assert_eq!(
+            run(&settings, Some(120.0)),
+            (99.9, 100.0, Some(clamped.into())),
             "clamped, then above"
         );
         let broken = Settings {
             threshold: 96.0,
             ..settings
         };
-        assert_eq!(ceiling(&broken, None), 100.0, "a broken pair runs at 100");
+        let cfg = auto_config(&broken, &AutoFlags::default(), None);
+        assert_eq!(cfg.ceiling, 100.0, "a broken pair runs at 100");
     }
 
     #[test]
@@ -830,6 +867,73 @@ mod tests {
     }
 
     #[test]
+    fn the_threshold_flag_warning_comes_at_start_and_after_each_reload_that_keeps_it() {
+        // The file's ceiling is 95, which `--threshold 96` reaches: a warning at start naming
+        // (95). The first sleep's write raises it to 96, still reached (a warning naming (96)),
+        // and the second's to 98, which the flag no longer reaches (none).
+        let fx = Fx::new();
+        let (a, b) = two(&fx);
+        fx.read(&a, 10.0, 10.0, T0, T0 + 300);
+        fx.read(&b, 20.0, 10.0, T0, T0 + 300);
+        fx.settings("[autoswitch]\nceiling = 95\n", 1);
+        let (clock, cancel) = (fx.clock.clone(), fx.engine.cancel().clone());
+        let second_written = std::cell::Cell::new(false);
+        let slices = Slices::new(&fx.clock, |n| {
+            if n == 0 {
+                fx.settings("[autoswitch]\nceiling = 96\n", 2);
+            }
+            if clock.now_ms() > (T0 + 70) * 1000 && !second_written.replace(true) {
+                fx.settings("[autoswitch]\nceiling = 98\n", 3);
+            }
+            if clock.now_ms() > (T0 + 140) * 1000 {
+                cancel.request(libc::SIGTERM);
+            }
+        });
+        let sink = Recorded::new(&fx.clock);
+        let run = AutoRun {
+            flags: AutoFlags {
+                threshold: Some(96.0),
+                ..AutoFlags::default()
+            },
+            ..looping()
+        };
+        assert_eq!(
+            run_loop(&fx.engine, &run, &sink, &slices, &mut || 0.0).unwrap(),
+            0
+        );
+        let warnings = |sink: &Recorded<'_>| -> Vec<String> {
+            sink.events()
+                .into_iter()
+                .filter_map(|(_, e)| match e {
+                    AutoEvent::ConfigWarning { message, .. } => Some(message),
+                    _ => None,
+                })
+                .collect()
+        };
+        let warning = |ceiling: &str| {
+            format!(
+                "--threshold 96 is at or above `autoswitch.ceiling` ({ceiling}); using a ceiling of 100"
+            )
+        };
+        assert_eq!(warnings(&sink), [warning("95"), warning("96")]);
+
+        let fx = Fx::new();
+        two(&fx);
+        fx.settings("[autoswitch]\nceiling = 95\n", 1);
+        let once = AutoRun { once: true, ..run };
+        let sink = Recorded::new(&fx.clock);
+        run_loop(
+            &fx.engine,
+            &once,
+            &sink,
+            &Slices::none(&fx.clock),
+            &mut || 0.0,
+        )
+        .unwrap();
+        assert_eq!(warnings(&sink), [warning("95")]);
+    }
+
+    #[test]
     fn a_failed_tick_is_reported_and_the_loop_keeps_its_normal_cadence() {
         // b at 95 % decides to switch to a, whose access token needs a refresh that cannot be
         // sent: §11.2 step 12's error. The next tick comes after the normal 60 s, not after a
@@ -927,7 +1031,12 @@ mod tests {
         for id in [&a, &b, &alice, &bob] {
             fx.read(id, 10.0, 10.0, T0, T0 + 300);
         }
-        let cfg = |p: &ProviderId| configured(&fx.engine, p, &AutoFlags::default()).unwrap().0;
+        let cfg = |p: &ProviderId| {
+            let quiet = Recorded::new(&fx.clock);
+            configured(&fx.engine, p, &AutoFlags::default(), &quiet)
+                .unwrap()
+                .0
+        };
         let held_cc = fx.engine.auto(&cc(), cfg(&cc()), false).unwrap().unwrap();
         let cancel = fx.engine.cancel().clone();
         let slices = Slices::new(&fx.clock, move |_| cancel.request(libc::SIGTERM));
@@ -989,9 +1098,14 @@ mod tests {
             ..looping()
         };
         let none = Slices::none(&fx.clock);
-        let cfg = configured(&fx.engine, &cc(), &AutoFlags::default())
-            .unwrap()
-            .0;
+        let cfg = configured(
+            &fx.engine,
+            &cc(),
+            &AutoFlags::default(),
+            &Recorded::new(&fx.clock),
+        )
+        .unwrap()
+        .0;
         let held = fx.engine.auto(&cc(), cfg, false).unwrap().unwrap();
         let sink = Recorded::new(&fx.clock);
         assert_eq!(
