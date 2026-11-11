@@ -1,6 +1,6 @@
 # tagteam — Directory mappings in `config.toml`
 
-**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/61
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/62
 **Date:** 2026-11-11
 **Scope:**
 - Where `tagteam map` keeps the directory → account mappings that `tagteam run` and the shell

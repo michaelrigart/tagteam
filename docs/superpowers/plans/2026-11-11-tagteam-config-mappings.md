@@ -1,6 +1,6 @@
 # Directory mappings in `config.toml`: implementation plan
 
-**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/61
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/62
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
