@@ -1899,10 +1899,21 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
    then only as a last resort (step 10), never for `consume-first`. No candidates →
    `no-candidates` (BLOCKED); for a `consume-first` trigger, whose active account is healthy,
    `below-threshold` (NO_ACTION) instead.
-8. **Rank** the OAuth candidates:
-   - **Skip** unknown headroom, full candidates, and the barred account (§11.3). *(Amended by
-     the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.3: it
-     skipped headroom ≤ 0.)*
+8. **Rank** the OAuth candidates.
+
+   **Terms.** A **full** account is at or above the ceiling (headroom ≤ 100 − ceiling). An
+   account is **out** at headroom ≤ 0; every out account is full. It has **room** at
+   headroom > 0. An account is **clear** when its usage is more than 3 points below the
+   ceiling (headroom > 100 − ceiling + 3). A move is **hard** on `failover`, or on `at-limit`
+   when the active account is out, and **soft** on `at-limit` when it is full but not out.
+   At ceiling 100, full and out are the same, and every `at-limit` is hard. A soft move
+   never lands on an account within 3 points of the ceiling, so auto cannot cycle between
+   accounts near it. Unknown headroom is never full.
+
+   - **Skip** unknown headroom, headroom ≤ 0, and the barred account (§11.3); `proactive` and
+     `consume-first` also skip full candidates. *(Amended by the
+     [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.3: they skipped
+     headroom ≤ 0.)*
    - **Landing rule.** For `proactive` and `consume-first`, the landing account must be below
      the threshold, unless *every* account is above it.
    - **`best`:** candidate headroom − active headroom ≥ `hysteresis_pct`. Order by most
@@ -1926,14 +1937,6 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
        position.
      - **A hard move** ranks every OAuth candidate with room, most headroom first, ties to the
        lower position: the candidates below the ceiling, then the full ones with room.
-     - **Terms.** A **full** account is at or above the ceiling (headroom ≤ 100 − ceiling). An
-       account is **out** at headroom ≤ 0; every out account is full. It has **room** at
-       headroom > 0. An account is **clear** when its usage is more than 3 points below the
-       ceiling (headroom > 100 − ceiling + 3). A move is **hard** on `failover`, or on `at-limit`
-       when the active account is out, and **soft** on `at-limit` when it is full but not out.
-       At ceiling 100, full and out are the same, and every `at-limit` is hard. A soft move
-       never lands on an account within 3 points of the ceiling, so auto cannot cycle between
-       accounts near it. Unknown headroom is never full.
      *(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.1, §3.3 and §3.8.)*
 9. **Nothing ranked.** With a hard move and API-key candidates (step 7), go to step 10 with
    those. A soft move never reaches an API key. *(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md)
@@ -1943,8 +1946,8 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
    |---|---|
    | No readable candidate | `no-comparison` (BLOCKED) |
    | `consume-first` found nothing | `reset-unknown` or `already-consuming-soonest` (NO_ACTION) |
-   | Candidates not all known to be full | `no-qualifying-candidate` (BLOCKED, normal cadence); with `proactive` or a soft move and every account above the threshold, its detail is `all-above` |
-   | Every candidate known to be full | `all-exhausted {earliestResetAt}` (BLOCKED); sleep as §11.4 says |
+   | Not every OAuth candidate known to be full | `no-qualifying-candidate` (BLOCKED, normal cadence); with `proactive` or a soft move, a live account that is not an API key and every account above the threshold, its detail is `all-above` |
+   | Every OAuth candidate known to be full | `all-exhausted {earliestResetAt}` (BLOCKED); sleep as §11.4 says |
 
    `earliestResetAt` is when the move this tick wanted could first land: the earliest time a
    candidate is back, meaning the latest reset among its relevant windows at or above a level.
