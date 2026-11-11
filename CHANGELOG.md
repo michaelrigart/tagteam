@@ -7,6 +7,11 @@ with the one before, so any release may contain breaking changes. Each section s
 
 ## [Unreleased]
 
+### Changed
+
+- Checked against Claude Code 2.1.322, now the newest version tagteam is known to work with.
+  `tagteam doctor` no longer warns about Claude Code versions up to 2.1.322.
+
 ## [20261031.2215.0] - 2026-10-31
 
 ### Added
