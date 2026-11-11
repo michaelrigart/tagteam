@@ -624,3 +624,118 @@ pub(crate) fn go_live(state: &mut State, status: Status) -> u64 {
     assert!(state.daemon.live());
     link
 }
+
+/// A home with two FakeAgent accounts, for the auto lane's tests: the engines it gives run on
+/// the system clock over a scripted HTTP port that answers nothing, record their events as
+/// `auto`'s and hold their locks as a TUI's, as the binary's factory builds them.
+pub(crate) struct LaneHome {
+    _dir: tempfile::TempDir,
+    pub(crate) env: tagteam_provider::Env,
+    keychain: std::sync::Arc<tagteam_provider::FakeKeychain>,
+    built: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl LaneHome {
+    pub(crate) fn new() -> LaneHome {
+        let dir = tempfile::tempdir().unwrap();
+        let home = LaneHome {
+            env: tagteam_provider::Env::for_test(dir.path()),
+            _dir: dir,
+            keychain: std::sync::Arc::new(tagteam_provider::FakeKeychain::new()),
+            built: std::sync::Arc::default(),
+        };
+        let engine = home.engine_as(
+            tagteam_provider::Cancel::new(),
+            tagteam_engine::EventSource::Cli,
+        );
+        for handle in ["a", "b"] {
+            tagteam_fake::login(
+                &home.env,
+                handle,
+                "ws",
+                &format!("tok-{handle}"),
+                &format!("renew-{handle}"),
+            );
+            let opts = tagteam_engine::lifecycle::AddOptions {
+                provider: home.provider(),
+                position: None,
+                alias: None,
+                yes: false,
+            };
+            engine.add_live(opts).unwrap();
+        }
+        home
+    }
+
+    pub(crate) fn provider(&self) -> ProviderId {
+        ProviderId::new(tagteam_fake::FAKE_AGENT)
+    }
+
+    fn engine_as(
+        &self,
+        cancel: tagteam_provider::Cancel,
+        source: tagteam_engine::EventSource,
+    ) -> tagteam_engine::Engine {
+        use std::sync::Arc;
+
+        use tagteam_engine::vault::{KeychainVault, Vault};
+        let mut env = self.env.clone();
+        env.cancel = cancel;
+        tagteam_engine::Engine::new(tagteam_engine::EngineConfig {
+            env,
+            registry: tagteam_engine::registry::ProviderRegistry::new()
+                .with(Arc::new(tagteam_fake::FakeAgent::new())),
+            vault: Vault::new(Box::new(KeychainVault::new(self.keychain.clone()))),
+            oracle: Arc::new(tagteam_engine::oracle::NoOracle),
+            clock: Arc::new(tagteam_provider::SystemClock),
+            http: Arc::new(tagteam_provider::ScriptedHttp::new()),
+            default_provider: self.provider(),
+            settings: tagteam_engine::settings::Settings::default(),
+            process: Arc::new(tagteam_provider::liveness::SystemProcessProbe),
+            spawner: Arc::new(tagteam_provider::process::ScriptedSpawner::new()),
+            run_shell: tagteam_provider::RunShell::Outside,
+            source,
+        })
+    }
+
+    /// The lane's engine, under `cancel`.
+    pub(crate) fn lane_engine(&self, cancel: tagteam_provider::Cancel) -> tagteam_engine::Engine {
+        self.built.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.engine_as(cancel, tagteam_engine::EventSource::Auto)
+            .with_lock_holder(HolderKind::Tui)
+    }
+
+    /// The factory the lane is given: it builds `lane_engine`, and counts the builds.
+    pub(crate) fn factory(self: &std::sync::Arc<Self>) -> crate::auto_lane::AutoFactory {
+        let home = std::sync::Arc::clone(self);
+        std::sync::Arc::new(move |cancel| {
+            Ok(crate::auto_lane::LaneEngine {
+                engine: home.lane_engine(cancel),
+                keychain_counts: Vec::new(),
+            })
+        })
+    }
+
+    /// How many engines the factory has built.
+    pub(crate) fn built(&self) -> usize {
+        self.built.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// FakeAgent's engine lock record, as another process reads it.
+    pub(crate) fn lock(&self) -> tagteam_provider::Read<tagteam_engine::auto::EngineHolder> {
+        self.engine_as(
+            tagteam_provider::Cancel::new(),
+            tagteam_engine::EventSource::Cli,
+        )
+        .engine_holder(&self.provider())
+    }
+
+    /// `PRAGMA user_version` past this build's, as a newer tagteam's migration leaves it.
+    pub(crate) fn newer_store(&self) {
+        let file = self.env.data_dir().join("tagteam.db");
+        let conn = rusqlite::Connection::open(file).unwrap();
+        let newer = tagteam_engine::store::SCHEMA_VERSION + 1;
+        conn.execute_batch(&format!("PRAGMA user_version = {newer};"))
+            .unwrap();
+    }
+}

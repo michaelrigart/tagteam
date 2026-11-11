@@ -7,12 +7,14 @@ use std::sync::Arc;
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::EventSource;
+use tagteam_engine::auto::HolderKind;
 use tagteam_engine::daemon::daemon_socket_path;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::timeline::{Scope, TimelineView};
 use tagteam_engine::tokens::{IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport};
 use tagteam_engine::views::ProviderNames;
 use tagteam_provider::Cancel;
+use tagteam_tui::auto_lane::{AutoFactory, LaneEngine};
 use tagteam_tui::source::{
     AccountsSnapshot, CollectSummary, EngineSource, Source, SourceError, SourceFactory,
 };
@@ -125,6 +127,7 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
         warnings,
         config_mtime,
         accounts_view,
+        auto: Some(auto_engines(inside.clone(), provider.clone())),
     };
     let exit = tagteam_tui::run(opts, sources(inside, provider), host);
     if let Some(report) = &exit.report {
@@ -146,6 +149,23 @@ fn sources(ctx: Context, provider: Option<ProviderId>) -> SourceFactory {
             Err(e) => Box::new(Refused(SourceError::from(e))),
         },
     )
+}
+
+/// The auto lane's engine (TUI auto-switch spec §3.1), built inside its thread under the token
+/// the lane gives, which is its own and not the shutdown token (Ruling 15): recording its
+/// events as `auto`'s and holding its locks as a TUI's, over the counted Keychain as
+/// `run_command` gathers it.
+fn auto_engines(ctx: Context, provider: Option<ProviderId>) -> AutoFactory {
+    Arc::new(move |token| {
+        let mut lane = ctx.clone();
+        lane.env.cancel = token;
+        let keychain_counts = lane.keychain_counts();
+        let (engine, _warnings) = app::engine_for(lane, provider.as_ref(), EventSource::Auto)?;
+        Ok(LaneEngine {
+            engine: engine.with_lock_holder(HolderKind::Tui),
+            keychain_counts,
+        })
+    })
 }
 
 /// The source of a lane whose engine could not be built: every read answers with that error,
@@ -206,9 +226,34 @@ fn screen_for(cli: &Cli) -> Screen {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use tagteam_cc::live::Platform;
     use tagteam_engine::EngineError;
+    use tagteam_provider::{Env, FakeKeychain};
 
     use super::*;
+
+    #[test]
+    fn the_auto_lane_s_engines_record_auto_and_hold_as_a_tui_under_the_lane_s_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context {
+            env: Env::for_test(dir.path()),
+            keychain: Arc::new(FakeKeychain::new()),
+            vault_keychain: None,
+            platform: Platform::MacOs,
+            api_base: None,
+            stdout_terminal: false,
+            no_color_env: false,
+            force_color_env: false,
+            shown_warnings: Arc::from(Vec::<String>::new()),
+        };
+        let token = Cancel::new();
+        let lane = auto_engines(ctx, None)(token.clone()).unwrap();
+        assert_eq!(lane.engine.source(), EventSource::Auto);
+        assert_eq!(lane.engine.lock_holder(), HolderKind::Tui);
+        assert_eq!(lane.engine.cancel().requested(), None);
+        token.request(libc::SIGTERM);
+        assert_eq!(lane.engine.cancel().requested(), Some(libc::SIGTERM));
+    }
 
     #[test]
     fn tui_opens_on_the_screen_it_names_and_on_accounts_otherwise() {

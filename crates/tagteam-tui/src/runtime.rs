@@ -16,9 +16,10 @@ use tagteam_engine::views::ProviderNames;
 use tagteam_provider::Cancel;
 
 use crate::ask::Answers;
+use crate::auto_lane::AutoFactory;
 use crate::host::{Action, ActionOutcome, Host};
 use crate::input::{Input, Pause};
-use crate::lanes::{Lanes, StatusFetch};
+use crate::lanes::{Lanes, StatusFetch, refusal, refused_outcome};
 use crate::live::{self, Backoff};
 use crate::msg::{ActionsReq, Cmd, DaemonReq, IndexReq, Msg, ReportReq, ViewsReq};
 use crate::screens::tokens::TokensState;
@@ -72,6 +73,9 @@ pub struct TuiOptions {
     pub config_mtime: Option<SystemTime>,
     /// `ui.accounts_view`: the view the Accounts screen opens in.
     pub accounts_view: AccountsView,
+    /// Builds the auto lane's engine (TUI auto-switch spec §3.1): the open TUI then runs the
+    /// daemon's jobs itself while no daemon runs. `None` for a TUI that switches nothing.
+    pub auto: Option<AutoFactory>,
 }
 
 /// How the TUI ended.
@@ -121,6 +125,7 @@ pub(crate) fn run_with<T: Tty, P: Pause>(
         &opts.shutdown,
         &answers,
         status,
+        opts.auto.clone(),
     );
     if let Some(path) = opts.daemon.clone() {
         let died = lanes.stray_death("live", &tx);
@@ -300,6 +305,10 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
         if opts.daemon.is_some() {
             // C-R20: the first collection waits to know who collects.
             state.daemon.await_daemon(now);
+        }
+        if opts.auto.is_some() {
+            // Ruling 9: and for the lane's first report.
+            state.daemon.await_lane(now);
         }
         Ui {
             state,
@@ -580,6 +589,14 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
     /// §7.3: runs `action` with the terminal handed back, then takes the terminal again. When
     /// the input thread does not pause, nothing runs and the TUI keeps the terminal.
     fn suspend(&mut self, action: Action) {
+        // The store turned newer after the action was asked for (S§3.7): it never starts, and
+        // never has the terminal. It ends as any finished action does, so the dialog that
+        // handed it over leaves nothing behind.
+        if let Some(why) = refusal(&self.lanes.upgraded, action.writes_store()) {
+            let outcome = refused_outcome(why);
+            self.deliver(Msg::ActionDone { action, outcome });
+            return;
+        }
         if !self.paused(Some(&action)) {
             return;
         }
@@ -638,12 +655,16 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
         if !self.paused(None) {
             return;
         }
+        // A stopped process keeps its locks and reads as live: the auto lane lets go of them
+        // first (S§3.1).
+        self.lanes.suspend_auto();
         match self.tty.stop() {
             Ok(()) => {
                 // A signal that came while the process was stopped comes first (R17).
                 if self.shutting_down() {
                     return;
                 }
+                self.lanes.resume_auto();
                 self.input.resume();
                 self.resized();
                 self.state.dirty = true;
@@ -684,19 +705,23 @@ mod tests {
     use ratatui::backend::TestBackend;
     use tagteam_core::AccountId;
     use tagteam_daemon::client::ClientError;
+    use tagteam_engine::auto::HolderKind;
+    use tagteam_engine::daemon::daemon_lock_path;
     use tagteam_engine::timeline::{Scope, TimelineView};
     use tagteam_engine::tokens::{
         IndexProgress, IndexState, RefreshOutcome, TokenPeriod, TokenQuery, TokenReport,
     };
+    use tagteam_provider::{ProcessStamp, Read};
 
     use super::*;
+    use crate::auto_lane::AutoFactory;
     use crate::host::{AccountRef, Ask};
     use crate::live::StatusError;
     use crate::live::{LIVE_QUEUE, Live, LiveQueue};
     use crate::source::{AccountsSnapshot, CollectSummary, Source, SourceError};
     use crate::state::BannerKind;
     use crate::term::repaint;
-    use crate::testutil::CC_NAMES;
+    use crate::testutil::{CC_NAMES, LaneHome};
     use crate::theme::Background;
 
     /// What the fake terminal and input were asked to do, in order.
@@ -744,6 +769,8 @@ mod tests {
         active: bool,
         panics: bool,
         on_draw: Option<Box<dyn FnOnce()>>,
+        /// Runs as the process is stopped, so a test sees what is true at that moment.
+        on_stop: Option<Box<dyn Fn()>>,
     }
 
     impl FakeTty {
@@ -755,6 +782,7 @@ mod tests {
                 active: true,
                 panics: false,
                 on_draw: None,
+                on_stop: None,
             }
         }
 
@@ -801,6 +829,9 @@ mod tests {
 
         fn stop(&mut self) -> io::Result<()> {
             self.log.push("stop");
+            if let Some(at_stop) = &self.on_stop {
+                at_stop();
+            }
             Ok(())
         }
     }
@@ -1140,6 +1171,7 @@ mod tests {
             warnings: vec![],
             config_mtime: None,
             accounts_view: AccountsView::List,
+            auto: None,
         }
     }
 
@@ -1203,7 +1235,16 @@ mod tests {
             let host: Arc<dyn Host> = Arc::new(host(&opts));
             let (tx, rx) = mpsc::channel();
             let answers = Answers::default();
-            let lanes = Lanes::spawn(None, &sources, &host, &tx, &opts.shutdown, &answers, status);
+            let lanes = Lanes::spawn(
+                None,
+                &sources,
+                &host,
+                &tx,
+                &opts.shutdown,
+                &answers,
+                status,
+                opts.auto.clone(),
+            );
             let log = Log::default();
             Fixture {
                 opts,
@@ -2548,6 +2589,216 @@ mod tests {
             "{} frames for 201 messages",
             fx.frames.seen().len()
         );
+        assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    /// Waits up to 5 s for FakeAgent's engine lock record to be one the TUI's lane holds
+    /// (`present`) or to be gone; whether it was.
+    fn lock_within(home: &LaneHome, present: bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let held = matches!(home.lock(), Read::Present(h) if h.kind == Some(HolderKind::Tui));
+            let gone = matches!(home.lock(), Read::Absent);
+            if (present && held) || (!present && gone) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A fixture whose TUI has an auto lane over `home`'s engines.
+    fn with_a_lane(home: &Arc<LaneHome>, host: impl FnOnce(&TuiOptions) -> Scripted) -> Fixture {
+        let opts = TuiOptions {
+            auto: Some(home.factory()),
+            ..options()
+        };
+        Fixture::with(opts, quick(), host)
+    }
+
+    #[test]
+    fn quit_joins_the_auto_lane_and_its_lock_is_free_after() {
+        let home = Arc::new(LaneHome::new());
+        let fx = with_a_lane(&home, |_| idle());
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            assert!(lock_within(&home, true), "the lane never took the lock");
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+        assert!(
+            matches!(home.lock(), Read::Absent),
+            "the lane was joined, so it let go"
+        );
+    }
+
+    #[test]
+    fn ctrl_z_frees_the_lock_before_the_process_stops_and_resume_takes_it_again() {
+        let home = Arc::new(LaneHome::new());
+        let fx = with_a_lane(&home, |_| idle());
+        let at_stop: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let ending = {
+            let mut ui = fx.ui();
+            let (seen, lock) = (Arc::clone(&at_stop), Arc::clone(&home));
+            ui.tty.on_stop = Some(Box::new(move || {
+                seen.lock()
+                    .unwrap()
+                    .push(matches!(lock.lock(), Read::Absent));
+            }));
+            ui.start();
+            assert!(lock_within(&home, true), "the lane never took the lock");
+            ui.execute(vec![Cmd::Stop]);
+            assert_eq!(
+                *at_stop.lock().unwrap(),
+                [true],
+                "free as the process stopped"
+            );
+            assert!(lock_within(&home, true), "the lane did not start again");
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+        assert!(matches!(home.lock(), Read::Absent));
+    }
+
+    #[test]
+    fn a_daemon_that_comes_up_during_a_hand_over_gets_the_lock_while_the_action_runs() {
+        let home = Arc::new(LaneHome::new());
+        let found: Arc<Mutex<Option<bool>>> = Arc::default();
+        let (lock, found_by_the_action) = (Arc::clone(&home), Arc::clone(&found));
+        let fx = with_a_lane(&home, move |_| Scripted {
+            act: never(),
+            foreground: Box::new(move |_| {
+                // A daemon starts: its record names this process, which is live.
+                let path = daemon_lock_path(&lock.env);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let stamp = ProcessStamp::current().unwrap();
+                let line = format!(
+                    "{{\"pid\":{},\"start\":{},\"version\":\"test\"}}\n",
+                    stamp.pid, stamp.start
+                );
+                std::fs::write(path, line).unwrap();
+                *found_by_the_action.lock().unwrap() = Some(lock_within(&lock, false));
+                done(0, "", "")
+            }),
+        });
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            assert!(lock_within(&home, true), "the lane never took the lock");
+            let run = Action::Run(account_a());
+            ui.state.running = Some(run.clone());
+            ui.execute(vec![Cmd::Suspend(run)]);
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(
+            *found.lock().unwrap(),
+            Some(true),
+            "the lane freed the lock while the action ran"
+        );
+        assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    #[test]
+    fn an_auto_lane_whose_engine_cannot_be_built_says_off_and_the_tui_runs_on() {
+        let factory: AutoFactory = Arc::new(|_| {
+            Err(SourceError {
+                kind: "test".into(),
+                message: "no engine in this test".into(),
+            })
+        });
+        let opts = TuiOptions {
+            auto: Some(factory),
+            ..options()
+        };
+        let fx = Fixture::with(opts, quick(), |_| idle());
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            // Its first report settles the first collection (Ruling 9).
+            pump(&mut ui, &fx.rx, |s| s.daemon.settled());
+            assert!(!ui.state.daemon.upgraded());
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    #[test]
+    fn an_auto_lane_that_panics_ends_the_tui_with_1_and_says_so() {
+        let factory: AutoFactory = Arc::new(|_| panic!("the auto lane's engine panicked"));
+        let opts = TuiOptions {
+            auto: Some(factory),
+            ..options()
+        };
+        let fx = Fixture::with(opts, quick(), |_| idle());
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            ui.run()
+        };
+        let exit = fx.finish(ending);
+        assert_eq!(exit.code, 1);
+        assert_eq!(
+            exit.report.as_deref(),
+            Some("tagteam: the TUI's auto lane panicked; the log has the details\n")
+        );
+    }
+
+    #[test]
+    fn a_lane_that_ended_for_a_newer_store_is_not_started_again_after_ctrl_z() {
+        let home = Arc::new(LaneHome::new());
+        home.newer_store();
+        let fx = with_a_lane(&home, |_| idle());
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            pump(&mut ui, &fx.rx, |s| s.daemon.upgraded());
+            assert_eq!(home.built(), 1);
+            ui.execute(vec![Cmd::Stop]);
+            // A run that began now would build its engine within moments.
+            thread::sleep(Duration::from_millis(300));
+            assert_eq!(home.built(), 1, "the lane started again");
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+        assert_eq!(home.built(), 1);
+    }
+
+    #[test]
+    fn a_writer_handed_the_terminal_after_the_store_turns_newer_never_runs() {
+        // `idle`'s foreground action panics if it is called.
+        let fx = Fixture::new(quick(), |_| idle());
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            fx.log.take();
+            fx.lanes.upgraded.store(true, Ordering::SeqCst);
+            // As the keychain-locked dialog leaves the state before it suspends (proceed.rs).
+            let run = Action::Run(account_a());
+            ui.state.running = Some(run.clone());
+            ui.state.on_terminal = true;
+            ui.execute(vec![Cmd::Suspend(run)]);
+            assert_eq!(
+                fx.log.take(),
+                Vec::<&str>::new(),
+                "the terminal and the keys stayed"
+            );
+            assert!(
+                ui.state.running.is_none(),
+                "it ended as a finished action does"
+            );
+            assert!(!ui.state.on_terminal);
+            assert!(ui.ending.is_none());
+            fx.key('q');
+            ui.run()
+        };
         assert_eq!(fx.finish(ending).code, 0);
     }
 }

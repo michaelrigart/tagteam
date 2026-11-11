@@ -9,7 +9,7 @@ use tagteam_provider::keychain::ReadCounts;
 use tagteam_provider::{Keychain, LockState, Platform};
 
 use crate::cli::{Cli, Command};
-use crate::{daemon_cmd, root_guard};
+use crate::root_guard;
 
 use early::{answer_completions, refuse_tui, run_shell_init, run_statusline};
 use failure::{Failure, KIND_INTERRUPTED, KIND_KEYCHAIN_LOCKED};
@@ -155,12 +155,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     }
     let command = cli.command.unwrap_or(Command::List);
     let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
-    let keychain_counts = match ctx.platform {
-        Platform::MacOs => daemon_cmd::keychain_counts(
-            std::iter::once(&ctx.keychain).chain(ctx.vault_keychain.as_ref()),
-        ),
-        Platform::Linux => Vec::new(),
-    };
+    let keychain_counts = ctx.keychain_counts();
     let platform = ctx.platform;
     let color = ColorEnv::of(&ctx, cli.no_color);
     let provider_flag = cli.provider.map(ProviderId::new);
