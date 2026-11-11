@@ -665,10 +665,10 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     cmds
 }
 
-/// Spec §6.3: whether something else collects for `provider`. In live mode, that is a daemon
-/// job in `auto` or `collect`, or one waiting for another engine, which collects for itself. A
-/// job that is `idle` or waits for a newer binary (`schema`), and a provider the daemon runs no
-/// job for, leave it to the TUI.
+/// Spec §6.3: whether something else collects for `provider`. That is a job, a live daemon's or
+/// the auto lane's, in `auto` or `collect`, or one waiting for another engine, which collects for
+/// itself. A job that is `idle` or waits for a newer binary (`schema`), and a provider no job
+/// runs for, leave it to the TUI.
 pub(crate) fn collected_elsewhere(state: &State, provider: &ProviderId) -> bool {
     state
         .daemon

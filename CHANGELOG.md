@@ -61,7 +61,7 @@ with the one before, so any release may contain breaking changes. Each section s
   another tagteam window` for another TUI's. It says when the daemon runs but the TUI has no
   link to its socket, where it said `auto off · no daemon`: `auto runs in the daemon (pid N) ·
   not connected` when the daemon holds the lock, and `daemon runs (pid N) · not connected, state
-  unknown` when it does not. `P` then changes nothing and says why.
+  unknown` when nothing holds it. `P` then changes nothing and says why.
 - `tagteam tui` writes nothing once a newer tagteam has migrated the store: it stops its
   refreshes and refuses `r` and every account action but `doctor` and `P`, with `tagteam was
   upgraded; restart the TUI`.
