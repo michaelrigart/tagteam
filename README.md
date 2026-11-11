@@ -319,7 +319,7 @@ moves one to the file when you map that directory again. So a script that reads 
 If a dotfile manager deploys `config.toml`, `map` writes the deployed file. Edit the source
 instead, or add the file to the manager again after `map`.
 
-Only the shell wrapper reads mappings. The IDE extensions and the desktop app do not go through
+Mappings apply only through `tagteam run`, which the shell wrapper calls. The IDE extensions and the desktop app do not go through
 it, so they use your default login. The desktop app's Code tab uses its own sign-in.
 
 ### Statusline

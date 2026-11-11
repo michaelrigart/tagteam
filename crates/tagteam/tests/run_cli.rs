@@ -15,8 +15,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{
-    FakeCall, cc_profile, cmd, expire_vault, fake_claude, fake_claude_calls, live_email, path_with,
-    seed_home, std_cmd, two_fresh_accounts,
+    FakeCall, cc_profile, cmd, expire_vault, fake_claude, fake_claude_calls, installed, live_email,
+    path_with, seed_home, std_cmd, two_fresh_accounts,
 };
 use serde_json::{Value, json};
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
@@ -709,12 +709,7 @@ fn wrapper_shell() -> (PathBuf, &'static [&'static str], &'static str) {
     let shells: [(&str, &[&str], &str); 2] =
         [("bash", &["-c"], "bash"), ("zsh", &["-f", "-c"], "zsh")];
     for (name, flags, init) in shells {
-        let found = std::env::var_os("PATH").and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|d| d.join(name))
-                .find(|p| p.is_file())
-        });
-        if let Some(shell) = found {
+        if let Some(shell) = installed(name) {
             return (shell, flags, init);
         }
     }
@@ -740,11 +735,12 @@ fn the_wrapper_in_a_directory_mapped_in_config_toml_starts_a_session() {
         String::from_utf8(out.stdout).unwrap()
     };
     let tagteam = assert_cmd::cargo::cargo_bin("tagteam");
-    let mut path = root.join("bin").into_os_string();
-    path.push(":");
-    path.push(tagteam.parent().unwrap());
-    path.push(":");
-    path.push(std::env::var_os("PATH").unwrap());
+    let path = std::env::join_paths(
+        [root.join("bin"), tagteam.parent().unwrap().to_path_buf()]
+            .into_iter()
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
     let out = home.out("wrapper");
     let c = std_cmd(root);
     let mut shell_cmd = Command::new(&shell);
