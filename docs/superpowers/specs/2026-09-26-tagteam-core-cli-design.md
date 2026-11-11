@@ -1946,7 +1946,7 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
    |---|---|
    | No readable candidate | `no-comparison` (BLOCKED) |
    | `consume-first` found nothing | `reset-unknown` or `already-consuming-soonest` (NO_ACTION) |
-   | Not every OAuth candidate known to be full | `no-qualifying-candidate` (BLOCKED, normal cadence); with `proactive` or a soft move, a live account that is not an API key and every account above the threshold, its detail is `all-above` |
+   | Not every OAuth candidate known to be full | `no-qualifying-candidate` (BLOCKED, normal cadence); with `proactive` or a soft move, when the live account is not an API key and every account is above the threshold, its detail is `all-above` |
    | Every OAuth candidate known to be full | `all-exhausted {earliestResetAt}` (BLOCKED); sleep as §11.4 says |
 
    `earliestResetAt` is when the move this tick wanted could first land: the earliest time a
