@@ -17,6 +17,9 @@ use crate::state::{Screen, State, ToastKind};
 /// `P` without a daemon to pause (spec §10, T2-16).
 pub const NO_DAEMON_RUNNING: &str = "no daemon runs · tagteam daemon install starts one";
 
+/// `P` with a daemon running that the TUI has no link to (S§3.4, Ruling 14).
+pub const NOT_CONNECTED: &str = "the TUI isn't connected to the daemon, so it can't show its state; `tagteam daemon status` says more";
+
 /// What a refused write says once the store is newer than this build (S§3.7).
 pub const UPGRADED: &str = "tagteam was upgraded; restart the TUI";
 
@@ -159,19 +162,25 @@ pub(crate) fn say_checked(state: &mut State, summary: &CollectSummary, now_ms: i
     state.toast(kind, text, now_ms);
 }
 
-/// `P` (spec §7.4): pause the daemon's auto-switching for the provider the header follows, or
-/// resume it, as its last `status` says it is. A confirm dialog asks first, default no. Without a
-/// daemon (timer mode) it says how to start one and changes nothing, and so for a provider the
-/// daemon runs no job for: the TUI changes no setting whose effect it cannot show (T2-16).
+/// `P` (spec §7.4, S§3.4): pause auto-switching for the provider the header follows, or resume
+/// it, as the live daemon's last `status` says it is, or else the auto lane's own job. A confirm
+/// dialog asks first, default no. With neither it says why and changes nothing: a daemon that
+/// runs without a link to it, or none to pause (timer mode); and so for a provider the daemon
+/// runs no job for: the TUI changes no setting whose effect it cannot show (T2-16).
 fn pause(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     if busy(state, now_ms) {
         return vec![];
     }
-    if !state.daemon.live() {
-        state.toast(ToastKind::Info, NO_DAEMON_RUNNING, now_ms);
+    let provider = daemon::focus(state);
+    if !state.daemon.live() && state.daemon.hosted_job(&provider).is_none() {
+        let says = if state.daemon.mismatch().is_none() && state.daemon_pid().is_some() {
+            NOT_CONNECTED
+        } else {
+            NO_DAEMON_RUNNING
+        };
+        state.toast(ToastKind::Info, says, now_ms);
         return vec![];
     }
-    let provider = daemon::focus(state);
     let Some(job) = state.daemon.job(&provider) else {
         let display = state.names_of(&provider).display_name;
         let text = format!("the daemon runs no job for {display}");
@@ -442,6 +451,7 @@ mod tests {
     use crossterm::event::KeyCode;
 
     use super::*;
+    use tagteam_engine::auto::HolderKind;
     use tagteam_engine::timeline::Scope;
     use tagteam_engine::views::UsageStatus;
 
@@ -2473,6 +2483,84 @@ mod tests {
             )
         );
         assert!(state.overlay.is_none());
+    }
+
+    fn lane_says(state: &mut State, mode: &str, autoswitch: bool) {
+        let status = job_in(mode, autoswitch);
+        update(state, Msg::Lane(LaneReport::Status(status)), NOW_MS);
+    }
+
+    #[test]
+    fn p_with_the_lane_running_asks_and_writes_the_setting() {
+        // S§3.4: the lane's board is read as a daemon's `status`, so `P` toggles as it does there.
+        let mut state = loaded(2);
+        lane_says(&mut state, "auto", true);
+        assert!(update(&mut state, ch('P'), NOW_MS).is_empty());
+        let pause = Action::Autoswitch {
+            provider: cc(),
+            on: false,
+        };
+        assert_eq!(
+            asked(&state),
+            ("Pause auto for Claude Code?", false, &pause)
+        );
+        let later = NOW_MS + GUARD_MS;
+        assert_eq!(
+            update(&mut state, ch('y'), later),
+            [Cmd::Act(pause.clone())]
+        );
+        assert_eq!(state.running, Some(pause));
+        let mut state = loaded(2);
+        lane_says(&mut state, "collect", false);
+        update(&mut state, ch('P'), NOW_MS);
+        let resume = Action::Autoswitch {
+            provider: cc(),
+            on: true,
+        };
+        assert_eq!(
+            asked(&state),
+            ("Resume auto for Claude Code?", false, &resume)
+        );
+    }
+
+    #[test]
+    fn p_with_a_daemon_without_its_socket_changes_nothing_and_says_so() {
+        // S§3.4: the TUI changes no setting whose effect it cannot show.
+        for holders in [
+            vec![(HolderKind::Daemon, 4242)],
+            vec![(HolderKind::Auto, 4711)],
+            vec![],
+        ] {
+            let mut state = fresh(Screen::Accounts);
+            state.accounts.apply(held(&holders, Some(4242)));
+            assert!(
+                update(&mut state, ch('P'), NOW_MS).is_empty(),
+                "{holders:?}"
+            );
+            let toast = state.toast.as_ref().unwrap();
+            assert_eq!(
+                (toast.kind, toast.text.as_str()),
+                (ToastKind::Info, NOT_CONNECTED),
+                "{holders:?}"
+            );
+            assert!(state.overlay.is_none(), "{holders:?}");
+        }
+    }
+
+    #[test]
+    fn p_says_no_daemon_runs_only_when_the_lane_cannot_run() {
+        for report in [LaneReport::Off, LaneReport::Upgraded] {
+            let mut state = loaded(1);
+            update(&mut state, Msg::Lane(report.clone()), NOW_MS);
+            assert!(update(&mut state, ch('P'), NOW_MS).is_empty());
+            let toast = state.toast.as_ref().unwrap();
+            assert_eq!(
+                (toast.kind, toast.text.as_str()),
+                (ToastKind::Info, NO_DAEMON_RUNNING),
+                "{report:?}"
+            );
+            assert!(state.overlay.is_none(), "{report:?}");
+        }
     }
 
     #[test]

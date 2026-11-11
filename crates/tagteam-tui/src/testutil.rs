@@ -17,6 +17,7 @@ use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind};
 use tagteam_daemon::protocol::{
     Status, StatusDaemon, StatusJob, StatusNotifications, StatusProvider, Wire,
 };
+use tagteam_engine::auto::HolderKind;
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::switch::LiveLogin;
 use tagteam_engine::timeline::{Lane, Series, TimelineView};
@@ -33,7 +34,7 @@ use crate::live::Live;
 use crate::msg::{Cmd, Msg};
 use crate::screens::accounts::View;
 use crate::screens::tokens::TokensState;
-use crate::source::AccountsSnapshot;
+use crate::source::{AccountsSnapshot, AutoHolder};
 use crate::state::{Screen, Startup, State};
 use crate::theme::{Background, Role, Theme};
 
@@ -190,9 +191,26 @@ pub(crate) fn snapshot(accounts: Vec<AccountView>) -> AccountsSnapshot {
         in_run_shell: false,
         read_at_s: NOW_S,
         auto_holders: vec![],
+        daemon_pid: None,
         config_mtime: None,
         last_auto: vec![],
     }
+}
+
+/// `snapshot(many(1))` with Claude Code's engine lock held by `holders` (kind, pid), and a daemon
+/// whose record is live at `daemon_pid`.
+pub(crate) fn held(holders: &[(HolderKind, u32)], daemon_pid: Option<u32>) -> AccountsSnapshot {
+    let mut snap = snapshot(many(1));
+    snap.auto_holders = holders
+        .iter()
+        .map(|&(kind, pid)| AutoHolder {
+            provider: cc(),
+            pid,
+            kind,
+        })
+        .collect();
+    snap.daemon_pid = daemon_pid;
+    snap
 }
 
 /// Sets `view`'s live login to `live`, and its forecast to the one the engine computes with it.

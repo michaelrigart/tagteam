@@ -6,8 +6,9 @@ use std::time::SystemTime;
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::Engine;
+use tagteam_engine::auto::HolderKind;
 use tagteam_engine::collect::{CollectMode, Collected};
-use tagteam_engine::daemon::{daemon_lock_path, read_daemon_record};
+use tagteam_engine::daemon::{daemon_lock_path, live_daemon_pid, read_daemon_record};
 use tagteam_engine::error::EngineError;
 use tagteam_engine::failure::FailureKind;
 use tagteam_engine::settings::Settings;
@@ -16,7 +17,7 @@ use tagteam_engine::tokens::{
     IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport, Wait,
 };
 use tagteam_engine::views::{ProviderAccounts, ShellAccount};
-use tagteam_provider::{Liveness, Read, RunShell, TransientKind};
+use tagteam_provider::{Liveness, ProcessStamp, Read, RunShell, TransientKind};
 
 /// How far back the accounts read looks for each provider's last auto-line event (§5.3,
 /// §12.2): History's longest range, so `w` can always show it.
@@ -38,6 +39,14 @@ impl From<EngineError> for SourceError {
     }
 }
 
+/// A live process holding `provider`'s engine lock (C-16, T2-11, S§3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoHolder {
+    pub provider: ProviderId,
+    pub pid: u32,
+    pub kind: HolderKind,
+}
+
 #[derive(Debug, Clone)]
 pub struct AccountsSnapshot {
     /// Each provider's view; its `live` says whether tagteam manages its live login.
@@ -47,9 +56,11 @@ pub struct AccountsSnapshot {
     pub in_run_shell: bool,
     /// The engine clock, in seconds, when this was read.
     pub read_at_s: i64,
-    /// Each listed provider whose engine lock names a live process other than the daemon: its
-    /// pid (C-16, T2-11).
-    pub auto_holders: Vec<(ProviderId, u32)>,
+    /// Every live engine-lock holder but this process: the daemon's as `HolderKind::Daemon`
+    /// (its record matches `daemon.lock`'s), else the record's kind, `Auto` when it has none.
+    pub auto_holders: Vec<AutoHolder>,
+    /// `live_daemon_pid` at this read.
+    pub daemon_pid: Option<u32>,
     /// `config.toml`'s modification time when this was read (`Settings::mtime`): a change from
     /// the one start-up saw clears the start-up warnings (redesign §5.6, T2-21).
     pub config_mtime: Option<SystemTime>,
@@ -120,7 +131,7 @@ impl Source for EngineSource {
             ShellAccount::Managed(row) => Some(row.id),
             ShellAccount::NotInShell | ShellAccount::Unmanaged => None,
         };
-        let auto_holders = foreign_engine_holders(engine, &providers);
+        let auto_holders = engine_holders(engine, &providers);
         let read_at_ms = engine.now_ms();
         let mut last_auto = Vec::new();
         for p in &providers {
@@ -135,6 +146,7 @@ impl Source for EngineSource {
             in_run_shell: matches!(engine.run_shell(), RunShell::Inside { .. }),
             read_at_s: read_at_ms.div_euclid(1000),
             auto_holders,
+            daemon_pid: live_daemon_pid(engine.env()),
             config_mtime: Settings::mtime(engine.env()),
             last_auto,
         })
@@ -213,24 +225,31 @@ impl Source for EngineSource {
 }
 
 /// Each of `providers` whose engine lock record names a process that runs, judged by an exact pid
-/// and start-time match as `doctor` does (an undeterminable one counts as live), and that is not
-/// the daemon `daemon.lock` names: a `tagteam auto` in another terminal (C-16, T2-11).
-fn foreign_engine_holders(
-    engine: &Engine,
-    providers: &[ProviderAccounts],
-) -> Vec<(ProviderId, u32)> {
+/// and start-time match as `doctor` does (an undeterminable one counts as live), other than this
+/// process. The daemon `daemon.lock` names is a `Daemon`; any other is the kind its record says,
+/// `Auto` when it says none.
+fn engine_holders(engine: &Engine, providers: &[ProviderAccounts]) -> Vec<AutoHolder> {
     let daemon = match read_daemon_record(&daemon_lock_path(engine.env())) {
         Read::Present(r) => Some((r.pid, r.start)),
         Read::Absent | Read::Unreadable(_) => None,
     };
+    let me = ProcessStamp::current().ok();
     providers
         .iter()
         .filter_map(|p| match engine.engine_holder(&p.provider) {
-            Read::Present(stamp)
-                if stamp.liveness() != Liveness::Dead
-                    && daemon != Some((stamp.pid, stamp.start)) =>
+            Read::Present(holder)
+                if holder.liveness() != Liveness::Dead && Some(holder.stamp()) != me =>
             {
-                Some((p.provider.clone(), stamp.pid))
+                let kind = if daemon == Some((holder.pid, holder.start)) {
+                    HolderKind::Daemon
+                } else {
+                    holder.kind.unwrap_or(HolderKind::Auto)
+                };
+                Some(AutoHolder {
+                    provider: p.provider.clone(),
+                    pid: holder.pid,
+                    kind,
+                })
             }
             Read::Present(_) | Read::Absent | Read::Unreadable(_) => None,
         })

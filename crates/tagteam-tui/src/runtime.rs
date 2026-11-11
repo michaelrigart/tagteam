@@ -832,6 +832,7 @@ mod tests {
                 in_run_shell: false,
                 read_at_s: 0,
                 auto_holders: vec![],
+                daemon_pid: None,
                 config_mtime: None,
                 last_auto: vec![],
             })
