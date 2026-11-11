@@ -166,7 +166,8 @@ pub(crate) fn say_checked(state: &mut State, summary: &CollectSummary, now_ms: i
 /// it, as the live daemon's last `status` says it is, or else the auto lane's own job. A confirm
 /// dialog asks first, default no. With neither it says why and changes nothing: a daemon that
 /// runs without a link to it, or none to pause (timer mode); and so for a provider the daemon
-/// runs no job for: the TUI changes no setting whose effect it cannot show (T2-16).
+/// runs no job for: the TUI changes no setting whose effect it cannot show (T2-16). So too for a
+/// provider the auto lane has no line for yet, while the lane starts or runs.
 fn pause(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     if busy(state, now_ms) {
         return vec![];
@@ -174,9 +175,12 @@ fn pause(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     let provider = daemon::focus(state);
     if !state.daemon.live() && state.daemon.hosted_job(&provider).is_none() {
         let says = if state.daemon.mismatch().is_none() && state.daemon_pid().is_some() {
-            NOT_CONNECTED
+            NOT_CONNECTED.to_owned()
+        } else if state.daemon.mismatch().is_none() && state.daemon.lane_can_run() {
+            let display = state.names_of(&provider).display_name;
+            format!("auto has no state for {display} yet")
         } else {
-            NO_DAEMON_RUNNING
+            NO_DAEMON_RUNNING.to_owned()
         };
         state.toast(ToastKind::Info, says, now_ms);
         return vec![];
@@ -2570,6 +2574,46 @@ mod tests {
                 "{report:?}"
             );
             assert!(state.overlay.is_none(), "{report:?}");
+        }
+    }
+
+    #[test]
+    fn p_says_auto_has_no_state_yet_while_the_lane_starts_or_has_no_line_for_the_provider() {
+        // S§3.4: "no daemon runs" is for a lane that cannot run; one that starts, or runs with no
+        // job for the focus provider, has no state for it yet.
+        let said = |state: &State| {
+            let toast = state.toast.as_ref().unwrap();
+            (toast.kind, toast.text.clone())
+        };
+        let yet = (
+            ToastKind::Info,
+            "auto has no state for Claude Code yet".to_owned(),
+        );
+        // Before the lane's first report.
+        let mut state = loaded(1);
+        state.daemon.await_lane(NOW_MS);
+        assert!(update(&mut state, ch('P'), NOW_MS).is_empty());
+        assert_eq!(said(&state), yet);
+        assert!(state.overlay.is_none());
+        // A board that lists another provider only.
+        let mut state = loaded(1);
+        state.daemon.await_lane(NOW_MS);
+        let other = daemon_status(vec![daemon_job("fake-agent", "auto", true)], vec![]);
+        update(&mut state, Msg::Lane(LaneReport::Status(other)), NOW_MS);
+        assert!(update(&mut state, ch('P'), NOW_MS).is_empty());
+        assert_eq!(said(&state), yet);
+        assert!(state.overlay.is_none());
+        // Once it ended, it is "no daemon runs" again.
+        for report in [LaneReport::Off, LaneReport::Upgraded] {
+            let mut state = loaded(1);
+            state.daemon.await_lane(NOW_MS);
+            update(&mut state, Msg::Lane(report.clone()), NOW_MS);
+            assert!(update(&mut state, ch('P'), NOW_MS).is_empty());
+            assert_eq!(
+                said(&state),
+                (ToastKind::Info, NO_DAEMON_RUNNING.to_owned()),
+                "{report:?}"
+            );
         }
     }
 

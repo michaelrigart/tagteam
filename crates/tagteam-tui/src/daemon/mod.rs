@@ -65,6 +65,21 @@ pub(crate) enum NotedWhat {
     Warning(String),
 }
 
+/// Where the auto lane is, as its reports say (S§3.3, S§3.4).
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum LaneLife {
+    /// The TUI has no lane.
+    #[default]
+    None,
+    /// The lane is configured and has reported nothing yet: it reports only once a provider
+    /// has a line.
+    Starting,
+    /// The lane has reported a board and not ended.
+    Running,
+    /// The lane ended `Off` or `Upgraded`: it runs nothing.
+    Ended,
+}
+
 /// The daemon as the TUI knows it (spec §8).
 #[derive(Default)]
 pub struct DaemonState {
@@ -108,6 +123,8 @@ pub struct DaemonState {
     lane_unsettled_until: Option<i64>,
     /// The auto lane's last board: its jobs, which run here while no daemon does (S§3.3).
     hosted: Option<Status>,
+    /// Whether the lane has not reported, runs, or ended.
+    lane: LaneLife,
     /// The lane found the store newer than this build and stopped (S§3.7).
     upgraded: bool,
     /// Each provider's latest decision on this link (spec §5.3's rank 2).
@@ -144,6 +161,11 @@ impl DaemonState {
     /// `provider`'s job on the auto lane's last board.
     pub fn hosted_job(&self, provider: &ProviderId) -> Option<&StatusProvider> {
         job_in(self.hosted.as_ref()?, provider)
+    }
+
+    /// The lane is configured and has not ended `Off` or `Upgraded`: it runs, or is starting.
+    pub(crate) fn lane_can_run(&self) -> bool {
+        matches!(self.lane, LaneLife::Starting | LaneLife::Running)
     }
 
     /// The lane stopped for a store newer than this build, until the TUI restarts.
@@ -185,6 +207,7 @@ impl DaemonState {
     /// collection too (Ruling 9).
     pub(crate) fn await_lane(&mut self, now_ms: i64) {
         self.lane_unsettled_until = Some(now_ms + SETTLE_MS);
+        self.lane = LaneLife::Starting;
     }
 
     /// The daemon's latest decision for `provider` on this link (spec §5.3's rank 2).
@@ -374,11 +397,18 @@ pub(crate) fn on_lane(state: &mut State, report: LaneReport, now_ms: i64) -> Vec
     let hosted_before = state.daemon.hosts_jobs();
     match report {
         LaneReport::Event(event) => return apply_event(state, event, now_ms, false),
-        LaneReport::Status(status) => state.daemon.hosted = Some(status),
-        LaneReport::Off => state.daemon.hosted = None,
+        LaneReport::Status(status) => {
+            state.daemon.hosted = Some(status);
+            state.daemon.lane = LaneLife::Running;
+        }
+        LaneReport::Off => {
+            state.daemon.hosted = None;
+            state.daemon.lane = LaneLife::Ended;
+        }
         LaneReport::Upgraded => {
             state.daemon.hosted = None;
             state.daemon.upgraded = true;
+            state.daemon.lane = LaneLife::Ended;
         }
     }
     state.daemon.lane_unsettled_until = None;
