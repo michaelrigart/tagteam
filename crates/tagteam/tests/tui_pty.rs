@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1291,11 +1292,6 @@ fn with_no_daemon_the_tui_switches_an_account_at_its_limit() {
     let home = Home::with_bearers(short_tempdir());
     let root = home.root();
     let env = Env::for_test(root);
-    let open_store = || {
-        Store::open_existing(&env.data_dir().join("tagteam.db"))
-            .unwrap()
-            .unwrap()
-    };
     let now = now_epoch_s();
     record_reading(
         root,
@@ -1340,16 +1336,23 @@ fn with_no_daemon_the_tui_switches_an_account_at_its_limit() {
     tui.wait_until(LONG, "the engine lock naming the TUI", || {
         fs::read_to_string(&lock).is_ok_and(|r| r.contains(r#""holder":"tui""#))
     });
-    let switches = || -> Vec<_> {
-        open_store()
-            .events()
-            .unwrap()
+    // The lane writes the store as this reads it: a store that cannot be opened or read just now
+    // is a switch not seen yet.
+    let seen = RefCell::new(Vec::new());
+    tui.wait_until(LONG, "the switch event", || {
+        let Ok(Some(store)) = Store::open_existing(&env.data_dir().join("tagteam.db")) else {
+            return false;
+        };
+        let Ok(events) = store.events() else {
+            return false;
+        };
+        *seen.borrow_mut() = events
             .into_iter()
             .filter(|e| e.kind.as_str() == "switch")
-            .collect()
-    };
-    tui.wait_until(LONG, "the switch event", || !switches().is_empty());
-    let switches = switches();
+            .collect::<Vec<_>>();
+        !seen.borrow().is_empty()
+    });
+    let switches = seen.into_inner();
     assert_eq!(switches.len(), 1, "{switches:?}");
     assert_eq!(switches[0].source.as_str(), "auto", "{switches:?}");
     assert_eq!(

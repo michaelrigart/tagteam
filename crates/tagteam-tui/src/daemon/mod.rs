@@ -1804,13 +1804,20 @@ mod tests {
                 jobs.push(job);
             }
             update(&mut state, lane(lane_status(jobs)), NOW_MS);
-            let at_30 = names(&tick(&mut state, NOW_MS + 30_000));
+            let cmds = tick(&mut state, NOW_MS + 30_000);
             let want = if collected {
                 vec!["accounts", "collect"]
             } else {
                 vec!["accounts"]
             };
-            assert_eq!(at_30, want, "{fake_job:?}");
+            assert_eq!(names(&cmds), want, "{fake_job:?}");
+            // The lane's `claude-code` job collects for itself, so only `fake-agent`'s account
+            // is offered to the collector, and only when nothing else collects for it.
+            let offered = cmds.iter().find_map(|c| match c {
+                Cmd::CollectDue { accounts, .. } => Some(accounts.clone()),
+                _ => None,
+            });
+            assert_eq!(offered, collected.then(|| vec![id(3)]), "{fake_job:?}");
             // `r` still collects every account shown.
             let r = update(&mut state, ch('r'), NOW_MS + 31_000);
             let all = r.iter().find_map(|c| match c {
