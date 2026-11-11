@@ -12,11 +12,11 @@ use std::time::Instant;
 
 use common::{FakeFx, Fx, capture_logs, cc};
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_engine::EngineError;
 use tagteam_engine::config::{SETTINGS_LOCK_TIMEOUT, SettingsChange};
 use tagteam_engine::settings::{
-    AccountsView, ColorMode, KEYS, KeyKind, Settings, SettingsError, Value, config_path,
+    AccountsView, ColorMode, KEYS, Key, KeyKind, Settings, SettingsError, Value, config_path,
 };
+use tagteam_engine::{Engine, EngineError};
 use tagteam_provider::FlockGuard;
 use tagteam_provider::profile::RunShell;
 
@@ -529,9 +529,129 @@ fn every_numeric_key_in_the_registry_refuses_a_step_past_either_end() {
     );
 }
 
-/// A value `set` takes for a key of `kind`: the bottom of a range, or the last choice.
-fn sample(kind: &KeyKind) -> String {
-    match kind {
+/// What a `config set` that must refuse says.
+fn refusal_message(
+    engine: &Engine,
+    name: &str,
+    provider: Option<&ProviderId>,
+    raw: &str,
+) -> String {
+    let err = engine.config_set(name, provider, raw).unwrap_err();
+    assert_eq!(err.kind(), "invalid-input", "{name} {raw}");
+    err.to_string()
+}
+
+/// What a `config unset` that must refuse says.
+fn unset_refusal_message(engine: &Engine, name: &str) -> String {
+    let err = engine.config_unset(name, None).unwrap_err();
+    assert_eq!(err.kind(), "invalid-input", "{name}");
+    err.to_string()
+}
+
+#[test]
+fn a_write_that_breaks_the_pair_is_refused_and_nothing_is_written() {
+    // S3.2: a write after which a provider's threshold is at or above its ceiling is refused, from
+    // either side of the pair, and the file is left as it was.
+    let fx = Fx::new();
+    let file = "[autoswitch]\nthreshold = 90\n";
+    write_config(&fx, file);
+
+    assert_eq!(
+        refusal_message(&fx.engine, "autoswitch.ceiling", None, "90"),
+        "`autoswitch.ceiling` must be above `autoswitch.threshold` (claude-code would have a threshold of 90 and a ceiling of 90)"
+    );
+    assert_eq!(config_text(&fx), file);
+
+    assert!(set(&fx, "autoswitch.ceiling", "95").changed);
+    let held = config_text(&fx);
+    assert_eq!(
+        refusal_message(&fx.engine, "autoswitch.threshold", None, "95"),
+        "`autoswitch.threshold` must be below `autoswitch.ceiling` (claude-code would have a threshold of 95 and a ceiling of 95)"
+    );
+    assert_eq!(config_text(&fx), held);
+}
+
+#[test]
+fn both_spellings_of_a_provider_entry_are_refused_alike() {
+    let fx = Fx::new();
+    let file = "[autoswitch]\nthreshold = 90\n";
+    write_config(&fx, file);
+    let expected = "`provider.claude-code.autoswitch.ceiling` must be above `autoswitch.threshold` (claude-code would have a threshold of 90 and a ceiling of 85)";
+
+    assert_eq!(
+        refusal_message(
+            &fx.engine,
+            "provider.claude-code.autoswitch.ceiling",
+            None,
+            "85"
+        ),
+        expected
+    );
+    assert_eq!(
+        refusal_message(&fx.engine, "autoswitch.ceiling", Some(&cc()), "85"),
+        expected
+    );
+    assert_eq!(config_text(&fx), file);
+}
+
+#[test]
+fn an_unset_that_breaks_the_pair_is_refused() {
+    // Removing a threshold lets the global (or default) one back in, which can sit at or above
+    // the ceiling that held beside the old one.
+    let fx = Fx::new();
+    let file = "[autoswitch]\nthreshold = 80\nceiling = 85\n";
+    write_config(&fx, file);
+    assert_eq!(
+        unset_refusal_message(&fx.engine, "autoswitch.threshold"),
+        "`autoswitch.threshold` must be below `autoswitch.ceiling` (claude-code would have a threshold of 90 and a ceiling of 85)"
+    );
+    assert_eq!(config_text(&fx), file);
+    assert!(unset(&fx, "autoswitch.ceiling").changed);
+
+    let file = "[autoswitch]\nthreshold = 92\n[provider.claude-code.autoswitch]\nthreshold = 80\nceiling = 85\n";
+    write_config(&fx, file);
+    assert_eq!(
+        unset_refusal_message(&fx.engine, "provider.claude-code.autoswitch.threshold"),
+        "`provider.claude-code.autoswitch.threshold` must be below `autoswitch.ceiling` (claude-code would have a threshold of 92 and a ceiling of 85)"
+    );
+    assert_eq!(config_text(&fx), file);
+}
+
+#[test]
+fn a_global_write_is_checked_for_every_registered_provider() {
+    // A global ceiling reaches every provider, so a provider whose own threshold it passes
+    // refuses it even though claude-code, which comes first, would hold.
+    let ffx = FakeFx::new();
+    let file = "[provider.fake-agent.autoswitch]\nthreshold = 96\n";
+    write_config(&ffx.fx, file);
+    assert_eq!(
+        refusal_message(&ffx.engine, "autoswitch.ceiling", None, "95"),
+        "`autoswitch.ceiling` must be above `autoswitch.threshold` (fake-agent would have a threshold of 96 and a ceiling of 95)"
+    );
+    assert_eq!(config_text(&ffx.fx), file);
+}
+
+#[test]
+fn a_pair_the_file_already_breaks_blocks_no_write() {
+    // Review Focus 3: a file that breaks the pair already reads with a warning and a ceiling of
+    // 100. A write that does not newly break it, whatever its key, is not refused.
+    let fx = Fx::new();
+    write_config(&fx, "[autoswitch]\nthreshold = 95\nceiling = 90\n");
+    for (name, raw) in [
+        ("daemon.autoswitch", "false"),
+        ("autoswitch.cooldown_seconds", "600"),
+        ("autoswitch.ceiling", "92"),
+        ("autoswitch.ceiling", "96"),
+    ] {
+        assert!(set(&fx, name, raw).changed, "{name} {raw}");
+    }
+}
+
+/// A value `set` takes for `key`: the bottom of a range, or the last choice. The ceiling takes
+/// the top of its range: the bottom is never above a threshold, so a write refuses it.
+fn sample(key: &Key) -> String {
+    match &key.kind {
+        KeyKind::Float(r) if key.name == "autoswitch.ceiling" => r.end().to_string(),
         KeyKind::Float(r) => r.start().to_string(),
         KeyKind::Int(r) => r.start().to_string(),
         KeyKind::Bool => "yes".into(),
@@ -550,12 +670,7 @@ fn every_key_set_through_the_registry_reads_back_without_a_warning() {
     // global table and from a provider's.
     let fx = Fx::new();
     for key in KEYS {
-        // The bottom of the ceiling's range is never above a threshold, so the reader refuses it.
-        let raw = if key.name == "autoswitch.ceiling" {
-            "100".to_owned()
-        } else {
-            sample(&key.kind)
-        };
+        let raw = sample(key);
         set(&fx, key.name, &raw);
         if key.per_provider {
             fx.engine

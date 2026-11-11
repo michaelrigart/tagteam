@@ -19,7 +19,9 @@ use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
 use crate::profiles::is_private;
-use crate::settings::{Key, KeyKind, SettingsError, Value, config_path, resolve};
+use crate::settings::{
+    Key, KeyId, KeyKind, SettingsError, Value, autoswitch_pair, config_path, pair_holds, resolve,
+};
 
 /// How long a write waits for the settings lock (§4.3, §6.4). Each poll of the wait is a
 /// cancellation point (§14.1).
@@ -153,6 +155,61 @@ impl Engine {
         Ok(())
     }
 
+    /// [`apply`], then [`Engine::check_pair`] against the document as it was read.
+    fn edited(
+        &self,
+        entry: &Entry,
+        value: Option<&Value>,
+        file: Option<(String, DocumentMut)>,
+    ) -> Result<Option<String>, SettingsError> {
+        let before = file.as_ref().map(|(_, doc)| doc.clone());
+        let text = apply(entry, value, file)?;
+        if let Some(after) = &text {
+            self.check_pair(entry, before.as_ref(), after)?;
+        }
+        Ok(text)
+    }
+
+    /// Refuses a write of `autoswitch.threshold` or `autoswitch.ceiling` after which a registered
+    /// provider's threshold is at or above its ceiling, when the pair held before it. A pair the
+    /// file already breaks blocks no write (a read repairs it, with a warning), and no file holds
+    /// every default, which is a valid pair.
+    fn check_pair(
+        &self,
+        entry: &Entry,
+        before: Option<&DocumentMut>,
+        after: &str,
+    ) -> Result<(), SettingsError> {
+        let (is_ceiling, other) = match entry.key.id {
+            KeyId::Ceiling => (true, "autoswitch.threshold"),
+            KeyId::Threshold => (false, "autoswitch.ceiling"),
+            _ => return Ok(()),
+        };
+        let empty = DocumentMut::new();
+        let before = before.unwrap_or(&empty);
+        let after = after
+            .parse::<DocumentMut>()
+            .expect("an edit of a valid document is valid");
+        for provider in self.registry.all() {
+            let id = provider.id();
+            let (threshold, ceiling) = autoswitch_pair(&after, &id);
+            let (was_threshold, was_ceiling) = autoswitch_pair(before, &id);
+            if pair_holds(threshold, ceiling) || !pair_holds(was_threshold, was_ceiling) {
+                continue;
+            }
+            let relation = if is_ceiling { "above" } else { "below" };
+            return Err(invalid(
+                entry,
+                format!(
+                    "must be {relation} `{other}` ({id} would have a threshold of {} and a ceiling of {})",
+                    Value::Float(threshold).display(),
+                    Value::Float(ceiling).display(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// One edit of the file, in two passes:
     /// 1. A first look without the lock. When the edit changes nothing it returns here, so it
     ///    creates nothing, not even the lock file (§5).
@@ -164,7 +221,7 @@ impl Engine {
     /// lock is released: nothing else is taken while it is held (§4.3).
     fn edit(&self, entry: Entry, value: Option<Value>) -> Result<SettingsChange, EngineError> {
         let path = config_path(&self.env);
-        if apply(&entry, value.as_ref(), read(&path)?)?.is_none() {
+        if self.edited(&entry, value.as_ref(), read(&path)?)?.is_none() {
             return Ok(SettingsChange {
                 key: entry.name,
                 value,
@@ -181,7 +238,7 @@ impl Engine {
             .map_err(SettingsError::Lock)?;
             let current = read(&path)?;
             hooks::point(self, "settings-read")?;
-            match apply(&entry, value.as_ref(), current)? {
+            match self.edited(&entry, value.as_ref(), current)? {
                 None => false,
                 Some(text) => {
                     ensure_private_dir(&self.env.config_dir()).map_err(SettingsError::Io)?;
