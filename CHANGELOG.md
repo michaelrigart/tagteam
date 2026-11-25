@@ -30,6 +30,13 @@ with the one before, so any release may contain breaking changes. Each section s
   variable was set, and `tagteam doctor` reports it.
 - Checked against Claude Code 2.1.332, now the newest version tagteam is known to work with.
   `tagteam doctor` no longer warns about Claude Code versions up to 2.1.332.
+- With `autoswitch.strategy` set to `consume-first`, auto hands over to the account whose weekly
+  window resets soonest, not the emptiest one, when it leaves a full account and for `proactive`
+  and `failover` switches. An account with an unknown reset comes last. Before, a full account
+  went to the emptiest one, and the `consume-first` check moved again after the cooldown. Which
+  accounts qualify has not changed, and `best` is unchanged. Accounts at or above the ceiling
+  still come after the others, and when every account is above the threshold the order by
+  recovery time is unchanged.
 
 ## [20261111.1935.0] - 2026-11-11
 
