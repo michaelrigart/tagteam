@@ -1339,9 +1339,25 @@ impl<'a> Reader<'a> {
         Some(current)
     }
 
+    /// Whether a segment of `path` exists but is not a table, so `table` read it as absent.
+    fn blocked(&self, path: &[&str]) -> bool {
+        let mut current: &dyn TableLike = self.doc.as_table();
+        for segment in path {
+            match current.get(segment) {
+                None => return false,
+                Some(item) => match item.as_table_like() {
+                    Some(table) => current = table,
+                    None => return true,
+                },
+            }
+        }
+        false
+    }
+
     /// `key`'s value for `provider`, and the table it came from: the first table that holds a
     /// valid one, the provider's own first when the key is per provider. A present value that
-    /// is not valid warns, naming the dotted key, and the next table is tried.
+    /// is not valid warns, naming the dotted key, and the next table is tried. A table that is
+    /// no table counts as a present, invalid value.
     fn read_key(&mut self, key: &Key, provider: &ProviderId) -> Option<(Value, Source)> {
         let own: Vec<&str> = key.table().into_iter().collect();
         let mut tables: Vec<(Vec<&str>, Source)> = Vec::with_capacity(2);
@@ -1354,6 +1370,7 @@ impl<'a> Reader<'a> {
         let mut present = false;
         for (path, source) in tables {
             let Some(table) = self.table(&path) else {
+                present |= self.blocked(&path);
                 continue;
             };
             let Some(item) = table.get(key.leaf()) else {

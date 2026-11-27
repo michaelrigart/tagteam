@@ -54,10 +54,11 @@ and 14).
   Claude Code's own item refuses the write, a `displaced/` copy or a refreshed token persisted
   just before it can remain: a second copy of a credential that is still live, and the next
   successful run publishes the persisted generation. The setting is read at each write,
-  applies to tagteam's writes only and changes nothing on Linux. It does not cover session
-  profiles (below), which hand their login over in a file, though a `tagteam run` that needs a
-  stored token that is due is refused in a session that cannot write the Keychain, or a
-  plain-text login already on disk; `tagteam doctor` warns about one while the setting is off.
+  applies to tagteam's writes only and changes nothing on Linux. It does not cover a
+  plain-text login already on disk, which `tagteam doctor` warns about while the setting is
+  off, or session profiles (below), which hand their login over in a file. A `tagteam run`
+  that needs a stored token that is due is still refused in a session that cannot write the
+  Keychain.
 - **Credentials and `security`'s command line.** tagteam passes a credential to
   `/usr/bin/security` on standard input (`security -i`), not on its command line. When a
   credential exceeds about 3.8 KB, `security` receives it on its command line instead, which

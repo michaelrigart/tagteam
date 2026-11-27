@@ -580,6 +580,24 @@ fn an_invalid_value_keeps_the_last_good_one() {
 }
 
 #[test]
+fn a_keychain_entry_that_is_not_a_table_keeps_the_last_good_value() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.set_keychain_file_fallback(false);
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+    let first = fx.switch_to(&a, false).unwrap_err();
+    assert_eq!(first.kind(), "keychain-fallback-refused", "{first}");
+    write_config(&fx, "keychain = false\n");
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert!(!fx.paths().credentials_file.exists());
+}
+
+#[test]
 fn a_missing_config_allows_the_fallback() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
