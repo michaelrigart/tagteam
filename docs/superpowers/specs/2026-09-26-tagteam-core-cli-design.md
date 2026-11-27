@@ -3854,8 +3854,13 @@ caches account- and org-scoped data (`groveConfigCache`, `modelAccessCache`,
   `--text` prints text. Fields: `loggedIn`, `authMethod`, `apiProvider`, `analyticsDisabled`,
   `projectsDirectory`, `configDirectory` and `loginExpiresAt` (*2.1.318*) always; `email`, `orgId`,
   `orgName` and `subscriptionType` for a `claude.ai` login; `apiKeySource` and others when they
-  apply. `authMethod` is `claude.ai`, `api_key`, `api_key_helper`, `oauth_token`, `third_party`, or
-  `none` when logged out. It exits 0 only when logged in. `loginExpiresAt` is the ISO 8601 time at
+  apply. `consoleProfileSignInOffered: true` (*2.1.325*) appears when CC would offer a Console
+  sign-in that stores a profile and no API key: on the first-party provider, with no forced
+  `claude.ai` login method or organization. It says what `claude auth login` can do and does not
+  depend on the login in use (a throwaway home prints it logged out and with
+  `CLAUDE_CODE_OAUTH_TOKEN` set, *2.1.332*), so §12.3 does not read it. `authMethod` is
+  `claude.ai`, `api_key`, `api_key_helper`, `oauth_token`, `third_party`, or `none` when logged
+  out. It exits 0 only when logged in. `loginExpiresAt` is the ISO 8601 time at
   which CC expects the stored `claude.ai` login to end, and `null` when there is none, as when
   logged out; §12.3 does not read it. Its source order is `ANTHROPIC_AUTH_TOKEN`,
   `CLAUDE_CODE_OAUTH_TOKEN`, the token file descriptor, an `apiKeyHelper`, a workload-identity
