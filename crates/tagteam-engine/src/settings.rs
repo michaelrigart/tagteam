@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use tagteam_core::autoswitch::AutoStrategy;
 use tagteam_core::tokens::{CardOverride, PriceOverride};
 use tagteam_core::{ProviderId, str_enum};
-use tagteam_provider::{Env, LockError};
+use tagteam_provider::{BeforeFallback, Env, Fallback, LockError};
 use toml_edit::{DocumentMut, Item, TableLike};
 
 pub const DEFAULT_THRESHOLD: f64 = 90.0;
@@ -1033,22 +1033,9 @@ impl Settings {
         (read.settings, read.warnings)
     }
 
-    /// [`Settings::load`], plus `keychain.file_fallback` as the file holds it now (see
-    /// [`Settings::load_keychain_file_fallback`]).
-    pub fn load_with_file_fallback(
-        env: &Env,
-        provider: &ProviderId,
-    ) -> (Settings, Vec<String>, Option<bool>) {
-        let read = read_file(env, provider);
-        let fallback = file_fallback_of(&read);
-        (read.settings, read.warnings, fallback)
-    }
-
-    /// `keychain.file_fallback` as `config.toml` holds it now: the default when the file or the
-    /// key is missing, `None` when the file exists but cannot be read or parsed, or holds an
-    /// invalid value for the key.
-    pub fn load_keychain_file_fallback(env: &Env, provider: &ProviderId) -> Option<bool> {
-        file_fallback_of(&read_file(env, provider))
+    /// `keychain.file_fallback` as `config.toml` holds it now (see [`FileFallback`]).
+    pub(crate) fn load_keychain_file_fallback(env: &Env, provider: &ProviderId) -> FileFallback {
+        FileFallback::of(&read_file(env, provider))
     }
 
     /// `config.toml`'s modification time; `None` when the file is missing or its metadata
@@ -1192,9 +1179,37 @@ struct FileRead {
     warnings: Vec<String>,
 }
 
-fn file_fallback_of(read: &FileRead) -> Option<bool> {
-    (!read.broken && !read.invalid.contains(&KeyId::KeychainFileFallback))
-        .then_some(read.settings.keychain_file_fallback)
+/// `keychain.file_fallback` as `config.toml` holds it: whether tagteam may store a secret in
+/// plain text when the Keychain refuses a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileFallback {
+    /// The key is true, or the file or the key is missing (the default).
+    Allowed,
+    /// The key is false.
+    Off,
+    /// The file exists but cannot be read or parsed, the key is invalid, or `keychain` is not a
+    /// table. A setting that cannot be read is not a permission, so it acts as `Off`.
+    Unknown,
+}
+
+impl FileFallback {
+    fn of(read: &FileRead) -> Self {
+        if read.broken || read.invalid.contains(&KeyId::KeychainFileFallback) {
+            Self::Unknown
+        } else if read.settings.keychain_file_fallback {
+            Self::Allowed
+        } else {
+            Self::Off
+        }
+    }
+
+    /// `Allow(before)` when the fallback is allowed, else `Refuse`.
+    pub(crate) fn policy(self, before: BeforeFallback<'_>) -> Fallback<'_> {
+        match self {
+            Self::Allowed => Fallback::Allow(before),
+            Self::Off | Self::Unknown => Fallback::Refuse,
+        }
+    }
 }
 
 fn read_file(env: &Env, provider: &ProviderId) -> FileRead {

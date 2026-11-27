@@ -674,8 +674,10 @@ impl Engine {
             let mut before_fallback = |bytes: &[u8]| cx.before_fallback(self, bytes);
             // The undo is dropped, never run: it would write the consumed generation back. The
             // storage-write wait honours `cancel`, as the config-lock wait did (§9.1, §14.1).
-            p.write_credential(&env, &locks, &login, self.fallback(&mut before_fallback))
+            let setting = self.file_fallback();
+            p.write_credential(&env, &locks, &login, setting.policy(&mut before_fallback))
                 .map(|_| ())
+                .map_err(|e| self.refusal(setting, EngineError::from(e)))
         };
         for w in &cx.warnings {
             tracing::warn!(
@@ -685,7 +687,7 @@ impl Engine {
             );
         }
         if let Err(e) = written {
-            return not_published(EngineError::from(e));
+            return not_published(e);
         }
         let landed = match p.read_live_auth(&self.env).credential {
             Read::Present(c) if c.provenance() == Provenance::Fresh => {

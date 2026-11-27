@@ -61,6 +61,13 @@ pub enum EngineError {
         "the Keychain refused a write and `keychain.file_fallback` is off, so the credential was not stored; run tagteam from the desktop login session, or allow the fallback with `tagteam config set keychain.file_fallback true`"
     )]
     KeychainFallbackRefused,
+    /// Spec §3.5: as `KeychainFallbackRefused`, but `keychain.file_fallback` cannot be read from
+    /// `path`, which counts as off.
+    #[error(
+        "the Keychain refused a write and `keychain.file_fallback` cannot be read from {}, so the credential was not stored; repair that file, or run tagteam from the desktop login session",
+        path.display()
+    )]
+    KeychainFallbackUnreadable { path: PathBuf },
     #[error("the live credential belongs to {found}, not {expected}; refusing to add it")]
     OwnerMismatch { expected: String, found: String },
     #[error("the live login changed while it was being checked; run the command again")]
@@ -571,7 +578,8 @@ impl EngineError {
     /// write's, or a refused write whose restore failed too.
     pub fn is_fallback_refusal(&self) -> bool {
         match self {
-            EngineError::KeychainFallbackRefused => true,
+            EngineError::KeychainFallbackRefused
+            | EngineError::KeychainFallbackUnreadable { .. } => true,
             EngineError::Provider(ProviderError::FallbackRefused { .. }) => true,
             EngineError::Provider(ProviderError::RestoreFailed { cause, .. }) => {
                 matches!(**cause, ProviderError::FallbackRefused { .. })
@@ -604,7 +612,8 @@ impl EngineError {
             EngineError::NoLiveLogin { .. } => "no-live-login",
             EngineError::LiveApiKey => "live-api-key",
             EngineError::DegradedRead => "degraded-read",
-            EngineError::KeychainFallbackRefused => "keychain-fallback-refused",
+            EngineError::KeychainFallbackRefused
+            | EngineError::KeychainFallbackUnreadable { .. } => "keychain-fallback-refused",
             EngineError::OwnerMismatch { .. } => "owner-mismatch",
             EngineError::LiveMoved => "live-moved",
             EngineError::NeedsConfirmation { .. } => "needs-confirmation",
@@ -714,6 +723,7 @@ mod tests {
     fn a_fallback_refusal_is_the_probe_the_write_or_a_write_whose_restore_failed() {
         let refused = || ProviderError::FallbackRefused { item: "x".into() };
         assert!(EngineError::KeychainFallbackRefused.is_fallback_refusal());
+        assert!(EngineError::KeychainFallbackUnreadable { path: "c".into() }.is_fallback_refusal());
         assert!(EngineError::Provider(refused()).is_fallback_refusal());
         assert!(
             EngineError::Provider(ProviderError::RestoreFailed {
@@ -814,6 +824,10 @@ mod tests {
             (EngineError::DegradedRead, "degraded-read"),
             (
                 EngineError::KeychainFallbackRefused,
+                "keychain-fallback-refused",
+            ),
+            (
+                EngineError::KeychainFallbackUnreadable { path: "c".into() },
                 "keychain-fallback-refused",
             ),
             (

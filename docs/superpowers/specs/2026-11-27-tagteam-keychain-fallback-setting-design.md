@@ -6,8 +6,8 @@
 Scope: one new settings key (the `autoswitch.ceiling` change added one in about 120 lines), two
 changed arguments on the `Provider` trait with two implementations, the engine's probe and its
 two call sites, the rollback's error, one daemon backoff input and one `doctor` check. As
-built it is 772 lines: the reviews added the probe at the refresh gate, the last good value for
-a broken config and the deferred refusal in `tagteam run`. Michael accepted it as one increment
+built it is 772 lines: the reviews added the probe at the refresh gate, the handling of a
+broken config and the deferred refusal in `tagteam run`. Michael accepted it as one increment
 on 2026-11-28.
 **Scope:** The macOS credential write of the Claude Code provider
 (`crates/tagteam-cc/src/live.rs`, `provider.rs`, `doctor.rs`), the `Provider` trait
@@ -79,7 +79,8 @@ two ways out, and leaves everything as it was.
 
 **Anti-goals**
 
-- Any change of behaviour with the default.
+- Any change of behaviour with the default, except one: a `config.toml` that cannot be read, on
+  a Mac whose Keychain refuses the write, counts as off (§3.1).
 - A refusal that deletes, moves or rewrites a credential.
 
 ## 3. Design
@@ -97,13 +98,24 @@ It joins `KEYS` after `notify.events`, with a `KeyId::KeychainFileFallback` and 
 `Settings::keychain_file_fallback` field. `tagteam config`, `config get`, `config set` and
 `config unset` take it through the registry with no code of their own. The engine reads it from the
 file at each write and each probe, not from its settings snapshot: only the daemon reloads that
-snapshot, and a running `tagteam auto` or TUI must follow an edit at its next write too. The engine
-keeps the last value it read successfully for this key in a field of its own, seeded from the
-settings it was built with and updated by each successful read, a reload included. A file that
-exists but cannot be read or parsed, or holds an invalid value for this key, gives that value, and
-a reload of such a file never replaces it with the default, as it does the settings snapshot. A
-missing file or key gives the default. A fresh process with a broken file has only the default,
-and warns as every command does for a broken config.
+snapshot, and a running `tagteam auto` or TUI must follow an edit at its next write too. The read
+has three states, decided in one place (`FileFallback` in `settings.rs`):
+
+- `Allowed`: the file or the key is missing (the default), or the key is `true`.
+- `Off`: the key is `false`.
+- `Unknown`: the file exists but cannot be read or parsed, the key holds an invalid value, or
+  `keychain` is not a table. The engine remembers nothing between reads: each use reads the file
+  again, so a repaired file is followed at the next write, and a process that rebuilds its engine
+  (the TUI after a suspend) decides the same way as one that never stopped.
+
+`Unknown` behaves as `Off` everywhere: the write is refused, the probe runs and `doctor`'s check
+appears. A setting that cannot be read is not a permission to store a secret in plain text. That
+also holds for a user who never set it: with a broken `config.toml`, a switch fails, with the
+config named (§3.5), but only when the Keychain refuses the write. A fresh process warns as every
+command does for a broken config.
+
+(Changed 2026-11-28 after the pre-merge review: the remembered value was wrong in a new way in
+five review rounds.)
 
 ### 3.2 Handing the choice to the provider
 
@@ -206,6 +218,18 @@ Both carry this text, the provider's naming its item:
 > the Keychain refused a write and `keychain.file_fallback` is off, so the credential was not
 > stored; run tagteam from the desktop login session, or allow the fallback with
 > `tagteam config set keychain.file_fallback true`
+
+When the setting is `Unknown` (§3.1), both carry this text instead, naming the settings file as
+`tagteam config path` shows it:
+
+> the Keychain refused a write and `keychain.file_fallback` cannot be read from {path}, so the
+> credential was not stored; repair that file, or run tagteam from the desktop login session
+
+The provider knows nothing of settings, so it raises the same `FallbackRefused` for both. The
+engine chooses the text in one place: at its two write sites it reads the setting once, builds the
+policy from it, and maps a `FallbackRefused` from the write to
+`EngineError::KeychainFallbackUnreadable { path }` when the setting was `Unknown`. The probe's
+refusal takes the same text. Both have the kind `keychain-fallback-refused` and count as refusals.
 
 `EngineError::kind()` gives both `keychain-fallback-refused`. A switch whose write is refused
 and whose rollback put everything back returns the refusal itself, not `rolled-back`

@@ -53,9 +53,9 @@ and 14).
   credential is saved and no refresh token is spent first. Where that probe passes and only
   Claude Code's own item refuses the write, a `displaced/` copy or a refreshed token persisted
   just before it can remain: a second copy of a credential that is still live, and the next
-  successful run publishes the persisted generation. The setting is read at each write,
-  applies to tagteam's writes only and changes nothing on Linux. It does not cover a
-  plain-text login already on disk, which `tagteam doctor` warns about while the setting is
+  successful run publishes the persisted generation. The setting is read at each write, and a
+  `config.toml` that cannot be read counts as off. It applies to tagteam's writes only and
+  changes nothing on Linux. It does not cover a plain-text login already on disk, which `tagteam doctor` warns about while the setting is
   off, or session profiles (below), which hand their login over in a file. A `tagteam run`
   that needs a stored token that is due is still refused in a session that cannot write the
   Keychain.

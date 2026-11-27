@@ -514,14 +514,26 @@ fn a_config_broken_after_the_fallback_was_turned_off_still_refuses() {
 
         let err = fx.switch_to(&a, false).unwrap_err();
 
-        assert_eq!(err.kind(), "keychain-fallback-refused", "{broken:?}: {err}");
-        assert!(!fx.paths().credentials_file.exists());
+        assert_unreadable_refusal(&fx, &err);
     }
 }
 
 fn write_config(fx: &Fx, text: &str) {
     std::fs::create_dir_all(fx.env.config_dir()).unwrap();
     std::fs::write(fx.env.config_dir().join("config.toml"), text).unwrap();
+}
+
+fn assert_unreadable_refusal(fx: &Fx, err: &EngineError) {
+    let path = fx.env.config_dir().join("config.toml");
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "the Keychain refused a write and `keychain.file_fallback` cannot be read from {}, so the credential was not stored; repair that file, or run tagteam from the desktop login session",
+            path.display()
+        )
+    );
+    assert!(!fx.paths().credentials_file.exists());
 }
 
 #[test]
@@ -539,8 +551,7 @@ fn a_config_broken_then_reloaded_still_refuses() {
 
     let err = fx.switch_to(&a, false).unwrap_err();
 
-    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
-    assert!(!fx.paths().credentials_file.exists());
+    assert_unreadable_refusal(&fx, &err);
 }
 
 #[test]
@@ -557,12 +568,11 @@ fn a_fallback_turned_off_after_start_then_broken_still_refuses() {
 
     let err = fx.switch_to(&a, false).unwrap_err();
 
-    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
-    assert!(!fx.paths().credentials_file.exists());
+    assert_unreadable_refusal(&fx, &err);
 }
 
 #[test]
-fn an_invalid_value_keeps_the_last_good_one() {
+fn an_invalid_value_refuses_and_names_the_config() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
@@ -575,12 +585,11 @@ fn an_invalid_value_keeps_the_last_good_one() {
 
     let err = fx.switch_to(&a, false).unwrap_err();
 
-    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
-    assert!(!fx.paths().credentials_file.exists());
+    assert_unreadable_refusal(&fx, &err);
 }
 
 #[test]
-fn a_keychain_entry_that_is_not_a_table_keeps_the_last_good_value() {
+fn a_keychain_entry_that_is_not_a_table_refuses_and_names_the_config() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
@@ -593,8 +602,54 @@ fn a_keychain_entry_that_is_not_a_table_keeps_the_last_good_value() {
 
     let err = fx.switch_to(&a, false).unwrap_err();
 
-    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert_unreadable_refusal(&fx, &err);
+}
+
+#[test]
+fn a_broken_config_refuses_even_when_the_fallback_was_never_turned_off() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    write_config(&fx, "x = = 1\n");
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_unreadable_refusal(&fx, &err);
+    assert_eq!(fx.engine.fallback_refusals(), 1);
+}
+
+#[test]
+fn a_broken_config_changes_nothing_when_the_keychain_takes_the_write() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    write_config(&fx, "x = = 1\n");
+
+    let out = fx.switch_to(&a, false).unwrap();
+
+    assert_eq!(out.stored_in, Some(SecretStore::Keychain));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
     assert!(!fx.paths().credentials_file.exists());
+    assert_eq!(fx.engine.fallback_refusals(), 0);
+}
+
+#[test]
+fn a_repaired_config_allows_the_fallback_again() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    write_config(&fx, "x = = 1\n");
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+    let first = fx.switch_to(&a, false).unwrap_err();
+    assert_unreadable_refusal(&fx, &first);
+    write_config(&fx, "[autoswitch]\nthreshold = 80\n");
+
+    let out = fx.switch_to(&a, false).unwrap();
+
+    assert!(matches!(out.stored_in, Some(SecretStore::Fallback(_))));
 }
 
 #[test]

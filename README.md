@@ -390,8 +390,9 @@ set to absolute paths. Directories are created lazily with mode 0700.
   nothing. Before a switch, a live-token refresh or a stored account's refresh, tagteam
   rewrites the account's own `tagteam` Keychain item with its own bytes, and stops there if
   that fails, before anything is saved or a token is spent. The setting is global, tagteam
-  reads it at each write, so an edit applies with no restart, and Linux ignores it. The daemon
-  backs off after a refusal, from 1 minute up to 15. It does not cover session profiles (next
+  reads it at each write, so an edit applies with no restart, and Linux ignores it. A
+  `config.toml` that cannot be read counts as off. The daemon backs off after a refusal, from
+  1 minute up to 15. It does not cover session profiles (next
   item), apart from this: a `tagteam run` that needs a stored token that is due is refused in a
   session that cannot write the Keychain. Nor does it cover a plain-text login already on
   disk; while it is off, `tagteam doctor` runs the check `cc.keychain-fallback` and warns

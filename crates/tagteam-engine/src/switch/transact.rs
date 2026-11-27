@@ -313,6 +313,7 @@ impl Engine {
             identity: pf.target_identity.clone(),
         };
         let mut before_fallback = |bytes: &[u8]| cx.before_fallback(self, bytes);
+        let setting = self.file_fallback();
         let stored_in = match self.apply(
             p,
             ApplyStep {
@@ -322,13 +323,14 @@ impl Engine {
             },
             req,
             &mut tx,
-            self.fallback(&mut before_fallback),
+            setting.policy(&mut before_fallback),
         ) {
             Ok(stored_in) => {
                 tx.disarm();
                 stored_in
             }
             Err(cause) => {
+                let cause = self.refusal(setting, cause);
                 self.note_refusal(&cause);
                 return Err(tx.fail(cause));
             }

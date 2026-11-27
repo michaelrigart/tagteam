@@ -214,6 +214,31 @@ fn a_refused_probe_stops_a_switch_before_anything_is_saved() {
 }
 
 #[test]
+fn a_refused_probe_under_a_broken_config_names_the_config() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.login("stranger@x.co", "rt-s");
+    std::fs::create_dir_all(fx.env.config_dir()).unwrap();
+    std::fs::write(fx.env.config_dir().join("config.toml"), "x = = 1\n").unwrap();
+    fx.kc.set_fail_write(SERVICE, true);
+    let items = fx.kc.items();
+
+    let err = switch(&fx, to(&a), true).unwrap_err();
+
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert!(
+        err.to_string().contains(&format!(
+            "cannot be read from {}",
+            fx.env.config_dir().join("config.toml").display()
+        )),
+        "{err}"
+    );
+    assert!(fx.displaced().is_empty());
+    assert_eq!(fx.kc.items(), items);
+    assert_eq!(fx.engine.fallback_refusals(), 1);
+}
+
+#[test]
 fn with_the_default_a_switch_never_probes() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");

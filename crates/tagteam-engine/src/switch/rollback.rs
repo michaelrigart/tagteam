@@ -118,7 +118,8 @@ fn rolled_back(cause: EngineError, failed: Vec<String>) -> EngineError {
         };
     }
     match cause {
-        EngineError::Provider(ProviderError::FallbackRefused { .. }) => cause,
+        EngineError::Provider(ProviderError::FallbackRefused { .. })
+        | EngineError::KeychainFallbackUnreadable { .. } => cause,
         cause => EngineError::RolledBack(cause.to_string()),
     }
 }
