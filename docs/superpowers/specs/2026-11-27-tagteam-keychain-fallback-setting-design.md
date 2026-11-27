@@ -1,6 +1,6 @@
 # tagteam — `keychain.file_fallback`: refuse the plain-text Keychain fallback
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/68
 **Date:** 2026-11-27
 **Size:** about 500 lines of non-test code, in one increment (§7). It rests on the files in
 Scope: one new settings key (the `autoswitch.ceiling` change added one in about 120 lines), two

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** In progress
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/68. This plan is complete; do not run it again.
 
 **Goal:** An opt-in setting that makes tagteam, on macOS, refuse a credential write the Keychain
 refuses instead of storing the secret in plain text.
