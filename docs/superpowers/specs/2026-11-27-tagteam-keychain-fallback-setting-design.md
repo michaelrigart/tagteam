@@ -92,9 +92,9 @@ two ways out, and leaves everything as it was.
 
 It joins `KEYS` after `notify.events`, with a `KeyId::KeychainFileFallback` and a
 `Settings::keychain_file_fallback` field. `tagteam config`, `config get`, `config set` and
-`config unset` take it through the registry with no code of their own. It is read through the
-engine's settings, which a running daemon already reloads (`engine.rs:233`), so the daemon
-follows an edit at its next run.
+`config unset` take it through the registry with no code of their own. The engine reads it from the
+file at each write and each probe, not from its settings snapshot: only the daemon reloads that
+snapshot, and a running `tagteam auto` or TUI must follow an edit at its next write too.
 
 ### 3.2 Handing the choice to the provider
 

@@ -240,6 +240,13 @@ as "spec §n". Line numbers are as of `b223d07c`.
   ```
   `Vault::probe_write` does not count in `Vault::writes` and logs nothing at INFO.
 
+- [ ] **Step 0: Read the setting fresh (Task 3's review).** Add
+  `pub(crate) fn file_fallback_allowed(&self) -> bool` to `Engine`:
+  `Settings::load(&self.env, self.default_provider()).0.keychain_file_fallback`. `fallback()`,
+  the probe and `doctor` use it in place of `self.settings()`. Test first, in
+  `tests/switch_rollback.rs`: `a_fallback_turned_off_after_the_engine_was_built_is_followed`:
+  write `[keychain]\nfile_fallback = false` to the fixture's `config.toml` without
+  `reload_settings`, fail the live item's writes → kind `keychain-fallback-refused`.
 - [ ] **Step 1: Write the failing tests:**
   - `vault.rs`: `a_probe_rewrites_the_item_with_its_own_bytes` (bytes unchanged after `Ok(true)`);
     `a_probe_of_a_keychain_that_refuses_writes_is_false` (`set_fail_write("tagteam", true)`);
@@ -354,8 +361,7 @@ as "spec §n". Line numbers are as of `b223d07c`.
 - [ ] **Step 1: Write the documents.** README and SECURITY say: what the setting does, that the
   default mirrors Claude Code's own fallback, that it does not cover session profiles
   (`tagteam run` writes `sessions/<id>/.credentials.json`) or a plain-text login already there,
-  that a refusal is fixed by running from the desktop login session, and that a running
-  `tagteam auto` reads the setting at start (the daemon follows an edit). The CHANGELOG entry
+  that a refusal is fixed by running from the desktop login session, and that an edit is followed at the next write, with no restart. The CHANGELOG entry
   names the setting, the error kind and the `doctor` check.
 - [ ] **Step 2: Run the six commands of `CONTRIBUTING.md` lines 36–41.** Expected: no
   formatting diff, no clippy warning, every test passing; report passed/total. The pty tests
