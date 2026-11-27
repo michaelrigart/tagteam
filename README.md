@@ -386,15 +386,17 @@ set to absolute paths. Directories are created lazily with mode 0700.
   key in `primaryApiKey` of `~/.claude.json`. Claude Code does the same, and the default,
   `keychain.file_fallback` `true`, mirrors it. With
   `tagteam config set keychain.file_fallback false` such a write fails with the error kind
-  `keychain-fallback-refused`, and nothing is stored, moved or deleted. Before a switch, a
-  live-token refresh or a stored account's refresh, tagteam rewrites the account's own
-  `tagteam` Keychain item with its own bytes, and stops there if that fails, before anything
-  is saved or a token is spent. The setting is global, tagteam reads it at each write, so an
-  edit applies with no restart, and Linux ignores it. The daemon backs off after a refusal,
-  from 1 minute up to 15. It does not cover session profiles (next item) or a plain-text login
-  already on disk; while it is off, `tagteam doctor` runs the check `cc.keychain-fallback` and
-  warns about such a login. A refusal means tagteam ran where the Keychain cannot be written,
-  such as over SSH: run it from the desktop login session, or set the setting back to `true`.
+  `keychain-fallback-refused`: the refused write stores nothing in plain text and deletes
+  nothing. Before a switch, a live-token refresh or a stored account's refresh, tagteam
+  rewrites the account's own `tagteam` Keychain item with its own bytes, and stops there if
+  that fails, before anything is saved or a token is spent. The setting is global, tagteam
+  reads it at each write, so an edit applies with no restart, and Linux ignores it. The daemon
+  backs off after a refusal, from 1 minute up to 15. It does not cover session profiles (next
+  item), apart from this: a `tagteam run` that needs a stored token that is due is refused in a
+  session that cannot write the Keychain. Nor does it cover a plain-text login already on
+  disk; while it is off, `tagteam doctor` runs the check `cc.keychain-fallback` and warns
+  about such a login. A refusal means tagteam ran where the Keychain cannot be written, such
+  as over SSH: run it from the desktop login session, or set the setting back to `true`.
 - **Session profiles** used by `tagteam run` hold their account's credential the way Claude
   Code keeps it. tagteam writes `sessions/<id>/.credentials.json` (mode 0600); on macOS,
   Claude Code moves it into its own Keychain item, `Claude Code-credentials-<hash>`, on its

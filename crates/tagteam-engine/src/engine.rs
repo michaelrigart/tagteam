@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -139,6 +139,9 @@ pub struct Engine {
     lock_holder: HolderKind,
     store: Mutex<Option<Arc<Store>>>,
     fallback_refusals: AtomicU64,
+    /// `keychain.file_fallback` as this engine last read it cleanly: from the settings it was
+    /// built with, then from each read of a file that held a valid value or none.
+    file_fallback: AtomicBool,
     #[cfg(feature = "test-hooks")]
     pub(crate) fail_at: Mutex<Option<&'static str>>,
     #[cfg(feature = "test-hooks")]
@@ -148,6 +151,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Self {
+        let file_fallback = cfg.settings.keychain_file_fallback;
         Self {
             env: cfg.env,
             registry: cfg.registry,
@@ -167,6 +171,7 @@ impl Engine {
             },
             store: Mutex::new(None),
             fallback_refusals: AtomicU64::new(0),
+            file_fallback: AtomicBool::new(file_fallback),
             #[cfg(feature = "test-hooks")]
             fail_at: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
@@ -247,9 +252,14 @@ impl Engine {
     /// forgiving, the provider's own table first), makes it the engine's settings, and returns
     /// the read's warnings. A missing or corrupt file gives the defaults, as at start-up. The
     /// daemon reloads for the provider its command acts on, at start and whenever the file's
-    /// mtime changes (D4.2); the collector and the views read the result.
+    /// mtime changes (D4.2); the collector and the views read the result. A file that is
+    /// corrupt, or invalid for `keychain.file_fallback`, leaves the engine's last good value of
+    /// that key as it was.
     pub fn reload_settings(&self, provider: &ProviderId) -> Vec<String> {
-        let (settings, warnings) = Settings::load(&self.env, provider);
+        let (settings, warnings, fallback) = Settings::load_with_file_fallback(&self.env, provider);
+        if let Some(fallback) = fallback {
+            self.file_fallback.store(fallback, Ordering::Relaxed);
+        }
         *self
             .settings
             .write()
@@ -264,11 +274,18 @@ impl Engine {
 
     /// `keychain.file_fallback`, read from `config.toml` at each use rather than from the
     /// settings snapshot: only the daemon reloads that, and a running `auto` or the TUI must
-    /// follow an edit at its next write. A file that exists but cannot be read or parsed gives
-    /// the snapshot's value, the last this process read.
+    /// follow an edit at its next write. A missing file or key gives the default. A file that
+    /// exists but cannot be read or parsed, or holds an invalid value for the key, gives the
+    /// last value this engine read cleanly: its own, which a reload of a broken file never
+    /// replaces with the defaults.
     pub(crate) fn file_fallback_allowed(&self) -> bool {
-        Settings::load_keychain_file_fallback(&self.env, self.default_provider())
-            .unwrap_or_else(|| self.settings().keychain_file_fallback)
+        match Settings::load_keychain_file_fallback(&self.env, self.default_provider()) {
+            Some(read) => {
+                self.file_fallback.store(read, Ordering::Relaxed);
+                read
+            }
+            None => self.file_fallback.load(Ordering::Relaxed),
+        }
     }
 
     /// `Refuse` when `keychain.file_fallback` is off, else `Allow(before)`.
@@ -297,16 +314,9 @@ impl Engine {
         }
     }
 
-    /// Counts `e` when its kind is `keychain-fallback-refused`, or when a refused write's
-    /// restore failed too.
+    /// Counts `e` when it is a fallback refusal.
     pub(crate) fn note_refusal(&self, e: &EngineError) {
-        let refused = match e {
-            EngineError::Provider(ProviderError::RestoreFailed { cause, .. }) => {
-                matches!(**cause, ProviderError::FallbackRefused { .. })
-            }
-            e => e.kind() == "keychain-fallback-refused",
-        };
-        if refused {
+        if e.is_fallback_refusal() {
             self.fallback_refusals.fetch_add(1, Ordering::Relaxed);
         }
     }

@@ -1033,11 +1033,22 @@ impl Settings {
         (read.settings, read.warnings)
     }
 
-    /// `keychain.file_fallback` as `config.toml` holds it now: the default when the file is
-    /// missing, `None` when it exists but cannot be read or parsed.
-    pub fn load_keychain_file_fallback(env: &Env, provider: &ProviderId) -> Option<bool> {
+    /// [`Settings::load`], plus `keychain.file_fallback` as the file holds it now (see
+    /// [`Settings::load_keychain_file_fallback`]).
+    pub fn load_with_file_fallback(
+        env: &Env,
+        provider: &ProviderId,
+    ) -> (Settings, Vec<String>, Option<bool>) {
         let read = read_file(env, provider);
-        (!read.broken).then_some(read.settings.keychain_file_fallback)
+        let fallback = file_fallback_of(&read);
+        (read.settings, read.warnings, fallback)
+    }
+
+    /// `keychain.file_fallback` as `config.toml` holds it now: the default when the file or the
+    /// key is missing, `None` when the file exists but cannot be read or parsed, or holds an
+    /// invalid value for the key.
+    pub fn load_keychain_file_fallback(env: &Env, provider: &ProviderId) -> Option<bool> {
+        file_fallback_of(&read_file(env, provider))
     }
 
     /// `config.toml`'s modification time; `None` when the file is missing or its metadata
@@ -1175,8 +1186,15 @@ struct FileRead {
     settings: Settings,
     /// Per [`KEYS`] entry, the table its value came from.
     sources: Vec<Source>,
+    /// The keys whose value was present in every table that holds it, yet invalid in each.
+    invalid: Vec<KeyId>,
     unknown: Vec<String>,
     warnings: Vec<String>,
+}
+
+fn file_fallback_of(read: &FileRead) -> Option<bool> {
+    (!read.broken && !read.invalid.contains(&KeyId::KeychainFileFallback))
+        .then_some(read.settings.keychain_file_fallback)
 }
 
 fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
@@ -1186,6 +1204,7 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
         broken: false,
         settings: Settings::default(),
         sources: vec![Source::Default; KEYS.len()],
+        invalid: Vec::new(),
         unknown: Vec::new(),
         warnings: Vec::new(),
     };
@@ -1218,6 +1237,7 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
         doc: &doc,
         path: &shown,
         warnings: Vec::new(),
+        invalid: Vec::new(),
     };
     for (key, source) in KEYS.iter().zip(read.sources.iter_mut()) {
         if let Some((value, from)) = reader.read_key(key, provider) {
@@ -1253,6 +1273,7 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
     read.settings.prices = reader.read_prices();
     read.settings.mappings = reader.read_mappings(provider, &env.home);
     read.warnings = reader.warnings;
+    read.invalid = reader.invalid;
     unknown_keys(doc.as_table(), &mut Vec::new(), &mut read.unknown);
     read.unknown.sort();
     read
@@ -1266,6 +1287,7 @@ pub(crate) fn autoswitch_pair(doc: &DocumentMut, provider: &ProviderId) -> (f64,
         doc,
         path: "",
         warnings: Vec::new(),
+        invalid: Vec::new(),
     };
     let mut settings = Settings::default();
     for key in KEYS
@@ -1284,6 +1306,8 @@ struct Reader<'a> {
     /// The settings file's full path, which every warning starts with.
     path: &'a str,
     warnings: Vec<String>,
+    /// The keys `read_key` found present but invalid, and that no later table made good.
+    invalid: Vec<KeyId>,
 }
 
 impl<'a> Reader<'a> {
@@ -1327,6 +1351,7 @@ impl<'a> Reader<'a> {
             tables.push((path, Source::Provider));
         }
         tables.push((own, Source::Global));
+        let mut present = false;
         for (path, source) in tables {
             let Some(table) = self.table(&path) else {
                 continue;
@@ -1347,12 +1372,18 @@ impl<'a> Reader<'a> {
             }
             match value {
                 Some(value) => return Some((value, source)),
-                None => self.warn(format!(
-                    "{}: `{dotted}` {} (ignored)",
-                    self.path,
-                    key.expect()
-                )),
+                None => {
+                    present = true;
+                    self.warn(format!(
+                        "{}: `{dotted}` {} (ignored)",
+                        self.path,
+                        key.expect()
+                    ));
+                }
             }
+        }
+        if present {
+            self.invalid.push(key.id);
         }
         None
     }

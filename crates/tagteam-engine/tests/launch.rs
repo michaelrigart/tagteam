@@ -2073,6 +2073,67 @@ mod hooked {
         }
     }
 
+    /// A killed session of `a` whose token is due, `keychain.file_fallback` off and a vault that
+    /// refuses writes. A reservation taken at `launch-before-locks` makes the launch a join.
+    fn due_launch_with_a_refusing_vault(
+        joining: bool,
+    ) -> (Fx, PathBuf, Arc<Mutex<Option<FlockGuard>>>, AccountRow) {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let profile = killed_session(&fx, &a, "a@x.co");
+        fx.script_refresh(Some("rt-a-2"));
+        fx.expire_access(&a);
+        fx.set_keychain_file_fallback(false);
+        fx.kc.set_fail_write(SERVICE, true);
+        let race = profile
+            .join(LAUNCH_DIR)
+            .join(format!("{}-race.lock", std::process::id()));
+        let session = Arc::new(Mutex::new(None));
+        let started = session.clone();
+        fx.engine.on_point(
+            "launch-before-locks",
+            Box::new(move || {
+                if joining {
+                    *started.lock().unwrap() = FlockGuard::try_lock(&race).unwrap();
+                }
+            }),
+        );
+        let planned = row(&fx, &a);
+        (fx, profile, session, planned)
+    }
+
+    #[test]
+    fn a_refused_probe_does_not_stop_a_launch_that_joins_a_session() {
+        let (fx, profile, session, planned) = due_launch_with_a_refusing_vault(true);
+
+        let launched = fx
+            .engine
+            .launch(&planned, claude_bin(), &fx.work_dir("app"))
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(!launched.bootstrapped);
+        assert_eq!(live_reservations(&profile), 2);
+        assert_eq!(token_requests(&fx), 0);
+        drop((launched, session));
+    }
+
+    #[test]
+    fn a_refused_probe_refuses_a_launch_that_needs_the_stored_credential() {
+        let (fx, profile, session, planned) = due_launch_with_a_refusing_vault(false);
+        let before = dir_tree(&profile);
+
+        let err = refused(
+            fx.engine
+                .launch(&planned, claude_bin(), &fx.work_dir("app")),
+        );
+
+        assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+        assert!(err.to_string().contains("keychain.file_fallback"), "{err}");
+        assert_eq!(token_requests(&fx), 0);
+        assert_eq!(dir_tree(&profile), before, "nothing was written");
+        drop(session);
+    }
+
     #[test]
     fn the_gate_finds_the_account_busy_while_the_launch_holds_its_lock() {
         // §7.3 step 1: a reservation can only appear while the gate cannot hold the lock.

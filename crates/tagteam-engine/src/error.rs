@@ -567,6 +567,19 @@ fn session_owned_message(position: u32, label: &str, owner: &SessionOwner) -> St
 }
 
 impl EngineError {
+    /// Whether this is a refusal under `keychain.file_fallback = false`: the probe's, the
+    /// write's, or a refused write whose restore failed too.
+    pub fn is_fallback_refusal(&self) -> bool {
+        match self {
+            EngineError::KeychainFallbackRefused => true,
+            EngineError::Provider(ProviderError::FallbackRefused { .. }) => true,
+            EngineError::Provider(ProviderError::RestoreFailed { cause, .. }) => {
+                matches!(**cause, ProviderError::FallbackRefused { .. })
+            }
+            _ => false,
+        }
+    }
+
     /// Stable `error.type` for `--json` output (§14).
     pub fn kind(&self) -> &'static str {
         if let Some(e) = self.lock_error() {
@@ -696,6 +709,28 @@ fn lock_kind(e: &LockError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fallback_refusal_is_the_probe_the_write_or_a_write_whose_restore_failed() {
+        let refused = || ProviderError::FallbackRefused { item: "x".into() };
+        assert!(EngineError::KeychainFallbackRefused.is_fallback_refusal());
+        assert!(EngineError::Provider(refused()).is_fallback_refusal());
+        assert!(
+            EngineError::Provider(ProviderError::RestoreFailed {
+                cause: Box::new(refused()),
+                restore: Box::new(ProviderError::Invalid("b".into())),
+            })
+            .is_fallback_refusal()
+        );
+        assert!(
+            !EngineError::Provider(ProviderError::RestoreFailed {
+                cause: Box::new(ProviderError::Invalid("a".into())),
+                restore: Box::new(refused()),
+            })
+            .is_fallback_refusal()
+        );
+        assert!(!EngineError::Provider(ProviderError::Invalid("a".into())).is_fallback_refusal());
+    }
 
     /// Pins every variant's `kind()` string: it's part of `--json`'s stable contract (§14), so
     /// a change here is a breaking change, not a refactor.

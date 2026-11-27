@@ -717,7 +717,7 @@ impl AutoEngine<'_> {
         let fresh = match self.engine.freshen_auto(p, &row) {
             Ok(fresh) => fresh,
             Err(e) if fatal(&e) => return Err(e),
-            Err(e) if e.kind() == "keychain-fallback-refused" => {
+            Err(e) if e.is_fallback_refusal() => {
                 return self.target_failed(t, &row, &e, sink);
             }
             Err(e) => AutoFreshened::Failed(FreshenFailure::Text(e.to_string())),

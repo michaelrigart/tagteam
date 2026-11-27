@@ -94,8 +94,13 @@ It joins `KEYS` after `notify.events`, with a `KeyId::KeychainFileFallback` and 
 `Settings::keychain_file_fallback` field. `tagteam config`, `config get`, `config set` and
 `config unset` take it through the registry with no code of their own. The engine reads it from the
 file at each write and each probe, not from its settings snapshot: only the daemon reloads that
-snapshot, and a running `tagteam auto` or TUI must follow an edit at its next write too. A file that
-exists but cannot be read or parsed gives the value this process last read.
+snapshot, and a running `tagteam auto` or TUI must follow an edit at its next write too. The engine
+keeps the last value it read successfully for this key in a field of its own, seeded from the
+settings it was built with and updated by each successful read, a reload included. A file that
+exists but cannot be read or parsed, or holds an invalid value for this key, gives that value, and
+a reload of such a file never replaces it with the default, as it does the settings snapshot. A
+missing file or key gives the default. A fresh process with a broken file has only the default,
+and warns as every command does for a broken config.
 
 ### 3.2 Handing the choice to the provider
 
@@ -181,6 +186,11 @@ not, the write itself is refused as in §3.3: no file, no deletion, no pin. A `d
 or a persisted refresh made just before it stays, as after any failed write today, and §3.6
 reports it.
 
+A launch's stored-token refresh (`tagteam run`) reaches the same probe at the refresh gate. Its
+refusal is carried across the locks like the gate's other refusals (`LaunchFresh.refusal`), so a
+launch that joins a running session, which needs no stored credential, goes on, and one that needs
+the credential is refused with the refusal's own kind and text.
+
 ### 3.5 The error
 
 Two sources, one kind:
@@ -238,7 +248,9 @@ Out of scope. `tagteam run` hands a profile its login in `sessions/<id>/.credent
 (`write_credential_file`, `live.rs:800`) because tagteam never creates a profile's Keychain item:
 Claude Code creates it on its first write and removes the file's secret. There is no Keychain
 write to refuse and no other way to hand the login over, so refusing would disable `tagteam run`.
-`README.md` and `SECURITY.md` say that the setting does not cover it.
+`README.md` and `SECURITY.md` say that the setting does not cover it, except that a `tagteam run`
+that needs a stored token that is due is refused by the refresh gate's probe (§3.4) in a session
+that cannot write the Keychain.
 
 ### 3.9 `doctor`
 
@@ -249,6 +261,8 @@ is no such check, so `doctor`'s output does not change.
 - `warn` while `.credentials.json` holds a login or `primaryApiKey` holds a key, naming the
   file and saying that the setting stops new fallbacks and removes nothing. It offers no fix
   command: which program put the secret there, and what moves it back, is Claude Code's.
+- `warn` when a file cannot be read, so that whether a plain-text login or API key is held cannot
+  be told, with a fix that makes the credentials file and the global config readable.
 
 The check reads whether the entries hold a secret, never the secret. `Provider::doctor_checks`
 takes no settings today (`provider.rs:911`), so it gains an argument that carries the choice.

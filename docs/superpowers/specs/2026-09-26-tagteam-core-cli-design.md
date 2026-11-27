@@ -3106,8 +3106,9 @@ for a check that is not a provider's, and `fix` is null when there is nothing to
     symlinked config dir's target → info, naming the command that deletes it
   - `keychain.file_fallback` off, on macOS only: `.credentials.json` holding a login, or
     `primaryApiKey` a key → warn, naming each file and saying that the setting stops new
-    fallbacks and removes nothing, with no fix; neither → ok. With the default there is no such
-    check. *(Amended by the [keychain-fallback spec](2026-11-27-tagteam-keychain-fallback-setting-design.md) §3.9.)*
+    fallbacks and removes nothing, with no fix; neither → ok; a file that cannot be read, so
+    that whether it holds one cannot be told → warn, with a fix that makes it readable. With
+    the default there is no such check. *(Amended by the [keychain-fallback spec](2026-11-27-tagteam-keychain-fallback-setting-design.md) §3.9.)*
 - **Environment.** The variables doctor runs with, which a `claude` started from the same
   shell inherits:
   - `CLAUDE_CONFIG_DIR` set but empty, or set to a spelling of the default home: CC 2.1.286

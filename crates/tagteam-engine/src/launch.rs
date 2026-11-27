@@ -262,7 +262,8 @@ impl Engine {
     /// is known only under the locks, and a join uses no stored credential (§12.5 step 3). A
     /// quarantined account is never refreshed (§7.4), and one whose stored credential cannot be
     /// read has nothing to refresh: `locked_login` judges both for a quiescent launch. The
-    /// gate's refusals are `LaunchFresh.refusal`.
+    /// gate's refusals are `LaunchFresh.refusal`, a refused write probe (`keychain.file_fallback`
+    /// off) among them.
     fn freshen_for_launch(
         &self,
         p: &dyn Provider,
@@ -286,7 +287,15 @@ impl Engine {
         // §14.1 (R10.2): nothing is locked yet, and the gate has no cancellation point of its
         // own, so a signal that has landed stops the launch before it spends the refresh token.
         self.check_cancel()?;
-        let out = self.refresh_stored(p, &row.id, &vault)?;
+        let out = match self.refresh_stored(p, &row.id, &vault) {
+            Err(refused) if refused.is_fallback_refusal() => {
+                return Ok(LaunchFresh {
+                    warnings: Vec::new(),
+                    refusal: Some(refused),
+                });
+            }
+            out => out?,
+        };
         Ok(match self.classify_gate(out, p, row, GateMode::Launch)? {
             GateVerdict::Proceed => LaunchFresh::default(),
             GateVerdict::ProceedWarn(warning) => LaunchFresh {

@@ -519,6 +519,66 @@ fn a_config_broken_after_the_fallback_was_turned_off_still_refuses() {
     }
 }
 
+fn write_config(fx: &Fx, text: &str) {
+    std::fs::create_dir_all(fx.env.config_dir()).unwrap();
+    std::fs::write(fx.env.config_dir().join("config.toml"), text).unwrap();
+}
+
+#[test]
+fn a_config_broken_then_reloaded_still_refuses() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.set_keychain_file_fallback(false);
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+    let first = fx.switch_to(&a, false).unwrap_err();
+    assert_eq!(first.kind(), "keychain-fallback-refused", "{first}");
+    write_config(&fx, "x = = 1\n");
+    assert_eq!(fx.engine.reload_settings(&fx.provider()).len(), 1);
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert!(!fx.paths().credentials_file.exists());
+}
+
+#[test]
+fn a_fallback_turned_off_after_start_then_broken_still_refuses() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    write_config(&fx, "[keychain]\nfile_fallback = false\n");
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+    let first = fx.switch_to(&a, false).unwrap_err();
+    assert_eq!(first.kind(), "keychain-fallback-refused", "{first}");
+    write_config(&fx, "[keychain\nfile_fallback = false\n");
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert!(!fx.paths().credentials_file.exists());
+}
+
+#[test]
+fn an_invalid_value_keeps_the_last_good_one() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.set_keychain_file_fallback(false);
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+    let first = fx.switch_to(&a, false).unwrap_err();
+    assert_eq!(first.kind(), "keychain-fallback-refused", "{first}");
+    write_config(&fx, "[keychain]\nfile_fallback = 2\n");
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert!(!fx.paths().credentials_file.exists());
+}
+
 #[test]
 fn a_missing_config_allows_the_fallback() {
     let fx = Fx::new();
