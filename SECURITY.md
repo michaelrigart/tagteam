@@ -43,6 +43,17 @@ and 14).
   reached only through `/usr/bin/security`. On Linux it is `vault/<id>.json` and
   `<id>.prev.json` with mode 0600 in a directory with mode 0700. The SQLite store
   (`tagteam.db`) holds metadata and usage readings, never a credential.
+- **The plain-text fallback.** On macOS, when the Keychain refuses a write of Claude Code's
+  login or API key, tagteam stores the secret in a plain file instead, as Claude Code does: a
+  login in `.credentials.json`, an API key in `primaryApiKey` of `~/.claude.json`. That is the
+  default (`keychain.file_fallback` is `true`). Set it to `false` and such a write fails with
+  the error kind `keychain-fallback-refused`; nothing is stored, moved or deleted. Before a
+  switch or a refresh that could fall back, tagteam rewrites the account's own `tagteam`
+  Keychain item with its own bytes and refuses if that fails, so no credential is saved and no
+  refresh token is spent first. The setting is read at each write, applies to tagteam's writes
+  only and changes nothing on Linux. It does not cover session profiles (below), which hand
+  their login over in a file, or a plain-text login already on disk; `tagteam doctor` warns
+  about one while the setting is off.
 - **Credentials and `security`'s command line.** tagteam passes a credential to
   `/usr/bin/security` on standard input (`security -i`), not on its command line. When a
   credential exceeds about 3.8 KB, `security` receives it on its command line instead, which

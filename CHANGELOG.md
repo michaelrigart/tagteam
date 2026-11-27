@@ -7,6 +7,19 @@ with the one before, so any release may contain breaking changes. Each section s
 
 ## [Unreleased]
 
+### Added
+
+- `keychain.file_fallback`, default `true`, global only, under `[keychain]` in `config.toml`.
+  Set to `false`, a macOS write of Claude Code's login or API key that the Keychain refuses
+  fails with the error kind `keychain-fallback-refused` instead of storing the secret in
+  `.credentials.json` or `primaryApiKey`, and nothing is stored. Before a switch, a live-token
+  refresh or a stored account's refresh, tagteam rewrites the account's own `tagteam` Keychain
+  item with its own bytes and refuses there if that fails. The setting is read at each write,
+  and the daemon backs off 60 s, doubling to 15 min, after a refused run. Linux, session
+  profiles and a plain-text login already on disk are unchanged.
+- `tagteam doctor` runs the check `cc.keychain-fallback` while `keychain.file_fallback` is off:
+  a warning when `.credentials.json` holds a login or `primaryApiKey` a key.
+
 ### Changed
 
 - `tagteam run` now also removes `CLAUDE_CODE_RUNNER_MODEL_SOCKET`, the path of a self-hosted

@@ -3752,6 +3752,12 @@ since 2.1.283.
     stays pinned until the operation that fell back (one switch or one recovery) ends, so its
     later writes go to the file too, and a rollback clears the pin. The next operation tries
     the Keychain again, which matters for a long-lived process such as `auto` or the daemon.
+    *(Amended by the [keychain-fallback spec](2026-11-27-tagteam-keychain-fallback-setting-design.md)
+    §3.3.)* With `keychain.file_fallback` false the fallback is refused: a write the Keychain
+    refuses fails with `keychain-fallback-refused` before any file is written, any item deleted
+    or any pin set. Before a switch, a live-token refresh or a stored account's refresh, the
+    engine rewrites the account's vault item with its own bytes and refuses there if that
+    fails (§3.4). Linux is unchanged.
 - **Vault reads on macOS.** The Keychain is primary. A Linux-style file vault is never used on
   macOS; the fallback for a failed vault write is `rescue/` (§6.3).
 
