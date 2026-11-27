@@ -128,6 +128,7 @@ fn config_list_shows_every_key_with_its_value_and_source_then_the_unknown_ones()
             "daemon.autoswitch                    default   true\n",
             "notify.enabled                       default   true\n",
             "notify.events                        default   switch,quarantine,limit\n",
+            "keychain.file_fallback               default   true\n",
             "\n",
             "Unknown keys, ignored:\n",
             "  autoswitch.thresold\n",
@@ -168,6 +169,7 @@ fn config_list_json_is_the_specs_shape() {
                 row("daemon.autoswitch", json!(true), json!(true), "default"),
                 row("notify.enabled", json!(true), json!(true), "default"),
                 row("notify.events", events.clone(), events, "default"),
+                row("keychain.file_fallback", json!(true), json!(true), "default"),
             ],
             "unknown": ["autoswitch.thresold"],
         })
@@ -599,6 +601,31 @@ mod set_and_unset {
             &["config", "unset", "ui.color"],
             "ui.color is not set.\n".into(),
         );
+    }
+
+    #[test]
+    fn config_set_and_unset_round_trip_keychain_file_fallback() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let file = settings_file(root);
+        cmd(root)
+            .args(["config", "set", "keychain.file_fallback", "false"])
+            .assert()
+            .success();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "[keychain]\nfile_fallback = false\n"
+        );
+        cmd(root)
+            .args(["config", "get", "keychain.file_fallback"])
+            .assert()
+            .success()
+            .stdout("false\n");
+        cmd(root)
+            .args(["config", "unset", "keychain.file_fallback"])
+            .assert()
+            .success();
+        assert!(!fs::read_to_string(&file).unwrap().contains("keychain"));
     }
 
     #[test]

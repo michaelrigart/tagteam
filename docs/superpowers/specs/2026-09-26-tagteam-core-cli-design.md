@@ -801,6 +801,7 @@ source}], unknown: [key]}`; `get` returns `{schemaVersion, key, provider, value,
 | `daemon.autoswitch` | true | bool | yes |
 | `notify.enabled` | true | bool | — |
 | `notify.events` | `["switch","quarantine","limit"]` | a list of `switch`, `quarantine` and `limit`; duplicates collapse; `''` is the empty list | yes |
+| `keychain.file_fallback` | true | bool; false makes a credential write the macOS Keychain refuses fail instead of falling back to the file *(amended by the [keychain-fallback spec](2026-11-27-tagteam-keychain-fallback-setting-design.md) §3.1)* | — |
 
 The `daemon.*` and `notify.*` keys are the daemon's (daemon spec D7). `daemon.autoswitch` set
 to false pauses the daemon's auto-switching for a provider, and that of an open TUI too. It does

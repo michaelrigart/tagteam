@@ -223,6 +223,7 @@ pub(crate) enum KeyId {
     DaemonAutoswitch,
     NotifyEnabled,
     NotifyEvents,
+    KeychainFileFallback,
 }
 
 /// One §6.4 key.
@@ -354,6 +355,12 @@ pub const KEYS: &[Key] = &[
         name: "notify.events",
         kind: KeyKind::NotifyEvents,
         per_provider: true,
+    },
+    Key {
+        id: KeyId::KeychainFileFallback,
+        name: "keychain.file_fallback",
+        kind: KeyKind::Bool,
+        per_provider: false,
     },
 ];
 
@@ -982,6 +989,9 @@ pub struct Settings {
     /// `notify.events` (D7): the kinds the daemon notifies, in the order written. The provider's
     /// own table first.
     pub notify_events: Vec<NotifyEvent>,
+    /// `keychain.file_fallback`: whether a credential write the macOS Keychain refuses may fall
+    /// back to the credentials file. The same for every provider.
+    pub keychain_file_fallback: bool,
 }
 
 impl Default for Settings {
@@ -1008,6 +1018,7 @@ impl Default for Settings {
             daemon_autoswitch: true,
             notify_enabled: true,
             notify_events: NotifyEvent::ALL.to_vec(),
+            keychain_file_fallback: true,
         }
     }
 }
@@ -1057,6 +1068,7 @@ impl Settings {
             KeyId::AccountsView => Value::Str(self.accounts_view.as_str().to_owned()),
             KeyId::DaemonAutoswitch => Value::Bool(self.daemon_autoswitch),
             KeyId::NotifyEnabled => Value::Bool(self.notify_enabled),
+            KeyId::KeychainFileFallback => Value::Bool(self.keychain_file_fallback),
             KeyId::NotifyEvents => Value::List(
                 self.notify_events
                     .iter()
@@ -1099,6 +1111,7 @@ impl Settings {
             }
             KeyId::DaemonAutoswitch => self.daemon_autoswitch = value.into_bool(),
             KeyId::NotifyEnabled => self.notify_enabled = value.into_bool(),
+            KeyId::KeychainFileFallback => self.keychain_file_fallback = value.into_bool(),
             KeyId::NotifyEvents => {
                 self.notify_events = value
                     .into_list()
