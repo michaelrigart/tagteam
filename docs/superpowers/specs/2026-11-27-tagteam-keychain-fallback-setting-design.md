@@ -79,8 +79,9 @@ two ways out, and leaves everything as it was.
 
 **Anti-goals**
 
-- Any change of behaviour with the default, except one: a `config.toml` that cannot be read, on
-  a Mac whose Keychain refuses the write, counts as off (§3.1).
+- Any change of behaviour with the default, except one: a `config.toml` that cannot be read
+  counts as off (§3.1). On a Mac the probe then runs and `doctor` shows its check, which says
+  the setting is off; a write the Keychain refuses is refused.
 - A refusal that deletes, moves or rewrites a credential.
 
 ## 3. Design
@@ -132,7 +133,7 @@ pub enum Fallback<'a> {
 ```
 
 The engine builds it at its two call sites, `switch/transact.rs:306` and `active.rs:672`:
-`Refuse` when `keychain_file_fallback` is `false`, else `Allow` with today's callback. The enum
+`Refuse` when the setting is off or cannot be read (§3.1), else `Allow` with today's callback. The enum
 keeps "refuse, yet with a save callback" unrepresentable. `tagteam-fake` never falls back and
 ignores it. A provider's Linux path never looks at it.
 

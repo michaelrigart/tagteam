@@ -801,7 +801,7 @@ source}], unknown: [key]}`; `get` returns `{schemaVersion, key, provider, value,
 | `daemon.autoswitch` | true | bool | yes |
 | `notify.enabled` | true | bool | — |
 | `notify.events` | `["switch","quarantine","limit"]` | a list of `switch`, `quarantine` and `limit`; duplicates collapse; `''` is the empty list | yes |
-| `keychain.file_fallback` | true | bool; false makes a credential write the macOS Keychain refuses fail instead of falling back to the file *(amended by the [keychain-fallback spec](2026-11-27-tagteam-keychain-fallback-setting-design.md) §3.1)* | — |
+| `keychain.file_fallback` | true | bool; false, or a settings file that cannot be read, makes a credential write the macOS Keychain refuses fail instead of falling back to the file *(amended by the [keychain-fallback spec](2026-11-27-tagteam-keychain-fallback-setting-design.md) §3.1)* | — |
 
 The `daemon.*` and `notify.*` keys are the daemon's (daemon spec D7). `daemon.autoswitch` set
 to false pauses the daemon's auto-switching for a provider, and that of an open TUI too. It does
@@ -3104,7 +3104,7 @@ for a check that is not a provider's, and `fix` is null when there is nothing to
   - an item under a former fallback name of the home doctor runs in (Appendix A.2): the
     unsuffixed item when `CLAUDE_CONFIG_DIR` names the default home, or the item named from a
     symlinked config dir's target → info, naming the command that deletes it
-  - `keychain.file_fallback` off, on macOS only: `.credentials.json` holding a login, or
+  - `keychain.file_fallback` off, or a settings file that cannot be read, on macOS only: `.credentials.json` holding a login, or
     `primaryApiKey` a key → warn, naming each file and saying that the setting stops new
     fallbacks and removes nothing, with no fix; neither → ok; a file that cannot be read, so
     that whether it holds one cannot be told → warn, with a fix that makes it readable. With
