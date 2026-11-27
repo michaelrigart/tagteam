@@ -1,6 +1,6 @@
 # Claude Code 2.1.332 drift (issue #64): implementation plan
 
-**Status:** In progress
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/67
 
 **Goal:** `crates/tagteam-cc/compat/` matches Claude Code 2.1.332, the weekly drift check finds
 nothing, and `tagteam run` scrubs `CLAUDE_CODE_RUNNER_MODEL_SOCKET`.
@@ -29,28 +29,28 @@ and docs), as the cloud-sessions token's commit `08c7c3af` was.
 
 **Depends on:** none
 
-- [ ] Test first: add `CLAUDE_CODE_RUNNER_MODEL_SOCKET` after `CLAUDE_CODE_SESSIONS_OAUTH_TOKEN`
+- [x] Test first: add `CLAUDE_CODE_RUNNER_MODEL_SOCKET` after `CLAUDE_CODE_SESSIONS_OAUTH_TOKEN`
   in `SCRUBBED` (`crates/tagteam-cc/tests/session.rs`, now 24 names), in the doctor test's set
   names and expected `unset` lines (`crates/tagteam-cc/tests/doctor.rs`), and in the scrub test
   of `crates/tagteam/src/app/context.rs`. Run them and see them fail.
-- [ ] Add the name to `CC_SCRUB` (`crates/tagteam-cc/src/session.rs`), in §12.5's order, and a
+- [x] Add the name to `CC_SCRUB` (`crates/tagteam-cc/src/session.rs`), in §12.5's order, and a
   `scrub` line to `crates/tagteam-cc/compat/known-env` under "Carries or points at a credential",
   with 2.1.332 named in that comment.
-- [ ] CHANGELOG, under Unreleased / Changed: `tagteam run` also removes the name, warns when it
+- [x] CHANGELOG, under Unreleased / Changed: `tagteam run` also removes the name, warns when it
   was set, and `tagteam doctor` reports it.
-- [ ] The focused tests pass; `scripts/cc-drift.sh` reports no unclassified name for 2.1.332.
+- [x] The focused tests pass; `scripts/cc-drift.sh` reports no unclassified name for 2.1.332.
 
 ### Task 2: Bless 2.1.332
 
 **Depends on:** 1
 
-- [ ] `cargo xtask compat` against 2.1.332 exits 0 with no failed check.
-- [ ] Set `crates/tagteam-cc/compat/tested-cc-version` and the README's version to 2.1.332, and
+- [x] `cargo xtask compat` against 2.1.332 exits 0 with no failed check.
+- [x] Set `crates/tagteam-cc/compat/tested-cc-version` and the README's version to 2.1.332, and
   add the CHANGELOG line, as `5957760a` did for 2.1.322.
 
 ### Task 3: Verification
 
 **Depends on:** 2
 
-- [ ] The full suite, clippy and rustfmt on the final commit; `scripts/cc-drift.sh` against the
+- [x] The full suite, clippy and rustfmt on the final commit; `scripts/cc-drift.sh` against the
   installed 2.1.332 exits 0 with an empty report; `scripts/cc-drift-test.sh` passes.
