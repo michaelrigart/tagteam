@@ -5,7 +5,10 @@
 **Size:** about 500 lines of non-test code, in one increment (§7). It rests on the files in
 Scope: one new settings key (the `autoswitch.ceiling` change added one in about 120 lines), two
 changed arguments on the `Provider` trait with two implementations, the engine's probe and its
-two call sites, the rollback's error, one daemon backoff input and one `doctor` check.
+two call sites, the rollback's error, one daemon backoff input and one `doctor` check. As
+built it is 772 lines: the reviews added the probe at the refresh gate, the last good value for
+a broken config and the deferred refusal in `tagteam run`. Michael accepted it as one increment
+on 2026-11-28.
 **Scope:** The macOS credential write of the Claude Code provider
 (`crates/tagteam-cc/src/live.rs`, `provider.rs`, `doctor.rs`), the `Provider` trait
 (`crates/tagteam-provider/src/provider.rs`) and the fake (`crates/tagteam-fake`), one new setting
@@ -178,8 +181,7 @@ The engine probes only when the setting is `false`:
   collection refreshes inactive accounts there. Without the probe, a session that cannot write
   the Keychain spends the token, fails to store its successor in the vault and saves it to
   `rescue/` in plain text. While refusals last, those accounts' usage figures go stale.
-  (Added 2026-11-27 after the plan's review, in Michael's absence: inside goal 2, and one call
-  site to take out again.)
+  (Added 2026-11-27 after the plan's review; Michael confirmed it on 2026-11-28.)
 
 **What remains.** In a session where the vault item takes a write and Claude Code's item does
 not, the write itself is refused as in §3.3: no file, no deletion, no pin. A `displaced/` copy
