@@ -871,8 +871,9 @@ impl Provider for ClaudeCode {
         env: &Env,
         spawner: &dyn ProcessSpawner,
         cancel: &Cancel,
+        file_fallback: bool,
     ) -> Vec<Check> {
-        doctor::checks(&self.live, env, spawner, cancel)
+        doctor::checks(&self.live, env, spawner, cancel, file_fallback)
     }
 
     /// The state of the Keychain `cc.keychain` asks about: only on macOS does CC use one.

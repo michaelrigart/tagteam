@@ -922,14 +922,16 @@ pub trait Provider: Send + Sync {
     /// §13.6: the provider's own checks for `tagteam doctor`, run in the effective (outer)
     /// environment `env` with the engine's spawn port (Decision 2). They read and probe only:
     /// nothing is written or unlocked, nothing asks, and every spawn is bounded by its timeout.
-    /// A set `cancel` stops any spawn under way. A provider without checks of its own has none.
+    /// A set `cancel` stops any spawn under way. `file_fallback` is the `keychain.file_fallback`
+    /// setting. A provider without checks of its own has none.
     fn doctor_checks(
         &self,
         env: &Env,
         spawner: &dyn ProcessSpawner,
         cancel: &Cancel,
+        file_fallback: bool,
     ) -> Vec<Check> {
-        let _ = (env, spawner, cancel);
+        let _ = (env, spawner, cancel, file_fallback);
         Vec::new()
     }
 

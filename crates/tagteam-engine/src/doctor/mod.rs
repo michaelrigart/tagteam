@@ -161,7 +161,12 @@ impl Engine {
             run.mappings(p.as_ref());
             self.check_cancel()?;
             let id = p.id();
-            for check in p.doctor_checks(&self.env, self.spawner.as_ref(), self.cancel()) {
+            for check in p.doctor_checks(
+                &self.env,
+                self.spawner.as_ref(),
+                self.cancel(),
+                self.settings().keychain_file_fallback,
+            ) {
                 run.push(Some(&id), check);
             }
             self.check_cancel()?;

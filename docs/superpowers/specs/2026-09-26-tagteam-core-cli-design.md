@@ -3104,6 +3104,10 @@ for a check that is not a provider's, and `fix` is null when there is nothing to
   - an item under a former fallback name of the home doctor runs in (Appendix A.2): the
     unsuffixed item when `CLAUDE_CONFIG_DIR` names the default home, or the item named from a
     symlinked config dir's target → info, naming the command that deletes it
+  - `keychain.file_fallback` off, on macOS only: `.credentials.json` holding a login, or
+    `primaryApiKey` a key → warn, naming each file and saying that the setting stops new
+    fallbacks and removes nothing, with no fix; neither → ok. With the default there is no such
+    check. *(Amended by the [keychain-fallback spec](2026-11-27-tagteam-keychain-fallback-setting-design.md) §3.9.)*
 - **Environment.** The variables doctor runs with, which a `claude` started from the same
   shell inherits:
   - `CLAUDE_CONFIG_DIR` set but empty, or set to a spelling of the default home: CC 2.1.286

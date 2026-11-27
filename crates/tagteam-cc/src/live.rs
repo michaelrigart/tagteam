@@ -207,12 +207,18 @@ fn present_or_err(r: Read<Vec<u8>>) -> Result<Option<Vec<u8>>, ProviderError> {
 }
 
 /// `primaryApiKey` in the global config. An empty one names no key, so it reads as absent.
-fn read_primary_api_key(paths: &CcPaths) -> Read<Vec<u8>> {
+pub(crate) fn read_primary_api_key(paths: &CcPaths) -> Read<Vec<u8>> {
     match config::get_key(&paths.global_config, "primaryApiKey") {
         Read::Present(Some(Value::String(k))) if !k.is_empty() => Read::Present(k.into_bytes()),
         Read::Present(_) | Read::Absent => Read::Absent,
         Read::Unreadable(e) => Read::Unreadable(e),
     }
+}
+
+/// Whether `bytes` are a JSON object with an account-scoped key: a login, not only the
+/// machine-shared keys a credential entry carries for every account (Appendix A.4).
+pub(crate) fn holds_login(bytes: &[u8]) -> bool {
+    object(bytes).is_some_and(|o| machine_shared_only(&o).len() < o.len())
 }
 
 /// Removes what the path resolves to; a symlink itself is never deleted (§9.5).

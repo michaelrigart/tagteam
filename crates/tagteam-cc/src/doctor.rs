@@ -19,7 +19,7 @@ use crate::env::{
     CONFIG_DIR, SECURE_STORAGE_DIR, config_dir, securestorage_dir, set_config_dir,
     set_securestorage_dir,
 };
-use crate::live::{LiveStore, Platform};
+use crate::live::{LiveStore, Platform, holds_login, read_primary_api_key};
 use crate::locks::{CONFIG_STALE, CRED_STALE, STORAGE_WRITE_STALE};
 use crate::naming::{ItemKind, keychain_account, keychain_service};
 use crate::paths::CcPaths;
@@ -116,6 +116,7 @@ pub(crate) fn checks(
     env: &Env,
     spawner: &dyn ProcessSpawner,
     cancel: &Cancel,
+    file_fallback: bool,
 ) -> Vec<Check> {
     let mut out = Vec::new();
     let paths = CcPaths::resolve(env);
@@ -137,6 +138,9 @@ pub(crate) fn checks(
     }
     out.push(Check::info("cc.paths", where_));
     let state = mac.then(|| keychain(live.keychain(), env, &acct, &mut out));
+    if mac && !file_fallback {
+        out.push(keychain_fallback(&paths));
+    }
     environment(env, &mut out);
     // `claude auth status` reads the stored login, which a keychain that is locked, or whose
     // state cannot be told, would ask SecurityAgent to unlock (§13.6): `cc.keychain` has said
@@ -325,6 +329,51 @@ fn keychain(kc: &dyn Keychain, env: &Env, acct: &str, out: &mut Vec<Check>) -> L
         }
     }
     state
+}
+
+/// `keychain.file_fallback` off: whether a plain-text entry still holds a secret, a login in
+/// `.credentials.json` or a key in `primaryApiKey`. It reads whether, never the secret, and
+/// removes nothing.
+fn keychain_fallback(paths: &CcPaths) -> Check {
+    let mut held = Vec::new();
+    let mut untold = Vec::new();
+    match config::read_bytes(&paths.credentials_file) {
+        Read::Present(b) if holds_login(&b) => held.push((&paths.credentials_file, "a login")),
+        Read::Unreadable(e) => untold.push(e.to_string()),
+        Read::Present(_) | Read::Absent => {}
+    }
+    match read_primary_api_key(paths) {
+        Read::Present(_) => held.push((&paths.global_config, "an API key")),
+        Read::Unreadable(e) => untold.push(e.to_string()),
+        Read::Absent => {}
+    }
+    if !held.is_empty() {
+        let message = held
+            .iter()
+            .map(|(path, what)| {
+                format!(
+                    "{} holds {what} in plain text; `keychain.file_fallback` is off, which stops new fallbacks and removes nothing",
+                    path.display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(". ");
+        return Check::warn("cc.keychain-fallback", message);
+    }
+    if !untold.is_empty() {
+        return Check::warn(
+            "cc.keychain-fallback",
+            format!(
+                "whether a plain-text login or API key is held cannot be told: {}",
+                untold.join("; ")
+            ),
+        )
+        .fix("make the credentials file and the global config readable by this user");
+    }
+    Check::ok(
+        "cc.keychain-fallback",
+        "no plain-text login or API key is held, and `keychain.file_fallback` is off",
+    )
 }
 
 /// Appendix A.2's former fallback names of the home `env` names: the unsuffixed items when
