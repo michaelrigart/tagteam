@@ -2320,9 +2320,11 @@ mod tests {
             switched(&run(&soft_hand_over(), &AutoState::default(), &cfg)),
             (Trigger::AtLimit, vec![4, 5, 3, 2])
         );
+        // `best` keeps its order with a long window too.
         let best = AutoConfig {
             strategy: AutoStrategy::Best,
-            ..cfg.clone()
+            ceiling: 95.0,
+            ..self::cfg()
         };
         assert_eq!(
             switched(&run(&soft_hand_over(), &AutoState::default(), &best)),

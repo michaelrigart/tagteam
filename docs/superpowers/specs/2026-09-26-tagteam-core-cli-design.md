@@ -1948,9 +1948,12 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
      be strictly sooner than the active account's (unknown → skip). Order by soonest reset,
      then most headroom. Before switching, re-check the current account and all candidates
      (§8.3) and re-rank; the target's reading must be ≤ 180 s old, else `stale-usage`.
-     *(Amended by michaelrigart/tagteam#65: under `consume-first`, `proactive` orders its
-     targets this way too, an unknown reset last, where it ordered by most headroom. `at-limit`
-     and `failover` do so for the candidates below the threshold; see their bullet below.)*
+     *(Amended by michaelrigart/tagteam#65: under `consume-first`, `proactive` takes this order
+     too, soonest reset, an unknown reset last, then most headroom, where it ordered by most
+     headroom. Only the order: the re-check stays with the `consume-first` trigger, and when
+     every account is above the threshold the rule below still orders `proactive`. `at-limit`
+     and `failover` take the order for the candidates below the threshold; see their bullet
+     below.)*
    - **Every account above the threshold:** for each pair, pick the recovery axis when both the
      active account and the candidate are within 3 points of headroom, or either one resets
      within 4 h. Otherwise use the headroom axis.
