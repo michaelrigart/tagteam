@@ -446,6 +446,7 @@ fn variables_that_redirect_the_login_warn_each_by_name() {
         "ANTHROPIC_API_KEY",
         "CLAUDE_CODE_GATEWAY_TOKEN",
         "CLAUDE_CODE_SESSIONS_OAUTH_TOKEN",
+        "CLAUDE_CODE_RUNNER_MODEL_SOCKET",
         "USE_STAGING_OAUTH",
         "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     ] {
@@ -470,6 +471,7 @@ fn variables_that_redirect_the_login_warn_each_by_name() {
             "unset ANTHROPIC_API_KEY",
             "unset CLAUDE_CODE_GATEWAY_TOKEN",
             "unset CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+            "unset CLAUDE_CODE_RUNNER_MODEL_SOCKET",
             "unset CLAUDE_CODE_SESSIONS_OAUTH_TOKEN"
         ]
     );
