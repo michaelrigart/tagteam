@@ -22,7 +22,13 @@ as "spec §n". Line numbers are as of `b223d07c`.
 ## Global Constraints
 
 - With the default (`true`) no behaviour and no output changes: every existing test passes
-  unchanged except where a signature changed.
+  unchanged except where a signature changed or a test pins the list of every settings key
+  (Task 1 names those).
+- A test that sets the setting in a fixture writes `config.toml` and then calls
+  `engine.reload_settings(&provider)`: only the daemon's `SettingsJob` reloads the engine's
+  settings by itself.
+- Under `Fallback::Allow` every log line keeps its text word for word
+  (`crates/tagteam-engine/tests/log_lines.rs:747-768` pins it).
 - Linux never reads the setting and never probes.
 - Tests use the doubles only (`FakeKeychain`, temp homes). Nothing touches the login keychain.
 - Each new test's name says the regression it catches, and passes the revert check: revert the
@@ -60,7 +66,9 @@ as "spec §n". Line numbers are as of `b223d07c`.
 **Files:**
 - Modify: `crates/tagteam-engine/src/settings.rs` (`KeyId`, `KEYS` after `notify.events`,
   `Settings`, `Settings::value`, `Settings::apply`, the defaults)
-- Test: `crates/tagteam-engine/tests/settings.rs`, `crates/tagteam/tests/config_cli.rs`
+- Test: `crates/tagteam-engine/tests/settings.rs`, `crates/tagteam/tests/config_cli.rs`. Both
+  pin every key and gain the new one: `config_cli.rs:103-175` (the list and its JSON), and
+  `settings.rs` near 1165 (shapes), 1301 (defaults) and 1977 (`SAMPLES: [_; 19]` becomes 20)
 - Modify: `docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md` §6.4 (the key's row,
   marked "amended by the keychain-fallback spec")
 
@@ -92,7 +100,7 @@ as "spec §n". Line numbers are as of `b223d07c`.
   `Provider::write_credential`), `crates/tagteam-provider/src/lib.rs` (re-export)
 - Modify: `crates/tagteam-cc/src/live.rs` (`write_credential_entry`, `write_entry`,
   `write_managed_key`), `crates/tagteam-cc/src/provider.rs:505`
-- Modify: `crates/tagteam-fake/src/provider.rs:513`
+- Modify: `crates/tagteam-fake/src/provider.rs:513`, `crates/tagteam-fake/tests/provider.rs:191,250`
 - Modify: `crates/tagteam-engine/src/switch/transact.rs:306,668`, `active.rs:672` (pass
   `Fallback::Allow(&mut before_fallback)`; behaviour unchanged in this task)
 - Modify: `crates/tagteam-engine/src/error.rs` (`kind()`, and its kind table tests)
@@ -137,13 +145,13 @@ as "spec §n". Line numbers are as of `b223d07c`.
 - [ ] **Step 3: Add `Fallback` and `FallbackRefused`; change the trait and the three
   implementations.** In `write_entry` and `write_managed_key`, match the policy at the point the
   Keychain write has failed (and, in `write_entry`, when the pin is set): `Refuse` returns
-  `FallbackRefused { item: svc }` before `report_item`; `Allow(before)` continues as today. The
-  WARN line becomes "keychain write failed" with a `fallback` field (`"file"`, `"primaryApiKey"`
-  or `"refused"`). The engine call sites pass `Allow`.
+  `FallbackRefused { item: svc }` before `report_item`; `Allow(before)` continues as today, its two WARN
+  lines unchanged. Under `Refuse` the WARN line is "keychain write failed, and the fallback is
+  off" with the same `rc` field. The engine call sites pass `Allow`.
 - [ ] **Step 4: Add the kind** in `EngineError::kind()` and its two table tests
   (`error.rs:701`, `:765`).
-- [ ] **Step 5: Run `cargo test -p tagteam-cc --locked` and `-p tagteam-engine --locked`;
-  expect PASS.**
+- [ ] **Step 5: Run `cargo test --locked` for `-p tagteam-cc`, `-p tagteam-fake` and
+  `-p tagteam-engine`; expect PASS.**
 - [ ] **Step 6: Commit** ("Let a credential write refuse the Keychain fallback").
 
 ### Task 3: The engine applies the setting and reports the refusal
@@ -176,20 +184,27 @@ as "spec §n". Line numbers are as of `b223d07c`.
   - `a_refused_switch_reports_the_refusal_and_not_a_rollback`: setting `false`, the live item's
     service set to fail writes → `Err(e)` with `e.kind() == "keychain-fallback-refused"`; the
     live item, `.credentials.json`, and the journal are as before; `fallback_refusals() == 1`.
-  - `a_refused_switch_whose_rollback_fails_stays_rollback_failed`: as above with the restore
-    made to fail (as `switch_rollback.rs` already arranges) → kind `rollback-failed`.
-  - `with_the_default_a_refused_keychain_write_still_falls_back`: setting absent → the existing
-    fallback outcome (`SecretStore::Fallback`), `fallback_refusals() == 0`.
+  - In `rollback.rs`'s unit tests, for the pure function below:
+    `a_clean_rollback_of_a_refusal_keeps_the_refusal` (kind `keychain-fallback-refused`),
+    `a_clean_rollback_of_another_cause_is_rolled_back`, and
+    `a_failed_rollback_of_a_refusal_is_rollback_failed`.
+  - Add `assert_eq!(engine.fallback_refusals(), 0)` to the existing
+    `a_rolled_back_fallback_leaves_the_next_switch_on_the_keychain` (`switch_rollback.rs:409`).
   - `a_switch_from_a_file_login_with_the_setting_off_creates_the_item` (Review Focus 1): no
-    item, login in `.credentials.json`, writes succeed → `SecretStore::Keychain`.
+    item, login in `.credentials.json`, writes succeed → `SecretStore::Keychain`. It guards
+    against a refusal that fires without a refused write, and passes before the change too.
   - `a_refused_publish_is_not_published_and_counted`: a refresh whose publish write is refused
     under `false` → `ActiveOutcome::PersistedNotPublished`, `fallback_refusals() == 1`, no
     `.credentials.json` created.
 - [ ] **Step 2: Run them; expect failures.**
 - [ ] **Step 3: Implement.** `fallback()` reads `self.settings()`. Both call sites build the
-  policy with it. `Rollback::fail`: when the rollback put everything back and `cause` is
-  `EngineError::Provider(ProviderError::FallbackRefused { .. })`, return `cause` itself; the WARN
-  line is unchanged. `fail` and `publish`'s `not_published` call `note_refusal`.
+  policy with it. `Rollback::fail` takes its returned error from a pure function
+  `fn rolled_back(cause: EngineError, failed: Vec<String>) -> EngineError` in `rollback.rs`:
+  with `failed` empty and `cause` an `EngineError::Provider(ProviderError::FallbackRefused { .. })`
+  it returns `cause`; otherwise what `fail` returns today. The log lines are unchanged.
+  `Rollback` holds no engine, so `transact` calls `note_refusal(&cause)` at `transact.rs:322`
+  before `tx.fail(cause)`; `publish`'s `not_published` calls it too. `note_refusal` counts a
+  `RestoreFailed` whose `cause` is a `FallbackRefused` as well: the write was refused either way.
 - [ ] **Step 4: Run `cargo test -p tagteam-engine --locked`; expect PASS.**
 - [ ] **Step 5: Commit** ("Refuse the Keychain fallback when keychain.file_fallback is off").
 
@@ -201,8 +216,8 @@ as "spec §n". Line numbers are as of `b223d07c`.
 - Modify: `crates/tagteam-engine/src/vault.rs` (`VaultBackend`, `KeychainVault`, `Vault`),
   `crates/tagteam-engine/src/error.rs` (`EngineError::KeychainFallbackRefused`),
   `switch/transact.rs:262` (after `preflight`, before `settle_pre`),
-  `active.rs` (`run_active_refresh`, after `active_quarantine` and before `reconcile_active`'s
-  result is published or requested)
+  `active.rs` (`run_active_refresh`, after `active_quarantine` and before `reconcile_active`,
+  which may persist a generation)
 - Test: `crates/tagteam-engine/tests/vault.rs`, `tests/switch.rs`, the refresh tests' file
 
 **Interfaces:**
@@ -218,6 +233,8 @@ as "spec §n". Line numbers are as of `b223d07c`.
   KeychainFallbackRefused,
   impl Engine {
       /// Spec §3.4: with the setting off, refuses unless `lock`'s vault item takes a write.
+      /// `Ok` when the item is unreadable or absent: the operation then ends with the error
+      /// it has today.
       pub(crate) fn probe_keychain_write(&self, lock: &AccountLock) -> Result<(), EngineError>;
   }
   ```
@@ -232,10 +249,9 @@ as "spec §n". Line numbers are as of `b223d07c`.
     unmanaged live login (so the switch would displace it), `set_fail_write("tagteam", true)` →
     kind `keychain-fallback-refused`; `displaced/` and `rescue/` are empty, the vault items and
     the journal are unchanged; `fallback_refusals() == 1`.
-    `with_the_default_a_switch_never_probes`: setting absent, a keychain that counts writes to
-    service `tagteam` sees none beyond those of the same switch today (compare with a run of
-    the unchanged fixture).
-    `linux_never_probes_with_the_setting_off` (Review Focus 2).
+    `with_the_default_a_switch_never_probes`: setting absent, `set_fail_write("tagteam", true)`,
+    and a switch that needs no vault write (the outgoing generation already held) → it succeeds.
+    Linux (Review Focus 2) is `a_file_vault_never_probes` above: the file vault is Linux's.
   - refresh: `a_refused_probe_sends_no_token_request`, with a Claude Code item and without one:
     setting `false`, `set_fail_write("tagteam", true)`, an expired live token → `Err` of kind
     `keychain-fallback-refused`; the fake HTTP saw no request; the vault generation is unchanged.
@@ -243,17 +259,18 @@ as "spec §n". Line numbers are as of `b223d07c`.
 - [ ] **Step 3: Implement the probe.** `KeychainVault::probe_write`: `find`; `Absent` →
   `Ok(true)`; `Unreadable` → `Err`; `Present(b)` → `upsert(SERVICE, key, &b)`, `Ok(true)` on
   success, `Ok(false)` on failure with the `rc` at WARN. `probe_keychain_write` returns `Ok(())`
-  at once when the setting is `true`; `Ok(false)` becomes `KeychainFallbackRefused`, counted
-  with `note_refusal`.
-- [ ] **Step 4: Call it.** Switch: with the target's account lock, directly after `preflight`
-  returns. Refresh: with `lock`, inside the pass loop directly after the quarantine check, so it
+  at once when the setting is `true`, and on a probe `Err`; `Ok(false)` becomes
+  `KeychainFallbackRefused`, counted with `note_refusal`. An item over `security`'s line limit
+  goes on argv as every vault write of it does (`security.rs:515`); the probe adds no new case.
+- [ ] **Step 4: Call it.** Switch: with the target's account lock from `ls.account_locks` (as
+  `transact.rs:373` finds it), directly after `preflight` returns. Refresh: with `lock`, inside the pass loop directly after the quarantine check, so it
   precedes both the self-heal `publish` and `request_active`.
 - [ ] **Step 5: Run `cargo test -p tagteam-engine --locked`; expect PASS.**
 - [ ] **Step 6: Commit** ("Probe the vault item before a switch or refresh that may not fall back").
 
 ### Task 5: The daemon backs off after a refused run
 
-**Depends on:** Task 3.
+**Depends on:** Task 4.
 
 **Files:**
 - Modify: `crates/tagteam-daemon/src/backoff.rs` (`after_run`),
@@ -275,7 +292,8 @@ as "spec §n". Line numbers are as of `b223d07c`.
     least 60 s and `daemon status` shows `backoff`; one `switch-failed` event; a second tick
     inside 30 minutes adds none (spec §3.6).
     `a_setting_flipped_back_ends_the_refusals_at_the_next_run` (Review Focus 4): write `true`,
-    let the job reload (mtime), the next tick switches by the fallback and the backoff ends.
+    call `engine.reload_settings`, clear the `tagteam` failure and fail Claude Code's service
+    instead; the next tick switches by the fallback and the backoff ends.
 - [ ] **Step 2: Run them; expect failures.**
 - [ ] **Step 3: Implement.** `refused` is checked first: it raises the level whatever `reads`
   holds; otherwise today's logic. The job reads `engine.fallback_refusals()` before the run and
@@ -290,9 +308,9 @@ as "spec §n". Line numbers are as of `b223d07c`.
 **Files:**
 - Modify: `crates/tagteam-provider/src/provider.rs:911` (`doctor_checks`),
   `crates/tagteam-cc/src/provider.rs:877`, `crates/tagteam-cc/src/doctor.rs:114`,
-  `crates/tagteam-fake/src/provider.rs`, `crates/tagteam-engine/src/doctor/mod.rs:164`
+  `crates/tagteam-engine/src/doctor/mod.rs:164` (the fake has no override and needs no change)
 - Modify: core spec §13.6 (amended)
-- Test: `crates/tagteam-cc/tests/doctor.rs`
+- Test: `crates/tagteam-cc/tests/doctor.rs` (its helper at line 63 gains the argument, `true`)
 
 **Interfaces:**
 - Consumes: `Settings::keychain_file_fallback`.
@@ -311,7 +329,7 @@ as "spec §n". Line numbers are as of `b223d07c`.
 - [ ] **Step 3: Implement.** A login is present when `.credentials.json` parses to an object
   with account-scoped keys (the test `keep_shared` already makes in `live.rs`); an API key when
   `read_primary_api_key` is `Present`. The engine passes
-  `self.engine.settings().keychain_file_fallback`.
+  `self.settings().keychain_file_fallback` (the receiver at `doctor/mod.rs:164` is `self`).
 - [ ] **Step 4: Run `cargo test -p tagteam-cc --locked --test doctor` and
   `-p tagteam-engine --locked doctor`; expect PASS.**
 - [ ] **Step 5: Amend core §13.6 and commit** ("Report plain-text secrets in doctor when the fallback is off").
@@ -328,7 +346,8 @@ as "spec §n". Line numbers are as of `b223d07c`.
 - [ ] **Step 1: Write the documents.** README and SECURITY say: what the setting does, that the
   default mirrors Claude Code's own fallback, that it does not cover session profiles
   (`tagteam run` writes `sessions/<id>/.credentials.json`) or a plain-text login already there,
-  and that a refusal is fixed by running from the desktop login session. The CHANGELOG entry
+  that a refusal is fixed by running from the desktop login session, and that a running
+  `tagteam auto` reads the setting at start (the daemon follows an edit). The CHANGELOG entry
   names the setting, the error kind and the `doctor` check.
 - [ ] **Step 2: Run the six commands of `CONTRIBUTING.md` lines 36–41.** Expected: no
   formatting diff, no clippy warning, every test passing; report passed/total. The pty tests
