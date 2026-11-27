@@ -1870,7 +1870,7 @@ mod validation {
     use tagteam_provider::{Cancel, Identity, SessionEnv, Validity};
 
     /// §12.5's list, verbatim, so a change to `CC_SCRUB` cannot hide behind itself.
-    const SCRUBBED: [&str; 23] = [
+    const SCRUBBED: [&str; 24] = [
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "CLAUDE_CODE_OAUTH_TOKEN",
@@ -1890,6 +1890,7 @@ mod validation {
         "CLAUDE_CODE_HOST_CREDS_FILE",
         "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
         "CLAUDE_CODE_SESSIONS_OAUTH_TOKEN",
+        "CLAUDE_CODE_RUNNER_MODEL_SOCKET",
         "CLAUDE_CODE_CUSTOM_OAUTH_URL",
         "USE_LOCAL_OAUTH",
         "USE_STAGING_OAUTH",

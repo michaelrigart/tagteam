@@ -7,6 +7,15 @@ with the one before, so any release may contain breaking changes. Each section s
 
 ## [Unreleased]
 
+### Changed
+
+- `tagteam run` now also removes `CLAUDE_CODE_RUNNER_MODEL_SOCKET`, the path of a self-hosted
+  runner's model socket (new in Claude Code 2.1.332), from the session's environment, so a session
+  cannot run on the runner's model access in place of its account's login. It warns when the
+  variable was set, and `tagteam doctor` reports it.
+- Checked against Claude Code 2.1.332, now the newest version tagteam is known to work with.
+  `tagteam doctor` no longer warns about Claude Code versions up to 2.1.332.
+
 ## [20261111.1935.0] - 2026-11-11
 
 ### Added
