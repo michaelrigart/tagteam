@@ -2435,7 +2435,7 @@ renames CC's config file or Keychain item (Appendix A.1, A.7):
   `ANTHROPIC_IDENTITY_TOKEN`, `ANTHROPIC_IDENTITY_TOKEN_FILE`;
 - `CLAUDE_CODE_SESSION_ACCESS_TOKEN`, `CLAUDE_CODE_GATEWAY_TOKEN`,
   `CLAUDE_CODE_HOST_CREDS_FILE`, `CLAUDE_CODE_HOST_AUTH_ENV_VAR`,
-  `CLAUDE_CODE_SESSIONS_OAUTH_TOKEN`;
+  `CLAUDE_CODE_SESSIONS_OAUTH_TOKEN`, `CLAUDE_CODE_RUNNER_MODEL_SOCKET`;
 - `CLAUDE_CODE_CUSTOM_OAUTH_URL`, `USE_LOCAL_OAUTH`, `USE_STAGING_OAUTH`;
 - `CLAUDE_SECURESTORAGE_CONFIG_DIR`.
 
@@ -3883,6 +3883,13 @@ caches account- and org-scoped data (`groveConfigCache`, `modelAccessCache`,
   CC's own subprocess scrub lists beside `CLAUDE_CODE_OAUTH_TOKEN`. `auth status` reports no
   change for it, alone or with `CLAUDE_CODE_SDK_HAS_SESSIONS_OAUTH_REFRESH`, and the controls
   behave as before.
+  *2.1.332* reads `CLAUDE_CODE_RUNNER_MODEL_SOCKET`, the path of a self-hosted runner's model
+  socket. As the binary reads, a non-interactive session nested in a runner's session, with no
+  credential in its environment, adopts it: CC sends its model requests to the socket and sets a
+  placeholder `CLAUDE_CODE_OAUTH_TOKEN`, so the session runs on the runner's model access and not
+  on the stored login. CC's own subprocess scrub lists the name beside `CLAUDE_CODE_OAUTH_TOKEN`.
+  `auth status` reports no change for it in a throwaway home; the adoption itself needs a runner
+  and was not exercised.
 - **The config lock's retries** (*2.1.292*): CC retries the config lock on a backoff of 200, 400,
   800, 1600, 3200 and 4000 ms (each stretched by a random factor of 1 to 2, so 10.2 to 20.4 s in
   all, as *2.1.322* reads); during its first 30 s, until its interactive UI is up, it stops
