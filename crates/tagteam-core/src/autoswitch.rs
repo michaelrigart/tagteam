@@ -647,16 +647,18 @@ fn rank(r: &Ranking, oauth: &[Rated]) -> Vec<AccountId> {
             }
         };
         let landing = oauth.iter().filter(|c| c.headroom.is_some_and(usable));
-        let order = hand_over_order(r.cfg);
-        if !r.hard() {
-            return ordered(landing.collect(), order);
+        if r.cfg.effective_strategy() == AutoStrategy::Best {
+            return ordered(landing.collect(), most_headroom);
         }
-        // A hard move also takes full candidates with room, but only after the ones below the
-        // ceiling, which it orders like a soft move. The full ones go by most headroom.
-        let (full_ones, open): (Vec<&Rated>, Vec<&Rated>) =
-            landing.partition(|c| c.headroom.is_some_and(|h| full(h, r.cfg.ceiling)));
-        let mut targets = ordered(open, order);
-        targets.extend(ordered(full_ones, most_headroom));
+        // `consume-first` takes the soonest reset only among landings below the threshold, as
+        // its own trigger does (`landing_ok`). The rest go after them by most headroom, which
+        // puts a hard move's full ones last.
+        let (below, rest): (Vec<&Rated>, Vec<&Rated>) = landing.partition(|c| {
+            c.headroom
+                .is_some_and(|h| below_threshold(h, r.cfg.threshold))
+        });
+        let mut targets = ordered(below, soonest_long_reset);
+        targets.extend(ordered(rest, most_headroom));
         return targets;
     }
     let bar = barred(r.st, &r.active.account.id);
@@ -743,15 +745,22 @@ fn most_headroom(a: &Rated, b: &Rated) -> Ordering {
 /// `consume-first`: the soonest long-window reset first, an unknown one last, then most
 /// headroom.
 fn soonest_long_reset(a: &Rated, b: &Rated) -> Ordering {
-    let key = |c: &Rated| c.long_reset.map_or((1, 0), |at| (0, at));
-    key(a).cmp(&key(b)).then_with(|| most_headroom(a, b))
+    unknown_last(a.long_reset)
+        .cmp(&unknown_last(b.long_reset))
+        .then_with(|| most_headroom(a, b))
 }
 
 /// Every account above the threshold: the soonest binding-window recovery first, a past or
 /// unknown one last, then most headroom.
 fn soonest_recovery(a: &Rated, b: &Rated) -> Ordering {
-    let key = |c: &Rated| c.recovery_at.map_or((1, 0), |at| (0, at));
-    key(a).cmp(&key(b)).then_with(|| most_headroom(a, b))
+    unknown_last(a.recovery_at)
+        .cmp(&unknown_last(b.recovery_at))
+        .then_with(|| most_headroom(a, b))
+}
+
+/// The sort key of a time that may be unknown: the soonest first, an unknown one last.
+fn unknown_last(at: Option<i64>) -> (u8, i64) {
+    at.map_or((1, 0), |at| (0, at))
 }
 
 /// §11.2 step 8's exception: every account is above the threshold. Step 4: a way back from an API
@@ -2318,6 +2327,48 @@ mod tests {
         assert_eq!(
             switched(&run(&soft_hand_over(), &AutoState::default(), &best)),
             (Trigger::AtLimit, vec![4, 5, 3, 2])
+        );
+    }
+
+    #[test]
+    fn consume_first_hands_a_hard_move_below_the_threshold_before_a_sooner_reset_above_it() {
+        // The default ceiling of 100: 2 is not full, resets first of all and has 1 point left.
+        let s = snap(
+            1,
+            vec![
+                at(1, 100.0),
+                resets_in(2, 99.0, 1),
+                resets_in(3, 10.0, 3),
+                resets_in(4, 50.0, 2),
+            ],
+        );
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &consume_first())),
+            (Trigger::AtLimit, vec![4, 3, 2])
+        );
+    }
+
+    #[test]
+    fn consume_first_hands_a_soft_move_below_the_threshold_before_a_sooner_reset_above_it() {
+        let cfg = AutoConfig {
+            ceiling: 95.0,
+            ..consume_first()
+        };
+        // 2 and 5 are clear but at or above the threshold (90). They reset before the others,
+        // 2 before 5, and 5 has more headroom.
+        let s = snap(
+            1,
+            vec![
+                at(1, 96.0),
+                resets_in(2, 91.0, 1),
+                resets_in(3, 40.0, 4),
+                resets_in(4, 10.0, 6),
+                resets_in(5, 90.0, 2),
+            ],
+        );
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &cfg)),
+            (Trigger::AtLimit, vec![3, 4, 5, 2])
         );
     }
 
