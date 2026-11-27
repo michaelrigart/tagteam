@@ -2288,6 +2288,11 @@ mod tests {
             switched(&run(&s, &AutoState::default(), &consume_first())),
             (Trigger::Proactive, vec![3, 2, 4])
         );
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &cfg())),
+            (Trigger::Proactive, vec![4, 2, 3]),
+            "`best` keeps most headroom first"
+        );
     }
 
     #[test]
