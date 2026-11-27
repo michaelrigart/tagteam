@@ -217,7 +217,7 @@ as "spec §n". Line numbers are as of `b223d07c`.
   `crates/tagteam-engine/src/error.rs` (`EngineError::KeychainFallbackRefused`),
   `switch/transact.rs:262` (after `preflight`, before `settle_pre`),
   `active.rs` (`run_active_refresh`, after `active_quarantine` and before `reconcile_active`,
-  which may persist a generation)
+  which may persist a generation), `refresh.rs:569` (the refresh gate)
 - Test: `crates/tagteam-engine/tests/vault.rs`, `tests/switch.rs`, the refresh tests' file
 
 **Interfaces:**
@@ -255,6 +255,12 @@ as "spec §n". Line numbers are as of `b223d07c`.
   - refresh: `a_refused_probe_sends_no_token_request`, with a Claude Code item and without one:
     setting `false`, `set_fail_write("tagteam", true)`, an expired live token → `Err` of kind
     `keychain-fallback-refused`; the fake HTTP saw no request; the vault generation is unchanged.
+  - gate (beside the tests of `tests/gate_persist.rs`):
+    `a_refused_probe_sends_no_token_request_for_a_stored_account`: setting `false`,
+    `set_fail_write("tagteam", true)`, an inactive account with an expired token, refreshed
+    through `refresh_stored` → kind `keychain-fallback-refused`; no HTTP request; `rescue/` is
+    empty. `with_the_default_a_stored_refresh_never_probes`: setting absent, same keychain →
+    today's outcome for a failed vault write, unchanged.
 - [ ] **Step 2: Run them; expect failures.**
 - [ ] **Step 3: Implement the probe.** `KeychainVault::probe_write`: `find`; `Absent` →
   `Ok(true)`; `Unreadable` → `Err`; `Present(b)` → `upsert(SERVICE, key, &b)`, `Ok(true)` on
@@ -264,7 +270,9 @@ as "spec §n". Line numbers are as of `b223d07c`.
   goes on argv as every vault write of it does (`security.rs:515`); the probe adds no new case.
 - [ ] **Step 4: Call it.** Switch: with the target's account lock from `ls.account_locks` (as
   `transact.rs:373` finds it), directly after `preflight` returns. Refresh: with `lock`, inside the pass loop directly after the quarantine check, so it
-  precedes both the self-heal `publish` and `request_active`.
+  precedes both the self-heal `publish` and `request_active`. Refresh gate: with the account's
+  lock, directly before `p.refresh` at `refresh.rs:569`, so a refused probe sends no request and
+  returns the refusal as the gate's error.
 - [ ] **Step 5: Run `cargo test -p tagteam-engine --locked`; expect PASS.**
 - [ ] **Step 6: Commit** ("Probe the vault item before a switch or refresh that may not fall back").
 

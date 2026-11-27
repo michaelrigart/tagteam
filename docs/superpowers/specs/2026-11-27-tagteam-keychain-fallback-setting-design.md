@@ -167,6 +167,13 @@ The engine probes only when the setting is `false`:
   saved or journaled (before `settle_pre`).
 - **Refresh:** the live account's item, before the token request and before the self-heal
   publish. No request is sent after a refused probe.
+- **A stored account's refresh:** the account's item, at the refresh gate (`refresh.rs:569`),
+  before its token request. A switch freshens a target close to expiry there, and usage
+  collection refreshes inactive accounts there. Without the probe, a session that cannot write
+  the Keychain spends the token, fails to store its successor in the vault and saves it to
+  `rescue/` in plain text. While refusals last, those accounts' usage figures go stale.
+  (Added 2026-11-27 after the plan's review, in Michael's absence: inside goal 2, and one call
+  site to take out again.)
 
 **What remains.** In a session where the vault item takes a write and Claude Code's item does
 not, the write itself is refused as in §3.3: no file, no deletion, no pin. A `displaced/` copy
