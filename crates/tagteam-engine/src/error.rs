@@ -570,6 +570,9 @@ impl EngineError {
             EngineError::Store(_) => "store",
             EngineError::Provider(ProviderError::ConfigUnsplicable { .. }) => "config-unsplicable",
             EngineError::Provider(ProviderError::RestoreFailed { .. }) => "rollback-failed",
+            EngineError::Provider(ProviderError::FallbackRefused { .. }) => {
+                "keychain-fallback-refused"
+            }
             EngineError::Provider(_) => "provider",
             // unreachable: `lock_error()` above reads every lock carrier
             EngineError::Lock(_) | EngineError::Settings(SettingsError::Lock(_)) => "lock",
@@ -712,6 +715,10 @@ mod tests {
                     restore: Box::new(ProviderError::Invalid("b".into())),
                 }),
                 "rollback-failed",
+            ),
+            (
+                EngineError::Provider(ProviderError::FallbackRefused { item: "x".into() }),
+                "keychain-fallback-refused",
             ),
             (
                 EngineError::Provider(ProviderError::Invalid("x".into())),

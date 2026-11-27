@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tagteam_core::{AccountId, Fingerprint, OracleVerdict, ProviderId};
 use tagteam_provider::{
-    Cancel, CredLocks, Credential, LiveChange, Provenance, Provider, Read, RefreshResult,
+    Cancel, CredLocks, Credential, Fallback, LiveChange, Provenance, Provider, Read, RefreshResult,
     StoredLogin,
 };
 
@@ -672,7 +672,7 @@ impl Engine {
             let mut before_fallback = |bytes: &[u8]| cx.before_fallback(self, bytes);
             // The undo is dropped, never run: it would write the consumed generation back. The
             // storage-write wait honours `cancel`, as the config-lock wait did (§9.1, §14.1).
-            p.write_credential(&env, &locks, &login, &mut before_fallback)
+            p.write_credential(&env, &locks, &login, Fallback::Allow(&mut before_fallback))
                 .map(|_| ())
         };
         for w in &cx.warnings {

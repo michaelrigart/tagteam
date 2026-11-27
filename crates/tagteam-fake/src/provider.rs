@@ -20,7 +20,7 @@ use tagteam_provider::profile::{
 use tagteam_provider::provider::{DeadReason, RefreshResult, TransientKind, ValidateRequest};
 use tagteam_provider::splice::{self, render_nested};
 use tagteam_provider::{
-    BeforeFallback, Cancel, Capabilities, CredLocks, Credential, DoomedEntry, EntryKind, Env,
+    Cancel, Capabilities, CredLocks, Credential, DoomedEntry, EntryKind, Env, Fallback,
     FreshCredential, Identity, IdentitySurface, KindTraits, LineError, LiveAuth, LiveChange,
     LiveLockSet, LiveLocks, LockError, MergeReport, MkdirLock, MkdirLockSpec, MustShare,
     MutationGuard, Pace, PollBudget, Provider, ProviderError, ProviderVars, ProviderWords, Read,
@@ -510,13 +510,13 @@ impl Provider for FakeAgent {
 
     /// Composes the target with the machine's live `device` key, read fresh under the locks,
     /// and writes the credential file at 0600. A live credential that cannot be read is never
-    /// overwritten. FakeAgent never falls back, so `before_fallback` is never called.
+    /// overwritten. FakeAgent never falls back, so `fallback` is ignored.
     fn write_credential<'l>(
         &self,
         env: &Env,
         locks: &'l LiveLocks<'_>,
         target: &StoredLogin,
-        _before_fallback: BeforeFallback<'_>,
+        _fallback: Fallback<'_>,
     ) -> Result<Written<'l>, ProviderError> {
         locks.check_owned()?;
         let p = FakePaths::resolve(env);

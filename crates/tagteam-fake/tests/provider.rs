@@ -13,9 +13,9 @@ use tagteam_fake::{
 use tagteam_provider::http::{HttpError, HttpResponse, Method, RecordedRequest, ScriptedHttp};
 use tagteam_provider::provider::{TransientKind, ValidateRequest};
 use tagteam_provider::{
-    Capabilities, Credential, EntryKind, Env, LiveChange, LockError, MustShare, MutationGuard,
-    Pace, PollBudget, ProcStart, Provenance, Provider, ProviderError, Read, SecretStore,
-    SessionRecord, SharePolicy, StoredLogin, UsageResult, Window, Written,
+    Capabilities, Credential, EntryKind, Env, Fallback, LiveChange, LockError, MustShare,
+    MutationGuard, Pace, PollBudget, ProcStart, Provenance, Provider, ProviderError, Read,
+    SecretStore, SessionRecord, SharePolicy, StoredLogin, UsageResult, Window, Written,
 };
 
 struct Fx {
@@ -188,7 +188,7 @@ fn a_write_keeps_the_machines_device_key_and_undoes_exactly() {
 
     let Written { undo, stored_in } = f
         .fake
-        .write_credential(&f.env, &locks, &bob, &mut save_nothing)
+        .write_credential(&f.env, &locks, &bob, Fallback::Allow(&mut save_nothing))
         .unwrap();
     assert_eq!(stored_in, SecretStore::File(p.credential.clone()));
     let identity_undo = f
@@ -247,7 +247,7 @@ fn an_unreadable_live_credential_is_never_overwritten() {
     };
     assert!(matches!(
         f.fake
-            .write_credential(&f.env, &locks, &bob, &mut save_nothing),
+            .write_credential(&f.env, &locks, &bob, Fallback::Allow(&mut save_nothing)),
         Err(ProviderError::Unreadable(_))
     ));
     assert!(p.credential.is_dir(), "left exactly as found");

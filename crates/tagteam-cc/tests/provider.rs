@@ -15,9 +15,9 @@ use tagteam_core::usage::WindowKind;
 use tagteam_provider::http::{HttpResponse, Method, ScriptedHttp};
 use tagteam_provider::provider::TransientKind;
 use tagteam_provider::{
-    Capabilities, Credential, Env, FakeKeychain, Keychain, KeychainError, KindTraits, LiveLocks,
-    LockError, LockState, MutationGuard, Pace, PollBudget, Provider, ProviderError, Read,
-    SecretStore, StoredLogin, UsageResult, Window,
+    Capabilities, Credential, Env, FakeKeychain, Fallback, Keychain, KeychainError, KindTraits,
+    LiveLocks, LockError, LockState, MutationGuard, Pace, PollBudget, Provider, ProviderError,
+    Read, SecretStore, StoredLogin, UsageResult, Window,
 };
 
 /// A fallback hook for a test that saves nothing: every entry a fallback reports goes.
@@ -77,7 +77,7 @@ fn writes_the_composed_credential_and_the_identity_then_undoes_both() {
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
     let t = target(&f, "new@b.co", "rt-new");
     let written =
-        f.cc.write_credential(&f.env, &locks, &t, &mut save_nothing)
+        f.cc.write_credential(&f.env, &locks, &t, Fallback::Allow(&mut save_nothing))
             .unwrap();
     assert_eq!(written.stored_in, SecretStore::Keychain);
     let u1 = written.undo;
@@ -129,7 +129,7 @@ fn an_api_key_target_moves_the_auth_axis() {
         identity: f.cc.token_identity("api-key-2@token.local"),
     };
     let written =
-        f.cc.write_credential(&f.env, &locks, &t, &mut save_nothing)
+        f.cc.write_credential(&f.env, &locks, &t, Fallback::Allow(&mut save_nothing))
             .unwrap();
     assert_eq!(written.stored_in, SecretStore::Keychain);
     assert_eq!(
@@ -143,7 +143,7 @@ fn an_api_key_target_moves_the_auth_axis() {
         &f.env,
         &locks,
         &target(&f, "a@b.co", "rt"),
-        &mut save_nothing,
+        Fallback::Allow(&mut save_nothing),
     )
     .unwrap();
     assert!(
@@ -251,7 +251,7 @@ fn doomed_names_everything_each_change_destroys() {
                 &env,
                 &locks,
                 &target(&f, "p@x.co", "rt-p"),
-                &mut save_nothing,
+                Fallback::Allow(&mut save_nothing),
             )
             .unwrap();
             f.kc.set_fail_write(&primary, false);
@@ -299,7 +299,7 @@ fn doomed_names_everything_each_change_destroys() {
                     reported.push(b.to_vec());
                     Ok(())
                 };
-                f.cc.write_credential(env, locks, &login, &mut record)
+                f.cc.write_credential(env, locks, &login, Fallback::Allow(&mut record))
                     .unwrap();
             }
             LiveChange::ClearOther(kind) => {
@@ -383,7 +383,7 @@ fn an_unreadable_live_entry_is_never_overwritten() {
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt"),
-            &mut save_nothing
+            Fallback::Allow(&mut save_nothing)
         )
         .is_err()
     );
@@ -411,7 +411,7 @@ fn a_failed_write_restores_what_it_had_already_changed() {
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt"),
-            &mut save_nothing
+            Fallback::Allow(&mut save_nothing)
         )
         .is_err()
     );
@@ -442,7 +442,7 @@ fn a_restore_that_fails_is_reported_not_hidden() {
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt"),
-            &mut save_nothing,
+            Fallback::Allow(&mut save_nothing),
         )
         .err()
         .unwrap();
@@ -469,7 +469,7 @@ fn a_panic_inside_one_operation_restores_its_first_write() {
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt"),
-            &mut save_nothing,
+            Fallback::Allow(&mut save_nothing),
         )
     }));
     assert!(r.is_err());
@@ -500,7 +500,7 @@ fn a_transient_unreadable_caller_read_is_ignored_in_favor_of_a_fresh_one() {
         &f.env,
         &locks,
         &target(&f, "a@b.co", "rt"),
-        &mut save_nothing,
+        Fallback::Allow(&mut save_nothing),
     )
     .unwrap();
     assert_eq!(
@@ -525,7 +525,7 @@ fn garbage_live_bytes_refuse_to_compose_and_write_nothing() {
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt"),
-            &mut save_nothing,
+            Fallback::Allow(&mut save_nothing),
         )
         .err()
         .unwrap();
@@ -556,7 +556,7 @@ fn an_empty_live_entry_refuses_to_compose_and_writes_nothing() {
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt"),
-            &mut save_nothing
+            Fallback::Allow(&mut save_nothing)
         )
         .is_err()
     );
@@ -877,7 +877,7 @@ fn a_replaced_lock_directory_aborts_the_write_and_is_left_alone() {
 
     let t = target(&f, "new@b.co", "rt-new");
     assert!(matches!(
-        f.cc.write_credential(&f.env, &locks, &t, &mut save_nothing),
+        f.cc.write_credential(&f.env, &locks, &t, Fallback::Allow(&mut save_nothing)),
         Err(ProviderError::Lock(LockError::Compromised(_)))
     ));
     assert_eq!(f.kc.get(&svc, &acct).unwrap(), live, "nothing was written");
@@ -1137,6 +1137,37 @@ fn keychain_login(f: &Fx) -> (String, String) {
 }
 
 #[test]
+fn a_refused_api_key_switch_leaves_the_global_config_byte_identical() {
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    let before = "{\n  \"oauthAccount\": {\n    \"emailAddress\": \"old@a.co\"\n  },\n  \"userID\": \"u\"\n}\n";
+    fs::write(&paths.global_config, before).unwrap();
+    let svc = keychain_service(&f.env, ItemKind::ManagedKey);
+    f.kc.put(&svc, &keychain_account(&f.env), b"sk-ant-api03-old");
+    f.kc.set_fail_write(&svc, true);
+    let key = StoredLogin {
+        kind: "api_key".into(),
+        secret: b"sk-ant-api03-abcdefghijklmnopqrstuvwxyz".to_vec(),
+        identity: f.cc.token_identity("api-key-1@token.local"),
+    };
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let locks = f.cc.lock_live(&f.env, &g).unwrap();
+    let err =
+        f.cc.write_credential(&f.env, &locks, &key, Fallback::Refuse)
+            .err()
+            .expect("the refused write must fail");
+    assert!(
+        matches!(&err, ProviderError::FallbackRefused { item } if *item == svc),
+        "{err:?}"
+    );
+    assert_eq!(fs::read_to_string(&paths.global_config).unwrap(), before);
+    assert_eq!(
+        f.kc.get(&svc, &keychain_account(&f.env)).unwrap(),
+        b"sk-ant-api03-old"
+    );
+}
+
+#[test]
 fn a_fallback_pins_the_file_for_the_rest_of_its_operation() {
     // Appendix A.3: once a write falls back, every later write under the same live locks goes
     // to the file too, even with the Keychain healthy again.
@@ -1152,7 +1183,7 @@ fn a_fallback_pins_the_file_for_the_rest_of_its_operation() {
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt-1"),
-            &mut save_nothing,
+            Fallback::Allow(&mut save_nothing),
         )
         .unwrap();
     assert_eq!(first.stored_in, fell_back);
@@ -1162,7 +1193,7 @@ fn a_fallback_pins_the_file_for_the_rest_of_its_operation() {
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt-2"),
-            &mut save_nothing,
+            Fallback::Allow(&mut save_nothing),
         )
         .unwrap();
     assert_eq!(second.stored_in, fell_back);
@@ -1191,7 +1222,7 @@ fn the_next_operation_tries_the_keychain_again() {
                 &f.env,
                 &locks,
                 &target(&f, "a@b.co", "rt-1"),
-                &mut save_nothing,
+                Fallback::Allow(&mut save_nothing),
             )
             .unwrap();
         assert_eq!(
@@ -1207,7 +1238,7 @@ fn the_next_operation_tries_the_keychain_again() {
             &f.env,
             &locks,
             &target(&f, "b@b.co", "rt-2"),
-            &mut save_nothing,
+            Fallback::Allow(&mut save_nothing),
         )
         .unwrap();
     assert_eq!(written.stored_in, SecretStore::Keychain);
@@ -1239,7 +1270,7 @@ fn a_rollback_clears_the_pin_within_its_operation() {
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt-1"),
-            &mut save_nothing,
+            Fallback::Allow(&mut save_nothing),
         )
         .unwrap();
     assert_eq!(
@@ -1262,7 +1293,7 @@ fn a_rollback_clears_the_pin_within_its_operation() {
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt-2"),
-            &mut save_nothing,
+            Fallback::Allow(&mut save_nothing),
         )
         .unwrap();
     assert_eq!(again.stored_in, SecretStore::Keychain);
@@ -1372,7 +1403,7 @@ fn the_storage_write_lock_is_a_leaf_taken_only_around_each_entry_write() {
         identity: f.cc.token_identity("api-key-1@token.local"),
     };
     let undo =
-        f.cc.write_credential(&f.env, &locks, &key, &mut save_nothing)
+        f.cc.write_credential(&f.env, &locks, &key, Fallback::Allow(&mut save_nothing))
             .unwrap()
             .undo;
     assert!(!paths.storage_write_lock.exists() && !paths.storage_write_lock_v2.exists());
@@ -1382,7 +1413,7 @@ fn the_storage_write_lock_is_a_leaf_taken_only_around_each_entry_write() {
         &f.env,
         &locks,
         &target(&f, "new@b.co", "rt-new"),
-        &mut save_nothing,
+        Fallback::Allow(&mut save_nothing),
     )
     .unwrap();
     assert!(!paths.storage_write_lock.exists() && !paths.storage_write_lock_v2.exists());
@@ -1433,7 +1464,7 @@ fn a_write_that_finds_cc_changed_the_entry_aborts_and_leaves_everything_as_cc_le
             &f.env,
             &locks,
             &target(&f, "new@b.co", "rt-new"),
-            &mut save_nothing,
+            Fallback::Allow(&mut save_nothing),
         )
         .err()
         .unwrap();

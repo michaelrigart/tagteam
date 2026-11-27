@@ -10,8 +10,8 @@ use tagteam_provider::atomic::{
     ensure_private_dir, remove_target, write_atomic_private_with, write_atomic_with,
 };
 use tagteam_provider::{
-    BeforeFallback, Cancel, Credential, DoomedEntry, Env, Keychain, LiveLockSet, ProviderError,
-    Read, ReadError, SecretStore, cancel, poison::lock_unpoisoned,
+    BeforeFallback, Cancel, Credential, DoomedEntry, Env, Fallback, Keychain, LiveLockSet,
+    ProviderError, Read, ReadError, SecretStore, cancel, poison::lock_unpoisoned,
 };
 
 use crate::config::{self, read_bytes};
@@ -722,9 +722,10 @@ impl LiveStore {
     }
 
     /// Appendix A.3 write, including the verified file fallback, which first reports the item
-    /// it will delete to `before_fallback`. A fallback pins file mode, so every later
-    /// write of the same operation goes straight to the file. Returns where this write put the
-    /// credential: a file mirrored for hot reload does not make it a file store.
+    /// it will delete to `fallback`'s callback; under `Fallback::Refuse` a refused Keychain write
+    /// fails with `FallbackRefused` before anything else changes. A fallback pins file mode, so
+    /// every later write of the same operation goes straight to the file. Returns where this
+    /// write put the credential: a file mirrored for hot reload does not make it a file store.
     ///
     /// The whole write, its hot-reload rewrite or its fallback included, holds CC's
     /// storage-write lock (§9.1). Under it the entry is read again: its account-scoped keys must
@@ -736,11 +737,11 @@ impl LiveStore {
         paths: &CcPaths,
         bytes: &[u8],
         fence: Fence<'_>,
-        before_fallback: BeforeFallback<'_>,
+        fallback: Fallback<'_>,
     ) -> Result<SecretStore, ProviderError> {
         self.under_storage_write(env, paths, ItemKind::OAuth, fence, |now, fence| {
             let bytes = rebase(bytes, &shared_of(now));
-            self.write_entry(env, paths, &bytes, fence, before_fallback)
+            self.write_entry(env, paths, &bytes, fence, fallback)
         })
     }
 
@@ -751,7 +752,7 @@ impl LiveStore {
         paths: &CcPaths,
         bytes: &[u8],
         fence: Fence<'_>,
-        before_fallback: BeforeFallback<'_>,
+        fallback: Fallback<'_>,
     ) -> Result<SecretStore, ProviderError> {
         if !self.mac() {
             self.write_file(paths, bytes, fence)?;
@@ -775,12 +776,23 @@ impl LiveStore {
                     }
                     return Ok(SecretStore::Keychain);
                 }
-                Err(e) => tracing::warn!(
-                    rc = e.rc,
-                    "keychain write failed, falling back to the credentials file"
-                ),
+                Err(e) => {
+                    if matches!(fallback, Fallback::Refuse) {
+                        tracing::warn!(rc = e.rc, "keychain write failed, and the fallback is off");
+                        return Err(ProviderError::FallbackRefused { item: svc });
+                    }
+                    tracing::warn!(
+                        rc = e.rc,
+                        "keychain write failed, falling back to the credentials file"
+                    )
+                }
             }
         }
+        let Fallback::Allow(before_fallback) = fallback else {
+            return Err(ProviderError::FallbackRefused {
+                item: keychain_service(env, ItemKind::OAuth),
+            });
+        };
         self.report_item(env, ItemKind::OAuth, before_fallback)?;
         self.write_file(paths, bytes, fence)?;
         self.remove_item(env, ItemKind::OAuth, fence)?;
@@ -883,17 +895,19 @@ impl LiveStore {
     /// Keychain failure left behind (otherwise another account's plaintext key would stay
     /// live in `~/.claude.json`). When the Keychain refuses, the key goes to `primaryApiKey`
     /// instead, and the managed-key item is removed and verified gone, after being reported
-    /// to `before_fallback`: CC reads the Keychain first, so a stale item would stay the
-    /// effective key. Returns where this write put the key; the credential entry's file pin
-    /// plays no part in it. The managed-key item's write, its fallback included, holds CC's
-    /// storage-write lock and refuses if the item moved (§9.1).
+    /// to `fallback`'s callback: CC reads the Keychain first, so a stale item would stay the
+    /// effective key. Under `Fallback::Refuse` a refused Keychain write fails with
+    /// `FallbackRefused` before `primaryApiKey` is written or the item removed. Returns where
+    /// this write put the key; the credential entry's file pin plays no part in it. The
+    /// managed-key item's write, its fallback included, holds CC's storage-write lock and
+    /// refuses if the item moved (§9.1).
     pub fn write_managed_key(
         &self,
         env: &Env,
         paths: &CcPaths,
         key: &[u8],
         fence: Fence<'_>,
-        before_fallback: BeforeFallback<'_>,
+        fallback: Fallback<'_>,
     ) -> Result<SecretStore, ProviderError> {
         let key_str = String::from_utf8_lossy(key).trim().to_owned();
         let tail: String = key_str
@@ -969,13 +983,20 @@ impl LiveStore {
                 match upserted {
                     Ok(()) => return Ok(true),
                     Err(e) => {
+                        let Fallback::Allow(before_fallback) = fallback else {
+                            tracing::warn!(
+                                rc = e.rc,
+                                "keychain write failed, and the fallback is off"
+                            );
+                            return Err(ProviderError::FallbackRefused { item: svc });
+                        };
                         tracing::warn!(
                             rc = e.rc,
                             "keychain write failed, storing primaryApiKey instead"
-                        )
+                        );
+                        self.report_item(env, ItemKind::ManagedKey, before_fallback)?;
                     }
                 }
-                self.report_item(env, ItemKind::ManagedKey, before_fallback)?;
                 in_primary(fence)?;
                 self.remove_item(env, ItemKind::ManagedKey, fence)?;
                 Ok(false)

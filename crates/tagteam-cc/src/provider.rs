@@ -13,9 +13,9 @@ use tagteam_provider::process::{ProcessSpawner, SpawnSpec};
 use tagteam_provider::profile::refuse_linked_credential;
 use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{
-    BeforeFallback, Cancel, Capabilities, Check, CredLocks, Credential, DoomedEntry, Env,
-    ForeignFormat, FreshCredential, Identity, IdentitySurface, Keychain, KindTraits, LineError,
-    LiveAuth, LiveChange, LiveLockSet, LiveLocks, LockError, LockState, MergeReport, MustShare,
+    Cancel, Capabilities, Check, CredLocks, Credential, DoomedEntry, Env, Fallback, ForeignFormat,
+    FreshCredential, Identity, IdentitySurface, Keychain, KindTraits, LineError, LiveAuth,
+    LiveChange, LiveLockSet, LiveLocks, LockError, LockState, MergeReport, MustShare,
     MutationGuard, Pace, PollBudget, Provider, ProviderError, ProviderVars, ProviderWords, Read,
     SessionEnv, SessionRecord, SharePolicy, StoredLogin, Undo, UsageLine, UsageResult,
     ValidateRequest, Validity, Window, Written,
@@ -507,17 +507,13 @@ impl Provider for ClaudeCode {
         env: &Env,
         locks: &'l LiveLocks<'_>,
         target: &StoredLogin,
-        before_fallback: BeforeFallback<'_>,
+        fallback: Fallback<'_>,
     ) -> Result<Written<'l>, ProviderError> {
         let (undo, stored_in) = self.guarded(env, locks, |paths, fence| {
             let stored_in = if target.kind == KIND_API_KEY {
-                let stored_in = self.live.write_managed_key(
-                    env,
-                    paths,
-                    &target.secret,
-                    fence,
-                    before_fallback,
-                )?;
+                let stored_in =
+                    self.live
+                        .write_managed_key(env, paths, &target.secret, fence, fallback)?;
                 crash::point("after-target-axis");
                 self.live.clear_credential_account_keys(env, paths, fence)?;
                 stored_in
@@ -525,13 +521,9 @@ impl Provider for ClaudeCode {
                 let fresh = self.live.read_credential(env, paths);
                 let live_map = fresh_live_object(fresh)?;
                 let composed = shape::compose(&target.secret, live_map.as_ref())?;
-                let stored_in = self.live.write_credential_entry(
-                    env,
-                    paths,
-                    &composed,
-                    fence,
-                    before_fallback,
-                )?;
+                let stored_in = self
+                    .live
+                    .write_credential_entry(env, paths, &composed, fence, fallback)?;
                 crash::point("after-target-axis");
                 self.live.clear_managed_key(env, paths, fence)?;
                 stored_in

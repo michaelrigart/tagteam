@@ -1,7 +1,7 @@
 use tagteam_core::{AccountId, OutgoingAction, OutgoingClass, OutgoingFacts, decide_outgoing};
 use tagteam_provider::{
-    BeforeFallback, DoomedEntry, Identity, LiveAuth, LiveChange, LiveLocks, MutationGuard,
-    ProcessStamp, Provider, Read, ReadError, SecretStore, StoredLogin,
+    DoomedEntry, Fallback, Identity, LiveAuth, LiveChange, LiveLocks, MutationGuard, ProcessStamp,
+    Provider, Read, ReadError, SecretStore, StoredLogin,
 };
 
 use crate::account_lock::AccountLock;
@@ -313,7 +313,7 @@ impl Engine {
             },
             req,
             &mut tx,
-            &mut before_fallback,
+            Fallback::Allow(&mut before_fallback),
         ) {
             Ok(stored_in) => {
                 tx.disarm();
@@ -665,7 +665,7 @@ impl Engine {
         step: ApplyStep<'_>,
         req: &SwitchRequest,
         tx: &mut Rollback<'a, '_>,
-        before_fallback: BeforeFallback<'_>,
+        fallback: Fallback<'_>,
     ) -> Result<SecretStore, EngineError> {
         let ApplyStep {
             target,
@@ -678,7 +678,7 @@ impl Engine {
         // cancellation point, and neither is its rollback's.
         let env = self.critical_env();
         let stored_in = tx.write(|| {
-            p.write_credential(&env, locks, target_login, before_fallback)
+            p.write_credential(&env, locks, target_login, fallback)
                 .map(|w| (w.undo, w.stored_in))
         })?;
         hooks::point(self, "after-credential")?;

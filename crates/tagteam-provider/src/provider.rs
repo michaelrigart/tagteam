@@ -127,6 +127,14 @@ pub struct DoomedEntry {
 /// then restores what it changed.
 pub type BeforeFallback<'a> = &'a mut dyn FnMut(&[u8]) -> Result<(), ProviderError>;
 
+/// What `write_credential` does when the Keychain refuses a write.
+pub enum Fallback<'a> {
+    /// Appendix A.3's fallback, which first hands `before` the item it will delete.
+    Allow(BeforeFallback<'a>),
+    /// The write fails with `ProviderError::FallbackRefused`, before anything else changes.
+    Refuse,
+}
+
 /// The exact provider-owned state a switch may write (§3). Drives the pinned test (§15.3).
 #[derive(Debug, Clone, Default)]
 pub struct IdentitySurface {
@@ -424,6 +432,12 @@ pub enum ProviderError {
     /// write.
     #[error("the Keychain item {item} could not be verified gone, so {agent} may still read it")]
     ShadowingItem { item: String, agent: &'static str },
+    /// The Keychain refused a write and the policy forbids the file fallback: the credential was
+    /// not stored, and nothing past the refused write changed.
+    #[error(
+        "the Keychain refused a write to {item} and `keychain.file_fallback` is off, so the credential was not stored; run tagteam from the desktop login session, or allow the fallback with `tagteam config set keychain.file_fallback true`"
+    )]
+    FallbackRefused { item: String },
     /// A write failed part-way and restoring the previous state failed too: the live state is
     /// partial, and only journal recovery may settle it.
     #[error("{cause}; restoring the previous state also failed: {restore}")]
@@ -706,12 +720,13 @@ pub trait Provider: Send + Sync {
     /// (step 7). Refuses when an entry it would overwrite cannot be read fresh. The returned
     /// undo is tied to `locks`'s borrow (§9.4 step 10: the credential locks must be "held
     /// throughout") and cannot outlive it; `stored_in` is where this write put the secret.
+    /// `fallback` says whether a Keychain refusal may fall back to a file.
     fn write_credential<'l>(
         &self,
         env: &Env,
         locks: &'l LiveLocks<'_>,
         target: &StoredLogin,
-        before_fallback: BeforeFallback<'_>,
+        fallback: Fallback<'_>,
     ) -> Result<Written<'l>, ProviderError>;
     /// Clears the auth axis other than `kept_kind`'s (§9.6 finish-forward).
     fn clear_other_axis<'l>(
@@ -962,6 +977,17 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "the Keychain item Svc-credentials could not be verified gone, so Agent may still read it"
+        );
+    }
+
+    #[test]
+    fn a_refused_fallback_names_the_item_and_the_way_out() {
+        let e = ProviderError::FallbackRefused {
+            item: "Svc-credentials".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "the Keychain refused a write to Svc-credentials and `keychain.file_fallback` is off, so the credential was not stored; run tagteam from the desktop login session, or allow the fallback with `tagteam config set keychain.file_fallback true`"
         );
     }
 
