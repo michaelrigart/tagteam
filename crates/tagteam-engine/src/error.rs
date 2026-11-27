@@ -55,6 +55,12 @@ pub enum EngineError {
         "the Keychain could not be read, so the live credential may be out of date; unlock the Keychain and retry"
     )]
     DegradedRead,
+    /// Spec §3.4: `keychain.file_fallback` is off and the vault's Keychain item refused a write,
+    /// so nothing was saved and no token was spent.
+    #[error(
+        "the Keychain refused a write and `keychain.file_fallback` is off, so the credential was not stored; run tagteam from the desktop login session, or allow the fallback with `tagteam config set keychain.file_fallback true`"
+    )]
+    KeychainFallbackRefused,
     #[error("the live credential belongs to {found}, not {expected}; refusing to add it")]
     OwnerMismatch { expected: String, found: String },
     #[error("the live login changed while it was being checked; run the command again")]
@@ -585,6 +591,7 @@ impl EngineError {
             EngineError::NoLiveLogin { .. } => "no-live-login",
             EngineError::LiveApiKey => "live-api-key",
             EngineError::DegradedRead => "degraded-read",
+            EngineError::KeychainFallbackRefused => "keychain-fallback-refused",
             EngineError::OwnerMismatch { .. } => "owner-mismatch",
             EngineError::LiveMoved => "live-moved",
             EngineError::NeedsConfirmation { .. } => "needs-confirmation",
@@ -770,6 +777,10 @@ mod tests {
             ),
             (EngineError::LiveApiKey, "live-api-key"),
             (EngineError::DegradedRead, "degraded-read"),
+            (
+                EngineError::KeychainFallbackRefused,
+                "keychain-fallback-refused",
+            ),
             (
                 EngineError::OwnerMismatch {
                     expected: "a".into(),

@@ -566,6 +566,7 @@ impl Engine {
             .into_fresh()
             .expect("a vault read is authoritative, never degraded");
         hooks::point(self, "gate-before-request")?;
+        self.probe_keychain_write(&lock)?;
         let result = p.refresh(self.http.as_ref(), &fresh, now, GATE_TIMEOUT);
         let outcome = match result {
             RefreshResult::Refreshed { successor, owner } => {

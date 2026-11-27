@@ -51,6 +51,14 @@ pub(super) struct LockedSwitch<'a, 'g> {
     pub(super) memo: &'a VaultMemo<'a>,
 }
 
+/// The account lock a switch holds on `target`.
+fn locked_target<'a>(ls: &LockedSwitch<'a, '_>, target: &AccountRow) -> &'a AccountLock {
+    ls.account_locks
+        .iter()
+        .find(|l| l.id() == &target.id)
+        .expect("the target is locked")
+}
+
 /// The rows `rederive` locked and what `preflight` read under the locks.
 struct Preflight {
     target_identity: Identity,
@@ -260,6 +268,7 @@ impl Engine {
     ) -> Result<SwitchOutcome, EngineError> {
         let provider = &req.provider;
         let mut pf = self.preflight(p, locked, ls)?;
+        self.probe_keychain_write(locked_target(ls, &pf.target))?;
         self.settle_pre(p, ls, &pf.target)?;
 
         let mut warnings = plan.notes.clone();
@@ -373,11 +382,7 @@ impl Engine {
         // is written, so neither branch below reads the spent generation (§9.4 steps 2 and 5).
         // A rescue that cannot be read or adopted refuses the switch before its journal row
         // exists, so there is nothing to roll back.
-        let target_lock = ls
-            .account_locks
-            .iter()
-            .find(|l| l.id() == &target.id)
-            .expect("the target is locked");
+        let target_lock = locked_target(ls, target);
         self.settle_rescues(p, target, target_lock)?;
         // §9.2 lazy capture, after the rescues and before either branch reads the target's
         // vault: a rotation the profile holds is the generation composed and written below. A

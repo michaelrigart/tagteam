@@ -906,3 +906,43 @@ mod hooked {
         }
     }
 }
+
+#[test]
+fn a_refused_probe_sends_no_token_request_for_a_stored_account() {
+    let fx = Fx::new();
+    let a = due(&fx);
+    let snapshot = fx.vault_bytes(&a).unwrap();
+    fx.script_refresh(Some("rt-a2"));
+    fx.set_keychain_file_fallback(false);
+    fx.kc.set_fail_write(SERVICE, true);
+
+    let err = fx
+        .engine
+        .refresh_stored(fx.cc.as_ref(), &a, &snapshot)
+        .unwrap_err();
+
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert_eq!(fx.http.count(Method::Post, &Fx::endpoints().token), 0);
+    assert!(rescues(&fx).is_empty());
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+    assert_eq!(fx.engine.fallback_refusals(), 1);
+}
+
+#[test]
+fn with_the_default_a_stored_refresh_never_probes() {
+    let fx = Fx::new();
+    let a = due(&fx);
+    let snapshot = fx.vault_bytes(&a).unwrap();
+    fx.script_refresh(Some("rt-a2"));
+    fx.kc.set_fail_write(SERVICE, true);
+
+    let out = refresh(&fx, &a, &snapshot);
+
+    assert!(
+        matches!(&out, GateOutcome::Transient { kind, rescued: true } if kind.as_str() == "vault-write"),
+        "{out:?}"
+    );
+    assert_eq!(fx.http.count(Method::Post, &Fx::endpoints().token), 1);
+    assert_eq!(rescued_refresh_tokens(&fx), ["rt-a2"]);
+    assert_eq!(fx.engine.fallback_refusals(), 0);
+}

@@ -234,6 +234,7 @@ impl Engine {
             if let Some(reason) = self.active_quarantine(p, &row, &live)? {
                 return Ok(ActiveOutcome::Dead(reason));
             }
+            self.probe_keychain_write(&lock)?;
 
             // Step 3.
             let rec = self.reconcile_active(p, &row, &lock, &live, hint.as_ref())?;

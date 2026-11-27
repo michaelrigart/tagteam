@@ -165,7 +165,7 @@ impl Engine {
                 &self.env,
                 self.spawner.as_ref(),
                 self.cancel(),
-                self.settings().keychain_file_fallback,
+                self.file_fallback_allowed(),
             ) {
                 run.push(Some(&id), check);
             }

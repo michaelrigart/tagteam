@@ -262,12 +262,38 @@ impl Engine {
         self.fallback_refusals.load(Ordering::Relaxed)
     }
 
+    /// `keychain.file_fallback`, read from `config.toml` at each use rather than from the
+    /// settings snapshot: only the daemon reloads that, and a running `auto` or the TUI must
+    /// follow an edit at its next write.
+    pub(crate) fn file_fallback_allowed(&self) -> bool {
+        Settings::load(&self.env, self.default_provider())
+            .0
+            .keychain_file_fallback
+    }
+
     /// `Refuse` when `keychain.file_fallback` is off, else `Allow(before)`.
     pub(crate) fn fallback<'a>(&self, before: BeforeFallback<'a>) -> Fallback<'a> {
-        if self.settings().keychain_file_fallback {
+        if self.file_fallback_allowed() {
             Fallback::Allow(before)
         } else {
             Fallback::Refuse
+        }
+    }
+
+    /// Spec §3.4: with the setting off, refuses unless `lock`'s vault item takes a write. `Ok`
+    /// when the item is unreadable or absent: the operation then ends with the error it has
+    /// today.
+    pub(crate) fn probe_keychain_write(&self, lock: &AccountLock) -> Result<(), EngineError> {
+        if self.file_fallback_allowed() {
+            return Ok(());
+        }
+        match self.vault.probe_write(lock) {
+            Ok(false) => {
+                let refused = EngineError::KeychainFallbackRefused;
+                self.note_refusal(&refused);
+                Err(refused)
+            }
+            Ok(true) | Err(_) => Ok(()),
         }
     }
 

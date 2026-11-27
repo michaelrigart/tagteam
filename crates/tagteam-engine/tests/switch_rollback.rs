@@ -480,3 +480,23 @@ fn a_switch_from_a_file_login_with_the_setting_off_creates_the_item() {
     assert_eq!(out.stored_in, Some(SecretStore::Keychain));
     assert_eq!(fx.engine.fallback_refusals(), 0);
 }
+
+#[test]
+fn a_fallback_turned_off_after_the_engine_was_built_is_followed() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    std::fs::create_dir_all(fx.env.config_dir()).unwrap();
+    std::fs::write(
+        fx.env.config_dir().join("config.toml"),
+        "[keychain]\nfile_fallback = false\n",
+    )
+    .unwrap();
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert!(!fx.paths().credentials_file.exists());
+}

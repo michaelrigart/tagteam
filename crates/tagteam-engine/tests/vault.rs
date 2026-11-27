@@ -253,3 +253,94 @@ fn a_keychain_failure_stays_the_source_of_a_vault_write_or_delete() {
         "keychain operation failed (rc 25): injected delete failure"
     );
 }
+
+#[test]
+fn a_probe_rewrites_the_item_with_its_own_bytes() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let agent = FakeAgent::new();
+    let kc = Arc::new(FakeKeychain::new());
+    let v = Vault::new(Box::new(KeychainVault::new(kc.clone())));
+    let id = AccountId::from_string("p");
+    let lock = AccountLock::acquire(&env, &id, AccountLock::WAIT).unwrap();
+    v.store(&lock, &cred("gen1", "t"), &agent).unwrap();
+    let before = kc.items();
+
+    assert!(v.probe_write(&lock).unwrap());
+    kc.set_fail_write(SERVICE, true);
+    assert!(!v.probe_write(&lock).unwrap(), "the probe really writes");
+    kc.set_fail_write(SERVICE, false);
+
+    assert_eq!(kc.items(), before);
+    assert!(matches!(v.read_prev(&id), Read::Absent));
+}
+
+#[test]
+fn a_probe_of_a_keychain_that_refuses_writes_is_false() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let agent = FakeAgent::new();
+    let kc = Arc::new(FakeKeychain::new());
+    let v = Vault::new(Box::new(KeychainVault::new(kc.clone())));
+    let id = AccountId::from_string("r");
+    let lock = AccountLock::acquire(&env, &id, AccountLock::WAIT).unwrap();
+    v.store(&lock, &cred("gen1", "t"), &agent).unwrap();
+    kc.set_fail_write(SERVICE, true);
+
+    assert!(!v.probe_write(&lock).unwrap());
+    assert_eq!(v.read(&id).present().unwrap(), cred("gen1", "t"));
+}
+
+#[test]
+fn a_probe_of_an_unreadable_item_is_an_error() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let agent = FakeAgent::new();
+    let kc = Arc::new(FakeKeychain::new());
+    let v = Vault::new(Box::new(KeychainVault::new(kc.clone())));
+    let id = AccountId::from_string("u");
+    let lock = AccountLock::acquire(&env, &id, AccountLock::WAIT).unwrap();
+    v.store(&lock, &cred("gen1", "t"), &agent).unwrap();
+    kc.set_unreadable(SERVICE, id.as_str(), true);
+    kc.set_fail_write(SERVICE, true);
+
+    assert!(matches!(
+        v.probe_write(&lock),
+        Err(VaultError::Unreadable(_))
+    ));
+}
+
+#[test]
+fn a_probe_of_an_absent_item_is_true_and_creates_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let kc = Arc::new(FakeKeychain::new());
+    let v = Vault::new(Box::new(KeychainVault::new(kc.clone())));
+    let id = AccountId::from_string("n");
+    let lock = AccountLock::acquire(&env, &id, AccountLock::WAIT).unwrap();
+    kc.set_fail_write(SERVICE, true);
+
+    assert!(v.probe_write(&lock).unwrap());
+    assert!(kc.items().is_empty());
+}
+
+#[test]
+fn a_file_vault_never_probes() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let agent = FakeAgent::new();
+    let v = Vault::new(Box::new(FileVault::new(env.data_dir().join("vault"))));
+    let id = AccountId::from_string("f");
+    let lock = AccountLock::acquire(&env, &id, AccountLock::WAIT).unwrap();
+    v.store(&lock, &cred("gen1", "t"), &agent).unwrap();
+    let path = env.data_dir().join("vault/f.json");
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    assert!(v.probe_write(&lock).unwrap());
+
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        before
+    );
+}
