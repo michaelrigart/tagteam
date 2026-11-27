@@ -1948,9 +1948,9 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
      be strictly sooner than the active account's (unknown → skip). Order by soonest reset,
      then most headroom. Before switching, re-check the current account and all candidates
      (§8.3) and re-rank; the target's reading must be ≤ 180 s old, else `stale-usage`.
-     *(Amended by michaelrigart/tagteam#65: under `consume-first`, `proactive`, `at-limit` and
-     `failover` order their targets this way too, an unknown reset last, where they ordered by
-     most headroom.)*
+     *(Amended by michaelrigart/tagteam#65: under `consume-first`, `proactive` orders its
+     targets this way too, an unknown reset last, where it ordered by most headroom. `at-limit`
+     and `failover` do so for the candidates below the threshold; see their bullet below.)*
    - **Every account above the threshold:** for each pair, pick the recovery axis when both the
      active account and the candidate are within 3 points of headroom, or either one resets
      within 4 h. Otherwise use the headroom axis.
@@ -1966,10 +1966,13 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
      - **A hard move** ranks every OAuth candidate with room, most headroom first, ties to the
        lower position: the candidates below the ceiling, then the full ones with room.
      *(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md) §3.1, §3.3 and §3.8.)*
-     *(Amended by michaelrigart/tagteam#65: under `consume-first`, "most headroom first" above
-     reads as the `consume-first` order, soonest long-window reset first, an unknown reset last,
-     then most headroom. A hard move then ranks the candidates below the ceiling in that order,
-     and the full ones with room after them, most headroom first.)*
+     *(Amended by michaelrigart/tagteam#65: under `consume-first`, a soft and a hard move rank
+     the same candidates in two tiers. First the candidates below the threshold: soonest
+     long-window reset first, an unknown reset last, then most headroom, ties to the lower
+     position. Then every other candidate the move ranks, most headroom first, ties to the lower
+     position: for a soft move the clear ones at or above the threshold, for a hard move the
+     ones at or above the threshold and below the ceiling, then the full ones with room. `best`,
+     and `consume-first` without a long window, rank as stated above.)*
 9. **Nothing ranked.** With a hard move and API-key candidates (step 7), go to step 10 with
    those. A soft move never reaches an API key. *(Amended by the [autoswitch-ceiling spec](2026-11-11-tagteam-autoswitch-ceiling-design.md)
    §3.3.)* Otherwise:
