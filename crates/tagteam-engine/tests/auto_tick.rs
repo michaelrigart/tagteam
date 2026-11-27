@@ -10,8 +10,8 @@ use std::sync::Mutex;
 
 use common::{
     API_KEY, FakeFx, Fx, Recorded, block_rescue, capture_logs, crashed_switch, cred_at, credential,
-    fp, quarantine_of, quiescent, record_reading, sent_refresh_tokens, unblock_rescue,
-    usage_requests, usage_window, vault_fp, write_target_credential,
+    fp, quarantine_of, quiescent, record_reading, sent_refresh_tokens, token_requests,
+    unblock_rescue, usage_requests, usage_window, vault_fp, write_target_credential,
 };
 use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
@@ -1391,6 +1391,45 @@ fn a_target_that_cannot_be_freshened_for_now_is_an_error_at_the_normal_cadence()
             transient: true,
         }]
     );
+    assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
+}
+
+#[test]
+fn a_refusal_while_freshening_a_target_ends_the_tick_without_trying_another() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let c = fx.add("c@x.co", "rt-c"); // live, at its limit
+    read(&fx.engine, &a, &reading(false, 10.0, 20.0));
+    read(&fx.engine, &b, &reading(false, 10.0, 50.0));
+    read(&fx.engine, &c, &reading(false, 100.0, 50.0));
+    fx.expire_access(&a);
+    fx.expire_access(&b);
+    fx.set_keychain_file_fallback(false);
+    fx.kc.set_fail_write(SERVICE, true);
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+
+    let (outcome, decision) = engine.tick(&sink).unwrap();
+
+    assert_eq!(outcome, TickOutcome::Error);
+    assert!(matches!(decision, Decision::Switch { .. }));
+    let errors: Vec<_> = sink
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            AutoEvent::Error { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("keychain.file_fallback"), "{errors:?}");
+    assert_eq!(fx.engine.fallback_refusals(), 1);
+    assert_eq!(token_requests(&fx), 0);
     assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
 }
 

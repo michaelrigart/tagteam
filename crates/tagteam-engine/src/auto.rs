@@ -717,6 +717,9 @@ impl AutoEngine<'_> {
         let fresh = match self.engine.freshen_auto(p, &row) {
             Ok(fresh) => fresh,
             Err(e) if fatal(&e) => return Err(e),
+            Err(e) if e.kind() == "keychain-fallback-refused" => {
+                return self.target_failed(t, &row, &e, sink);
+            }
             Err(e) => AutoFreshened::Failed(FreshenFailure::Text(e.to_string())),
         };
         match fresh {
@@ -805,20 +808,30 @@ impl AutoEngine<'_> {
                 );
                 Ok(TargetStep::Next(None))
             }
-            Err(e) => {
-                self.count(t)?;
-                self.error(
-                    sink,
-                    format!(
-                        "could not switch to {} (position {}): {e}",
-                        row.label, row.position
-                    ),
-                    transient(&e),
-                );
-                self.switch_failed(&t.live.id, id, &e)?;
-                Ok(TargetStep::Stop(TickOutcome::Error))
-            }
+            Err(e) => self.target_failed(t, &row, &e, sink),
         }
+    }
+
+    /// A target whose switch, or whose freshening's Keychain probe, failed ends the tick: one
+    /// `error` event and a `switch-failed` row, with no other target tried.
+    fn target_failed(
+        &mut self,
+        t: &Ticked<'_>,
+        row: &AccountRow,
+        e: &EngineError,
+        sink: &dyn EventSink,
+    ) -> Result<TargetStep, EngineError> {
+        self.count(t)?;
+        self.error(
+            sink,
+            format!(
+                "could not switch to {} (position {}): {e}",
+                row.label, row.position
+            ),
+            transient(e),
+        );
+        self.switch_failed(&t.live.id, &row.id, e)?;
+        Ok(TargetStep::Stop(TickOutcome::Error))
     }
 
     /// Steps 10 to 12 for a `Switch` decision: each target in order, tried by `try_target`.

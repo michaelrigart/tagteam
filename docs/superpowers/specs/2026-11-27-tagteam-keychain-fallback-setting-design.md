@@ -94,7 +94,8 @@ It joins `KEYS` after `notify.events`, with a `KeyId::KeychainFileFallback` and 
 `Settings::keychain_file_fallback` field. `tagteam config`, `config get`, `config set` and
 `config unset` take it through the registry with no code of their own. The engine reads it from the
 file at each write and each probe, not from its settings snapshot: only the daemon reloads that
-snapshot, and a running `tagteam auto` or TUI must follow an edit at its next write too.
+snapshot, and a running `tagteam auto` or TUI must follow an edit at its next write too. A file that
+exists but cannot be read or parsed gives the value this process last read.
 
 ### 3.2 Handing the choice to the provider
 
@@ -203,7 +204,8 @@ code is the one a `provider` error has today; scripts tell it apart by the kind 
 
 - **A tick** that decides a switch and is refused ends as `TickOutcome::Error` with an `error`
   event, `transient: false`, like any failed switch. The `switch-failed` event keeps its 30-minute
-  quiet period for the same target and message (`auto.rs:1187`). `auto --once` exits with its
+  quiet period for the same target and message (`auto.rs:1187`). A refusal met while freshening a
+  target ends the tick the same way, without trying another target. `auto --once` exits with its
   error code.
 - **The foreground loop** keeps its normal cadence after a failed tick, as today (D "A failed tick
   keeps the normal cadence"). With the probe, a repeated attempt costs one refused Keychain write

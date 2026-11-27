@@ -264,11 +264,11 @@ impl Engine {
 
     /// `keychain.file_fallback`, read from `config.toml` at each use rather than from the
     /// settings snapshot: only the daemon reloads that, and a running `auto` or the TUI must
-    /// follow an edit at its next write.
+    /// follow an edit at its next write. A file that exists but cannot be read or parsed gives
+    /// the snapshot's value, the last this process read.
     pub(crate) fn file_fallback_allowed(&self) -> bool {
-        Settings::load(&self.env, self.default_provider())
-            .0
-            .keychain_file_fallback
+        Settings::load_keychain_file_fallback(&self.env, self.default_provider())
+            .unwrap_or_else(|| self.settings().keychain_file_fallback)
     }
 
     /// `Refuse` when `keychain.file_fallback` is off, else `Allow(before)`.

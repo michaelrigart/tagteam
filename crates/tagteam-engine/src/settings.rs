@@ -1033,6 +1033,13 @@ impl Settings {
         (read.settings, read.warnings)
     }
 
+    /// `keychain.file_fallback` as `config.toml` holds it now: the default when the file is
+    /// missing, `None` when it exists but cannot be read or parsed.
+    pub fn load_keychain_file_fallback(env: &Env, provider: &ProviderId) -> Option<bool> {
+        let read = read_file(env, provider);
+        (!read.broken).then_some(read.settings.keychain_file_fallback)
+    }
+
     /// `config.toml`'s modification time; `None` when the file is missing or its metadata
     /// cannot be read. A running `auto` re-reads the settings before a tick whenever this
     /// changes (§11.4). Read it before `load`, so a write landing between the two counts as
@@ -1163,6 +1170,8 @@ fn parse_bool_item(item: &Item) -> Option<bool> {
 struct FileRead {
     path: PathBuf,
     exists: bool,
+    /// The file exists but could not be read or parsed, so `settings` is all defaults.
+    broken: bool,
     settings: Settings,
     /// Per [`KEYS`] entry, the table its value came from.
     sources: Vec<Source>,
@@ -1174,6 +1183,7 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
     let mut read = FileRead {
         path: config_path(env),
         exists: true,
+        broken: false,
         settings: Settings::default(),
         sources: vec![Source::Default; KEYS.len()],
         unknown: Vec::new(),
@@ -1186,6 +1196,7 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
             return read;
         }
         Err(e) => {
+            read.broken = true;
             read.warnings.push(format!(
                 "{}: cannot read the settings file ({}); using the defaults",
                 read.path.display(),
@@ -1195,6 +1206,7 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
         }
     };
     let Ok(doc) = text.parse::<DocumentMut>() else {
+        read.broken = true;
         read.warnings.push(format!(
             "{}: the settings file is not valid TOML; using the defaults",
             read.path.display()
