@@ -851,6 +851,27 @@ fn with_the_fallback_off_a_login_in_the_credentials_file_warns_and_names_the_fil
 }
 
 #[test]
+fn with_the_fallback_off_a_torn_credentials_file_is_not_called_clean() {
+    let f = fx();
+    let file = CcPaths::resolve(&f.env).credentials_file;
+    fs::write(
+        &file,
+        r#"{"claudeAiOauth": {"accessToken": "sk-ant-secret""#,
+    )
+    .unwrap();
+    let checks = f.checks_with(false);
+    let c = one(&checks, "cc.keychain-fallback");
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(c.message.contains("cannot be told"), "{}", c.message);
+    assert!(
+        c.message.contains(&file.display().to_string()),
+        "{}",
+        c.message
+    );
+    assert!(!c.message.contains("sk-ant-secret"));
+}
+
+#[test]
 fn with_the_fallback_off_a_primary_api_key_warns_and_names_the_config() {
     let f = fx();
     let file = plain_key(&f);

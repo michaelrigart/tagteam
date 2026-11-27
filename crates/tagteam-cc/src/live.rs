@@ -216,9 +216,10 @@ pub(crate) fn read_primary_api_key(paths: &CcPaths) -> Read<Vec<u8>> {
 }
 
 /// Whether `bytes` are a JSON object with an account-scoped key: a login, not only the
-/// machine-shared keys a credential entry carries for every account (Appendix A.4).
-pub(crate) fn holds_login(bytes: &[u8]) -> bool {
-    object(bytes).is_some_and(|o| machine_shared_only(&o).len() < o.len())
+/// machine-shared keys a credential entry carries for every account (Appendix A.4). `None`
+/// when they are no JSON object, so nothing can be said.
+pub(crate) fn holds_login(bytes: &[u8]) -> Option<bool> {
+    object(bytes).map(|o| machine_shared_only(&o).len() < o.len())
 }
 
 /// Removes what the path resolves to; a symlink itself is never deleted (§9.5).

@@ -338,9 +338,16 @@ fn keychain_fallback(paths: &CcPaths) -> Check {
     let mut held = Vec::new();
     let mut untold = Vec::new();
     match config::read_bytes(&paths.credentials_file) {
-        Read::Present(b) if holds_login(&b) => held.push((&paths.credentials_file, "a login")),
+        Read::Present(b) => match holds_login(&b) {
+            Some(true) => held.push((&paths.credentials_file, "a login")),
+            Some(false) => {}
+            None => untold.push(format!(
+                "{} is not a JSON object",
+                paths.credentials_file.display()
+            )),
+        },
         Read::Unreadable(e) => untold.push(e.to_string()),
-        Read::Present(_) | Read::Absent => {}
+        Read::Absent => {}
     }
     match read_primary_api_key(paths) {
         Read::Present(_) => held.push((&paths.global_config, "an API key")),
@@ -368,7 +375,7 @@ fn keychain_fallback(paths: &CcPaths) -> Check {
                 untold.join("; ")
             ),
         )
-        .fix("make the credentials file and the global config readable by this user");
+        .fix("make the credentials file and the global config readable JSON for this user");
     }
     Check::ok(
         "cc.keychain-fallback",
