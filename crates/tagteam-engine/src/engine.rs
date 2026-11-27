@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -8,7 +9,10 @@ use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::liveness::ProcessProbe;
 use tagteam_provider::process::ProcessSpawner;
 use tagteam_provider::profile::RunShell;
-use tagteam_provider::{Cancel, Clock, Env, Http, MutationGuard, Provider, ProviderError, Read};
+use tagteam_provider::{
+    BeforeFallback, Cancel, Clock, Env, Fallback, Http, MutationGuard, Provider, ProviderError,
+    Read,
+};
 
 use crate::account_lock::AccountLock;
 use crate::auto::HolderKind;
@@ -134,6 +138,7 @@ pub struct Engine {
     /// `tagteam auto` and, briefly, `purge`, and is neither the daemon nor a window.
     lock_holder: HolderKind,
     store: Mutex<Option<Arc<Store>>>,
+    fallback_refusals: AtomicU64,
     #[cfg(feature = "test-hooks")]
     pub(crate) fail_at: Mutex<Option<&'static str>>,
     #[cfg(feature = "test-hooks")]
@@ -161,6 +166,7 @@ impl Engine {
                 EventSource::Cli | EventSource::Auto => HolderKind::Auto,
             },
             store: Mutex::new(None),
+            fallback_refusals: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             fail_at: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
@@ -249,6 +255,34 @@ impl Engine {
             .write()
             .unwrap_or_else(PoisonError::into_inner) = Arc::new(settings);
         warnings
+    }
+
+    /// How many writes this engine has refused under `keychain.file_fallback = false`.
+    pub fn fallback_refusals(&self) -> u64 {
+        self.fallback_refusals.load(Ordering::Relaxed)
+    }
+
+    /// `Refuse` when `keychain.file_fallback` is off, else `Allow(before)`.
+    pub(crate) fn fallback<'a>(&self, before: BeforeFallback<'a>) -> Fallback<'a> {
+        if self.settings().keychain_file_fallback {
+            Fallback::Allow(before)
+        } else {
+            Fallback::Refuse
+        }
+    }
+
+    /// Counts `e` when its kind is `keychain-fallback-refused`, or when a refused write's
+    /// restore failed too.
+    pub(crate) fn note_refusal(&self, e: &EngineError) {
+        let refused = match e {
+            EngineError::Provider(ProviderError::RestoreFailed { cause, .. }) => {
+                matches!(**cause, ProviderError::FallbackRefused { .. })
+            }
+            e => e.kind() == "keychain-fallback-refused",
+        };
+        if refused {
+            self.fallback_refusals.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The port providers send their requests through (§4.4).

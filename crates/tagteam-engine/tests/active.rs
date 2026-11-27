@@ -528,6 +528,24 @@ fn unpublished_b(fx: &Fx, a: &AccountId, b_expires: i64) {
 }
 
 #[test]
+fn a_refused_publish_is_not_published_and_counted() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    unpublished_b(&fx, &a, fx.clock.now_ms() + 3_600_000);
+    fx.set_keychain_file_fallback(false);
+    let (svc, _) = fx.live_item(ItemKind::OAuth);
+    fx.kc.set_fail_write(&svc, true);
+
+    let out = active(&fx, ActiveTrigger::Expired).unwrap();
+
+    assert_eq!(out, ActiveOutcome::PersistedNotPublished);
+    assert_eq!(fx.engine.fallback_refusals(), 1);
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+    assert!(!fx.paths().credentials_file.exists());
+    assert_eq!(token_requests(&fx), 0);
+}
+
+#[test]
 fn an_expired_recovered_generation_is_published_before_it_is_refreshed() {
     // B is published first (the self-heal), then refreshed to C in a second pass, so the live
     // store never falls two generations behind.

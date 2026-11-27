@@ -14,6 +14,7 @@ use tagteam_engine::oracle::Oracle;
 use tagteam_engine::store::JournalRow;
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget};
 use tagteam_engine::{Engine, EngineError};
+use tagteam_provider::keychain::Keychain;
 use tagteam_provider::{Credential, Env, Identity, ProcessStamp, Provider, SecretStore};
 
 fn request(fx: &Fx, target: SwitchTarget, force: bool) -> SwitchRequest {
@@ -430,6 +431,7 @@ fn a_rolled_back_fallback_leaves_the_next_switch_on_the_keychain() {
         !fx.paths().credentials_file.exists(),
         "the rollback removed the fallback's file"
     );
+    assert_eq!(fx.engine.fallback_refusals(), 0);
 
     fx.engine.fail_at(None);
     let out = fx.switch_to(&a, false).unwrap();
@@ -439,4 +441,42 @@ fn a_rolled_back_fallback_leaves_the_next_switch_on_the_keychain() {
         !fx.paths().credentials_file.exists(),
         "a Keychain write never creates the file"
     );
+}
+
+#[test]
+fn a_refused_switch_reports_the_refusal_and_not_a_rollback() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.set_keychain_file_fallback(false);
+    let cred_before = fx.live_credential();
+    let journal_before = fx.engine.store().unwrap().journal(&fx.provider()).unwrap();
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert_eq!(fx.live_credential(), cred_before);
+    assert!(!fx.paths().credentials_file.exists());
+    let store = fx.engine.store().unwrap();
+    assert_eq!(store.journal(&fx.provider()).unwrap(), journal_before);
+    assert_eq!(fx.engine.fallback_refusals(), 1);
+}
+
+#[test]
+fn a_switch_from_a_file_login_with_the_setting_off_creates_the_item() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live: b, in the Keychain
+    let (svc, acct) = fx.live_item(ItemKind::OAuth);
+    let live = fx.kc.get(&svc, &acct).unwrap();
+    fx.kc.delete(&svc, &acct).unwrap();
+    std::fs::write(fx.paths().credentials_file, live).unwrap();
+    fx.set_keychain_file_fallback(false);
+
+    let out = fx.switch_to(&a, false).unwrap();
+
+    assert_eq!(out.stored_in, Some(SecretStore::Keychain));
+    assert_eq!(fx.engine.fallback_refusals(), 0);
 }

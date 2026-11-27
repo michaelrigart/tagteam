@@ -541,6 +541,17 @@ impl Fx {
         }
     }
 
+    /// Writes `keychain.file_fallback` to `config.toml` and reloads the engine's settings.
+    pub fn set_keychain_file_fallback(&self, on: bool) {
+        fs::create_dir_all(self.env.config_dir()).unwrap();
+        fs::write(
+            self.env.config_dir().join("config.toml"),
+            format!("[keychain]\nfile_fallback = {on}\n"),
+        )
+        .unwrap();
+        assert!(self.engine.reload_settings(&self.provider()).is_empty());
+    }
+
     pub fn switch_to(&self, id: &AccountId, force: bool) -> Result<SwitchOutcome, EngineError> {
         self.engine.switch(self.switch_request(id, force))
     }

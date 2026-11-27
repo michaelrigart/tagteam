@@ -65,7 +65,6 @@ impl<'a> Rollback<'a, '_> {
                 kind = cause.kind(),
                 "rolled back a switch"
             );
-            EngineError::RolledBack(cause.to_string())
         } else {
             // A count (§14.2): each entry names a Keychain service or a file path, and an
             // error's text.
@@ -78,11 +77,8 @@ impl<'a> Rollback<'a, '_> {
                 failed = failed.len(),
                 "a switch was not fully rolled back; its journal row stays for recovery"
             );
-            EngineError::RollbackFailed {
-                cause: cause.to_string(),
-                failed: failed.join("; "),
-            }
         }
+        rolled_back(cause, failed)
     }
 
     /// Returns what could not be restored, `failed` included. The journal row is put back
@@ -111,6 +107,22 @@ impl<'a> Rollback<'a, '_> {
     }
 }
 
+/// What a rolled-back switch returns for `cause`: a refused write whose rollback put everything
+/// back stays the refusal, which names what to do; any other cause is `RolledBack`, and a
+/// rollback that left something behind is `RollbackFailed`.
+fn rolled_back(cause: EngineError, failed: Vec<String>) -> EngineError {
+    if !failed.is_empty() {
+        return EngineError::RollbackFailed {
+            cause: cause.to_string(),
+            failed: failed.join("; "),
+        };
+    }
+    match cause {
+        EngineError::Provider(ProviderError::FallbackRefused { .. }) => cause,
+        cause => EngineError::RolledBack(cause.to_string()),
+    }
+}
+
 impl Drop for Rollback<'_, '_> {
     fn drop(&mut self) {
         if !self.armed {
@@ -128,5 +140,32 @@ impl Drop for Rollback<'_, '_> {
                 "an unwinding switch was not fully rolled back; its journal row stays for recovery"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refusal() -> EngineError {
+        EngineError::Provider(ProviderError::FallbackRefused { item: "svc".into() })
+    }
+
+    #[test]
+    fn a_clean_rollback_of_a_refusal_keeps_the_refusal() {
+        let e = rolled_back(refusal(), vec![]);
+        assert_eq!(e.kind(), "keychain-fallback-refused");
+    }
+
+    #[test]
+    fn a_clean_rollback_of_another_cause_is_rolled_back() {
+        let e = rolled_back(EngineError::LiveMoved, vec![]);
+        assert!(matches!(e, EngineError::RolledBack(_)), "{e}");
+    }
+
+    #[test]
+    fn a_failed_rollback_of_a_refusal_is_rollback_failed() {
+        let e = rolled_back(refusal(), vec!["a file".into()]);
+        assert!(matches!(e, EngineError::RollbackFailed { .. }), "{e}");
     }
 }

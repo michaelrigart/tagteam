@@ -313,13 +313,16 @@ impl Engine {
             },
             req,
             &mut tx,
-            Fallback::Allow(&mut before_fallback),
+            self.fallback(&mut before_fallback),
         ) {
             Ok(stored_in) => {
                 tx.disarm();
                 stored_in
             }
-            Err(cause) => return Err(tx.fail(cause)),
+            Err(cause) => {
+                self.note_refusal(&cause);
+                return Err(tx.fail(cause));
+            }
         };
 
         let warnings = cx.warnings;
