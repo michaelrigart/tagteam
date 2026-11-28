@@ -647,7 +647,19 @@ fn rank(r: &Ranking, oauth: &[Rated]) -> Vec<AccountId> {
             }
         };
         let landing = oauth.iter().filter(|c| c.headroom.is_some_and(usable));
-        return ordered(landing.collect(), most_headroom);
+        if r.cfg.effective_strategy() == AutoStrategy::Best {
+            return ordered(landing.collect(), most_headroom);
+        }
+        // `consume-first` takes the soonest reset only among landings below the threshold, as
+        // its own trigger does (`landing_ok`). The rest go after them by most headroom, which
+        // puts a hard move's full ones last.
+        let (below, rest): (Vec<&Rated>, Vec<&Rated>) = landing.partition(|c| {
+            c.headroom
+                .is_some_and(|h| below_threshold(h, r.cfg.threshold))
+        });
+        let mut targets = ordered(below, soonest_long_reset);
+        targets.extend(ordered(rest, most_headroom));
+        return targets;
     }
     let bar = barred(r.st, &r.active.account.id);
     let ranked = gated(r, oauth, bar);
@@ -702,9 +714,19 @@ fn gated(r: &Ranking, oauth: &[Rated], bar: Option<&AccountId>) -> Vec<AccountId
     let order = match r.trigger {
         Trigger::ConsumeFirst => soonest_long_reset,
         _ if every_above => soonest_recovery,
-        _ => most_headroom,
+        _ => hand_over_order(r.cfg),
     };
     ordered(passing.collect(), order)
+}
+
+/// How targets that qualify on headroom are ordered: `consume-first` spends the quota that
+/// expires first, so it takes the soonest long-window reset, and `best` takes the most headroom.
+/// A `consume-first` strategy without a long window is `best` (`effective_strategy`).
+fn hand_over_order(cfg: &AutoConfig) -> fn(&Rated, &Rated) -> Ordering {
+    match cfg.effective_strategy() {
+        AutoStrategy::ConsumeFirst => soonest_long_reset,
+        AutoStrategy::Best => most_headroom,
+    }
 }
 
 fn ordered(mut ranked: Vec<&Rated>, order: fn(&Rated, &Rated) -> Ordering) -> Vec<AccountId> {
@@ -720,18 +742,25 @@ fn most_headroom(a: &Rated, b: &Rated) -> Ordering {
         .then(a.account.position.cmp(&b.account.position))
 }
 
-/// `consume-first`: the soonest long-window reset first, then most headroom.
+/// `consume-first`: the soonest long-window reset first, an unknown one last, then most
+/// headroom.
 fn soonest_long_reset(a: &Rated, b: &Rated) -> Ordering {
-    a.long_reset
-        .cmp(&b.long_reset)
+    unknown_last(a.long_reset)
+        .cmp(&unknown_last(b.long_reset))
         .then_with(|| most_headroom(a, b))
 }
 
 /// Every account above the threshold: the soonest binding-window recovery first, a past or
 /// unknown one last, then most headroom.
 fn soonest_recovery(a: &Rated, b: &Rated) -> Ordering {
-    let key = |c: &Rated| c.recovery_at.map_or((1, 0), |at| (0, at));
-    key(a).cmp(&key(b)).then_with(|| most_headroom(a, b))
+    unknown_last(a.recovery_at)
+        .cmp(&unknown_last(b.recovery_at))
+        .then_with(|| most_headroom(a, b))
+}
+
+/// The sort key of a time that may be unknown: the soonest first, an unknown one last.
+fn unknown_last(at: Option<i64>) -> (u8, i64) {
+    at.map_or((1, 0), |at| (0, at))
 }
 
 /// §11.2 step 8's exception: every account is above the threshold. Step 4: a way back from an API
@@ -2182,6 +2211,171 @@ mod tests {
                 recheck: true,
             },
             "no hysteresis; an equal, unknown or above-threshold reset is skipped"
+        );
+    }
+
+    /// An OAuth account at `pct` whose 7d window resets in `days` days.
+    fn resets_in(position: u32, pct: f64, days: i64) -> AccountSnapshot {
+        reset(at(position, pct), "7d", Some(NOW + days * 86_400))
+    }
+
+    /// Account 1 is at the ceiling (95), and the candidates are clear. Reset order and headroom
+    /// order differ: 2 resets first and is the fullest, 4 is the emptiest and resets last, and 5
+    /// has no known reset.
+    fn soft_hand_over() -> Snapshot {
+        snap(
+            1,
+            vec![
+                at(1, 96.0),
+                resets_in(2, 80.0, 1),
+                resets_in(3, 40.0, 3),
+                resets_in(4, 10.0, 6),
+                reset(at(5, 20.0), "7d", None),
+            ],
+        )
+    }
+
+    #[test]
+    fn consume_first_hands_a_soft_move_to_the_soonest_reset_and_an_unknown_one_last() {
+        let cfg = AutoConfig {
+            ceiling: 95.0,
+            ..consume_first()
+        };
+        assert_eq!(
+            switched(&run(&soft_hand_over(), &AutoState::default(), &cfg)),
+            (Trigger::AtLimit, vec![2, 3, 4, 5])
+        );
+    }
+
+    #[test]
+    fn consume_first_hands_a_hard_move_to_the_soonest_reset_then_the_full_ones_by_headroom() {
+        let cfg = AutoConfig {
+            ceiling: 95.0,
+            ..consume_first()
+        };
+        let s = snap(
+            1,
+            vec![
+                at(1, 100.0),
+                resets_in(2, 50.0, 3),
+                // Full (at or above 95) but with room: 3 resets first of all and has the least
+                // room, so the headroom order puts 4 before it.
+                reset(at(3, 99.0), "7d", Some(NOW + 3_600)),
+                reset(at(4, 97.0), "7d", Some(NOW + 7_200)),
+                resets_in(5, 85.0, 1),
+            ],
+        );
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &cfg)),
+            (Trigger::AtLimit, vec![5, 2, 4, 3])
+        );
+    }
+
+    #[test]
+    fn consume_first_hands_a_proactive_move_to_the_soonest_reset() {
+        // 1 is between the threshold and the ceiling; every candidate is clear of the
+        // hysteresis and below the threshold.
+        let s = snap(
+            1,
+            vec![
+                at(1, 95.0),
+                resets_in(2, 60.0, 3),
+                resets_in(3, 80.0, 1),
+                resets_in(4, 30.0, 6),
+            ],
+        );
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &consume_first())),
+            (Trigger::Proactive, vec![3, 2, 4])
+        );
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &cfg())),
+            (Trigger::Proactive, vec![4, 2, 3]),
+            "`best` keeps most headroom first"
+        );
+    }
+
+    #[test]
+    fn consume_first_hands_a_failover_to_the_soonest_reset() {
+        let mut dead = at(1, 50.0);
+        dead.quarantined = true;
+        let s = snap(
+            1,
+            vec![
+                dead,
+                resets_in(2, 60.0, 3),
+                resets_in(3, 80.0, 1),
+                resets_in(4, 30.0, 6),
+            ],
+        );
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &consume_first())),
+            (Trigger::Failover, vec![3, 2, 4])
+        );
+    }
+
+    #[test]
+    fn consume_first_without_a_long_window_hands_over_by_most_headroom_as_best_does() {
+        let cfg = AutoConfig {
+            ceiling: 95.0,
+            long_window: None,
+            ..consume_first()
+        };
+        assert_eq!(
+            switched(&run(&soft_hand_over(), &AutoState::default(), &cfg)),
+            (Trigger::AtLimit, vec![4, 5, 3, 2])
+        );
+        // `best` keeps its order with a long window too.
+        let best = AutoConfig {
+            strategy: AutoStrategy::Best,
+            ceiling: 95.0,
+            ..self::cfg()
+        };
+        assert_eq!(
+            switched(&run(&soft_hand_over(), &AutoState::default(), &best)),
+            (Trigger::AtLimit, vec![4, 5, 3, 2])
+        );
+    }
+
+    #[test]
+    fn consume_first_hands_a_hard_move_below_the_threshold_before_a_sooner_reset_above_it() {
+        // The default ceiling of 100: 2 is not full, resets first of all and has 1 point left.
+        let s = snap(
+            1,
+            vec![
+                at(1, 100.0),
+                resets_in(2, 99.0, 1),
+                resets_in(3, 10.0, 3),
+                resets_in(4, 50.0, 2),
+            ],
+        );
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &consume_first())),
+            (Trigger::AtLimit, vec![4, 3, 2])
+        );
+    }
+
+    #[test]
+    fn consume_first_hands_a_soft_move_below_the_threshold_before_a_sooner_reset_above_it() {
+        let cfg = AutoConfig {
+            ceiling: 95.0,
+            ..consume_first()
+        };
+        // 2 and 5 are clear but at or above the threshold (90). They reset before the others,
+        // 2 before 5, and 5 has more headroom.
+        let s = snap(
+            1,
+            vec![
+                at(1, 96.0),
+                resets_in(2, 91.0, 1),
+                resets_in(3, 40.0, 4),
+                resets_in(4, 10.0, 6),
+                resets_in(5, 90.0, 2),
+            ],
+        );
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &cfg)),
+            (Trigger::AtLimit, vec![3, 4, 5, 2])
         );
     }
 

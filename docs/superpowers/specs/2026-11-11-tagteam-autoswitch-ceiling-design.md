@@ -140,7 +140,9 @@ exactly the ceiling: both call it full. Judging headroom as `h ≤ 100 − ceili
   first, as now (`autoswitch.rs:541-547`).
 - **Step 6** is unchanged. `at-limit` and `failover` bypass the cooldown.
 - **Step 8, `proactive` and `consume-first`:** skip full candidates; before, it skipped headroom
-  ≤ 0. The rest is unchanged.
+  ≤ 0. The rest is unchanged. *(Amended by michaelrigart/tagteam#65: under `consume-first`,
+  `proactive` orders its targets by soonest long-window reset, as core §11.2 step 8 states,
+  except when every account is above the threshold.)*
   - **"Spent"** in the every-account-above rule ("within 3 points of headroom") is measured from
     the ceiling: `headroom − (100 − ceiling) ≤ 3` (`SPENT_HEADROOM_PCT`,
     `recovery_axis_useful`, `autoswitch.rs:408-418`). Without this, a ceiling of 97 or lower
@@ -151,6 +153,13 @@ exactly the ceiling: both call it full. Judging headroom as `h ≤ 100 − ceili
   position.
   1. OAuth candidates that are not full.
   2. Full OAuth candidates with room.
+- **Step 8, a soft or a hard move under `consume-first`** *(amended by
+  michaelrigart/tagteam#65)*: the two orders above hold for `best`, and for `consume-first`
+  without a long window. Under `consume-first` the same candidates rank in two tiers.
+  1. The ones below the threshold: soonest long-window reset first, an unknown reset last, then
+     most headroom, ties to the lower position.
+  2. Every other one, most headroom first, ties to the lower position. This keeps a hard move's
+     full candidates last.
 - **No §11.3 bar.** Neither move applies the no-return bar, as `at-limit` and `failover` don't
   today. The margin does its work for soft moves (§3.8).
 - **Steps 9 and 10, API keys:** appended after the OAuth targets on a hard move only. Today
