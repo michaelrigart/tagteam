@@ -191,8 +191,12 @@ pub fn bytes(n: u64) -> String {
 }
 
 /// `ms` in `tz`.
-fn zoned(ms: i64, tz: &TimeZone) -> Option<jiff::Zoned> {
-    Some(Timestamp::from_millisecond(ms).ok()?.to_zoned(tz.clone()))
+fn zoned(ms: i64, tz: &TimeZone) -> Option<jiff::ZonedDateTime> {
+    Some(
+        Timestamp::from_millisecond(ms)
+            .ok()?
+            .to_zoned_datetime(tz.clone()),
+    )
 }
 
 /// `ms` in `tz` as `2026-10-14 09:12`.
@@ -214,7 +218,7 @@ fn span(start_ms: i64, end_ms: i64, tz: &TimeZone, now_ms: i64, level: usize) ->
     else {
         return words::MISSING.to_owned();
     };
-    let date = |z: &jiff::Zoned| {
+    let date = |z: &jiff::ZonedDateTime| {
         if level == 0 && z.year() != now.year() {
             z.strftime("%Y-%m-%d").to_string()
         } else {

@@ -178,7 +178,8 @@ pub(crate) fn axis_row(grid: Grid, days: i64, tz: &TimeZone, theme: Theme) -> Li
 
 /// Each boundary T4-12 labels in `grid`'s range, oldest first, with its label.
 fn boundaries(grid: Grid, days: i64, tz: &TimeZone) -> Vec<(i64, String)> {
-    let date_of = |ms| Timestamp::from_millisecond(ms).map(|t| t.to_zoned(tz.clone()).date());
+    let date_of =
+        |ms| Timestamp::from_millisecond(ms).map(|t| t.to_zoned_datetime(tz.clone()).date());
     let (Ok(first), Ok(last)) = (date_of(grid.since_ms), date_of(grid.now_ms)) else {
         return vec![];
     };
@@ -192,7 +193,7 @@ fn boundaries(grid: Grid, days: i64, tz: &TimeZone) -> Vec<(i64, String)> {
         };
         for hour in hours {
             let at = date.at(hour, 0, 0, 0);
-            let Ok(zoned) = at.to_zoned(tz.clone()) else {
+            let Ok(zoned) = at.to_zoned_datetime(tz.clone()) else {
                 continue;
             };
             let ms = zoned.timestamp().as_millisecond();

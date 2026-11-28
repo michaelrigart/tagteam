@@ -115,7 +115,7 @@ pub(crate) fn said(state: &State, width: u16, now_ms: i64) -> Option<Said> {
 /// §5.3's time form in `tz` (T2-24): `HH:MM` on today's date, `Fri 15:38` within the six days
 /// before or after (a reset to come), else `Oct 12 15:38`.
 pub(crate) fn when(at_ms: i64, now_ms: i64, tz: &TimeZone) -> String {
-    let zoned = |ms| Timestamp::from_millisecond(ms).map(|t| t.to_zoned(tz.clone()));
+    let zoned = |ms| Timestamp::from_millisecond(ms).map(|t| t.to_zoned_datetime(tz.clone()));
     let (Ok(at), Ok(now)) = (zoned(at_ms), zoned(now_ms)) else {
         return MISSING.to_owned();
     };

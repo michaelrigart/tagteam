@@ -360,8 +360,9 @@ impl EventSink for HumanSink<'_> {
 /// Epoch seconds as the local time of day, `HH:MM:SS`; UTC should the zone be unreadable or the
 /// time lie outside the years jiff reads (about ±9999).
 pub fn local_time(epoch_s: i64) -> String {
-    let zoned = jiff::Timestamp::from_second(epoch_s)
-        .map(|ts| ts.to_zoned(jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC)));
+    let zoned = jiff::Timestamp::from_second(epoch_s).map(|ts| {
+        ts.to_zoned_datetime(jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC))
+    });
     let (h, m, s) = match zoned {
         Ok(z) => (
             i64::from(z.hour()),
