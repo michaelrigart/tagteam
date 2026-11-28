@@ -465,7 +465,7 @@ pub(crate) fn row_account(position: u32) -> RowAccount {
 pub(crate) fn day(days_ago: i64) -> PeriodKey {
     let at = jiff::Timestamp::from_millisecond(NOW_MS - days_ago * 24 * HOUR * 1000).unwrap();
     PeriodKey::Day {
-        date: at.to_zoned(TimeZone::UTC).date(),
+        date: at.to_zoned_datetime(TimeZone::UTC).date(),
     }
 }
 

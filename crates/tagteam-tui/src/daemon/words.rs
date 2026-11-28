@@ -228,7 +228,11 @@ pub(crate) fn iso_ms(iso: &str) -> Option<i64> {
 pub(crate) fn clock(ms: i64, tz: &TimeZone) -> String {
     Timestamp::from_millisecond(ms).map_or_else(
         |_| MISSING.to_owned(),
-        |t| t.to_zoned(tz.clone()).strftime("%H:%M").to_string(),
+        |t| {
+            t.to_zoned_datetime(tz.clone())
+                .strftime("%H:%M")
+                .to_string()
+        },
     )
 }
 

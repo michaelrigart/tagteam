@@ -709,7 +709,7 @@ fn local(ms: i64, tz: &TimeZone) -> String {
     jiff::Timestamp::from_millisecond(ms).map_or_else(
         |_| MISSING.to_owned(),
         |t| {
-            t.to_zoned(tz.clone())
+            t.to_zoned_datetime(tz.clone())
                 .strftime("%Y-%m-%d %H:%M")
                 .to_string()
         },

@@ -5,11 +5,10 @@ members = ["crates/*"]
 [workspace.package]
 version = "20261111.1935.0"
 edition = "2024"
-# The minimum supported Rust: the newest dependencies set it (uuid 1.29 and rusqlite 0.41 declare 1.89).
+# The minimum supported Rust: the newest dependencies set it (uuid 1.29 and rusqlite 0.43 declare 1.89).
 rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/michaelrigart/tagteam"
-homepage = "https://github.com/michaelrigart/tagteam"
 readme = "README.md"
 keywords = ["claude", "claude-code", "accounts", "cli", "switcher"]
 categories = ["command-line-utilities", "development-tools"]
@@ -40,7 +39,7 @@ fastrand = "2"
 hex = "0.4"
 # The token report's days and months in a time zone, DST included (token report §3.1): the
 # system zone database, nothing bundled. Pinned exactly, so a newer release is taken on purpose.
-jiff = { version = "=0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+jiff = { version = "=1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 libc = "0.2"
 # The TUI's input thread blocks on the terminal, SIGWINCH and a waker, with no wake-up while idle
 # (TUI redesign spec §14, PERF-R-9): `Poll` and `Waker`, and `SourceFd` for the terminal's fd.
@@ -48,7 +47,7 @@ libc = "0.2"
 # nothing new is built.
 mio = { version = "1.2", features = ["os-poll", "os-ext"] }
 ratatui = "=0.30.2"
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 sha2 = "0.11"

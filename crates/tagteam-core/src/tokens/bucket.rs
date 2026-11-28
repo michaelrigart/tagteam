@@ -3,22 +3,22 @@
 
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
-use jiff::{Timestamp, Zoned};
+use jiff::{Timestamp, ZonedDateTime};
 
 /// `ms` in `tz`, clamped to the range `jiff` represents.
-fn zoned(ms: i64, tz: &TimeZone) -> Zoned {
+fn zoned(ms: i64, tz: &TimeZone) -> ZonedDateTime {
     let at = Timestamp::from_millisecond(ms).unwrap_or(if ms < 0 {
         Timestamp::MIN
     } else {
         Timestamp::MAX
     });
-    at.to_zoned(tz.clone())
+    at.to_zoned_datetime(tz.clone())
 }
 
 /// The first instant of `date` in `tz`: its midnight, or the end of a gap that skips midnight.
 /// Clamped to the range `jiff` represents.
 fn start_of(date: Date, tz: &TimeZone) -> i64 {
-    match date.to_zoned(tz.clone()) {
+    match date.to_zoned_datetime(tz.clone()) {
         Ok(z) => z.timestamp().as_millisecond(),
         Err(_) if date.year() < 1970 => Timestamp::MIN.as_millisecond(),
         Err(_) => Timestamp::MAX.as_millisecond(),

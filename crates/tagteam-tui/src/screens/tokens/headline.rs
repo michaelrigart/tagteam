@@ -128,7 +128,7 @@ fn date_of(ms: i64, tz: &TimeZone) -> Option<Date> {
     Some(
         Timestamp::from_millisecond(ms)
             .ok()?
-            .to_zoned(tz.clone())
+            .to_zoned_datetime(tz.clone())
             .date(),
     )
 }
