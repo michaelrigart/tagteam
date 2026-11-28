@@ -56,7 +56,9 @@ is redundant with `repository`, because both hold the same URL. The fix removes
 falls back to `repository`, so the Homebrew formula's `homepage` line is unchanged (checked by
 generating the formula both ways). `cargo metadata` then reports `homepage: null` for `tagteam`,
 and the next publication to crates.io carries no homepage; its repository link is the same URL.
-The alternative, allowing the lint in a `[lints.cargo]` table, is rejected.
+dist's plan step then warns that the Homebrew job has no homepage, in the release log only,
+while still writing the formula's from `repository`: one warning in release logs in place of
+one on every build. The alternative, allowing the lint in a `[lints.cargo]` table, is rejected.
 
 ### 4.2 cargo-dist 0.34.0
 
