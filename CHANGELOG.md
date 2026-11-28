@@ -35,9 +35,10 @@ with the one before, so any release may contain breaking changes. Each section s
   and for `proactive` and `failover` switches. An account with an unknown reset comes last among
   them. Before, a full account went to the emptiest one, and the `consume-first` check moved
   again after the cooldown. Which accounts qualify has not changed, and `best` is unchanged.
-  Accounts at or above the threshold come after the ones below it, the emptiest first, so
-  accounts at or above the ceiling still come last. When every account is above the threshold,
-  the `proactive` order by recovery time is unchanged.
+  When auto leaves a full account or fails over, accounts at or above the threshold come after
+  the ones below it, the emptiest first, so accounts at or above the ceiling still come last.
+  When every account is above the threshold, the `proactive` order by recovery time is
+  unchanged.
 
 ## [20261111.1935.0] - 2026-11-11
 

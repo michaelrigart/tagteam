@@ -140,7 +140,9 @@ exactly the ceiling: both call it full. Judging headroom as `h ≤ 100 − ceili
   first, as now (`autoswitch.rs:541-547`).
 - **Step 6** is unchanged. `at-limit` and `failover` bypass the cooldown.
 - **Step 8, `proactive` and `consume-first`:** skip full candidates; before, it skipped headroom
-  ≤ 0. The rest is unchanged.
+  ≤ 0. The rest is unchanged. *(Amended by michaelrigart/tagteam#65: under `consume-first`,
+  `proactive` orders its targets by soonest long-window reset, as core §11.2 step 8 states,
+  except when every account is above the threshold.)*
   - **"Spent"** in the every-account-above rule ("within 3 points of headroom") is measured from
     the ceiling: `headroom − (100 − ceiling) ≤ 3` (`SPENT_HEADROOM_PCT`,
     `recovery_axis_useful`, `autoswitch.rs:408-418`). Without this, a ceiling of 97 or lower

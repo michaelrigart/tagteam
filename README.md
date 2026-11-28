@@ -188,9 +188,10 @@ seconds and waits 300 seconds between automatic switches. Change these with flag
 the background, without a terminal, use the [daemon](#daemon), which reads the same settings.
 With the `consume-first` strategy, auto moves to the account below the threshold whose long
 window (for Claude Code, the 7-day one) resets soonest, also when it leaves a full account, and
-an account with an unknown reset comes last among them. Accounts at or above the threshold come
-after those, the emptiest first. When every account is above the threshold, a switch away from
-an account that is not yet full still ranks by when each one recovers.
+an account with an unknown reset comes last among them. When auto leaves a full account or one
+it can no longer use, accounts at or above the threshold come after those, the emptiest first.
+When every account is above the threshold, a `proactive` switch, away from an account that is
+above the threshold but still usable and not full, ranks by when each one recovers as before.
 
 Usage can reach an account from places tagteam cannot see, such as the web app or another machine,
 and tagteam reads usage only at intervals, so a reading can already be out of date. To keep auto
