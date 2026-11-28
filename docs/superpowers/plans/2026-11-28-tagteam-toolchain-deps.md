@@ -27,7 +27,7 @@ as the spec's trial on `81507e2a` measured.
   `rustc --version` say 1.89.0 there.
 - Tasks 1 to 6 are one commit each, and the workspace builds with `--locked` after each. Tasks
   1, 2, 3, 4 and 6 run in that order: they share `Cargo.toml`, `Cargo.lock` or
-  `CONTRIBUTING.md`. Task 7 commits nothing; Task 8 commits the records.
+  `CONTRIBUTING.md`. Task 7 commits the records.
 - Editing `mise.toml` (Task 6) makes mise's shims refuse to run in this checkout until Michael
   trusts the file again. Nothing after it may go through a shim: cargo comes from the toolchain
   directory above, and dist and cargo-deny are called by their full paths under
@@ -44,7 +44,6 @@ as the spec's trial on `81507e2a` measured.
 | 5 | none |
 | 6 | 4 |
 | 7 | 5, 6 |
-| 8 | 7 |
 
 ### Task 1: Pin Rust 1.100.1
 
@@ -114,24 +113,20 @@ as the spec's trial on `81507e2a` measured.
 - [ ] `dist generate --check` passes; `dist build --artifacts=global --tag v20261111.1935.0`
   writes a formula whose `homepage` is the repository URL.
 
-### Task 7: Verification
+### Task 7: Pull request, records and verification
 
 **Depends on:** 5, 6
 
-No commit. On the last commit of Tasks 1 to 6:
+The local checks are every line of the spec's §6 that runs locally, with totals: the
+package-name, action and Rust-diff checks included, and the four Rust 1.89 checks of CI's `msrv`
+job in the 1.89.0 subshell. Freshness is not among them: Task 4's result stands, as §6 says.
 
-- [ ] Every line of the spec's §6 that runs locally, with totals, the package-name, action and
-  Rust-diff checks included. Freshness is not repeated: Task 4's result stands, as §6 says.
-- [ ] The four Rust 1.89 checks of CI's `msrv` job, in the 1.89.0 subshell.
-
-### Task 8: Pull request and records
-
-**Depends on:** 7
-
-- [ ] Push the branch and open the Draft PR.
+- [ ] Run the local checks on the last commit of Tasks 1 to 6, then push the branch and open the
+  Draft PR.
 - [ ] One commit sets `**Status:** Implemented` with the PR's URL in the spec and in this plan,
-  and ticks this plan's boxes.
-- [ ] CI is green on that commit, the release workflow's `release-smoke` job included.
-- [ ] If that job fails on the `$/` call: revert Task 6's commit, record cargo-dist as held back
-  in the spec, and put the new head through Task 7 again with dist 0.33.1 (Task 4's freshness
-  result still stands), then through the whole of the PR's CI, the release run included.
+  and ticks this plan's boxes. Push it.
+- [ ] On that commit: the local checks again, and their totals are the ones reported; the PR's
+  head is the same commit; its CI is green, the release workflow's `release-smoke` job included.
+- [ ] If the release workflow fails on a `$/` call, whether `release-smoke` fails to run or
+  GitHub rejects the workflow before any job starts: revert Task 6's commit, record cargo-dist
+  as held back in the spec, push, and repeat the previous step on the new head with dist 0.33.1.
