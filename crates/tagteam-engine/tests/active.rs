@@ -23,7 +23,7 @@ use tagteam_engine::quarantine::QuarantineReason;
 use tagteam_engine::store::Activation;
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::http::Method;
-use tagteam_provider::{Clock, Provider, TransientKind};
+use tagteam_provider::{Clock, Keychain, Provider, TransientKind};
 
 fn bytes(v: &Value) -> Vec<u8> {
     v.to_string().into_bytes()
@@ -525,6 +525,88 @@ fn unpublished_b(fx: &Fx, a: &AccountId, b_expires: i64) {
     fx.kc.put(SERVICE, a.as_str(), &bytes(&b));
     fx.kc
         .put(SERVICE, &format!("{a}.prev"), &cred("a@x.co", "rt-a"));
+}
+
+#[test]
+fn a_refused_publish_is_not_published_and_counted() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    unpublished_b(&fx, &a, fx.clock.now_ms() + 3_600_000);
+    fx.set_keychain_file_fallback(false);
+    let (svc, _) = fx.live_item(ItemKind::OAuth);
+    fx.kc.set_fail_write(&svc, true);
+
+    let out = active(&fx, ActiveTrigger::Expired).unwrap();
+
+    assert_eq!(out, ActiveOutcome::PersistedNotPublished);
+    assert_eq!(fx.engine.fallback_refusals(), 1);
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+    assert!(!fx.paths().credentials_file.exists());
+    assert_eq!(token_requests(&fx), 0);
+}
+
+#[test]
+fn a_refused_probe_sends_no_token_request() {
+    for with_item in [true, false] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        expire_live(&fx);
+        if !with_item {
+            let (svc, acct) = fx.live_item(ItemKind::OAuth);
+            let live = fx.kc.get(&svc, &acct).unwrap();
+            fx.kc.delete(&svc, &acct).unwrap();
+            fs::write(fx.paths().credentials_file, live).unwrap();
+        }
+        fx.set_keychain_file_fallback(false);
+        fx.kc.set_fail_write(SERVICE, true);
+        let vault = fx.vault_bytes(&a);
+
+        let err = active(&fx, ActiveTrigger::Expired).unwrap_err();
+
+        assert_eq!(
+            err.kind(),
+            "keychain-fallback-refused",
+            "{with_item}: {err}"
+        );
+        assert_eq!(token_requests(&fx), 0, "{with_item}");
+        assert_eq!(fx.vault_bytes(&a), vault, "{with_item}");
+        assert_eq!(fx.engine.fallback_refusals(), 1, "{with_item}");
+    }
+}
+
+#[test]
+fn a_refused_probe_stops_the_self_heal_publish_too() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    unpublished_b(&fx, &a, fx.clock.now_ms() + 3_600_000);
+    fx.set_keychain_file_fallback(false);
+    fx.kc.set_fail_write(SERVICE, true);
+    let items = fx.kc.items();
+
+    let err = active(&fx, ActiveTrigger::Expired).unwrap_err();
+
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert_eq!(fx.kc.items(), items);
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+}
+
+#[test]
+fn with_the_default_a_live_refresh_never_probes() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    expire_live(&fx);
+    fx.script_refresh(Some("rt-a2"));
+    fx.kc.set_fail_write(SERVICE, true);
+
+    let out = active(&fx, ActiveTrigger::Expired);
+
+    assert!(
+        !matches!(&out, Err(e) if e.kind() == "keychain-fallback-refused"),
+        "{out:?}"
+    );
+    assert_eq!(token_requests(&fx), 1);
+    assert_eq!(fx.engine.fallback_refusals(), 0);
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
 }
 
 #[test]

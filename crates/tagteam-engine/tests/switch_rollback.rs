@@ -14,6 +14,7 @@ use tagteam_engine::oracle::Oracle;
 use tagteam_engine::store::JournalRow;
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget};
 use tagteam_engine::{Engine, EngineError};
+use tagteam_provider::keychain::Keychain;
 use tagteam_provider::{Credential, Env, Identity, ProcessStamp, Provider, SecretStore};
 
 fn request(fx: &Fx, target: SwitchTarget, force: bool) -> SwitchRequest {
@@ -430,6 +431,7 @@ fn a_rolled_back_fallback_leaves_the_next_switch_on_the_keychain() {
         !fx.paths().credentials_file.exists(),
         "the rollback removed the fallback's file"
     );
+    assert_eq!(fx.engine.fallback_refusals(), 0);
 
     fx.engine.fail_at(None);
     let out = fx.switch_to(&a, false).unwrap();
@@ -439,4 +441,228 @@ fn a_rolled_back_fallback_leaves_the_next_switch_on_the_keychain() {
         !fx.paths().credentials_file.exists(),
         "a Keychain write never creates the file"
     );
+}
+
+#[test]
+fn a_refused_switch_reports_the_refusal_and_not_a_rollback() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.set_keychain_file_fallback(false);
+    let cred_before = fx.live_credential();
+    let journal_before = fx.engine.store().unwrap().journal(&fx.provider()).unwrap();
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert_eq!(fx.live_credential(), cred_before);
+    assert!(!fx.paths().credentials_file.exists());
+    let store = fx.engine.store().unwrap();
+    assert_eq!(store.journal(&fx.provider()).unwrap(), journal_before);
+    assert_eq!(fx.engine.fallback_refusals(), 1);
+}
+
+#[test]
+fn a_switch_from_a_file_login_with_the_setting_off_creates_the_item() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live: b, in the Keychain
+    let (svc, acct) = fx.live_item(ItemKind::OAuth);
+    let live = fx.kc.get(&svc, &acct).unwrap();
+    fx.kc.delete(&svc, &acct).unwrap();
+    std::fs::write(fx.paths().credentials_file, live).unwrap();
+    fx.set_keychain_file_fallback(false);
+
+    let out = fx.switch_to(&a, false).unwrap();
+
+    assert_eq!(out.stored_in, Some(SecretStore::Keychain));
+    assert_eq!(fx.engine.fallback_refusals(), 0);
+}
+
+#[test]
+fn a_fallback_turned_off_after_the_engine_was_built_is_followed() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    std::fs::create_dir_all(fx.env.config_dir()).unwrap();
+    std::fs::write(
+        fx.env.config_dir().join("config.toml"),
+        "[keychain]\nfile_fallback = false\n",
+    )
+    .unwrap();
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert!(!fx.paths().credentials_file.exists());
+}
+
+#[test]
+fn a_config_broken_after_the_fallback_was_turned_off_still_refuses() {
+    for broken in ["[keychain\nfile_fallback = false\n", "x = = 1\n"] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        fx.add("b@x.co", "rt-b");
+        fx.set_keychain_file_fallback(false);
+        std::fs::write(fx.env.config_dir().join("config.toml"), broken).unwrap();
+        fx.kc
+            .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+
+        let err = fx.switch_to(&a, false).unwrap_err();
+
+        assert_unreadable_refusal(&fx, &err);
+    }
+}
+
+fn write_config(fx: &Fx, text: &str) {
+    std::fs::create_dir_all(fx.env.config_dir()).unwrap();
+    std::fs::write(fx.env.config_dir().join("config.toml"), text).unwrap();
+}
+
+fn assert_unreadable_refusal(fx: &Fx, err: &EngineError) {
+    let path = fx.env.config_dir().join("config.toml");
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "the Keychain refused a write and `keychain.file_fallback` cannot be read from {}, so the credential was not stored; repair that file, or run tagteam from the desktop login session",
+            path.display()
+        )
+    );
+    assert!(!fx.paths().credentials_file.exists());
+}
+
+#[test]
+fn a_config_broken_then_reloaded_still_refuses() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.set_keychain_file_fallback(false);
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+    let first = fx.switch_to(&a, false).unwrap_err();
+    assert_eq!(first.kind(), "keychain-fallback-refused", "{first}");
+    write_config(&fx, "x = = 1\n");
+    assert_eq!(fx.engine.reload_settings(&fx.provider()).len(), 1);
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_unreadable_refusal(&fx, &err);
+}
+
+#[test]
+fn a_fallback_turned_off_after_start_then_broken_still_refuses() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    write_config(&fx, "[keychain]\nfile_fallback = false\n");
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+    let first = fx.switch_to(&a, false).unwrap_err();
+    assert_eq!(first.kind(), "keychain-fallback-refused", "{first}");
+    write_config(&fx, "[keychain\nfile_fallback = false\n");
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_unreadable_refusal(&fx, &err);
+}
+
+#[test]
+fn an_invalid_value_refuses_and_names_the_config() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.set_keychain_file_fallback(false);
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+    let first = fx.switch_to(&a, false).unwrap_err();
+    assert_eq!(first.kind(), "keychain-fallback-refused", "{first}");
+    write_config(&fx, "[keychain]\nfile_fallback = 2\n");
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_unreadable_refusal(&fx, &err);
+}
+
+#[test]
+fn a_keychain_entry_that_is_not_a_table_refuses_and_names_the_config() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.set_keychain_file_fallback(false);
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+    let first = fx.switch_to(&a, false).unwrap_err();
+    assert_eq!(first.kind(), "keychain-fallback-refused", "{first}");
+    write_config(&fx, "keychain = false\n");
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_unreadable_refusal(&fx, &err);
+}
+
+#[test]
+fn a_broken_config_refuses_even_when_the_fallback_was_never_turned_off() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    write_config(&fx, "x = = 1\n");
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_unreadable_refusal(&fx, &err);
+    assert_eq!(fx.engine.fallback_refusals(), 1);
+}
+
+#[test]
+fn a_broken_config_changes_nothing_when_the_keychain_takes_the_write() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    write_config(&fx, "x = = 1\n");
+
+    let out = fx.switch_to(&a, false).unwrap();
+
+    assert_eq!(out.stored_in, Some(SecretStore::Keychain));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+    assert!(!fx.paths().credentials_file.exists());
+    assert_eq!(fx.engine.fallback_refusals(), 0);
+}
+
+#[test]
+fn a_repaired_config_allows_the_fallback_again() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    write_config(&fx, "x = = 1\n");
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+    let first = fx.switch_to(&a, false).unwrap_err();
+    assert_unreadable_refusal(&fx, &first);
+    write_config(&fx, "[autoswitch]\nthreshold = 80\n");
+
+    let out = fx.switch_to(&a, false).unwrap();
+
+    assert!(matches!(out.stored_in, Some(SecretStore::Fallback(_))));
+}
+
+#[test]
+fn a_missing_config_allows_the_fallback() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.set_keychain_file_fallback(false);
+    std::fs::remove_file(fx.env.config_dir().join("config.toml")).unwrap();
+    fx.kc
+        .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+
+    let out = fx.switch_to(&a, false).unwrap();
+
+    assert!(matches!(out.stored_in, Some(SecretStore::Fallback(_))));
 }

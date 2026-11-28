@@ -1,7 +1,7 @@
 use tagteam_core::{AccountId, OutgoingAction, OutgoingClass, OutgoingFacts, decide_outgoing};
 use tagteam_provider::{
-    BeforeFallback, DoomedEntry, Identity, LiveAuth, LiveChange, LiveLocks, MutationGuard,
-    ProcessStamp, Provider, Read, ReadError, SecretStore, StoredLogin,
+    DoomedEntry, Fallback, Identity, LiveAuth, LiveChange, LiveLocks, MutationGuard, ProcessStamp,
+    Provider, Read, ReadError, SecretStore, StoredLogin,
 };
 
 use crate::account_lock::AccountLock;
@@ -49,6 +49,14 @@ pub(super) struct LockedSwitch<'a, 'g> {
     pub(super) account_locks: &'a [AccountLock],
     pub(super) locks: &'a LiveLocks<'g>,
     pub(super) memo: &'a VaultMemo<'a>,
+}
+
+/// The account lock a switch holds on `target`.
+fn locked_target<'a>(ls: &LockedSwitch<'a, '_>, target: &AccountRow) -> &'a AccountLock {
+    ls.account_locks
+        .iter()
+        .find(|l| l.id() == &target.id)
+        .expect("the target is locked")
 }
 
 /// The rows `rederive` locked and what `preflight` read under the locks.
@@ -260,6 +268,7 @@ impl Engine {
     ) -> Result<SwitchOutcome, EngineError> {
         let provider = &req.provider;
         let mut pf = self.preflight(p, locked, ls)?;
+        self.probe_keychain_write(locked_target(ls, &pf.target))?;
         self.settle_pre(p, ls, &pf.target)?;
 
         let mut warnings = plan.notes.clone();
@@ -304,6 +313,7 @@ impl Engine {
             identity: pf.target_identity.clone(),
         };
         let mut before_fallback = |bytes: &[u8]| cx.before_fallback(self, bytes);
+        let setting = self.file_fallback();
         let stored_in = match self.apply(
             p,
             ApplyStep {
@@ -313,13 +323,17 @@ impl Engine {
             },
             req,
             &mut tx,
-            &mut before_fallback,
+            setting.policy(&mut before_fallback),
         ) {
             Ok(stored_in) => {
                 tx.disarm();
                 stored_in
             }
-            Err(cause) => return Err(tx.fail(cause)),
+            Err(cause) => {
+                let cause = self.refusal(setting, cause);
+                self.note_refusal(&cause);
+                return Err(tx.fail(cause));
+            }
         };
 
         let warnings = cx.warnings;
@@ -370,11 +384,7 @@ impl Engine {
         // is written, so neither branch below reads the spent generation (§9.4 steps 2 and 5).
         // A rescue that cannot be read or adopted refuses the switch before its journal row
         // exists, so there is nothing to roll back.
-        let target_lock = ls
-            .account_locks
-            .iter()
-            .find(|l| l.id() == &target.id)
-            .expect("the target is locked");
+        let target_lock = locked_target(ls, target);
         self.settle_rescues(p, target, target_lock)?;
         // §9.2 lazy capture, after the rescues and before either branch reads the target's
         // vault: a rotation the profile holds is the generation composed and written below. A
@@ -665,7 +675,7 @@ impl Engine {
         step: ApplyStep<'_>,
         req: &SwitchRequest,
         tx: &mut Rollback<'a, '_>,
-        before_fallback: BeforeFallback<'_>,
+        fallback: Fallback<'_>,
     ) -> Result<SecretStore, EngineError> {
         let ApplyStep {
             target,
@@ -678,7 +688,7 @@ impl Engine {
         // cancellation point, and neither is its rollback's.
         let env = self.critical_env();
         let stored_in = tx.write(|| {
-            p.write_credential(&env, locks, target_login, before_fallback)
+            p.write_credential(&env, locks, target_login, fallback)
                 .map(|w| (w.undo, w.stored_in))
         })?;
         hooks::point(self, "after-credential")?;

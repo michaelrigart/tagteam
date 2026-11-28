@@ -801,6 +801,7 @@ source}], unknown: [key]}`; `get` returns `{schemaVersion, key, provider, value,
 | `daemon.autoswitch` | true | bool | yes |
 | `notify.enabled` | true | bool | — |
 | `notify.events` | `["switch","quarantine","limit"]` | a list of `switch`, `quarantine` and `limit`; duplicates collapse; `''` is the empty list | yes |
+| `keychain.file_fallback` | true | bool; false, or a settings file that cannot be read, makes a credential write the macOS Keychain refuses fail instead of falling back to the file *(amended by the [keychain-fallback spec](2026-11-27-tagteam-keychain-fallback-setting-design.md) §3.1)* | — |
 
 The `daemon.*` and `notify.*` keys are the daemon's (daemon spec D7). `daemon.autoswitch` set
 to false pauses the daemon's auto-switching for a provider, and that of an open TUI too. It does
@@ -3103,6 +3104,11 @@ for a check that is not a provider's, and `fix` is null when there is nothing to
   - an item under a former fallback name of the home doctor runs in (Appendix A.2): the
     unsuffixed item when `CLAUDE_CONFIG_DIR` names the default home, or the item named from a
     symlinked config dir's target → info, naming the command that deletes it
+  - `keychain.file_fallback` off, or a settings file that cannot be read, on macOS only: `.credentials.json` holding a login, or
+    `primaryApiKey` a key → warn, naming each file and saying that the setting stops new
+    fallbacks and removes nothing, with no fix; neither → ok; a file that cannot be read, so
+    that whether it holds one cannot be told → warn, with a fix that makes it readable. With
+    the default there is no such check. *(Amended by the [keychain-fallback spec](2026-11-27-tagteam-keychain-fallback-setting-design.md) §3.9.)*
 - **Environment.** The variables doctor runs with, which a `claude` started from the same
   shell inherits:
   - `CLAUDE_CONFIG_DIR` set but empty, or set to a spelling of the default home: CC 2.1.286
@@ -3747,6 +3753,12 @@ since 2.1.283.
     stays pinned until the operation that fell back (one switch or one recovery) ends, so its
     later writes go to the file too, and a rollback clears the pin. The next operation tries
     the Keychain again, which matters for a long-lived process such as `auto` or the daemon.
+    *(Amended by the [keychain-fallback spec](2026-11-27-tagteam-keychain-fallback-setting-design.md)
+    §3.3.)* With `keychain.file_fallback` false the fallback is refused: a write the Keychain
+    refuses fails with `keychain-fallback-refused` before any file is written, any item deleted
+    or any pin set. Before a switch, a live-token refresh or a stored account's refresh, the
+    engine rewrites the account's vault item with its own bytes and refuses there if that
+    fails (§3.4). Linux is unchanged.
 - **Vault reads on macOS.** The Keychain is primary. A Linux-style file vault is never used on
   macOS; the fallback for a failed vault write is `rescue/` (§6.3).
 

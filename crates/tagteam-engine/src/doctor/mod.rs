@@ -20,6 +20,7 @@ use tagteam_provider::{Check, CheckStatus, LockState, Provider};
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::service::ServiceKind;
+use crate::settings::FileFallback;
 use crate::store::{AccountRow, Store};
 
 mod accounts;
@@ -161,7 +162,12 @@ impl Engine {
             run.mappings(p.as_ref());
             self.check_cancel()?;
             let id = p.id();
-            for check in p.doctor_checks(&self.env, self.spawner.as_ref(), self.cancel()) {
+            for check in p.doctor_checks(
+                &self.env,
+                self.spawner.as_ref(),
+                self.cancel(),
+                self.file_fallback() == FileFallback::Allowed,
+            ) {
                 run.push(Some(&id), check);
             }
             self.check_cancel()?;

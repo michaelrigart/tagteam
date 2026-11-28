@@ -1,8 +1,9 @@
 //! D4.1: the keychain backoff. A provider run whose secret reads ended locked, with none
 //! answered, moves the provider's next run later: 60 s, doubling with each such run to at most
-//! 15 min. A run with any answered read ends it. A run that made no counted read (nothing was
-//! due, or every item was absent) changes nothing. It is not a mode (D4.3), and it carries
-//! over a mode change, since the keychain is no less locked.
+//! 15 min. A run the engine refused, under `keychain.file_fallback = false`, does the same
+//! whatever its reads were. A run with any answered read, and no refusal, ends it. A run that
+//! made no counted read (nothing was due, or every item was absent) changes nothing. It is not
+//! a mode (D4.3), and it carries over a mode change, since the keychain is no less locked.
 
 use tagteam_core::time::ms_to_s_ceil;
 use tagteam_provider::keychain::ReadTally;
@@ -30,16 +31,18 @@ impl KeychainBackoff {
         Self::default()
     }
 
-    /// After a run that made `reads` (D4.1): `Some(delay_ms)` while backing off, `None` when
-    /// this run ended the backoff or none was ever started.
-    pub fn after_run(&mut self, reads: ReadTally, now_ms: i64) -> Option<i64> {
-        if reads.answered > 0 {
+    /// After a run that made `reads`, and was `refused` when the engine refused a write in it
+    /// (D4.1): `Some(delay_ms)` while backing off, `None` when this run ended the backoff or
+    /// none was ever started. A refused run counts as a locked one, whatever its reads were.
+    pub fn after_run(&mut self, reads: ReadTally, refused: bool, now_ms: i64) -> Option<i64> {
+        if refused {
+            self.level = self.level.saturating_add(1);
+        } else if reads.answered > 0 {
             self.level = 0;
             self.until_ms = None;
             self.delay_ms = 0;
             return None;
-        }
-        if reads.looks_locked() {
+        } else if reads.looks_locked() {
             self.level = self.level.saturating_add(1);
         }
         if self.level == 0 {
@@ -92,7 +95,7 @@ mod tests {
         let mut now = NOW;
         let mut delays = Vec::new();
         for _ in 0..7 {
-            let delay = b.after_run(locked(), now).expect("backing off");
+            let delay = b.after_run(locked(), false, now).expect("backing off");
             assert_eq!(
                 b.current(),
                 Some(Backoff {
@@ -110,11 +113,11 @@ mod tests {
     #[test]
     fn an_answered_read_ends_it_and_a_run_without_counted_reads_leaves_it_as_it_was() {
         let mut b = KeychainBackoff::new();
-        b.after_run(locked(), NOW);
-        assert_eq!(b.after_run(locked(), NOW + 60_000), Some(120_000));
+        b.after_run(locked(), false, NOW);
+        assert_eq!(b.after_run(locked(), false, NOW + 60_000), Some(120_000));
         // Nothing was due, or every item was absent: the level holds, from now.
         assert_eq!(
-            b.after_run(ReadTally::default(), NOW + 180_000),
+            b.after_run(ReadTally::default(), false, NOW + 180_000),
             Some(120_000)
         );
         assert_eq!(
@@ -128,19 +131,81 @@ mod tests {
             answered: 1,
             locked: 3,
         };
-        assert_eq!(b.after_run(mixed, NOW + 300_000), None);
+        assert_eq!(b.after_run(mixed, false, NOW + 300_000), None);
         assert_eq!(
             (b.current(), b.until_ms(), b.wait_ms(NOW)),
             (None, None, None)
         );
         // The next locked run starts again from 60 s.
-        assert_eq!(b.after_run(locked(), NOW + 360_000), Some(60_000));
+        assert_eq!(b.after_run(locked(), false, NOW + 360_000), Some(60_000));
+    }
+
+    #[test]
+    fn a_refused_run_backs_off_even_when_its_reads_were_answered() {
+        let mut b = KeychainBackoff::new();
+        let answered = ReadTally {
+            answered: 2,
+            locked: 0,
+        };
+        assert_eq!(b.after_run(answered, true, NOW), Some(60_000));
+        assert_eq!(
+            b.current(),
+            Some(Backoff {
+                until: (NOW + 60_000) / 1000
+            })
+        );
+        assert_eq!(b.after_run(ReadTally::default(), true, NOW), Some(120_000));
+    }
+
+    #[test]
+    fn a_second_refused_run_doubles_the_delay() {
+        let mut b = KeychainBackoff::new();
+        assert_eq!(b.after_run(locked(), false, NOW), Some(60_000));
+        assert_eq!(b.after_run(locked(), true, NOW + 60_000), Some(120_000));
+        assert_eq!(
+            b.after_run(ReadTally::default(), true, NOW + 180_000),
+            Some(240_000)
+        );
+    }
+
+    #[test]
+    fn a_run_without_a_refusal_and_with_an_answered_read_ends_it() {
+        let mut b = KeychainBackoff::new();
+        b.after_run(ReadTally::default(), true, NOW);
+        assert_eq!(
+            b.after_run(ReadTally::default(), true, NOW + 60_000),
+            Some(120_000)
+        );
+        let answered = ReadTally {
+            answered: 1,
+            locked: 0,
+        };
+        assert_eq!(b.after_run(answered, false, NOW + 180_000), None);
+        assert_eq!(
+            (b.current(), b.until_ms(), b.wait_ms(NOW)),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn refused_runs_stop_doubling_at_fifteen_minutes() {
+        let mut b = KeychainBackoff::new();
+        let mut now = NOW;
+        let mut delays = Vec::new();
+        for _ in 0..7 {
+            let delay = b
+                .after_run(ReadTally::default(), true, now)
+                .expect("backing off");
+            delays.push(delay / 1000);
+            now += delay;
+        }
+        assert_eq!(delays, [60, 120, 240, 480, 900, 900, 900]);
     }
 
     #[test]
     fn the_wait_left_never_exceeds_the_delay_whatever_the_clock_does() {
         let mut b = KeychainBackoff::new();
-        b.after_run(locked(), NOW);
+        b.after_run(locked(), false, NOW);
         assert_eq!(b.wait_ms(NOW + 20_000), Some(40_000));
         assert_eq!(b.wait_ms(NOW + 60_000), Some(0));
         assert_eq!(b.wait_ms(NOW + 90_000), Some(0));
@@ -162,7 +227,7 @@ mod tests {
                 locked: 1,
             },
         ] {
-            assert_eq!(b.after_run(reads, NOW), None, "{reads:?}");
+            assert_eq!(b.after_run(reads, false, NOW), None, "{reads:?}");
             assert_eq!(b.current(), None);
         }
     }

@@ -450,6 +450,7 @@ impl<'e> ProviderJob<'e> {
         self.last_tick_at = Some(ms_to_s(now));
         // D4.1: every secret read the run makes, whether it collects, freshens or switches.
         let before = self.reads();
+        let refusals = self.engine.fallback_refusals();
         let worked = if self.mode == Some(Mode::Auto) {
             self.tick(cx)
         } else {
@@ -459,9 +460,10 @@ impl<'e> ProviderJob<'e> {
             return Ran::Stop(StopReason::Signal);
         };
         let reads = self.reads().since(before);
+        let refused = self.engine.fallback_refusals() > refusals;
         self.after_run_notices(cx, worked.switched);
         let now = self.engine.now_ms();
-        let delay_ms = match self.backoff.after_run(reads, now) {
+        let delay_ms = match self.backoff.after_run(reads, refused, now) {
             Some(backoff_ms) => worked.delay_ms.max(backoff_ms),
             None => worked.delay_ms,
         };
@@ -1711,6 +1713,8 @@ mod tests {
 
 #[cfg(test)]
 mod backoff_tests {
+    use tagteam_cc::{ItemKind, keychain_service};
+    use tagteam_engine::EventKind;
     use tagteam_engine::vault::SERVICE;
     use tagteam_provider::{Clock, Keychain};
 
@@ -1961,5 +1965,98 @@ mod backoff_tests {
         assert_eq!(fetch_errors(&events, 1), ["keychain-unavailable"]);
         let s = status(&board, &cc());
         assert_eq!((s.backoff, s.next_tick_at), (None, Some(T0 + 60)));
+    }
+
+    /// `a` at 10 % and the live `b` at 95 % of the long window, both read at `T0` and next
+    /// due at `T0 + 300`: every tick before then decides to switch to `a`.
+    fn due_to_switch(fx: &Fx) {
+        let (a, b) = two(fx);
+        fx.read(&a, 10.0, 10.0, T0, T0 + 300);
+        fx.read(&b, 20.0, 95.0, T0, T0 + 300);
+    }
+
+    fn switch_failures(fx: &Fx) -> usize {
+        fx.engine
+            .store()
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == EventKind::SwitchFailed)
+            .count()
+    }
+
+    #[test]
+    fn a_refused_auto_tick_delays_the_next_run_by_the_backoff() {
+        // Spec §3.6: a refusal reaches the job only through the engine's count. The tick
+        // decides a switch, the probe refuses it, and the run counts as a locked one: 60 s,
+        // doubling. The second refusal names the same target and message, so it adds no
+        // `switch-failed` event inside 30 minutes.
+        let fx = Fx::new();
+        due_to_switch(&fx);
+        fx.settings("[keychain]\nfile_fallback = false\n", 1);
+        fx.kc.set_fail_write(SERVICE, true);
+        let board = board();
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        let mut job = ProviderJob::new(&fx.engine, cc(), job_ctx(&board));
+        job.run(&mut cx);
+        let s = status(&board, &cc());
+        assert_eq!(
+            s.last_outcome.map(|o| o.kind),
+            Some(OutcomeKind::Error),
+            "the tick was refused"
+        );
+        assert_eq!(s.backoff, Some(Backoff { until: T0 + 60 }));
+        assert_eq!(s.next_tick_at, Some(T0 + 60));
+        assert_eq!(fx.engine.fallback_refusals(), 1);
+        assert_eq!(switch_failures(&fx), 1);
+        fx.clock.advance_ms(60_000);
+        job.run(&mut cx);
+        let s = status(&board, &cc());
+        assert_eq!(s.backoff, Some(Backoff { until: T0 + 180 }));
+        assert_eq!(s.next_tick_at, Some(T0 + 180));
+        assert_eq!(fx.engine.fallback_refusals(), 2);
+        assert_eq!(switch_failures(&fx), 1, "the quiet period holds");
+    }
+
+    #[test]
+    fn a_setting_flipped_back_ends_the_refusals_at_the_next_run() {
+        // Review Focus 4: the engine reads the setting fresh, so a run after the edit writes
+        // as before. Claude Code's own item refuses, so the write falls back to the file, and
+        // the run that switched is not refused and its answered reads end the backoff.
+        let fx = Fx::new();
+        due_to_switch(&fx);
+        fx.settings("[keychain]\nfile_fallback = false\n", 1);
+        fx.kc.set_fail_write(SERVICE, true);
+        let board = board();
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        let mut job = ProviderJob::new(&fx.engine, cc(), counted(&fx, &board));
+        job.run(&mut cx);
+        assert_eq!(
+            status(&board, &cc()).backoff,
+            Some(Backoff { until: T0 + 60 })
+        );
+        fx.settings("[keychain]\nfile_fallback = true\n", 2);
+        fx.kc.set_fail_write(SERVICE, false);
+        fx.kc
+            .set_fail_write(&keychain_service(&fx.env, ItemKind::OAuth), true);
+        fx.clock.advance_ms(60_000);
+        job.run(&mut cx);
+        let s = status(&board, &cc());
+        assert_eq!(s.last_outcome.map(|o| o.kind), Some(OutcomeKind::Switch));
+        assert_eq!(s.backoff, None);
+        assert_eq!(fx.engine.fallback_refusals(), 1);
     }
 }

@@ -381,6 +381,23 @@ set to absolute paths. Directories are created lazily with mode 0700.
   `tagteam`, an item per account plus one for its previous generation), accessed only through
   `/usr/bin/security`. On Linux it is `vault/<id>.json` and `<id>.prev.json`, mode 0600 in a
   0700 directory. The store holds metadata only, never a credential.
+- **The Keychain fallback.** On macOS, when the Keychain refuses a write of Claude Code's login
+  or API key, tagteam stores it in plain text instead: a login in `.credentials.json`, an API
+  key in `primaryApiKey` of `~/.claude.json`. Claude Code does the same, and the default,
+  `keychain.file_fallback` `true`, mirrors it. With
+  `tagteam config set keychain.file_fallback false` such a write fails with the error kind
+  `keychain-fallback-refused`: the refused write stores nothing in plain text and deletes
+  nothing. Before a switch, a live-token refresh or a stored account's refresh, tagteam
+  rewrites the account's own `tagteam` Keychain item with its own bytes, and stops there if
+  that fails, before anything is saved or a token is spent. The setting is global, tagteam
+  reads it at each write, so an edit applies with no restart, and Linux ignores it. A
+  `config.toml` that cannot be read counts as off. The daemon backs off after a refusal, from
+  1 minute up to 15. It does not cover session profiles (next
+  item), apart from this: a `tagteam run` that needs a stored token that is due is refused in a
+  session that cannot write the Keychain. Nor does it cover a plain-text login already on
+  disk; while it is off, `tagteam doctor` runs the check `cc.keychain-fallback` and warns
+  about such a login. A refusal means tagteam ran where the Keychain cannot be written, such
+  as over SSH: run it from the desktop login session, or set the setting back to `true`.
 - **Session profiles** used by `tagteam run` hold their account's credential the way Claude
   Code keeps it. tagteam writes `sessions/<id>/.credentials.json` (mode 0600); on macOS,
   Claude Code moves it into its own Keychain item, `Claude Code-credentials-<hash>`, on its

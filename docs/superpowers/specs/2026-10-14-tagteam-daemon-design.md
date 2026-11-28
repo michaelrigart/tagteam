@@ -158,7 +158,11 @@ The scheduler never waits on a socket client or on a notification.
      collects, freshens or switches. The job then backs off (D4.3): its next run is 60 s
      later, doubling with each such run to at most 15 min. A run with any answered secret read
      ends the backoff. A run whose secret reads were all absent, or that made none, changes
-     nothing. Linux has no Keychain, so it never backs off for one.
+     nothing. Linux has no Keychain, so it never backs off for one. *(Amended by the Keychain
+     fallback spec [§3.6](2026-11-27-tagteam-keychain-fallback-setting-design.md): a run in
+     which the engine refused a write under `keychain.file_fallback = false` backs the job off
+     in the same way, whatever its reads were; the job compares the engine's count of refusals
+     before and after the run. A run without a refusal is judged by its reads as above.)*
 4. **The store.** With no store yet, every provider job is `idle` until one appears. A store
    whose schema is newer than this build (§6.1) is not an exit: a service would restart the same
    binary into the same refusal. The daemon logs it at ERROR once, every provider job waits

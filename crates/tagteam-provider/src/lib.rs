@@ -92,7 +92,7 @@ pub use profile::{
 pub use provider::ValidateRequest;
 pub use provider::{
     BeforeFallback, Capabilities, CapturedLogin, CredLocks, DeadReason, DoomedEntry, EntryKind,
-    Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks,
+    Fallback, Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks,
     MergeReport, MustShare, Provider, ProviderError, RefreshResult, SecretStore, SessionEnv,
     SharePolicy, StoredLogin, TransientKind, Undo, UsageResult, Validity, Written,
 };

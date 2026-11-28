@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::{
     API_KEY, FakeFx, Fx, OTHER_API_KEY, STRAY_API_KEY, capture_logs, credential,
-    mutation_lock_free, token_requests, usage_fixture,
+    mutation_lock_free, rescue_files, token_requests, usage_fixture,
 };
 use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
@@ -188,6 +188,68 @@ fn an_unmanaged_live_login_is_a_noop_unless_forced() {
     assert!(out.switched);
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
     assert_eq!(displaced_files(&fx), 1);
+}
+
+#[test]
+fn a_refused_probe_stops_a_switch_before_anything_is_saved() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.login("stranger@x.co", "rt-s");
+    fx.set_keychain_file_fallback(false);
+    fx.kc.set_fail_write(SERVICE, true);
+    let items = fx.kc.items();
+    let live = fx.live_credential();
+    let store = fx.engine.store().unwrap();
+    let journal = store.journal(&fx.provider()).unwrap();
+
+    let err = switch(&fx, to(&a), true).unwrap_err();
+
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert!(fx.displaced().is_empty());
+    assert_eq!(rescue_files(&fx), 0);
+    assert_eq!(fx.kc.items(), items);
+    assert_eq!(fx.live_credential(), live);
+    assert_eq!(store.journal(&fx.provider()).unwrap(), journal);
+    assert_eq!(fx.engine.fallback_refusals(), 1);
+}
+
+#[test]
+fn a_refused_probe_under_a_broken_config_names_the_config() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.login("stranger@x.co", "rt-s");
+    std::fs::create_dir_all(fx.env.config_dir()).unwrap();
+    std::fs::write(fx.env.config_dir().join("config.toml"), "x = = 1\n").unwrap();
+    fx.kc.set_fail_write(SERVICE, true);
+    let items = fx.kc.items();
+
+    let err = switch(&fx, to(&a), true).unwrap_err();
+
+    assert_eq!(err.kind(), "keychain-fallback-refused", "{err}");
+    assert!(
+        err.to_string().contains(&format!(
+            "cannot be read from {}",
+            fx.env.config_dir().join("config.toml").display()
+        )),
+        "{err}"
+    );
+    assert!(fx.displaced().is_empty());
+    assert_eq!(fx.kc.items(), items);
+    assert_eq!(fx.engine.fallback_refusals(), 1);
+}
+
+#[test]
+fn with_the_default_a_switch_never_probes() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.kc.set_fail_write(SERVICE, true);
+
+    let out = switch(&fx, to(&a), false).unwrap();
+
+    assert!(out.switched);
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+    assert_eq!(fx.engine.fallback_refusals(), 0);
 }
 
 #[test]

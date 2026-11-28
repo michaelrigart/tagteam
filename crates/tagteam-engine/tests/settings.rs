@@ -123,6 +123,9 @@ autoswitch = false
 [notify]
 enabled = false
 events = ["limit", "switch"]
+
+[keychain]
+file_fallback = false
 "#,
     );
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -162,6 +165,7 @@ events = ["limit", "switch"]
             daemon_autoswitch: false,
             notify_enabled: false,
             notify_events: vec![NotifyEvent::Limit, NotifyEvent::Switch],
+            keychain_file_fallback: false,
         }
     );
 }
@@ -1199,6 +1203,7 @@ fn the_registry_is_section_six_four_s_table_in_order() {
             ("daemon.autoswitch", Shape::Other(KeyKind::Bool), true),
             ("notify.enabled", Shape::Other(KeyKind::Bool), false),
             ("notify.events", Shape::Other(KeyKind::NotifyEvents), true),
+            ("keychain.file_fallback", Shape::Other(KeyKind::Bool), false),
         ]
     );
 }
@@ -1327,6 +1332,7 @@ fn every_key_reads_back_its_default_from_the_settings() {
             ("daemon.autoswitch", Value::Bool(true)),
             ("notify.enabled", Value::Bool(true)),
             ("notify.events", list(&["switch", "quarantine", "limit"])),
+            ("keychain.file_fallback", Value::Bool(true)),
         ]
     );
 }
@@ -1974,7 +1980,7 @@ fn every_refusal_says_what_the_value_must_be() {
 }
 
 /// One command-line sample per registry key, in the registry's order.
-const SAMPLES: [(&str, &str); 19] = [
+const SAMPLES: [(&str, &str); 20] = [
     ("default_provider", "fake-agent"),
     ("autoswitch.threshold", "75.5"),
     ("autoswitch.ceiling", "97.5"),
@@ -1994,6 +2000,7 @@ const SAMPLES: [(&str, &str); 19] = [
     ("daemon.autoswitch", "no"),
     ("notify.enabled", "0"),
     ("notify.events", "limit, switch"),
+    ("keychain.file_fallback", "no"),
 ];
 
 /// A `config.toml` holding `value` at `key`'s global spot, written as `Value::to_item` stores it.
@@ -2820,4 +2827,37 @@ fn mapping_keys_are_known_and_a_top_level_mappings_table_is_not() {
     );
     let with_top = format!("{known}\n[mappings]\n\"/x\" = \"a\"\n");
     assert_eq!(inspect_as(&with_top, PROVIDER).unknown, ["mappings./x"]);
+}
+
+#[test]
+fn keychain_file_fallback_defaults_to_true_and_reads_every_boolean_spelling() {
+    let (s, warnings) = load("");
+    assert!(s.keychain_file_fallback);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    for text in ["false", "\"false\"", "0"] {
+        let (s, warnings) = load(&format!("[keychain]\nfile_fallback = {text}\n"));
+        assert!(!s.keychain_file_fallback, "{text}");
+        assert!(warnings.is_empty(), "{text}: {warnings:?}");
+    }
+    let (s, warnings) = load("[keychain]\nfile_fallback = \"maybe\"\n");
+    assert!(s.keychain_file_fallback);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("`keychain.file_fallback`"),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn keychain_file_fallback_is_refused_in_a_provider_table() {
+    let cc = ProviderId::new(PROVIDER);
+    for (name, flag) in [
+        ("provider.claude-code.keychain.file_fallback", None),
+        ("keychain.file_fallback", Some(&cc)),
+    ] {
+        assert!(
+            matches!(resolve(name, flag), Err(SettingsError::NotPerProvider(k)) if k == "keychain.file_fallback"),
+            "{name}"
+        );
+    }
 }

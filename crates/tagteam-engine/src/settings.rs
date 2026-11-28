@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use tagteam_core::autoswitch::AutoStrategy;
 use tagteam_core::tokens::{CardOverride, PriceOverride};
 use tagteam_core::{ProviderId, str_enum};
-use tagteam_provider::{Env, LockError};
+use tagteam_provider::{BeforeFallback, Env, Fallback, LockError};
 use toml_edit::{DocumentMut, Item, TableLike};
 
 pub const DEFAULT_THRESHOLD: f64 = 90.0;
@@ -223,6 +223,7 @@ pub(crate) enum KeyId {
     DaemonAutoswitch,
     NotifyEnabled,
     NotifyEvents,
+    KeychainFileFallback,
 }
 
 /// One §6.4 key.
@@ -354,6 +355,12 @@ pub const KEYS: &[Key] = &[
         name: "notify.events",
         kind: KeyKind::NotifyEvents,
         per_provider: true,
+    },
+    Key {
+        id: KeyId::KeychainFileFallback,
+        name: "keychain.file_fallback",
+        kind: KeyKind::Bool,
+        per_provider: false,
     },
 ];
 
@@ -982,6 +989,9 @@ pub struct Settings {
     /// `notify.events` (D7): the kinds the daemon notifies, in the order written. The provider's
     /// own table first.
     pub notify_events: Vec<NotifyEvent>,
+    /// `keychain.file_fallback`: whether a credential write the macOS Keychain refuses may fall
+    /// back to the credentials file. The same for every provider.
+    pub keychain_file_fallback: bool,
 }
 
 impl Default for Settings {
@@ -1008,6 +1018,7 @@ impl Default for Settings {
             daemon_autoswitch: true,
             notify_enabled: true,
             notify_events: NotifyEvent::ALL.to_vec(),
+            keychain_file_fallback: true,
         }
     }
 }
@@ -1020,6 +1031,11 @@ impl Settings {
     pub fn load(env: &Env, provider: &ProviderId) -> (Settings, Vec<String>) {
         let read = read_file(env, provider);
         (read.settings, read.warnings)
+    }
+
+    /// `keychain.file_fallback` as `config.toml` holds it now (see [`FileFallback`]).
+    pub(crate) fn load_keychain_file_fallback(env: &Env, provider: &ProviderId) -> FileFallback {
+        FileFallback::of(&read_file(env, provider))
     }
 
     /// `config.toml`'s modification time; `None` when the file is missing or its metadata
@@ -1057,6 +1073,7 @@ impl Settings {
             KeyId::AccountsView => Value::Str(self.accounts_view.as_str().to_owned()),
             KeyId::DaemonAutoswitch => Value::Bool(self.daemon_autoswitch),
             KeyId::NotifyEnabled => Value::Bool(self.notify_enabled),
+            KeyId::KeychainFileFallback => Value::Bool(self.keychain_file_fallback),
             KeyId::NotifyEvents => Value::List(
                 self.notify_events
                     .iter()
@@ -1099,6 +1116,7 @@ impl Settings {
             }
             KeyId::DaemonAutoswitch => self.daemon_autoswitch = value.into_bool(),
             KeyId::NotifyEnabled => self.notify_enabled = value.into_bool(),
+            KeyId::KeychainFileFallback => self.keychain_file_fallback = value.into_bool(),
             KeyId::NotifyEvents => {
                 self.notify_events = value
                     .into_list()
@@ -1150,19 +1168,58 @@ fn parse_bool_item(item: &Item) -> Option<bool> {
 struct FileRead {
     path: PathBuf,
     exists: bool,
+    /// The file exists but could not be read or parsed, so `settings` is all defaults.
+    broken: bool,
     settings: Settings,
     /// Per [`KEYS`] entry, the table its value came from.
     sources: Vec<Source>,
+    /// The keys whose value was present in every table that holds it, yet invalid in each.
+    invalid: Vec<KeyId>,
     unknown: Vec<String>,
     warnings: Vec<String>,
+}
+
+/// `keychain.file_fallback` as `config.toml` holds it: whether tagteam may store a secret in
+/// plain text when the Keychain refuses a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileFallback {
+    /// The key is true, or the file or the key is missing (the default).
+    Allowed,
+    /// The key is false.
+    Off,
+    /// The file exists but cannot be read or parsed, the key is invalid, or `keychain` is not a
+    /// table. A setting that cannot be read is not a permission, so it acts as `Off`.
+    Unknown,
+}
+
+impl FileFallback {
+    fn of(read: &FileRead) -> Self {
+        if read.broken || read.invalid.contains(&KeyId::KeychainFileFallback) {
+            Self::Unknown
+        } else if read.settings.keychain_file_fallback {
+            Self::Allowed
+        } else {
+            Self::Off
+        }
+    }
+
+    /// `Allow(before)` when the fallback is allowed, else `Refuse`.
+    pub(crate) fn policy(self, before: BeforeFallback<'_>) -> Fallback<'_> {
+        match self {
+            Self::Allowed => Fallback::Allow(before),
+            Self::Off | Self::Unknown => Fallback::Refuse,
+        }
+    }
 }
 
 fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
     let mut read = FileRead {
         path: config_path(env),
         exists: true,
+        broken: false,
         settings: Settings::default(),
         sources: vec![Source::Default; KEYS.len()],
+        invalid: Vec::new(),
         unknown: Vec::new(),
         warnings: Vec::new(),
     };
@@ -1173,6 +1230,7 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
             return read;
         }
         Err(e) => {
+            read.broken = true;
             read.warnings.push(format!(
                 "{}: cannot read the settings file ({}); using the defaults",
                 read.path.display(),
@@ -1182,6 +1240,7 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
         }
     };
     let Ok(doc) = text.parse::<DocumentMut>() else {
+        read.broken = true;
         read.warnings.push(format!(
             "{}: the settings file is not valid TOML; using the defaults",
             read.path.display()
@@ -1193,6 +1252,7 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
         doc: &doc,
         path: &shown,
         warnings: Vec::new(),
+        invalid: Vec::new(),
     };
     for (key, source) in KEYS.iter().zip(read.sources.iter_mut()) {
         if let Some((value, from)) = reader.read_key(key, provider) {
@@ -1228,6 +1288,7 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
     read.settings.prices = reader.read_prices();
     read.settings.mappings = reader.read_mappings(provider, &env.home);
     read.warnings = reader.warnings;
+    read.invalid = reader.invalid;
     unknown_keys(doc.as_table(), &mut Vec::new(), &mut read.unknown);
     read.unknown.sort();
     read
@@ -1241,6 +1302,7 @@ pub(crate) fn autoswitch_pair(doc: &DocumentMut, provider: &ProviderId) -> (f64,
         doc,
         path: "",
         warnings: Vec::new(),
+        invalid: Vec::new(),
     };
     let mut settings = Settings::default();
     for key in KEYS
@@ -1259,6 +1321,8 @@ struct Reader<'a> {
     /// The settings file's full path, which every warning starts with.
     path: &'a str,
     warnings: Vec<String>,
+    /// The keys `read_key` found present but invalid, and that no later table made good.
+    invalid: Vec<KeyId>,
 }
 
 impl<'a> Reader<'a> {
@@ -1290,9 +1354,25 @@ impl<'a> Reader<'a> {
         Some(current)
     }
 
+    /// Whether a segment of `path` exists but is not a table, so `table` read it as absent.
+    fn blocked(&self, path: &[&str]) -> bool {
+        let mut current: &dyn TableLike = self.doc.as_table();
+        for segment in path {
+            match current.get(segment) {
+                None => return false,
+                Some(item) => match item.as_table_like() {
+                    Some(table) => current = table,
+                    None => return true,
+                },
+            }
+        }
+        false
+    }
+
     /// `key`'s value for `provider`, and the table it came from: the first table that holds a
     /// valid one, the provider's own first when the key is per provider. A present value that
-    /// is not valid warns, naming the dotted key, and the next table is tried.
+    /// is not valid warns, naming the dotted key, and the next table is tried. A table that is
+    /// no table counts as a present, invalid value.
     fn read_key(&mut self, key: &Key, provider: &ProviderId) -> Option<(Value, Source)> {
         let own: Vec<&str> = key.table().into_iter().collect();
         let mut tables: Vec<(Vec<&str>, Source)> = Vec::with_capacity(2);
@@ -1302,8 +1382,10 @@ impl<'a> Reader<'a> {
             tables.push((path, Source::Provider));
         }
         tables.push((own, Source::Global));
+        let mut present = false;
         for (path, source) in tables {
             let Some(table) = self.table(&path) else {
+                present |= self.blocked(&path);
                 continue;
             };
             let Some(item) = table.get(key.leaf()) else {
@@ -1322,12 +1404,18 @@ impl<'a> Reader<'a> {
             }
             match value {
                 Some(value) => return Some((value, source)),
-                None => self.warn(format!(
-                    "{}: `{dotted}` {} (ignored)",
-                    self.path,
-                    key.expect()
-                )),
+                None => {
+                    present = true;
+                    self.warn(format!(
+                        "{}: `{dotted}` {} (ignored)",
+                        self.path,
+                        key.expect()
+                    ));
+                }
             }
+        }
+        if present {
+            self.invalid.push(key.id);
         }
         None
     }

@@ -59,8 +59,12 @@ impl Fx {
     }
 
     fn checks(&self) -> Vec<Check> {
+        self.checks_with(true)
+    }
+
+    fn checks_with(&self, file_fallback: bool) -> Vec<Check> {
         self.cc
-            .doctor_checks(&self.env, &self.spawner, &Cancel::new())
+            .doctor_checks(&self.env, &self.spawner, &Cancel::new(), file_fallback)
     }
 
     /// A home Claude Code has been started in: its global config exists (§13.6 runs
@@ -786,4 +790,110 @@ fn the_online_hosts_are_probed_once_each_even_when_a_duplicate_is_not_adjacent()
         cc.doctor_hosts(),
         ["https://a.example/", "https://b.example/"]
     );
+}
+
+fn plain_login(f: &Fx) -> PathBuf {
+    let file = CcPaths::resolve(&f.env).credentials_file;
+    fs::write(
+        &file,
+        json!({"claudeAiOauth": {"accessToken": "sk-ant-secret"}, "mcpOAuth": {}}).to_string(),
+    )
+    .unwrap();
+    file
+}
+
+fn plain_key(f: &Fx) -> PathBuf {
+    let file = CcPaths::resolve(&f.env).global_config;
+    fs::write(&file, json!({"primaryApiKey": "sk-ant-secret"}).to_string()).unwrap();
+    file
+}
+
+#[test]
+fn with_the_default_there_is_no_fallback_check() {
+    let f = fx();
+    plain_login(&f);
+    plain_key(&f);
+    none(&f.checks(), "cc.keychain-fallback");
+}
+
+#[test]
+fn with_the_fallback_off_and_no_plain_text_secret_the_check_is_ok() {
+    let f = fx();
+    fs::write(
+        CcPaths::resolve(&f.env).credentials_file,
+        json!({"mcpOAuth": {}}).to_string(),
+    )
+    .unwrap();
+    let checks = f.checks_with(false);
+    assert_eq!(one(&checks, "cc.keychain-fallback").status, CheckStatus::Ok);
+    let ids: Vec<&str> = checks.iter().map(|c| c.id.as_str()).collect();
+    let at = |id| ids.iter().position(|i| *i == id).unwrap();
+    assert!(at("cc.keychain-fallback") > at("cc.keychain"));
+}
+
+#[test]
+fn with_the_fallback_off_a_login_in_the_credentials_file_warns_and_names_the_file() {
+    let f = fx();
+    let file = plain_login(&f);
+    let checks = f.checks_with(false);
+    let c = one(&checks, "cc.keychain-fallback");
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert_eq!(
+        c.message,
+        format!(
+            "{} holds a login in plain text; `keychain.file_fallback` is off, which stops new \
+             fallbacks and removes nothing",
+            file.display()
+        )
+    );
+    assert_eq!(c.fix, None);
+    assert!(!c.message.contains("sk-ant-secret"));
+}
+
+#[test]
+fn with_the_fallback_off_a_torn_credentials_file_is_not_called_clean() {
+    let f = fx();
+    let file = CcPaths::resolve(&f.env).credentials_file;
+    fs::write(
+        &file,
+        r#"{"claudeAiOauth": {"accessToken": "sk-ant-secret""#,
+    )
+    .unwrap();
+    let checks = f.checks_with(false);
+    let c = one(&checks, "cc.keychain-fallback");
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(c.message.contains("cannot be told"), "{}", c.message);
+    assert!(
+        c.message.contains(&file.display().to_string()),
+        "{}",
+        c.message
+    );
+    assert!(!c.message.contains("sk-ant-secret"));
+}
+
+#[test]
+fn with_the_fallback_off_a_primary_api_key_warns_and_names_the_config() {
+    let f = fx();
+    let file = plain_key(&f);
+    let checks = f.checks_with(false);
+    let c = one(&checks, "cc.keychain-fallback");
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(
+        c.message.starts_with(&format!(
+            "{} holds an API key in plain text;",
+            file.display()
+        )),
+        "{}",
+        c.message
+    );
+    assert_eq!(c.fix, None);
+    assert!(!c.message.contains("sk-ant-secret"));
+}
+
+#[test]
+fn the_fallback_check_never_appears_on_linux() {
+    let f = fx_on(Platform::Linux);
+    plain_login(&f);
+    plain_key(&f);
+    none(&f.checks_with(false), "cc.keychain-fallback");
 }

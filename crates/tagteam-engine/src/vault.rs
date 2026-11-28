@@ -58,6 +58,11 @@ pub trait VaultBackend: Send + Sync {
     fn keychain(&self) -> Option<&dyn Keychain> {
         None
     }
+    /// Whether the backend takes a write of `key`'s item as it is. `Err` when the item cannot
+    /// be read; `Ok(true)` when it is absent or the backend has nothing to probe.
+    fn probe_write(&self, _key: &str) -> Result<bool, VaultError> {
+        Ok(true)
+    }
     /// The directory of a file backend (Linux): purge deletes it whole (§10.5), and doctor
     /// lists it (§13.6).
     fn dir(&self) -> Option<&Path> {
@@ -94,6 +99,19 @@ impl VaultBackend for KeychainVault {
     }
     fn keychain(&self) -> Option<&dyn Keychain> {
         Some(self.keychain.as_ref())
+    }
+    fn probe_write(&self, key: &str) -> Result<bool, VaultError> {
+        match self.keychain.find(SERVICE, key) {
+            Read::Absent => Ok(true),
+            Read::Unreadable(e) => Err(VaultError::Unreadable(e)),
+            Read::Present(bytes) => match self.keychain.upsert(SERVICE, key, &bytes) {
+                Ok(()) => Ok(true),
+                Err(e) => {
+                    tracing::warn!(rc = e.rc, "a Keychain write probe was refused");
+                    Ok(false)
+                }
+            },
+        }
     }
 }
 
@@ -204,6 +222,14 @@ impl Vault {
             "stored a credential in the vault"
         );
         Ok(())
+    }
+
+    /// Whether the backend takes a write of the account's current item as it is, under the
+    /// account lock: the item is rewritten with its own bytes. It never rotates `.prev`, never
+    /// counts in `writes` (the bytes do not change) and logs nothing at INFO. `Err` when the
+    /// item cannot be read; `Ok(true)` when it is absent or the backend is a file vault.
+    pub fn probe_write(&self, lock: &AccountLock) -> Result<bool, VaultError> {
+        self.backend.probe_write(lock.id().as_str())
     }
 
     /// The backend's Keychain (macOS), or `None` (§10.5, §13.6).

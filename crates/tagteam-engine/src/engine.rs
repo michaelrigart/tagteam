@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use crate::event::EventSource;
 use crate::hooks;
 use crate::oracle::Oracle;
 use crate::registry::ProviderRegistry;
-use crate::settings::Settings;
+use crate::settings::{FileFallback, Settings, config_path};
 use crate::store::{JournalRow, Store, StoreError};
 use crate::vault::Vault;
 
@@ -134,6 +135,7 @@ pub struct Engine {
     /// `tagteam auto` and, briefly, `purge`, and is neither the daemon nor a window.
     lock_holder: HolderKind,
     store: Mutex<Option<Arc<Store>>>,
+    fallback_refusals: AtomicU64,
     #[cfg(feature = "test-hooks")]
     pub(crate) fail_at: Mutex<Option<&'static str>>,
     #[cfg(feature = "test-hooks")]
@@ -161,6 +163,7 @@ impl Engine {
                 EventSource::Cli | EventSource::Auto => HolderKind::Auto,
             },
             store: Mutex::new(None),
+            fallback_refusals: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             fail_at: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
@@ -241,7 +244,9 @@ impl Engine {
     /// forgiving, the provider's own table first), makes it the engine's settings, and returns
     /// the read's warnings. A missing or corrupt file gives the defaults, as at start-up. The
     /// daemon reloads for the provider its command acts on, at start and whenever the file's
-    /// mtime changes (D4.2); the collector and the views read the result.
+    /// mtime changes (D4.2); the collector and the views read the result. A file that is
+    /// corrupt gives the defaults here, but `keychain.file_fallback` is read from the file at
+    /// each use ([`Engine::file_fallback`]), never from this snapshot.
     pub fn reload_settings(&self, provider: &ProviderId) -> Vec<String> {
         let (settings, warnings) = Settings::load(&self.env, provider);
         *self
@@ -249,6 +254,60 @@ impl Engine {
             .write()
             .unwrap_or_else(PoisonError::into_inner) = Arc::new(settings);
         warnings
+    }
+
+    /// How many writes this engine has refused under `keychain.file_fallback = false`.
+    pub fn fallback_refusals(&self) -> u64 {
+        self.fallback_refusals.load(Ordering::Relaxed)
+    }
+
+    /// `keychain.file_fallback`, read from `config.toml` at each use rather than from the
+    /// settings snapshot: only the daemon reloads that, and a running `auto` or the TUI must
+    /// follow an edit at its next write. A setting that cannot be read is
+    /// [`FileFallback::Unknown`], which is never a permission to store a secret in plain text.
+    pub(crate) fn file_fallback(&self) -> FileFallback {
+        Settings::load_keychain_file_fallback(&self.env, self.default_provider())
+    }
+
+    /// The refusal `e` as `setting` words it: the engine's own, naming the file, when the setting
+    /// cannot be read, else `e`. The one place that text is chosen, for the probe's refusal and
+    /// the provider's alike.
+    pub(crate) fn refusal(&self, setting: FileFallback, e: EngineError) -> EngineError {
+        match (setting, e) {
+            (
+                FileFallback::Unknown,
+                EngineError::KeychainFallbackRefused
+                | EngineError::Provider(ProviderError::FallbackRefused { .. }),
+            ) => EngineError::KeychainFallbackUnreadable {
+                path: config_path(&self.env),
+            },
+            (_, e) => e,
+        }
+    }
+
+    /// Spec §3.4: with the setting off, refuses unless `lock`'s vault item takes a write. `Ok`
+    /// when the item is unreadable or absent: the operation then ends with the error it has
+    /// today.
+    pub(crate) fn probe_keychain_write(&self, lock: &AccountLock) -> Result<(), EngineError> {
+        let setting = self.file_fallback();
+        if setting == FileFallback::Allowed {
+            return Ok(());
+        }
+        match self.vault.probe_write(lock) {
+            Ok(false) => {
+                let refused = self.refusal(setting, EngineError::KeychainFallbackRefused);
+                self.note_refusal(&refused);
+                Err(refused)
+            }
+            Ok(true) | Err(_) => Ok(()),
+        }
+    }
+
+    /// Counts `e` when it is a fallback refusal.
+    pub(crate) fn note_refusal(&self, e: &EngineError) {
+        if e.is_fallback_refusal() {
+            self.fallback_refusals.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The port providers send their requests through (§4.4).

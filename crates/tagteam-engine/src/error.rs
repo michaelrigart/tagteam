@@ -55,6 +55,19 @@ pub enum EngineError {
         "the Keychain could not be read, so the live credential may be out of date; unlock the Keychain and retry"
     )]
     DegradedRead,
+    /// Spec §3.4: `keychain.file_fallback` is off and the vault's Keychain item refused a write,
+    /// so nothing was saved and no token was spent.
+    #[error(
+        "the Keychain refused a write and `keychain.file_fallback` is off, so the credential was not stored; run tagteam from the desktop login session, or allow the fallback with `tagteam config set keychain.file_fallback true`"
+    )]
+    KeychainFallbackRefused,
+    /// Spec §3.5: as `KeychainFallbackRefused`, but `keychain.file_fallback` cannot be read from
+    /// `path`, which counts as off.
+    #[error(
+        "the Keychain refused a write and `keychain.file_fallback` cannot be read from {}, so the credential was not stored; repair that file, or run tagteam from the desktop login session",
+        path.display()
+    )]
+    KeychainFallbackUnreadable { path: PathBuf },
     #[error("the live credential belongs to {found}, not {expected}; refusing to add it")]
     OwnerMismatch { expected: String, found: String },
     #[error("the live login changed while it was being checked; run the command again")]
@@ -561,6 +574,20 @@ fn session_owned_message(position: u32, label: &str, owner: &SessionOwner) -> St
 }
 
 impl EngineError {
+    /// Whether this is a refusal under `keychain.file_fallback = false`: the probe's, the
+    /// write's, or a refused write whose restore failed too.
+    pub fn is_fallback_refusal(&self) -> bool {
+        match self {
+            EngineError::KeychainFallbackRefused
+            | EngineError::KeychainFallbackUnreadable { .. } => true,
+            EngineError::Provider(ProviderError::FallbackRefused { .. }) => true,
+            EngineError::Provider(ProviderError::RestoreFailed { cause, .. }) => {
+                matches!(**cause, ProviderError::FallbackRefused { .. })
+            }
+            _ => false,
+        }
+    }
+
     /// Stable `error.type` for `--json` output (§14).
     pub fn kind(&self) -> &'static str {
         if let Some(e) = self.lock_error() {
@@ -570,6 +597,9 @@ impl EngineError {
             EngineError::Store(_) => "store",
             EngineError::Provider(ProviderError::ConfigUnsplicable { .. }) => "config-unsplicable",
             EngineError::Provider(ProviderError::RestoreFailed { .. }) => "rollback-failed",
+            EngineError::Provider(ProviderError::FallbackRefused { .. }) => {
+                "keychain-fallback-refused"
+            }
             EngineError::Provider(_) => "provider",
             // unreachable: `lock_error()` above reads every lock carrier
             EngineError::Lock(_) | EngineError::Settings(SettingsError::Lock(_)) => "lock",
@@ -582,6 +612,8 @@ impl EngineError {
             EngineError::NoLiveLogin { .. } => "no-live-login",
             EngineError::LiveApiKey => "live-api-key",
             EngineError::DegradedRead => "degraded-read",
+            EngineError::KeychainFallbackRefused
+            | EngineError::KeychainFallbackUnreadable { .. } => "keychain-fallback-refused",
             EngineError::OwnerMismatch { .. } => "owner-mismatch",
             EngineError::LiveMoved => "live-moved",
             EngineError::NeedsConfirmation { .. } => "needs-confirmation",
@@ -687,6 +719,29 @@ fn lock_kind(e: &LockError) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_fallback_refusal_is_the_probe_the_write_or_a_write_whose_restore_failed() {
+        let refused = || ProviderError::FallbackRefused { item: "x".into() };
+        assert!(EngineError::KeychainFallbackRefused.is_fallback_refusal());
+        assert!(EngineError::KeychainFallbackUnreadable { path: "c".into() }.is_fallback_refusal());
+        assert!(EngineError::Provider(refused()).is_fallback_refusal());
+        assert!(
+            EngineError::Provider(ProviderError::RestoreFailed {
+                cause: Box::new(refused()),
+                restore: Box::new(ProviderError::Invalid("b".into())),
+            })
+            .is_fallback_refusal()
+        );
+        assert!(
+            !EngineError::Provider(ProviderError::RestoreFailed {
+                cause: Box::new(ProviderError::Invalid("a".into())),
+                restore: Box::new(refused()),
+            })
+            .is_fallback_refusal()
+        );
+        assert!(!EngineError::Provider(ProviderError::Invalid("a".into())).is_fallback_refusal());
+    }
+
     /// Pins every variant's `kind()` string: it's part of `--json`'s stable contract (§14), so
     /// a change here is a breaking change, not a refactor.
     #[test]
@@ -712,6 +767,10 @@ mod tests {
                     restore: Box::new(ProviderError::Invalid("b".into())),
                 }),
                 "rollback-failed",
+            ),
+            (
+                EngineError::Provider(ProviderError::FallbackRefused { item: "x".into() }),
+                "keychain-fallback-refused",
             ),
             (
                 EngineError::Provider(ProviderError::Invalid("x".into())),
@@ -763,6 +822,14 @@ mod tests {
             ),
             (EngineError::LiveApiKey, "live-api-key"),
             (EngineError::DegradedRead, "degraded-read"),
+            (
+                EngineError::KeychainFallbackRefused,
+                "keychain-fallback-refused",
+            ),
+            (
+                EngineError::KeychainFallbackUnreadable { path: "c".into() },
+                "keychain-fallback-refused",
+            ),
             (
                 EngineError::OwnerMismatch {
                     expected: "a".into(),
