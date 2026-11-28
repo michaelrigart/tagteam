@@ -21,9 +21,13 @@ as the spec's trial on `81507e2a` measured.
 - unicode-normalization, ratatui, crossterm, generic-array and kem do not move.
 - Run cargo with Rust 1.100.1 itself: mise exports `RUSTUP_TOOLCHAIN=1.99.1`, which beats
   `rust-toolchain.toml`. Put `~/.rustup/toolchains/1.100.1-aarch64-apple-darwin/bin` first on
-  `PATH` and unset `RUSTUP_TOOLCHAIN`; confirm with `cargo --version`.
-- Each task is one commit, and the workspace builds with `--locked` after each. The tasks run
-  in order: several edit `Cargo.toml`, `Cargo.lock` or `CONTRIBUTING.md`.
+  `PATH` and unset `RUSTUP_TOOLCHAIN`; confirm with `cargo --version`. This cargo takes no
+  `+<version>`: for the Rust 1.89 checks, do the same in a subshell with
+  `~/.rustup/toolchains/1.89.0-aarch64-apple-darwin/bin`, and confirm both `cargo --version` and
+  `rustc --version` say 1.89.0 there.
+- Tasks 1 to 6 are one commit each, and the workspace builds with `--locked` after each. Tasks
+  1, 2, 3, 4 and 6 run in that order: they share `Cargo.toml`, `Cargo.lock` or
+  `CONTRIBUTING.md`. Task 7 commits nothing; Task 8 commits the records.
 - Editing `mise.toml` (Task 6) makes mise's shims refuse to run in this checkout until Michael
   trusts the file again. Nothing after it may go through a shim: cargo comes from the toolchain
   directory above, and dist and cargo-deny are called by their full paths under
@@ -37,9 +41,10 @@ as the spec's trial on `81507e2a` measured.
 | 2 | 1 |
 | 3 | 2 |
 | 4 | 3 |
-| 5 | 4 |
-| 6 | 5 |
-| 7 | 6 |
+| 5 | none |
+| 6 | 4 |
+| 7 | 5, 6 |
+| 8 | 7 |
 
 ### Task 1: Pin Rust 1.100.1
 
@@ -92,7 +97,7 @@ as the spec's trial on `81507e2a` measured.
 
 ### Task 5: cargo-deny-action v2.1.5
 
-**Depends on:** 4
+**Depends on:** none
 
 - [ ] Confirm `git ls-remote --tags https://github.com/EmbarkStudios/cargo-deny-action
   'v2.1.5*'` peels to `bb119f768ea239e765aeaef5769558d4f21213aa`.
@@ -100,7 +105,7 @@ as the spec's trial on `81507e2a` measured.
 
 ### Task 6: cargo-dist 0.34.0
 
-**Depends on:** 5
+**Depends on:** 4
 
 - [ ] `mise.toml` and `dist-workspace.toml`: 0.34.0; `CONTRIBUTING.md` names it.
 - [ ] Regenerate with the pinned binary,
@@ -111,11 +116,22 @@ as the spec's trial on `81507e2a` measured.
 
 ### Task 7: Verification
 
-**Depends on:** 6
+**Depends on:** 5, 6
 
-- [ ] Everything in the spec's §6 that runs locally, on the final commit, with totals: the
-  package-name, action and Rust-diff checks included.
-- [ ] After the Draft PR is open: CI green, the release workflow's `release-smoke` job included.
-  If that job fails on the `$/` call, revert Task 6's commit, record cargo-dist as held back in
-  the spec, run `dist generate --check` with 0.33.1, and require the release run green on that
-  commit.
+No commit. On the last commit of Tasks 1 to 6:
+
+- [ ] Every line of the spec's §6 that runs locally, with totals, the package-name, action and
+  Rust-diff checks included. Freshness is not repeated: Task 4's result stands, as §6 says.
+- [ ] The four Rust 1.89 checks of CI's `msrv` job, in the 1.89.0 subshell.
+
+### Task 8: Pull request and records
+
+**Depends on:** 7
+
+- [ ] Push the branch and open the Draft PR.
+- [ ] One commit sets `**Status:** Implemented` with the PR's URL in the spec and in this plan,
+  and ticks this plan's boxes.
+- [ ] CI is green on that commit, the release workflow's `release-smoke` job included.
+- [ ] If that job fails on the `$/` call: revert Task 6's commit, record cargo-dist as held back
+  in the spec, and put the new head through Task 7 again with dist 0.33.1 (Task 4's freshness
+  result still stands), then through the whole of the PR's CI, the release run included.
