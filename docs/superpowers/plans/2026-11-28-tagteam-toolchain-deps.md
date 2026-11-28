@@ -117,16 +117,17 @@ as the spec's trial on `81507e2a` measured.
 
 **Depends on:** 5, 6
 
-The local checks are every line of the spec's §6 that runs locally, with totals: the
-package-name, action and Rust-diff checks included, and the four Rust 1.89 checks of CI's `msrv`
-job in the 1.89.0 subshell. Freshness is not among them: Task 4's result stands, as §6 says.
+One commit, the records commit, made after the pull request exists.
 
-- [ ] Run the local checks on the last commit of Tasks 1 to 6, then push the branch and open the
-  Draft PR.
-- [ ] One commit sets `**Status:** Implemented` with the PR's URL in the spec and in this plan,
-  and ticks this plan's boxes. Push it.
-- [ ] On that commit: the local checks again, and their totals are the ones reported; the PR's
-  head is the same commit; its CI is green, the release workflow's `release-smoke` job included.
-- [ ] If the release workflow fails on a `$/` call, whether `release-smoke` fails to run or
-  GitHub rejects the workflow before any job starts: revert Task 6's commit, record cargo-dist
-  as held back in the spec, push, and repeat the previous step on the new head with dist 0.33.1.
+- [ ] Push the branch at the last commit of Tasks 1 to 6 and open the Draft PR.
+- [ ] Wait for the release workflow's run on that head. It fails on a `$/` call if
+  `release-smoke` cannot be started or GitHub rejects the workflow before any job starts.
+- [ ] The records commit sets `**Status:** Implemented` with the PR's URL in the spec and in
+  this plan, and ticks this plan's boxes. If the release run failed on a `$/` call, the same
+  commit also reverts Task 6's changes and records cargo-dist as held back in the spec.
+- [ ] On the records commit, before pushing it: every line of the spec's §6 that runs locally,
+  with totals, the package-name, action and Rust-diff checks included, and the four Rust 1.89
+  checks of CI's `msrv` job in the 1.89.0 subshell. dist is the version the commit pins.
+  Freshness is not repeated: Task 4's result stands, as §6 says.
+- [ ] Push it. The PR's head is that commit, and its CI is green, the release workflow's
+  `release-smoke` job included.
