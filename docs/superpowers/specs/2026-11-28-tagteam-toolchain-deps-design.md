@@ -1,6 +1,6 @@
 # tagteam — toolchain and dependency update, November 2026
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/69
 **Date:** 2026-11-28
 **Scope:** `rust-toolchain.toml`, `Cargo.toml`, `Cargo.lock`, `crates/tagteam/Cargo.toml`,
 `mise.toml`, `dist-workspace.toml`, `.github/workflows/release.yml` (generated),
@@ -17,7 +17,8 @@ Versions and dates are as read at each registry on 2026-11-28.
 ## 1. Purpose
 
 Bring the Rust toolchain, the release tool, every dependency, the lockfile and one CI action to
-their newest release. tagteam's behaviour does not change. One piece of package metadata does:
+their newest release. tagteam's behaviour does not change for any time it can meet (§4.4). One
+piece of package metadata does:
 the `tagteam` crate no longer declares a `homepage` (§4.1).
 
 It is not a small change: it regenerates the release workflow, which publishes the archives, the
@@ -104,10 +105,15 @@ comment-only SQL. No tagteam statement is one: the suite passes unchanged.
 
 ### 4.4 jiff 1.0.3
 
-jiff 1.0 is the same library as 0.2 with its API fixed. tagteam meets one of its breaking
-changes: the type `Zoned` is now `ZonedDateTime`, and `Timestamp::to_zoned` and
-`civil::Date::to_zoned` are now `to_zoned_datetime`. The change is that rename in nine files,
-plus what rustfmt reflows around the longer name. tagteam uses none of the other changed APIs
+jiff 1.0 is the same library as 0.2 with its API fixed, plus the bug fixes of 0.2.39 to 1.0.3.
+Two of those can change the day a time falls on, both outside any time token usage is dated:
+before 1970, where a time just before a time-zone offset change got the new offset early (one
+millisecond before Istanbul's 1910 change was bucketed a day late), and in the last second of
+the year 9999. tagteam's bucketing functions accept such times; nothing produces them. tagteam
+meets one of its
+breaking changes: the type `Zoned` is now `ZonedDateTime`, and `to_zoned` on `Timestamp`,
+`civil::Date` and `civil::DateTime` is now `to_zoned_datetime`. The change is that rename in
+nine files, plus what rustfmt reflows around the longer name. tagteam uses none of the other changed APIs
 (`Offset::saturating_add`, `Timestamp - Timestamp`, `Timestamp` to `SystemTime`, `ToSpan`,
 `jiff_tzdb`): with the rename alone, every target compiles.
 
@@ -139,7 +145,7 @@ workspace names itself is at its newest release, except the one deliberate hold 
 - **Younger than seven days:** allocator-api2 0.2.22, anyhow 1.0.105, cc 1.12.0, clap and
   clap_builder 4.6.10, find-msvc-tools 0.1.16, hashbrown 0.17.2, litrs 1.1.0, pest and its three
   companions 2.9.7, sha2 0.11.2, toml_edit 0.25.21, toml_parser 1.1.7, zerocopy and
-  zerocopy-derive 0.8.66.
+  zerocopy-derive 0.8.66, and jiff-core 1.0.2 and jiff-static 1.0.3 beside jiff.
 - **Two crates join the build.** psm 0.1.32 (reached through pest's stack guard) now has two
   more build dependencies:
   - `ar_archive_writer` 0.5.5, https://crates.io/crates/ar_archive_writer, published 2026-11-11
@@ -197,7 +203,7 @@ On the final commit, with Rust 1.100.1, except where a line names another moment
 - the workflows use no external action that `81507e2a`'s do not, and every action commit in
   `release.yml` is one `dist-workspace.toml` pins;
 - `dist generate --check` with the cargo-dist version both pins name;
-- no build prints the `homepage` warning;
+- no cargo build prints Cargo's `redundant_homepage` warning;
 - no Rust file changes except by the jiff rename;
 - CI green on the pull request, the release workflow's `release-smoke` call included.
 

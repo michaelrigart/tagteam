@@ -1,6 +1,6 @@
 # Toolchain and dependency update, November 2026: implementation plan
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/69
 
 **Goal:** Rust 1.100.1, cargo-dist 0.34.0, rusqlite 0.43, jiff 1.0.3, cargo-deny-action v2.1.5
 and every package in the lockfile at its newest release.
@@ -49,68 +49,68 @@ as the spec's trial on `81507e2a` measured.
 
 **Depends on:** none
 
-- [ ] Check first: with 1.100.1, `cargo check -p tagteam --locked` prints the
+- [x] Check first: with 1.100.1, `cargo check -p tagteam --locked` prints the
   `package.homepage is redundant` warning.
-- [ ] `rust-toolchain.toml`: `channel = "1.100.1"`.
-- [ ] Remove `homepage.workspace = true` from `crates/tagteam/Cargo.toml` and `homepage` from
+- [x] `rust-toolchain.toml`: `channel = "1.100.1"`.
+- [x] Remove `homepage.workspace = true` from `crates/tagteam/Cargo.toml` and `homepage` from
   `[workspace.package]` in `Cargo.toml`.
-- [ ] `README.md` and `CONTRIBUTING.md`: Rust 1.99.1 becomes 1.100.1, including the
+- [x] `README.md` and `CONTRIBUTING.md`: Rust 1.99.1 becomes 1.100.1, including the
   `rust:1.99.1` image and `RUSTUP_TOOLCHAIN=1.99.1` in the Docker command.
-- [ ] The check no longer prints the warning; `cargo fmt --all --check` and clippy's three CI
+- [x] The check no longer prints the warning; `cargo fmt --all --check` and clippy's three CI
   configurations pass with `-D warnings`.
 
 ### Task 2: rusqlite 0.43
 
 **Depends on:** 1
 
-- [ ] `Cargo.toml`: `rusqlite = { version = "0.43", … }`; the minimum-supported-Rust comment and
+- [x] `Cargo.toml`: `rusqlite = { version = "0.43", … }`; the minimum-supported-Rust comment and
   `CONTRIBUTING.md` name rusqlite 0.43.
-- [ ] `cargo update rusqlite@0.41.1 libsqlite3-sys@0.39.1`: rusqlite 0.43.0, libsqlite3-sys
+- [x] `cargo update rusqlite@0.41.1 libsqlite3-sys@0.39.1`: rusqlite 0.43.0, libsqlite3-sys
   0.40.0, and whatever those two require; nothing else moves.
-- [ ] `cargo test -p tagteam-engine --locked` passes (the store tests).
+- [x] `cargo test -p tagteam-engine --locked` passes (the store tests).
 
 ### Task 3: jiff 1.0.3
 
 **Depends on:** 2
 
-- [ ] Check first: with `jiff = { version = "=1.0.3", … }` in `Cargo.toml` and `cargo update
+- [x] Check first: with `jiff = { version = "=1.0.3", … }` in `Cargo.toml` and `cargo update
   jiff@0.2.38`, `cargo check --workspace --all-targets --locked` fails on `jiff::Zoned` and
   `to_zoned` in `crates/tagteam-core/src/tokens/bucket.rs`.
-- [ ] Rename `Zoned` to `ZonedDateTime` and `to_zoned` to `to_zoned_datetime` wherever a Rust
+- [x] Rename `Zoned` to `ZonedDateTime` and `to_zoned` to `to_zoned_datetime` wherever a Rust
   file under `crates/` names them as jiff's, then `cargo fmt --all`.
-- [ ] Clippy's three CI configurations pass with `-D warnings`.
-- [ ] `cargo test -p tagteam-core -p tagteam-cc -p tagteam-engine -p tagteam-tui --locked`
+- [x] Clippy's three CI configurations pass with `-D warnings`.
+- [x] `cargo test -p tagteam-core -p tagteam-cc -p tagteam-engine -p tagteam-tui --locked`
   passes (the token report's days, months and time zones, and the TUI's dates).
 
 ### Task 4: Refresh the lockfile
 
 **Depends on:** 3
 
-- [ ] `cargo update`.
-- [ ] Freshness, in this same session (the spec's §6): `cargo update --dry-run` reports nothing
+- [x] `cargo update`.
+- [x] Freshness, in this same session (the spec's §6): `cargo update --dry-run` reports nothing
   to update, and every crates.io dependency a workspace manifest names is locked at the newest
   stable release crates.io lists, unicode-normalization excepted.
-- [ ] Against `81507e2a`, `Cargo.lock` gains `ar_archive_writer` 0.5.5 and `object` 0.39.1 and
+- [x] Against `81507e2a`, `Cargo.lock` gains `ar_archive_writer` 0.5.5 and `object` 0.39.1 and
   no other package name, and loses `atomic`, `bytemuck` and the three `defmt` crates.
-- [ ] `cargo deny check advisories` passes with cargo-deny 0.22.2.
+- [x] `cargo deny check advisories` passes with cargo-deny 0.22.2.
 
 ### Task 5: cargo-deny-action v2.1.5
 
 **Depends on:** none
 
-- [ ] Confirm `git ls-remote --tags https://github.com/EmbarkStudios/cargo-deny-action
+- [x] Confirm `git ls-remote --tags https://github.com/EmbarkStudios/cargo-deny-action
   'v2.1.5*'` peels to `bb119f768ea239e765aeaef5769558d4f21213aa`.
-- [ ] `ci.yml`: `EmbarkStudios/cargo-deny-action@bb119f768ea239e765aeaef5769558d4f21213aa # v2.1.5`.
+- [x] `ci.yml`: `EmbarkStudios/cargo-deny-action@bb119f768ea239e765aeaef5769558d4f21213aa # v2.1.5`.
 
 ### Task 6: cargo-dist 0.34.0
 
 **Depends on:** 4
 
-- [ ] `mise.toml` and `dist-workspace.toml`: 0.34.0; `CONTRIBUTING.md` names it.
-- [ ] Regenerate with the pinned binary,
+- [x] `mise.toml` and `dist-workspace.toml`: 0.34.0; `CONTRIBUTING.md` names it.
+- [x] Regenerate with the pinned binary,
   `~/.local/share/mise/installs/cargo-dist/0.34.0/*/dist generate`.
-- [ ] The diff of `release.yml` is exactly the installer URL and the two `uses: $/…` lines.
-- [ ] `dist generate --check` passes; `dist build --artifacts=global --tag v20261111.1935.0`
+- [x] The diff of `release.yml` is exactly the installer URL and the two `uses: $/…` lines.
+- [x] `dist generate --check` passes; `dist build --artifacts=global --tag v20261111.1935.0`
   writes a formula whose `homepage` is the repository URL.
 
 ### Task 7: Pull request, records and verification
@@ -119,15 +119,15 @@ as the spec's trial on `81507e2a` measured.
 
 One commit, the records commit, made after the pull request exists.
 
-- [ ] Push the branch at the last commit of Tasks 1 to 6 and open the Draft PR.
-- [ ] Wait for the release workflow's run on that head. It fails on a `$/` call if
+- [x] Push the branch at the last commit of Tasks 1 to 6 and open the Draft PR.
+- [x] Wait for the release workflow's run on that head. It fails on a `$/` call if
   `release-smoke` cannot be started or GitHub rejects the workflow before any job starts.
-- [ ] The records commit sets `**Status:** Implemented` with the PR's URL in the spec and in
+- [x] The records commit sets `**Status:** Implemented` with the PR's URL in the spec and in
   this plan, and ticks this plan's boxes. If the release run failed on a `$/` call, the same
   commit also reverts Task 6's changes and records cargo-dist as held back in the spec.
-- [ ] On the records commit, before pushing it: every line of the spec's §6 that runs locally,
+- [x] On the records commit, before pushing it: every line of the spec's §6 that runs locally,
   with totals, the package-name, action and Rust-diff checks included, and the four Rust 1.89
   checks of CI's `msrv` job in the 1.89.0 subshell. dist is the version the commit pins.
   Freshness is not repeated: Task 4's result stands, as §6 says.
-- [ ] Push it. The PR's head is that commit, and its CI is green, the release workflow's
+- [x] Push it. The PR's head is that commit, and its CI is green, the release workflow's
   `release-smoke` job included.
